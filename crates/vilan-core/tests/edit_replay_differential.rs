@@ -1606,6 +1606,23 @@ fn m188_retain_rows_are_restored_and_a_served_summary_reads_them() {
         "the leaf's `pass` was a served item: {:#?}",
         served.census
     );
+    // M189: the capture scan asks the closures the pass meets — the first
+    // analysis walks the cold module's `thrice` (three closures handed to
+    // calls) and the leaf's `read`; a keystroke that serves the module and
+    // `pass` asks the edited `read`'s one closure alone.
+    eprintln!(
+        "M189: capture scans: first {} warm {} served {}",
+        first.census.capture_scans, warm.census.capture_scans, served.census.capture_scans
+    );
+    assert_eq!(
+        (
+            first.census.capture_scans,
+            warm.census.capture_scans,
+            served.census.capture_scans
+        ),
+        (4, 0, 1),
+        "a served keystroke scans only the live set's closures"
+    );
 }
 
 /// M188's plant: the retaining summary folded from the LIVE rows alone, the

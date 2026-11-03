@@ -640,6 +640,11 @@ pub struct Census {
     /// family's live lane — a served keystroke reads a fraction of a filing
     /// one's.
     pub retain_rows_live: u64,
+    /// M189 (Order 56): the closures `check_view_escape` scanned for a
+    /// captured view — the ones its live positions and calls name, never the
+    /// program's every closure (it used to scan all of them, std's included,
+    /// on every analysis).
+    pub capture_scans: u64,
     /// B635's instrument ([`set_verify_graph_replays`]): the cold calls a
     /// REPLAYED post-rewrite graph names differently from the graph built
     /// whole over the same tree — 0 by construction, counted only while the
@@ -775,6 +780,7 @@ thread_local! {
             hover_rows_restored: 0,
             retaining_summaries: 0,
             retain_rows_live: 0,
+            capture_scans: 0,
             graph_replay_mismatches: 0,
             async_keys_served: 0,
             async_keys_rewalked: 0,
@@ -1156,8 +1162,8 @@ pub fn report(program: &Program) {
              live-entities={} move-rows-live={} r11-rows-live={} instances-served={} \
              instances-scanned={} instance-records-filed={} async-seeded={}/{} \
              async-records-filed={} async-record-bytes={} hover-rows-restored={} \
-             retaining-summaries={} retain-rows-live={} prefix-world={} prefix-layered={} \
-             prefix-hits={} prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
+             retaining-summaries={} retain-rows-live={} capture-scans={} prefix-world={} \
+             prefix-layered={} prefix-hits={} prefix-refusals={} prefix-file={} prefix-file-bytes={} prefix-file-us={} \
              prefix-checks={} prefix-checks-written={} tier-oracle={} \
              post-seam={}",
             census.base_hits,
@@ -1198,6 +1204,7 @@ pub fn report(program: &Program) {
             census.hover_rows_restored,
             census.retaining_summaries,
             census.retain_rows_live,
+            census.capture_scans,
             u8::from(census.prefix_world),
             u8::from(census.prefix_layered),
             census.prefix_hits,

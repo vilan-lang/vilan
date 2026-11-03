@@ -7473,10 +7473,9 @@ fn the_storing_callee_refusal_follows_a_chain_of_callees() {
     );
 }
 
-/// The analysis of `source` on a large-stack worker, with the number of
-/// callees whose C16 retaining summary that thread's census counted (E340,
-/// M188) and the diagnostics.
-fn retaining_summaries_of(source: &str) -> (u64, Vec<String>) {
+/// The analysis of `source` on a large-stack worker, with that thread's
+/// census (E340, M188, M189) and the diagnostics.
+fn escape_census_of(source: &str) -> (vilan_core::incremental::Census, Vec<String>) {
     let source = source.to_string();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -7491,7 +7490,7 @@ fn retaining_summaries_of(source: &str) -> (u64, Vec<String>) {
                 &Workspace::default(),
             );
             (
-                vilan_core::incremental::census().retaining_summaries,
+                vilan_core::incremental::census(),
                 errors.into_iter().map(|error| error.msg).collect(),
             )
         })
@@ -7508,13 +7507,14 @@ fn the_retaining_summary_is_computed_only_for_a_call_that_hands_on_a_capturing_c
     // It is asked now only by a call that hands a view-capturing closure to
     // an ordinary callee (`stored_view_capturing_arguments`' only question),
     // so a capturing closure that is called in place costs nothing...
-    let (summaries, errors) = retaining_summaries_of(
+    let (census, errors) = escape_census_of(
         r#"
         import std::io::print;
         fun read(v: &mut i32): i32 { let g = || *v; g() }
         fun main() { mut n = 3; print(read(&mut n)); }
         "#,
     );
+    let summaries = census.retaining_summaries;
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(
         summaries, 0,
@@ -7523,7 +7523,7 @@ fn the_retaining_summary_is_computed_only_for_a_call_that_hands_on_a_capturing_c
     // ...a view-capturing closure handed to a callee asks for THAT callee's
     // summary once (M188: the second call is a lookup), and the callee that
     // only calls it still compiles...
-    let (summaries, errors) = retaining_summaries_of(
+    let (census, errors) = escape_census_of(
         r#"
         import std::io::print;
         fun twice(g: || i32): i32 { g() + g() }
@@ -7531,13 +7531,14 @@ fn the_retaining_summary_is_computed_only_for_a_call_that_hands_on_a_capturing_c
         fun main() { mut n = 3; print(read(&mut n)); }
         "#,
     );
+    let summaries = census.retaining_summaries;
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(
         summaries, 1,
         "one callee asked, one summary, computed once per analysis"
     );
     // ...and the storing callee is still refused through it.
-    let (summaries, errors) = retaining_summaries_of(
+    let (census, errors) = escape_census_of(
         r#"
         import std::io::print;
         struct Holder { f: || i32 }
@@ -7547,6 +7548,7 @@ fn the_retaining_summary_is_computed_only_for_a_call_that_hands_on_a_capturing_c
         fun main() { let h = outer(); print((h.f)()); }
         "#,
     );
+    let summaries = census.retaining_summaries;
     assert_eq!(summaries, 1);
     assert!(
         errors
@@ -7564,7 +7566,7 @@ fn a_summary_that_reaches_a_derived_function_reads_its_synthesized_body() {
     // so asking `compare` (for the closure at position 0) reaches `eq`'s
     // body; the debug build checks the answer against the whole-program
     // rounds, and the closure, at a position nothing keeps, is admitted.
-    let (summaries, errors) = retaining_summaries_of(
+    let (census, errors) = escape_census_of(
         r#"
         import std::io::print;
         [derive(PartialEq)]
@@ -7577,7 +7579,42 @@ fn a_summary_that_reaches_a_derived_function_reads_its_synthesized_body() {
         "#,
     );
     assert!(errors.is_empty(), "{errors:?}");
-    assert_eq!(summaries, 2, "`compare` and the derived `eq` it reaches");
+    assert_eq!(
+        census.retaining_summaries, 2,
+        "`compare` and the derived `eq` it reaches"
+    );
+}
+
+#[test]
+fn the_capture_scan_asks_only_the_closures_the_escape_pass_meets() {
+    // M189 (Order 56): whether a closure captures a view was scanned for
+    // EVERY closure of the program on every analysis (~5,900 on kolt, std's
+    // included). It is asked now of the closures the pass meets - here the
+    // two handed to calls and the one stored in a field - and once each: the
+    // closure called in place, the one bound and never handed on, and std's
+    // closures are not scanned.
+    let (census, errors) = escape_census_of(
+        r#"
+        import std::io::print;
+        struct Holder { f: || i32 }
+        fun twice(g: || i32): i32 { g() + g() }
+        fun read(v: &mut i32): i32 {
+            let local = || *v;
+            let unused = || 7;
+            twice(|| *v) + twice(|| 1) + local()
+        }
+        fun main() {
+            mut n = 3;
+            let h = Holder { f = || 2 };
+            print(read(&mut n) + (h.f)());
+        }
+        "#,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        census.capture_scans, 3,
+        "the two closures handed to `twice` and the one stored in `Holder`"
+    );
 }
 
 #[test]
@@ -7587,7 +7624,7 @@ fn the_retaining_summary_closes_over_the_asked_callees_reach_only() {
     // summarized - and of no other: `store` and `relay` keep what they are
     // handed (and `relay` names `store`), but nothing the asked callee
     // reaches calls either, so neither is summarized.
-    let (summaries, errors) = retaining_summaries_of(
+    let (census, errors) = escape_census_of(
         r#"
         import std::io::print;
         struct Holder { f: || i32 }
@@ -7600,6 +7637,7 @@ fn the_retaining_summary_closes_over_the_asked_callees_reach_only() {
         fun main() { let h = outer(); print((h.f)()); print((relay(|| 1).f)()); }
         "#,
     );
+    let summaries = census.retaining_summaries;
     assert!(
         errors
             .iter()
@@ -7612,7 +7650,7 @@ fn the_retaining_summary_closes_over_the_asked_callees_reach_only() {
     );
     // A cycle among the reached callees closes too: `ping` and `pong` hand
     // the closure to each other and `pong` stores it, so `ping` keeps it.
-    let (summaries, errors) = retaining_summaries_of(
+    let (census, errors) = escape_census_of(
         r#"
         import std::io::print;
         struct Holder { f: || i32 }
@@ -7623,6 +7661,7 @@ fn the_retaining_summary_closes_over_the_asked_callees_reach_only() {
         fun main() { let h = outer(); print((h.f)()); }
         "#,
     );
+    let summaries = census.retaining_summaries;
     assert!(
         errors
             .iter()

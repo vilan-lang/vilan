@@ -1584,10 +1584,13 @@ pub const R11_FIXTURES: &[Fixture] = &[Fixture {
 // — which hands it on to the cold module's storing `keep`; to `keep` itself;
 // and make the cold `twice` store what it is handed. Each must be refused
 // naming the callee, and each refusal reads rows the keystroke did not walk.
+// The cold module's `thrice` hands three closures to calls: M189's capture
+// scan asks them on the analysis that walks the module, and not on a
+// keystroke that serves it.
 
 pub const RETAIN_MAIN: &str = "import pkg::views::render;\n\nfun main() {\n\tprint(render());\n}\n";
 
-pub const RETAIN_HOLDER: &str = "export struct Holder {\n\tf: || i32,\n}\n\nexport fun keep(g: || i32): Holder {\n\tHolder { f = g }\n}\n\nexport fun twice(g: || i32): i32 {\n\tg() + g()\n}\n";
+pub const RETAIN_HOLDER: &str = "export struct Holder {\n\tf: || i32,\n}\n\nexport fun keep(g: || i32): Holder {\n\tHolder { f = g }\n}\n\nexport fun twice(g: || i32): i32 {\n\tg() + g()\n}\n\nexport fun thrice(): i32 {\n\ttwice(|| 1) + twice(|| 2) + twice(|| 3)\n}\n";
 
 pub const RETAIN_VIEWS: &str = "import pkg::holder::{ Holder, keep, twice };\n\nexport fun render(): i32 {\n\tmut n = 3;\n\tread(&mut n)\n}\n\nfun read(v: &mut i32): i32 {\n\ttwice(|| *v)\n}\n\nfun pass(g: || i32): Holder {\n\tkeep(g)\n}\n";
 

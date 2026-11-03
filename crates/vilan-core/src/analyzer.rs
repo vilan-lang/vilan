@@ -29549,19 +29549,13 @@ impl<'src> Analyzer<'src> {
     fn check_view_escape(&mut self) {
         let view_bindings = self.view_bindings().clone();
         // A closure that captures a view is itself second-class (P4c): it cannot
-        // escape either, or the captured view would outlive its target.
-        let closure_ids: Vec<Id> = self.closures.keys().copied().collect();
-        let capturing: HashSet<Id> = closure_ids
-            .into_iter()
-            .filter(|closure_id| self.closure_captures_view_param(*closure_id))
-            .collect();
-        if crate::phase_pass_split_enabled() {
-            crate::phase_pass_mark(&format!(
-                "check_view_escape: closures capturing a view ({} of {})",
-                capturing.len(),
-                self.closures.len()
-            ));
-        }
+        // escape either, or the captured view would outlive its target. M189:
+        // asked per closure, of the closures this pass meets (a live escape
+        // position's value, a live call's argument, a live body's return leaf)
+        // and remembered for the pass — it used to scan every closure of the
+        // program (~5,900 on kolt, std's included, ~10-20 ms) on every
+        // keystroke, for the handful a served keystroke's live set can name.
+        let capturing = CaptureMemo::default();
         // Variant constructors that *are* a function's `Some(&mut self.x)` return
         // (including each branch of a conditional `if live { Some(..) } else { None
         // }`): the wrapped view projects a parameter, so the pair is a sanctioned
@@ -29658,8 +29652,7 @@ impl<'src> Analyzer<'src> {
                 // safe on JS only because the host boxes the place and traces
                 // it; on the emit-Rust backend (F1) it is a freed slot.
                 Expr::Call(call_id)
-                    if !capturing.is_empty()
-                        && self.call_hands_on_a_capturing_closure(*call_id, &capturing) =>
+                    if self.call_hands_on_a_capturing_closure(*call_id, &capturing) =>
                 {
                     let Some((callee_id, name)) = self.named_ordinary_callee(*call_id) else {
                         continue;
@@ -29788,6 +29781,10 @@ impl<'src> Analyzer<'src> {
                 expr_id,
             );
         }
+        if !crate::macros::in_macro_world() {
+            let scanned = capturing.answers.borrow().len() as u64;
+            crate::incremental::update_census(|census| census.capture_scans += scanned);
+        }
         // M188: the rows this analysis walked are filed with its record. A
         // SEEDED analysis (the editor's) walks them even when no call asked,
         // so the world's records carry the family before the keystroke that
@@ -29810,7 +29807,7 @@ impl<'src> Analyzer<'src> {
     /// with a view-capturing closure among its arguments — the calls
     /// [`Self::stored_view_capturing_arguments`] can answer anything for, and
     /// so the only ones that need C16's retaining fixpoint.
-    fn call_hands_on_a_capturing_closure(&self, call_id: Id, capturing: &HashSet<Id>) -> bool {
+    fn call_hands_on_a_capturing_closure(&self, call_id: Id, capturing: &CaptureMemo) -> bool {
         if self.call_is_variant_constructor(call_id) {
             return false;
         }
@@ -29821,7 +29818,7 @@ impl<'src> Analyzer<'src> {
                     matches!(
                         self.expr_id_to_expr_map.get(argument_id),
                         Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
-                            if capturing.contains(closure_id)
+                            if self.closure_captures_view(capturing, *closure_id)
                     )
                 })
             })
@@ -29852,7 +29849,7 @@ impl<'src> Analyzer<'src> {
     fn stored_view_capturing_arguments(
         &self,
         call_id: Id,
-        capturing: &HashSet<Id>,
+        capturing: &CaptureMemo,
         keeps: &BTreeSet<u32>,
         name: &str,
     ) -> Vec<(Id, String)> {
@@ -29868,7 +29865,7 @@ impl<'src> Analyzer<'src> {
                     && matches!(
                         self.expr_id_to_expr_map.get(*argument_id),
                         Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
-                            if capturing.contains(closure_id)
+                            if self.closure_captures_view(capturing, *closure_id)
                     )
             })
             .map(|(_, argument_id)| (*argument_id, name.to_string()))
@@ -30035,7 +30032,7 @@ impl<'src> Analyzer<'src> {
         &self,
         expr_id: Id,
         view_bindings: &HashSet<Id>,
-        capturing: &HashSet<Id>,
+        capturing: &CaptureMemo,
     ) -> bool {
         if self.is_view_expr(expr_id, view_bindings) {
             return true;
@@ -30043,7 +30040,7 @@ impl<'src> Analyzer<'src> {
         matches!(
             self.expr_id_to_expr_map.get(&expr_id),
             Some(Expr::Closure(closure_id)) | Some(Expr::Async(closure_id))
-                if capturing.contains(closure_id)
+                if self.closure_captures_view(capturing, *closure_id)
         )
     }
 
@@ -30094,6 +30091,18 @@ impl<'src> Analyzer<'src> {
         let mut visited = HashSet::default();
         self.scan_view_param_ref(&[], expr_id, &mut found, &mut visited);
         found
+    }
+
+    /// M189: [`Self::closure_captures_view_param`], asked once per closure per
+    /// pass. A function of the closure's own body and the conventions of the
+    /// parameters it names, so the memo answers exactly what the scan does.
+    fn closure_captures_view(&self, memo: &CaptureMemo, closure_id: Id) -> bool {
+        if let Some(captures) = memo.answers.borrow().get(&closure_id) {
+            return *captures;
+        }
+        let captures = self.closure_captures_view_param(closure_id);
+        memo.answers.borrow_mut().insert(closure_id, captures);
+        captures
     }
 
     /// Whether a closure body references a `&` / `&mut` parameter it CAPTURES —
@@ -83179,6 +83188,15 @@ impl ModuleTables {
             + self.retain.bytes()
             + self.hover.bytes()
     }
+}
+
+/// M189: `check_view_escape`'s per-closure answers to "does this closure
+/// capture a view parameter" (`Analyzer::closure_captures_view`), filled as
+/// the pass asks. A `RefCell` because the pass's readers take the analyzer
+/// shared; the pass's census reads its size (`capture-scans`).
+#[derive(Default)]
+struct CaptureMemo {
+    answers: std::cell::RefCell<HashMap<Id, bool>>,
 }
 
 /// The reused modules' rows, merged into the shape the passes read (M19 T1b).
