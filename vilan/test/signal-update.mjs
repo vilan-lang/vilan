@@ -485,7 +485,7 @@ function set2(self, value, $P, caller) {
 	set(self, value, $P, caller);
 }
 function set_with(self, transform, $O) {
-	set2(self, transform(get(self)), $O, "std/src/reactive.vl:2510:8");
+	set2(self, transform(get(self)), $O, "std/src/reactive.vl:2546:8");
 }
 const minting_derivation = __shared_new(false);
 const next_subscriber_id = __shared_new(0);

@@ -1343,6 +1343,10 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__dom_computed_style",
         "__dom_bounding_rect",
         "__dom_query_all",
+        "__dom_cut_run",
+        "__dom_remove_run",
+        "__dom_run_nodes",
+        "__dom_run_holds",
         "__router_path",
         "__router_url",
         "__router_state",
@@ -1812,6 +1816,56 @@ fn helper_source(name: &str) -> &'static str {
         "__dom_query_all" => {
             "function __dom_query_all(element, selector) {\n\
              \treturn Array.from(element.querySelectorAll(selector));\n\
+             }"
+        }
+        // M187: a `std::web::ui` region's RUN of sibling nodes, walked by
+        // `nextSibling` — what a DOM Range did before, without the Range. A
+        // Range is LIVE until it is collected: the browser updates every one
+        // still alive on every mutation of its document, so a Range per row
+        // made closing a long list quadratic and slowed everything after it.
+        // A walk leaves nothing behind. `__dom_cut_run` takes every node
+        // strictly between `after` and `before` into a fresh fragment (a
+        // row's order-pass cut); `__dom_remove_run` removes `from` and every
+        // node after it up to, not including, `before` (a row's retirement,
+        // a region's close).
+        "__dom_cut_run" => {
+            "function __dom_cut_run(after, before) {\n\
+             \tconst fragment = document.createDocumentFragment();\n\
+             \tfor (let node = after.nextSibling; node !== null && node !== before; ) {\n\
+             \t\tconst next = node.nextSibling;\n\
+             \t\tfragment.appendChild(node);\n\
+             \t\tnode = next;\n\
+             \t}\n\
+             \treturn fragment;\n\
+             }"
+        }
+        "__dom_remove_run" => {
+            "function __dom_remove_run(from, before) {\n\
+             \tfor (let node = from; node !== null && node !== before; ) {\n\
+             \t\tconst next = node.nextSibling;\n\
+             \t\tnode.remove();\n\
+             \t\tnode = next;\n\
+             \t}\n\
+             }"
+        }
+        // M187: a run that is LEAVING the document whole, as the set of its
+        // top-level nodes, and the question a region inside it asks — does a
+        // walk up from my anchor meet one of them. A set, so that a closing
+        // run of n rows answers each of the n nested regions in a walk as
+        // deep as the nesting, not one as long as the run.
+        "__dom_run_nodes" => {
+            "function __dom_run_nodes(from, before) {\n\
+             \tconst nodes = new Set();\n\
+             \tfor (let node = from; node !== null && node !== before; node = node.nextSibling) nodes.add(node);\n\
+             \treturn nodes;\n\
+             }"
+        }
+        "__dom_run_holds" => {
+            "function __dom_run_holds(nodes, node) {\n\
+             \tfor (let walk = node; walk !== null; walk = walk.parentNode) {\n\
+             \t\tif (nodes.has(walk)) return true;\n\
+             \t}\n\
+             \treturn false;\n\
              }"
         }
         // Router glue (std::web::router): `location.pathname` is a global property,

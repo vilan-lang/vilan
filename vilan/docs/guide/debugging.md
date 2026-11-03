@@ -320,11 +320,15 @@ it and without it, but for the comment that names it.
 ## Who woke this effect: the reactive trace
 
 `trace(true)` (`std::reactive::trace::trace`) writes a line to stderr for every subscriber a
-write wakes, naming the write and the cell:
+write wakes, naming where it was made, the write and the cell:
 
 ```text
-[reactive] effect #4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
+[reactive] effect #4 at src/views.vl:12:4 woken by cell #1 (made at src/main.vl:6:14), set at src/main.vl:12:2
 ```
+
+An effect, a derivation (`.memo()`, `.distinct()`, `.switch(..)`) and a UI
+binding (`<p>{count}</p>`, `bind_text`, `each`) each name your line that made
+them.
 
 In the VS Code debugger the lines are in the Debug Console too, and a stop in
 an effect a turn ran later — at the end of a `batch`, or on a microtask — has

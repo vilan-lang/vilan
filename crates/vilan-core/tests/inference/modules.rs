@@ -2073,11 +2073,34 @@ fn element_event_arity_lowers_to_on_and_on_event_byte_for_byte() {
         fun beep() {}
         main();
         "#;
+    // E345: `View::child` is `[track_caller]`, so each call passes its own
+    // site — the element's head in one spelling, the `.child(` in the other.
+    // The places differ by construction and nothing else may: they are blanked
+    // before the bytes are compared.
     assert_eq!(
-        compile_browser(element).expect("the element program compiles"),
-        compile_browser(chain).expect("the chain program compiles"),
+        without_sites(&compile_browser(element).expect("the element program compiles")),
+        without_sites(&compile_browser(chain).expect("the chain program compiles")),
         "the element event lowering must emit the chain's exact JS"
     );
+}
+
+/// `js` with every `"test.vl:<line>:<column>"` location literal (a
+/// `[track_caller]` argument) written `"test.vl:_"`.
+fn without_sites(js: &str) -> String {
+    const SITE: &str = "\"test.vl:";
+    let mut out = String::with_capacity(js.len());
+    let mut rest = js;
+    while let Some(at) = rest.find(SITE) {
+        out.push_str(&rest[..at + SITE.len()]);
+        rest = &rest[at + SITE.len()..];
+        let digits = rest
+            .find(|character: char| !(character.is_ascii_digit() || character == ':'))
+            .unwrap_or(rest.len());
+        out.push('_');
+        rest = &rest[digits..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[test]

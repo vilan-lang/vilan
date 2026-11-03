@@ -2305,6 +2305,262 @@ fn a88_the_anchors_go_with_the_content() {
     );
 }
 
+// --- M187: a run leaving whole takes its regions with it --------------------
+//
+// A region used to take a row out with a DOM Range of its own, per row, at every
+// close: a Range is LIVE until it is collected, so closing n rows cost n² and
+// slowed whatever ran next. And a page swapped away had every nested region cut
+// its own rows out first — each row's `each` of cells, one region at a time —
+// before the page's own run left. A row now leaves by a sibling walk, a close
+// removes the whole run in one walk, and a region under a run that is LEAVING
+// only clears its bookkeeping.
+
+/// The counting tail: `__cost()` reports, and resets, every node REMOVED from a
+/// parent (an element or a text node, a marker or an anchor included) and every
+/// DOM Range made since the program started.
+const M187_COST_HARNESS_TAIL: &str = r##"
+global.__cost = (() => {
+    let removed = 0;
+    for (const kind of [StubElement, StubText]) {
+        const remove = kind.prototype.remove;
+        kind.prototype.remove = function () {
+            if (this.parent) removed += 1;
+            return remove.call(this);
+        };
+    }
+    return () => {
+        const line = `removed=${removed} ranges=${global.rangesMade}`;
+        removed = 0;
+        return line;
+    };
+})();
+global.__tree = () => flatten(documentRoot);
+require("./app.js");
+"##;
+
+/// A page holding a table — an `each` of rows, each row an `each` of cells,
+/// each cell a reactive text — and, beside the table, a PORTAL: a `when` owned
+/// by the page and placed into an `<aside>` outside it. `ROWS` is substituted
+/// per build, so two sizes of one shape can be compared.
+const M187_PAGE: &str = r#"import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ View, each, mount_root, swap, view, when };
+
+fun numbers(count: i32): List<i32> {
+	mut out: List<i32> = [];
+	mut at = 0;
+	for at < count {
+		out.push(at);
+		at += 1;
+	}
+	out
+}
+
+fun main() {
+	let portal = view("aside");
+	let rows: SignalCell<List<i32>> = Signal::new(numbers(ROWS));
+	let cells: SignalCell<List<i32>> = Signal::new(numbers(3));
+	let label: SignalCell<str> = Signal::new("t");
+	let page: SignalCell<i32> = Signal::new(1);
+	let open: SignalCell<bool> = Signal::new(true);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(portal)
+			.child(swap(page, |shown: i32| {
+				if shown == 1 {
+					portal.child(when(open, || view("b").text("panel")));
+					view("table").child(each(rows, |id: i32| id, |id: i32| {
+						view("tr").child(each(cells, |cell: i32| cell, |cell: i32| view("td").child(label)))
+					}))
+				} else {
+					view("p").text("away")
+				}
+			}))
+	});
+	print(i"built|{tree()}|{cost()}");
+	rows.set(numbers(ROWS - 1));
+	print(i"shrink|{tree()}|{cost()}");
+	page.set(2);
+	print(i"leave|{tree()}|{cost()}");
+}
+
+[extern("__tree")]
+external fun tree(): str;
+
+[extern("__cost")]
+external fun cost(): str;
+
+main();
+"#;
+
+/// The `name|tree|cost` lines `M187_PAGE` prints, with the tree read by
+/// `nodes`.
+fn m187_lines(rows: usize) -> Vec<(String, Vec<String>, String)> {
+    let harness = format!("{DOM_STUB}{M187_COST_HARNESS_TAIL}");
+    let app = M187_PAGE.replace("ROWS", &rows.to_string());
+    let stdout = build_and_run(&format!("m187_page_{rows}"), &app, &harness);
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('|');
+            Some((
+                parts.next()?.to_string(),
+                nodes(parts.next()?),
+                parts.next()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// M187: a nested region under a run that is LEAVING cuts nothing, and nothing
+/// makes a DOM Range.
+///
+/// The costs are the same at 3 rows and at 30, which is the claim: a row leaving
+/// is its own marker and `<tr>` (2), whatever its `each` of cells holds, and
+/// the page leaving is the swap's marker and `<table>` (2) plus the PORTAL's
+/// `when` — its marker, its `<b>` and its anchor (3), because the portal's
+/// region is owned by the page but placed OUTSIDE its run, so its content must
+/// still go (A88's case, held). The leaving test is on the DOM and not on the
+/// owner tree for exactly that region: an owner-tree test would skip it and
+/// leave the `<b>` in the `<aside>`.
+///
+/// Non-vacuity, measured on the std before M187 at 30 rows: every nested
+/// `each` cut its rows out one Range at a time and every cell's text node
+/// removed itself, so `shrink` read `removed=8 ranges=4` and `leave` read
+/// `removed=236 ranges=122`.
+#[test]
+fn m187_a_region_under_a_leaving_run_cuts_nothing_and_makes_no_range() {
+    for rows in [3usize, 30] {
+        let lines = m187_lines(rows);
+        let table = |count: usize| {
+            let mut tree = vec![
+                "root".to_string(),
+                "main".to_string(),
+                "aside".to_string(),
+                "b'panel'".to_string(),
+                "table".to_string(),
+            ];
+            for _ in 0..count {
+                tree.push("tr".to_string());
+                for _ in 0..3 {
+                    tree.push("td".to_string());
+                    tree.push("#text't'".to_string());
+                }
+            }
+            tree
+        };
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    "built".to_string(),
+                    table(rows),
+                    "removed=0 ranges=0".to_string()
+                ),
+                (
+                    "shrink".to_string(),
+                    table(rows - 1),
+                    "removed=2 ranges=0".to_string()
+                ),
+                (
+                    "leave".to_string(),
+                    vec![
+                        "root".to_string(),
+                        "main".to_string(),
+                        "aside".to_string(),
+                        "p'away'".to_string(),
+                    ],
+                    "removed=5 ranges=0".to_string()
+                ),
+            ],
+            "M187 at {rows} rows: a row and a page leave as their own runs, the \
+             regions inside them cut nothing, the portal is emptied, and no DOM \
+             Range is made"
+        );
+    }
+}
+
+// --- E345: a binding's trace line names the element that made it ------------
+
+/// Four bindings over two cells under the reactive trace: a `{count}` hole
+/// written as a `.child(..)` call, the same hole in element syntax, a
+/// `bind_text`, and an `each`.
+const E345_BINDINGS: &str = r#"import std::reactive::trace::trace;
+import std::reactive::{ Signal, SignalCell };
+import std::web::ui::{ View, each, mount_root, view };
+
+fun main() {
+	trace(true);
+	let count: SignalCell<str> = Signal::new("1");
+	let rows: SignalCell<List<i32>> = Signal::new([1, 2]);
+	let _root = mount_root("app", || {
+		view("main")
+			.child(view("p").child(count))
+			.child(<b>{count}</b>)
+			.child(view("i").bind_text(count))
+			.child(view("ul").child(each(rows, |row: i32| row, |row: i32| view("li").text(i"{row}"))))
+	});
+	count.set("2");
+	rows.set([1, 2, 3]);
+}
+
+main();
+"#;
+
+/// `app.vl:<line>:<column>` of `column_needle` on the first line of
+/// `E345_BINDINGS` holding `line_needle` — a column counts characters, a tab
+/// one, as the compiler's locations do.
+fn e345_site(line_needle: &str, column_needle: &str) -> String {
+    let (index, line) = E345_BINDINGS
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(line_needle))
+        .unwrap_or_else(|| panic!("no line holds {line_needle:?}"));
+    let byte = line
+        .find(column_needle)
+        .unwrap_or_else(|| panic!("{column_needle:?} is not on {line:?}"));
+    format!("app.vl:{}:{}", index + 1, line[..byte].chars().count() + 1)
+}
+
+/// E345: under the reactive trace a UI binding's wake names the PROGRAM's site
+/// that made it — the `.child(..)` that placed a text hole, the element whose
+/// syntax holds the hole, the `bind_text` call, the `.child(..)` that placed an `each` —
+/// where it named nothing: the subscription is made inside std (`follow` calls
+/// `.sub`), and a std place is left out of the trace. The ui helpers are
+/// `[track_caller]` from the user's call down to `follow` (`Slot::place`,
+/// `AttrValue::apply` and `AttrBinding::bind_attribute` on their traits), so the
+/// place is forwarded rather than read where the `.sub` sits.
+///
+/// Non-vacuity: on the std before E345 the same four lines read
+/// `[reactive] effect #N woken by ...`, with no `at`.
+#[test]
+fn e345_a_ui_binding_names_the_site_that_made_it() {
+    // The trace writes to stderr under node (`console.error`; the console in a
+    // browser): the harness hands it to stdout, which is what is read back.
+    let harness = format!("{DOM_STUB}\nconsole.error = console.log;\nrequire(\"./app.js\");\n");
+    let stdout = build_and_run("e345_bindings", E345_BINDINGS, &harness);
+    let count_made = e345_site("let count: SignalCell<str> = Signal::new(", "new");
+    let rows_made = e345_site("let rows: SignalCell<List<i32>> = Signal::new(", "new");
+    let count_set = e345_site("count.set(\"2\")", "set");
+    let rows_set = e345_site("rows.set([1, 2, 3])", "set");
+    let expected = format!(
+        "[reactive] effect #0 at {} woken by cell #1 (made at {count_made}), set at {count_set}\n\
+         [reactive] effect #1 at {} woken by cell #1 (made at {count_made}), set at {count_set}\n\
+         [reactive] effect #2 at {} woken by cell #1 (made at {count_made}), set at {count_set}\n\
+         [reactive] effect #3 at {} woken by cell #2 (made at {rows_made}), set at {rows_set}\n",
+        e345_site(".child(view(\"p\").child(count))", "child(count)"),
+        // An element-syntax hole is the element's own `.child(..)`: it names
+        // the element.
+        e345_site(".child(<b>{count}</b>)", "<b>"),
+        e345_site(".bind_text(count)", "bind_text"),
+        e345_site(".child(each(rows", "child(each"),
+    );
+    assert_eq!(
+        stdout, expected,
+        "E345: every binding's trace line names the program's site that made it"
+    );
+}
+
 /// A85: the five value forms, each in a MIDDLE position of one chain, so every
 /// region has to keep its place from the static siblings AND from the other
 /// four. This is the shape the item exists for — `<ul>{header}{each(..)}
@@ -2640,25 +2896,42 @@ main();
 
 // --- A98: the order pass leaves an unmoved row alone -------------------------
 
-/// The counting tail. `__cost()` reports, and resets, the two numbers A98 is
-/// about: rows CUT out of the document by the order pass (one `extractContents`
-/// each) and rows BUILT from scratch (one `createElement` each, since every row
-/// here is one `<li>`). Before A98 the cut count was the whole live run on every
-/// pass, whatever the edit was.
-const A98_COST_HARNESS_TAIL: &str = r#"
+/// The counting tail. `__cost()` reports, and resets, the three numbers A98 and
+/// M187 are about: rows MOVED by the order pass (cut out and put back — counted
+/// where the put-back re-inserts a marker that is already in the document, one
+/// per row), rows RETIRED (a row leaving for good removes its marker — counted
+/// where an empty text node that has a parent is removed), and rows BUILT from
+/// scratch (one `createElement` each, since every row here is one `<li>`).
+/// Before A98 the move count was the whole live run on every pass, whatever the
+/// edit was; before M187 a row that left was CUT into a fragment first, as if it
+/// were moving, with a DOM Range of its own — `ranges` reads `rangesMade`, which
+/// is zero now.
+const A98_COST_HARNESS_TAIL: &str = r##"
 global.__cost = (() => {
-    let cut = 0;
+    let moved = 0;
+    let retired = 0;
     let built = 0;
     const element = document.createElement;
     document.createElement = (tag) => { built += 1; return element(tag); };
-    const proto = Object.getPrototypeOf(document.createRange());
-    const extract = proto.extractContents;
-    proto.extractContents = function (...args) { cut += 1; return extract.apply(this, args); };
-    return () => { const line = `cut=${cut} built=${built}`; cut = 0; built = 0; return line; };
+    const insert = StubElement.prototype.insertBefore;
+    StubElement.prototype.insertBefore = function (child, anchor) {
+        if (child.tagName === "#text" && child.parent) moved += 1;
+        return insert.call(this, child, anchor);
+    };
+    const remove = StubText.prototype.remove;
+    StubText.prototype.remove = function () {
+        if (this.parent && this._text === "") retired += 1;
+        return remove.call(this);
+    };
+    return () => {
+        const line = `moved=${moved} retired=${retired} built=${built} ranges=${global.rangesMade}`;
+        moved = 0; retired = 0; built = 0;
+        return line;
+    };
 })();
 global.__tree = () => flatten(documentRoot);
 require("./app.js");
-"#;
+"##;
 
 /// Eight edits over one four-row run, each driven from the same starting list
 /// so the costs are comparable, and each printed as `pass|tree|cost`. The
@@ -2747,8 +3020,8 @@ main();
 /// stay correct rather than get faster.
 ///
 /// Non-vacuity: with the A98 skip removed (every row cut, every row
-/// re-inserted) the seven cheap lines read `cut=4`/`cut=3` and the pin is red
-/// seven times over.
+/// re-inserted) the seven cheap lines read `moved=4`/`moved=3` and the pin is
+/// red seven times over.
 #[test]
 fn a98_the_order_pass_leaves_an_unmoved_row_alone() {
     let harness = format!("{DOM_STUB}{A98_COST_HARNESS_TAIL}");
@@ -2774,34 +3047,60 @@ fn a98_the_order_pass_leaves_an_unmoved_row_alone() {
     let expected: Vec<(String, Vec<String>, String)> = vec![
         // An appended row: nothing already in the run moved, so nothing is cut,
         // and the one new row is built before the anchor.
-        ("append", tree(&["a", "b", "c", "d", "e"]), "cut=0 built=1"),
+        (
+            "append",
+            tree(&["a", "b", "c", "d", "e"]),
+            "moved=0 retired=0 built=1",
+        ),
         // A prepended row: the four survivors are still in ascending order, so
         // the new row is threaded in before the first one's marker.
-        ("prepend", tree(&["z", "a", "b", "c", "d"]), "cut=0 built=1"),
-        // A removal cuts exactly the row that is going, wherever it sat.
-        ("remove-first", tree(&["b", "c", "d"]), "cut=1 built=0"),
-        ("remove-middle", tree(&["a", "b", "d"]), "cut=1 built=0"),
-        // A changed value rebuilds that row alone: the cut is its own, and the
-        // three rows around it never move.
-        ("relabel", tree(&["a", "B", "c", "d"]), "cut=1 built=1"),
+        (
+            "prepend",
+            tree(&["z", "a", "b", "c", "d"]),
+            "moved=0 retired=0 built=1",
+        ),
+        // A removal RETIRES exactly the row that is going, wherever it sat, and
+        // moves nothing (M187: it is no longer cut out first, as if it moved).
+        (
+            "remove-first",
+            tree(&["b", "c", "d"]),
+            "moved=0 retired=1 built=0",
+        ),
+        (
+            "remove-middle",
+            tree(&["a", "b", "d"]),
+            "moved=0 retired=1 built=0",
+        ),
+        // A changed value rebuilds that row alone: the old row is retired, and
+        // the three rows around it never move.
+        (
+            "relabel",
+            tree(&["a", "B", "c", "d"]),
+            "moved=0 retired=1 built=1",
+        ),
         // One row dragged across the whole run, both directions. The backward
         // scan settles the other three for the first, the forward scan for the
         // second — which is why both scans exist.
         (
             "last-to-front",
             tree(&["d", "a", "b", "c"]),
-            "cut=1 built=0",
+            "moved=1 retired=0 built=0",
         ),
         (
             "first-to-last",
             tree(&["b", "c", "d", "a"]),
-            "cut=1 built=0",
+            "moved=1 retired=0 built=0",
         ),
         // The control: a reverse genuinely moves everything but one row.
-        ("reverse", tree(&["d", "c", "b", "a"]), "cut=3 built=0"),
+        (
+            "reverse",
+            tree(&["d", "c", "b", "a"]),
+            "moved=3 retired=0 built=0",
+        ),
     ]
     .into_iter()
-    .map(|(name, tree, cost)| (name.to_string(), tree, cost.to_string()))
+    // M187: no edit makes a DOM Range — not a move, not a retirement.
+    .map(|(name, tree, cost)| (name.to_string(), tree, format!("{cost} ranges=0")))
     .collect();
     assert_eq!(
         seen, expected,
@@ -5293,59 +5592,83 @@ fn a112_s3_a_list_cell_under_each_builds_only_the_rows_its_ops_name() {
     let expected: Vec<(String, Vec<String>, String)> = vec![
         // The first build is the pass: seven elements, four keys read twice
         // (the plan and the key list it keeps).
-        ("mount", tree(&["a", "b", "c", "d"]), "cut=0 built=7 keys=8"),
+        (
+            "mount",
+            tree(&["a", "b", "c", "d"]),
+            "moved=0 retired=0 built=7 ranges=0 keys=8",
+        ),
         (
             "push",
             tree(&["a", "b", "c", "d", "e"]),
-            "cut=0 built=1 keys=1",
+            "moved=0 retired=0 built=1 ranges=0 keys=1",
         ),
         (
             "prepend",
             tree(&["z", "a", "b", "c", "d", "e"]),
-            "cut=0 built=1 keys=1",
+            "moved=0 retired=0 built=1 ranges=0 keys=1",
         ),
         (
             "remove",
             tree(&["z", "a", "c", "d", "e"]),
-            "cut=1 built=0 keys=0",
+            "moved=0 retired=1 built=0 ranges=0 keys=0",
         ),
         // Same key, different item: that row rebuilt, nothing else touched.
         (
             "set_at",
             tree(&["z", "A", "c", "d", "e"]),
-            "cut=1 built=1 keys=2",
+            "moved=0 retired=1 built=1 ranges=0 keys=2",
         ),
         // Same key, EQUAL item: a `Keep`, as the pass would have made it.
         (
             "set_at-same",
             tree(&["z", "A", "c", "d", "e"]),
-            "cut=0 built=0 keys=1",
+            "moved=0 retired=0 built=0 ranges=0 keys=1",
         ),
         (
             "insert_all",
             tree(&["z", "A", "g", "h", "c", "d", "e"]),
-            "cut=0 built=2 keys=2",
+            "moved=0 retired=0 built=2 ranges=0 keys=2",
         ),
         // Three ops, one notification: the push and the insert build a row
         // each, the removal cuts one.
         (
             "edit",
             tree(&["A", "f", "g", "h", "c", "d", "e", "i"]),
-            "cut=1 built=2 keys=2",
+            "moved=0 retired=1 built=2 ranges=0 keys=2",
         ),
         // A `Move` is the pass at the moved list: the one row that moved is cut
         // and put back (A98), nothing is built.
         (
             "move",
             tree(&["f", "g", "h", "A", "c", "d", "e", "i"]),
-            "cut=1 built=0 keys=16",
+            "moved=1 retired=0 built=0 ranges=0 keys=16",
         ),
         // A `Reset` is the pass: every row whose key left is cut.
-        ("set", tree(&["a", "b"]), "cut=8 built=2 keys=4"),
-        ("clear", tree(&[]), "cut=2 built=0 keys=0"),
-        ("plain-push", none.clone(), "cut=0 built=1 keys=8"),
-        ("big-push", none.clone(), "cut=0 built=1 keys=1"),
-        ("big-remove", none, "cut=1 built=0 keys=0"),
+        (
+            "set",
+            tree(&["a", "b"]),
+            "moved=0 retired=8 built=2 ranges=0 keys=4",
+        ),
+        (
+            "clear",
+            tree(&[]),
+            "moved=0 retired=2 built=0 ranges=0 keys=0",
+        ),
+        (
+            "plain-push",
+            none.clone(),
+            "moved=0 retired=0 built=1 ranges=0 keys=8",
+        ),
+        (
+            "big-push",
+            none.clone(),
+            "moved=0 retired=0 built=1 ranges=0 keys=1",
+        ),
+        (
+            "big-remove",
+            none,
+            "moved=0 retired=1 built=0 ranges=0 keys=0",
+        ),
     ]
     .into_iter()
     .map(|(name, tree, cost)| (name.to_string(), tree, cost.to_string()))
@@ -5768,55 +6091,55 @@ fn a112_s3b_a_list_cell_under_each_by_builds_only_the_rows_its_ops_name() {
         (
             "mount",
             tree(&["a", "b", "c", "d"]),
-            "cut=0 built=7 keys=8 maps=4",
+            "moved=0 retired=0 built=7 ranges=0 keys=8 maps=4",
         ),
         (
             "push",
             tree(&["a", "b", "c", "d", "e"]),
-            "cut=0 built=1 keys=1 maps=1",
+            "moved=0 retired=0 built=1 ranges=0 keys=1 maps=1",
         ),
         (
             "prepend",
             tree(&["z", "a", "b", "c", "d", "e"]),
-            "cut=0 built=1 keys=1 maps=1",
+            "moved=0 retired=0 built=1 ranges=0 keys=1 maps=1",
         ),
         (
             "remove",
             tree(&["z", "a", "c", "d", "e"]),
-            "cut=1 built=0 keys=0 maps=0",
+            "moved=0 retired=1 built=0 ranges=0 keys=0 maps=0",
         ),
         // Same key, different item: the row is KEPT and its cell written —
-        // where `each` rebuilds it (`cut=1 built=1`).
+        // where `each` rebuilds it (`retired=1 built=1`).
         (
             "set_at",
             tree(&["z", "A", "c", "d", "e"]),
-            "cut=0 built=0 keys=1 maps=1",
+            "moved=0 retired=0 built=0 ranges=0 keys=1 maps=1",
         ),
         // Same key, equal item: still a write into the cell, as the pass's
         // `Keep` makes one — `each_by` asks nothing of `T`, so it cannot tell.
         (
             "set_at-same",
             tree(&["z", "A", "c", "d", "e"]),
-            "cut=0 built=0 keys=1 maps=1",
+            "moved=0 retired=0 built=0 ranges=0 keys=1 maps=1",
         ),
         // A different KEY at that position: the row that was there is gone and a
         // new one is built, as the pass would plan it.
         (
             "set_at-key",
             tree(&["z", "A", "k", "d", "e"]),
-            "cut=1 built=1 keys=2 maps=1",
+            "moved=0 retired=1 built=1 ranges=0 keys=2 maps=1",
         ),
         (
             "insert_all",
             tree(&["z", "A", "g", "h", "k", "d", "e"]),
-            "cut=0 built=2 keys=2 maps=2",
+            "moved=0 retired=0 built=2 ranges=0 keys=2 maps=2",
         ),
         // Three ops, one notification: the push and the insert build a row
         // each, the removal cuts one.
         (
             "edit",
             tree(&["A", "f", "g", "h", "k", "d", "e", "i"]),
-            "cut=1 built=2 keys=2 maps=2",
+            "moved=0 retired=1 built=2 ranges=0 keys=2 maps=2",
         ),
         // A `Move` is the pass at the moved list: the one row that moved is cut
         // and put back (A98), nothing is built, and — the pass's price under
@@ -5824,17 +6147,41 @@ fn a112_s3b_a_list_cell_under_each_by_builds_only_the_rows_its_ops_name() {
         (
             "move",
             tree(&["f", "g", "h", "A", "k", "d", "e", "i"]),
-            "cut=1 built=0 keys=16 maps=8",
+            "moved=1 retired=0 built=0 ranges=0 keys=16 maps=8",
         ),
         // A `Reset` is the pass: every row whose key left is cut, and the one
         // key that survives (`1`, now "A" -> "a") keeps its row and has its
-        // cell written, which is where this differs from `each`'s `cut=8`.
-        ("set", tree(&["a", "b"]), "cut=7 built=1 keys=4 maps=2"),
-        ("clear", tree(&[]), "cut=2 built=0 keys=0 maps=0"),
-        ("plain-push", none.clone(), "cut=0 built=1 keys=8 maps=4"),
-        ("big-push", none.clone(), "cut=0 built=1 keys=1 maps=1"),
-        ("big-set_at", none.clone(), "cut=0 built=0 keys=1 maps=1"),
-        ("big-remove", none, "cut=1 built=0 keys=0 maps=0"),
+        // cell written, which is where this differs from `each`'s `retired=8`.
+        (
+            "set",
+            tree(&["a", "b"]),
+            "moved=0 retired=7 built=1 ranges=0 keys=4 maps=2",
+        ),
+        (
+            "clear",
+            tree(&[]),
+            "moved=0 retired=2 built=0 ranges=0 keys=0 maps=0",
+        ),
+        (
+            "plain-push",
+            none.clone(),
+            "moved=0 retired=0 built=1 ranges=0 keys=8 maps=4",
+        ),
+        (
+            "big-push",
+            none.clone(),
+            "moved=0 retired=0 built=1 ranges=0 keys=1 maps=1",
+        ),
+        (
+            "big-set_at",
+            none.clone(),
+            "moved=0 retired=0 built=0 ranges=0 keys=1 maps=1",
+        ),
+        (
+            "big-remove",
+            none,
+            "moved=0 retired=1 built=0 ranges=0 keys=0 maps=0",
+        ),
     ]
     .into_iter()
     .map(|(name, tree, cost)| (name.to_string(), tree, cost.to_string()))
@@ -5967,7 +6314,9 @@ fn a129_rows(line: &str) -> (Vec<(String, String)>, Vec<(String, String)>) {
 /// span's rows read from position 0 instead of `at` (`by-reconcile_to` reads
 /// `cut=1 built=2`, and the walk panics at turn 5); and every op of a drain
 /// applied, the `Reset` superseding nothing (`by-superseded` reads
-/// `cut=4 built=2`, the walk `by=584`).
+/// `cut=4 built=2`, the walk `by=584`). The plants' counts are in the tail's
+/// units before M187, when a row that left was cut like one that moved: a
+/// `cut` there is a `moved` plus a `retired` here.
 #[test]
 fn a129_a_splice_keeps_the_rows_whose_keys_survive_it() {
     let harness = format!("{DOM_STUB}{A98_COST_HARNESS_TAIL}");
@@ -5983,24 +6332,24 @@ fn a129_a_splice_keeps_the_rows_whose_keys_survive_it() {
     assert_eq!(
         costs,
         vec![
-            ("mount", "cut=0 built=9"),
+            ("mount", "moved=0 retired=0 built=9 ranges=0"),
             // The same three keys: every row kept, every cell written.
-            ("by-set_all", "cut=0 built=0"),
+            ("by-set_all", "moved=0 retired=0 built=0 ranges=0"),
             // The control: a `Reset` is the pass, and costs what the splice now does.
-            ("by-set", "cut=0 built=0"),
+            ("by-set", "moved=0 retired=0 built=0 ranges=0"),
             // One edit + an append: the edited row's cell written, one row built.
-            ("by-reconcile_to", "cut=0 built=1"),
+            ("by-reconcile_to", "moved=0 retired=0 built=1 ranges=0"),
             // `3` to the front inside one splice: that row moves, nothing is built.
-            ("by-reorder", "cut=1 built=0"),
+            ("by-reorder", "moved=1 retired=0 built=0 ranges=0"),
             // Bounded: row 2 leaves, `x` is new, `a` is kept.
-            ("by-bounded", "cut=1 built=1"),
+            ("by-bounded", "moved=0 retired=1 built=1 ranges=0"),
             // A push and a `set` in one drain: the `Reset` supersedes the push,
             // so `z` is never built — the pass alone builds `b` and cuts three.
-            ("by-superseded", "cut=3 built=1"),
-            ("set_all-equal", "cut=0 built=0"),
-            ("set_all-one", "cut=1 built=1"),
+            ("by-superseded", "moved=0 retired=3 built=1 ranges=0"),
+            ("set_all-equal", "moved=0 retired=0 built=0 ranges=0"),
+            ("set_all-one", "moved=0 retired=1 built=1 ranges=0"),
             // The edited row refreshed, `c` kept, `d` built.
-            ("reconcile_to", "cut=1 built=2"),
+            ("reconcile_to", "moved=0 retired=1 built=2 ranges=0"),
         ],
         "A129: a splice over surviving keys must cost what the pass costs; got:\n{stdout}"
     );

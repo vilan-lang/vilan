@@ -455,7 +455,7 @@ function take(self, item, $x) {
 	});
 	return __clone(item);
 }
-function selector(source, $a, $b) {
+function selector(source, $a, $b, caller) {
 	const cells = __shared_new(new Map());
 	const current2 = __shared_new(get(source));
 	as_derivation();
@@ -466,7 +466,7 @@ function selector(source, $a, $b) {
 		let $e = null;
 		if ($d[0] === 0) {
 			const leaving = $d[1];
-			$e = set(leaving, false, $a, "std/src/reactive.vl:3016:33");
+			$e = set(leaving, false, $a, "std/src/reactive.vl:3059:33");
 		} else {
 			$e = undefined;
 		}
@@ -475,12 +475,12 @@ function selector(source, $a, $b) {
 		let $q = null;
 		if ($p[0] === 0) {
 			const arriving = $p[1];
-			$q = set(arriving, true, $a, "std/src/reactive.vl:3020:35");
+			$q = set(arriving, true, $a, "std/src/reactive.vl:3063:35");
 		} else {
 			$q = undefined;
 		}
 		return $q;
-	}, "std/src/reactive.vl:3009:42"), $a, $b);
+	}, caller), $a, $b);
 	return [ cells, current2 ];
 }
 function of(self, key, $J) {
@@ -491,7 +491,7 @@ function of(self, key, $J) {
 		const existing = $K[1];
 		$L = existing;
 	} else {
-		const cell = new4(key === self[1].v, "std/src/reactive.vl:3040:46");
+		const cell = new4(key === self[1].v, "std/src/reactive.vl:3083:46");
 		self[0].v.set(hash2, __clone(cell));
 		defer_to_owner(() => {
 			self[0].v.delete(hash2);
@@ -597,7 +597,7 @@ const waking = __shared_new([ 1 ]);
 const no_cleanups = __shared_new([  ]);
 const owner_lists_allocated_count = __shared_new(0);
 const current = new5(1, "reactive-selector.vl:20:41");
-const selected = selector(current, [ 1 ], [ 1 ]);
+const selected = selector(current, [ 1 ], [ 1 ], "reactive-selector.vl:21:17");
 const rows = new3();
 const one = run_with_owner(rows, ($I) => {
 	return of(selected, 1, [ 0, $I ]);
