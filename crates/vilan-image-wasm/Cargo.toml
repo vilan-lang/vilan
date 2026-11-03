@@ -15,7 +15,7 @@
 # reach it); on the host it builds as an ordinary dynamic library nothing loads.
 [package]
 name = "vilan-image-wasm"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "vilan's std::image codec core built for wasm32, for programs on node."

@@ -13,7 +13,7 @@
 # avatar resize is one picture at a time.
 [package]
 name = "vilan-image"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The image codec core behind vilan's std::image, on both backends."

@@ -13,7 +13,7 @@
 # what lets the path dependency below resolve outside this repository too.
 [package]
 name = "vilan-rt-image"
-version = "0.53.1"
+version = "0.54.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The image half of the runtime for programs the vilan compiler emits as Rust."
