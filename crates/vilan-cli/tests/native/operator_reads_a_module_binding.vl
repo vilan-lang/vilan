@@ -1,0 +1,78 @@
+// B690: a module binding read ONLY inside a body an operator reaches. The JS
+// emitter's binding walk followed calls and never operators, so none of these
+// bindings was declared and each first use threw `ReferenceError`.
+import std::compare::{ Ordering, PartialEq, PartialOrd };
+import std::display::Display;
+import std::io::print;
+import std::operators::Add;
+
+const let scale = 10;
+const let unit = "px";
+struct Len {
+	value: i32,
+}
+
+// A comparison through `PartialOrd`'s inherited `gt` default, and `==` / `!=`
+// through the impl's own `eq`.
+impl Len with PartialOrd {
+	fun partial_compare(self, other: Len): Option<Ordering> {
+		(self.value * scale).partial_compare(other.value)
+	}
+}
+
+impl Len with PartialEq {
+	fun eq(self, other: Len): bool {
+		self.value * scale == other.value
+	}
+}
+
+// An arithmetic operator the impl declares.
+impl Len with Add {
+	fun add(self, other: Len): Len {
+		Len { value = self.value + other.value + bias }
+	}
+}
+
+// A concatenation rendering a bounded generic operand.
+impl Len with Display {
+	fun to_string(self): str {
+		i"{self.value}{unit}"
+	}
+}
+
+// An operator on a bounded generic, and one inside a trait default.
+fun bigger<T: PartialOrd>(left: T, right: T): bool {
+	left > right
+}
+
+fun shown<T: Display>(value: T): str {
+	"len=" + value
+}
+
+trait Twice with Add {
+	fun twice(self): Self {
+		self + self
+	}
+}
+
+impl Len with Twice {}
+
+// A module binding whose initializer runs an operator that reads a LATER
+// binding: the load order follows the operator into the impl.
+let summed = Len { value = 1 } + Len { value = 2 };
+let bias = 3;
+
+fun main() {
+	let small = Len { value = 2 };
+	let large = Len { value = 15 };
+	print(i"{small > large} {small < large} {small >= large}");
+	let twenty = Len { value = 20 };
+	print(i"{small == twenty} {small != twenty}");
+	let total = small + large;
+	print(i"{total.value}");
+	print(i"{bigger(small, large)} {bigger(large, small)}");
+	print(shown(small));
+	let doubled = small.twice();
+	print(i"{doubled.value}");
+	print(i"{summed.value}");
+}

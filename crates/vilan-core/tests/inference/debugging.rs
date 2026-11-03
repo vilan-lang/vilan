@@ -147,6 +147,43 @@ fn b646_a_for_loop_over_a_tracking_next_is_refused() {
     );
 }
 
+/// B646's guard: `[track_caller]` on a trait member the compiler calls with no
+/// argument list is refused at the declaration — an operator member (resolved
+/// by the trait's NAME, so a program's own `trait Add` is one), and a
+/// `to_string` a concatenation renders a bounded operand through. B690 made the
+/// operator a call edge, and the edge read as a `for` loop's `next` until this
+/// guard owned the case.
+#[test]
+fn b646_tracking_on_an_operator_member_is_refused_at_the_trait() {
+    assert_fails_once_with(
+        "trait Add {\n\t[track_caller]\n\tfun add(self, b: Self): Self;\n}\nstruct Money { cents: i32 }\nimpl Money with Add {\n\tfun add(self, b: Money): Money { Money { cents = self.cents + b.cents } }\n}\nfun main() {\n\tlet total = Money { cents = 1 } + Money { cents = 2 };\n\tprint(total.cents);\n}\n",
+        "`[track_caller]` on `Add`'s `add`, which the compiler calls implicitly — `a + b` calls it — with no argument list to pass a location through; drop the attribute",
+    );
+    assert_fails_once_with(
+        "trait PartialOrd {\n\t[track_caller]\n\tfun lt(self, b: Self): bool;\n}\nfun main() {}\n",
+        "`[track_caller]` on `PartialOrd`'s `lt`, which the compiler calls implicitly — `a < b` calls it",
+    );
+}
+
+#[test]
+fn b646_tracking_on_a_rendering_to_string_is_refused_at_the_trait() {
+    assert_fails_once_with(
+        "trait Shown {\n\t[track_caller]\n\tfun to_string(self): str;\n}\nstruct Money { cents: i32 }\nimpl Money with Shown {\n\tfun to_string(self): str { \"c\" }\n}\nfun show<T: Shown>(value: T): str { \"v=\" + value }\nfun main() {\n\tprint(show(Money { cents = 1 }));\n}\n",
+        "`[track_caller]` on `Shown`'s `to_string`, which the compiler calls implicitly — a concatenation or an i-string hole renders a value bounded by the trait through it",
+    );
+}
+
+/// The guard is about HOW a member is called, not its name alone: a tracking
+/// member of a trait no operator resolves through, and a `to_string` that does
+/// not answer a `str`, still track.
+#[test]
+fn b646_tracking_on_an_explicitly_called_member_still_compiles() {
+    assert_compiles_and_runs(
+        "import std::debug::caller;\ntrait Probe {\n\t[track_caller]\n\tfun add(self): str;\n\t[track_caller]\n\tfun to_string(self): i32;\n}\nstruct P {}\nimpl P with Probe {\n\tfun add(self): str { caller().text() }\n\tfun to_string(self): i32 { 7 }\n}\nfun main() {\n\tprint(P {}.add());\n\tprint(P {}.to_string());\n}\n",
+        "test.vl:14:13\n7\n",
+    );
+}
+
 /// A tracking function taken as a VALUE is refused: a call through the value
 /// cannot know to pass a location, and passing none would print nothing where
 /// the report promises a site.

@@ -2489,17 +2489,37 @@ pub fn str_split(text: &str, separator: &str) -> Vec<Str> {
     text.split(separator).map(Rc::from).collect()
 }
 
-/// `str::substring` — JavaScript's, which CLAMPS rather than panicking and
-/// swaps a reversed pair.
+/// `str::substring` — the checked slice, by UTF-16 code unit, as the JS
+/// backend's `__substring` is: `0 <= start <= end <= len()` or a panic with the
+/// same sentence, never a clamp or a swap.
+///
+/// B695 (strings.md, "A cut inside a surrogate pair"): a bound that falls
+/// between the two UTF-16 halves of one character moves back to that
+/// character's start — the half is not a `char`, so it cannot be answered here,
+/// and the JS backend floors the same way. `s.substring(0, k) +
+/// s.substring(k, s.len())` is `s` at every `k`.
 pub fn str_substring(text: &str, start: usize, end: usize) -> Str {
-    let characters: Vec<char> = text.chars().collect();
-    let length = characters.len();
-    let mut first = start.min(length);
-    let mut last = end.min(length);
-    if first > last {
-        std::mem::swap(&mut first, &mut last);
+    let length = str_len(text);
+    if !(start <= end && end <= length) {
+        panic_with(&format!(
+            "substring out of range: the length is {length} but the range is {start}..{end} — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end"
+        ));
     }
-    Rc::from(characters[first..last].iter().collect::<String>().as_str())
+    Rc::from(&text[code_point_floor(text, start)..code_point_floor(text, end)])
+}
+
+/// The byte offset of the character that UTF-16 position `unit` falls in (its
+/// start, when `unit` is between a pair's halves), or the text's end.
+fn code_point_floor(text: &str, unit: usize) -> usize {
+    let mut units = 0;
+    for (offset, character) in text.char_indices() {
+        let width = character.len_utf16();
+        if unit < units + width {
+            return offset;
+        }
+        units += width;
+    }
+    text.len()
 }
 
 /// `Math.round` — JavaScript's, which rounds a half UP (toward `+∞`) where
@@ -2859,10 +2879,38 @@ mod tests {
     }
 
     #[test]
-    fn substring_clamps_and_swaps_the_way_javascript_does() {
+    fn substring_indexes_utf16_units_and_floors_inside_a_pair() {
         assert_eq!(str_substring("abcdef", 1, 3).to_string(), "bc");
-        assert_eq!(str_substring("abcdef", 3, 1).to_string(), "bc");
-        assert_eq!(str_substring("abc", 0, 99).to_string(), "abc");
+        // B695: units, not characters — the emoji is two of them.
+        assert_eq!(str_substring("a\u{1f600}b", 3, 4).to_string(), "b");
+        assert_eq!(str_substring("a\u{1f600}b", 1, 3).to_string(), "\u{1f600}");
+        // A bound between the halves moves back to the pair's start.
+        assert_eq!(str_substring("\u{1f600}", 0, 1).to_string(), "");
+        assert_eq!(str_substring("\u{1f600}", 1, 2).to_string(), "\u{1f600}");
+        assert_eq!(str_substring("a\u{1f600}b", 2, 4).to_string(), "\u{1f600}b");
+        for cut in 0..=4 {
+            let joined = format!(
+                "{}{}",
+                str_substring("a\u{1f600}b", 0, cut),
+                str_substring("a\u{1f600}b", cut, 4)
+            );
+            assert_eq!(joined, "a\u{1f600}b", "recombined at {cut}");
+        }
+    }
+
+    #[test]
+    fn substring_refuses_a_range_past_the_length_or_inverted() {
+        for (start, end) in [(3, 1), (0, 99)] {
+            let refused = std::panic::catch_unwind(|| str_substring("abc", start, end));
+            let message = refused
+                .expect_err("refused")
+                .downcast::<String>()
+                .expect("a message");
+            assert!(
+                message.starts_with("substring out of range: the length is 3"),
+                "{message}"
+            );
+        }
     }
 
     // -- F20: the canonical key --

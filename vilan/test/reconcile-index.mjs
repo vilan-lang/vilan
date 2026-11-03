@@ -186,7 +186,7 @@ function reconcile(old_keys, old_items, items, key_of, same) {
 			if ($a[0] === 0) {
 				const at = $a[1];
 				if (__at(claimed, at, "std/src/reactive.vl:3880:9")) {
-					head = __at(next_same, at, "std/src/reactive.vl:3881:14");
+					head = __clone(__at(next_same, at, "std/src/reactive.vl:3881:14"));
 				} else {
 					advancing = false;
 				}
@@ -217,7 +217,7 @@ function reconcile(old_keys, old_items, items, key_of, same) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
-					walk = __at(next_same, at3, "std/src/reactive.vl:3906:14");
+					walk = __clone(__at(next_same, at3, "std/src/reactive.vl:3906:14"));
 				}
 				$f = undefined;
 			} else {
@@ -315,7 +315,7 @@ function reconcile2(old_keys, old_items, items, key_of, same) {
 			if ($n[0] === 0) {
 				const at = $n[1];
 				if (__at(claimed, at, "std/src/reactive.vl:3880:9")) {
-					head = __at(next_same, at, "std/src/reactive.vl:3881:14");
+					head = __clone(__at(next_same, at, "std/src/reactive.vl:3881:14"));
 				} else {
 					advancing = false;
 				}
@@ -346,7 +346,7 @@ function reconcile2(old_keys, old_items, items, key_of, same) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
-					walk = __at(next_same, at3, "std/src/reactive.vl:3906:14");
+					walk = __clone(__at(next_same, at3, "std/src/reactive.vl:3906:14"));
 				}
 				$s = undefined;
 			} else {
@@ -444,7 +444,7 @@ function reconcile3(old_keys, old_items, items, key_of, same) {
 			if ($w[0] === 0) {
 				const at = $w[1];
 				if (__at(claimed, at, "std/src/reactive.vl:3880:9")) {
-					head = __at(next_same, at, "std/src/reactive.vl:3881:14");
+					head = __clone(__at(next_same, at, "std/src/reactive.vl:3881:14"));
 				} else {
 					advancing = false;
 				}
@@ -475,7 +475,7 @@ function reconcile3(old_keys, old_items, items, key_of, same) {
 					found = [ 0, at3 ];
 					walking = false;
 				} else {
-					walk = __at(next_same, at3, "std/src/reactive.vl:3906:14");
+					walk = __clone(__at(next_same, at3, "std/src/reactive.vl:3906:14"));
 				}
 				$B = undefined;
 			} else {

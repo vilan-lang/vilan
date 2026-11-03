@@ -8961,3 +8961,93 @@ fn s4_a_named_length_crosses_an_import() {
         "a named length must cross an import: {emitted:?}"
     );
 }
+
+// --- E360: a path through an imported FUNCTION ------------------------------
+//
+// `import pkg::editor::editor;` then `editor::reader(..)`: the head names the
+// function, not the module of the same name, and nothing said so — the access
+// stayed unresolved and only its cascade printed ("could not be resolved" at
+// the binding, the enclosing call and a later `print`), in kolt pointing at a
+// closure several lines below.
+
+const E360_EDITOR: &str = "export *;\n\nfun editor(text: str): str {\n\ti\"editing {text}\"\n}\n\nfun reader(text: str): str {\n\ti\"reading {text}\"\n}\n";
+
+const E360_MAIN: &str = "import pkg::editor::editor;\n\nfun row(body: str, on_menu: |str| void): str {\n\ton_menu(body);\n\tbody\n}\n\nfun main() {\n\tlet shown = row(editor::reader(\"hello\"), |event| {\n\t\tprint(event);\n\t});\n\tprint(shown);\n}\n";
+
+/// The item's repro: ONE diagnostic, at the path, naming the function and both
+/// imports that make the path's intent work — and none of the cascade.
+#[test]
+fn e360_a_path_through_an_imported_function_names_the_cause_and_nothing_else() {
+    let analyzed = analyze_package(
+        &[("editor.vl", E360_EDITOR), ("main.vl", E360_MAIN)],
+        "main.vl",
+    );
+    assert_eq!(
+        analyzed.diagnostics.len(),
+        1,
+        "one root error, no cascade: {:?}",
+        analyzed.diagnostics
+    );
+    let (message, span, file) = &analyzed.diagnostics[0];
+    assert_eq!(file.as_deref(), Some("main.vl"));
+    assert_eq!(&E360_MAIN[span.clone()], "editor::reader");
+    assert_eq!(
+        message,
+        "`editor` is a function, not a module: `editor::reader` looks `reader` up in `editor`, \
+         and a function has no members; `editor` here is the function imported from \
+         `pkg::editor` — import `reader` too (`import pkg::editor::{ editor, reader }`), or \
+         import the module under a name of its own (`import pkg::editor::{ self as \
+         editor_module, editor }`, then `editor_module::reader(..)`)"
+    );
+}
+
+/// Both steers compile and run.
+#[test]
+fn e360_both_imports_the_refusal_names_resolve() {
+    for (import, call) in [
+        (
+            "import pkg::editor::{ editor, reader };",
+            "reader(\"hello\")",
+        ),
+        (
+            "import pkg::editor::{ self as editor_module, editor };",
+            "editor_module::reader(\"hello\")",
+        ),
+    ] {
+        let main = E360_MAIN
+            .replace("import pkg::editor::editor;", import)
+            .replace("editor::reader(\"hello\")", call);
+        let (_, stdout) =
+            compile_and_run_package(&[("editor.vl", E360_EDITOR), ("main.vl", &main)], "main.vl")
+                .unwrap_or_else(|errors| panic!("{import}: {errors:#?}"));
+        assert_eq!(stdout, "reading hello\nreading hello\n", "{import}");
+    }
+}
+
+/// A function declared in the same file as the path: the cause alone, with no
+/// import to name.
+#[test]
+fn e360_a_path_through_a_local_function_names_the_cause() {
+    assert_fails_once_with(
+        "fun editor(text: str): str { text }\nfun main() {\n\tprint(editor::reader(\"x\"));\n}\n",
+        "`editor` is a function, not a module: `editor::reader` looks `reader` up in `editor`, \
+         and a function has no members",
+    );
+}
+
+/// A path through a module, a type and an enum still resolves.
+#[test]
+fn e360_a_path_through_a_module_a_type_or_an_enum_is_unchanged() {
+    let (_, stdout) = compile_and_run_package(
+        &[
+            ("editor.vl", E360_EDITOR),
+            (
+                "main.vl",
+                "import pkg::editor;\nimport std::option::Option;\nstruct Point { x: i32 }\nimpl Point { fun origin(): Point { Point { x = 0 } } }\nfun main() {\n\tprint(editor::reader(\"m\"));\n\tprint(Point::origin().x);\n\tlet none: Option<i32> = Option::None;\n\tprint(none.is_none());\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("a path through a module, a type and an enum resolves");
+    assert_eq!(stdout, "reading m\n0\ntrue\n");
+}

@@ -71,7 +71,7 @@ fun path_root(): Shared<StorePathStep> {
 }
 
 /// The path one `step` below `path`: one allocation, sharing `path`.
-fun path_child(path: Shared<StorePathStep>, step: StoreStep): Shared<StorePathStep> {
+fun path_child(path: Shared<StorePathStep>, own step: StoreStep): Shared<StorePathStep> {
 	let depth = path.read().depth + 1;
 	Shared::new(StorePathStep { step, above = Some(path), depth })
 }
@@ -963,7 +963,7 @@ export impl Store<type T> {
 	[internal("a store's step down (A149 S3)")]
 	fun descend<F>(
 		self,
-		step: StoreStep,
+		own step: StoreStep,
 		read: |&T, (|&F| void)| void,
 		write: |&mut T, (|&mut F| void)| void,
 	): Store<F> {
@@ -1033,7 +1033,7 @@ export impl StoreSome<type P> {
 	[internal("a store's step down (A149 S3)")]
 	fun descend<F>(
 		self,
-		step: StoreStep,
+		own step: StoreStep,
 		read: |&P, (|&F| void)| void,
 		write: |&mut P, (|&mut F| void)| void,
 	): StoreSome<F> {

@@ -19,7 +19,7 @@ function unwrap_or(self, fallback) {
 	const $c = self;
 	let $d = null;
 	if ($c[0] === 0) {
-		const x = __clone($c[1]);
+		const x = $c[1];
 		$d = x;
 	} else {
 		$d = __clone(fallback);
@@ -61,7 +61,7 @@ function filter(self, predicate) {
 	return result;
 }
 const p = [ 0, [ 3, 4 ] ];
-console.log(String(unwrap_or(map(p, (q) => {
+console.log(String(unwrap_or(map(__clone(p), (q) => {
 	return q[0] + q[1];
 }), 0)));
 console.log(is_some_and(p, (q) => {

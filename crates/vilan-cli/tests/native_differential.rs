@@ -10871,6 +10871,73 @@ fn b689_hash_map_lends_in_place_on_both_backends() {
     );
 }
 
+/// B690: a module binding read ONLY inside a body an operator reaches — a
+/// comparison through `PartialOrd`'s inherited default, `==`/`!=` and `+`
+/// through the impl's own members, an operator on a bounded generic and on
+/// `self` inside a trait default, a concatenation rendering a bounded operand,
+/// and a module initializer whose operator reads a LATER binding. The JS
+/// emitter declared none of them (the call graph held no edge at an operator)
+/// and the first use threw `ReferenceError`; natively every binding is
+/// emitted. `inference::traits`' `b690_*` pins hold the JS values per channel.
+#[test]
+fn b690_an_operator_reads_a_module_binding_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_operator_reads_a_module_binding.vl"),
+        include_str!("native/operator_reads_a_module_binding.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_operator_reads_a_module_binding.vl"),
+        Verdict::Identical,
+        "a module binding an operator's impl reads must be declared on both backends"
+    );
+}
+
+/// B691: an enum with a payload is a value at every seam — a binding, a `mut`
+/// parameter, a struct literal's field, a list element, a `*view` read, a
+/// return of one, a closure answering `*slot`, a scalar payload, a user enum,
+/// and `to_array`'s answer. JS shared the `[index, ..data]` array at each, so a
+/// write through one copy's payload showed in the other; natively each was
+/// its own value. `inference::borrows`' `b691_*` pins hold the JS values per
+/// seam.
+#[test]
+fn b691_an_enum_is_a_value_at_every_seam_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_enum_value_seams.vl"),
+        include_str!("native/enum_value_seams.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_enum_value_seams.vl"),
+        Verdict::Identical,
+        "an enum must copy at every value seam on both backends"
+    );
+}
+
+/// B695: a cut inside a surrogate pair rounds to the code point on BOTH
+/// backends — `substring` at every position across `"a😀b"`, `code_at` of each
+/// half, `split("")`, `replace("", ..)` — where JS answered half a pair and the
+/// native substring counted characters, not UTF-16 units, so every index past
+/// a non-BMP character was off by one. `index_of` is not here: the native
+/// backend refuses its host binding (S1b), and its answers are code-point
+/// boundaries by construction (`inference::std_surface::b695_*`).
+#[test]
+fn b695_a_cut_inside_a_surrogate_pair_is_identical_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_surrogate_cuts.vl"),
+        include_str!("native/surrogate_cuts.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_surrogate_cuts.vl"),
+        Verdict::Identical,
+        "a cut inside a surrogate pair must answer alike on both backends"
+    );
+}
+
 /// B693 (store-assume-keeper.md §4.5): an assumed handle's fallback is kept by
 /// a feed on its variant's flag and read in place on both backends — every way
 /// a variant ends (the enum's own handle, `Option` → `None`, a key removed by

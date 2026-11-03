@@ -7516,6 +7516,36 @@ fn operator_symbol(op: BinaryOp) -> &'static str {
     }
 }
 
+/// Every `(trait name, member name, spelling)` an overloaded operator calls —
+/// [`operator_trait_method`] over each operator, for a reader that asks the
+/// other way round (B646's guard: such a member is called with no argument
+/// list, so it cannot take its caller's location).
+pub(crate) fn operator_members() -> impl Iterator<Item = (&'static str, &'static str, &'static str)>
+{
+    [
+        BinaryOp::Add,
+        BinaryOp::Sub,
+        BinaryOp::Mul,
+        BinaryOp::Div,
+        BinaryOp::Rem,
+        BinaryOp::Shl,
+        BinaryOp::Shr,
+        BinaryOp::BitAnd,
+        BinaryOp::BitXor,
+        BinaryOp::BitOr,
+        BinaryOp::Eq,
+        BinaryOp::Lt,
+        BinaryOp::Gt,
+        BinaryOp::LtEq,
+        BinaryOp::GtEq,
+    ]
+    .into_iter()
+    .filter_map(|op| {
+        operator_trait_method(op)
+            .map(|(trait_name, member)| (trait_name, member, operator_symbol(op)))
+    })
+}
+
 /// The `(trait name, method name)` an arithmetic operator dispatches to, e.g.
 /// `+` -> `("Add", "add")`. Returns `None` for comparison/logical operators,
 /// which are not overloadable.
@@ -25764,6 +25794,57 @@ impl<'src> Analyzer<'src> {
         self.imply_owner_scope_on_view_parameters();
     }
 
+    /// E360: the refusal at `head::member` where `head` names a function. The
+    /// usual way to write it is the import of a function that shares its
+    /// module's name (`import pkg::editor::editor;`), so when the function
+    /// was declared in another module the message names both imports that
+    /// would make the path's intent work. The module's own name cannot be the
+    /// second: with `import pkg::editor::{ self, editor }` the head still
+    /// resolves to the function, so the steer renames the module.
+    fn refuse_a_path_through_a_function(&mut self, access_id: Id, function_id: Id, member: &str) {
+        let Some(name) = self
+            .functions
+            .get(&function_id)
+            .map(|function| function.name)
+        else {
+            return;
+        };
+        let declared_elsewhere = self.source_of_id(function_id) != self.source_of_id(access_id);
+        let module_path = self
+            .source_of_id(function_id)
+            .filter(|_| declared_elsewhere)
+            .and_then(|source| {
+                let module_id = self
+                    .modules
+                    .values()
+                    .find(|module| self.source_of_id(module.id) == Some(source))?
+                    .id;
+                self.module_import_paths().remove(&module_id)
+            });
+        let mut msg = format!(
+            "`{name}` is a function, not a module: `{name}::{member}` looks `{member}` up in \
+             `{name}`, and a function has no members"
+        );
+        if let Some(path) = module_path {
+            msg.push_str(&format!(
+                "; `{name}` here is the function imported from `{path}` — import `{member}` too \
+                 (`import {path}::{{ {name}, {member} }}`), or import the module under a name \
+                 of its own (`import {path}::{{ self as {name}_module, {name} }}`, then \
+                 `{name}_module::{member}(..)`)"
+            ));
+        }
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&access_id).unwrap_or(&&EMPTY_SPAN),
+                msg,
+            },
+            access_id,
+        );
+        self.expr_id_to_expr_map.insert(access_id, Expr::Error);
+    }
+
     /// B677 door 2 (`closure-owner.md` §4, RULED 2026-11-02): a `fun`'s
     /// closure parameter whose declared result is a view — std's `View`, or a
     /// `Slot` (the trait the UI places) — carries `context owner_scope` by
@@ -27901,6 +27982,22 @@ impl<'src> Analyzer<'src> {
             // over the concrete type leaves `b` alone. `__clone` of the pair
             // copies the value and keeps the table, which is what a copy is.
             Type::Dyn(_, _) => true,
+            // B691: an enum with a payload lowers to the `[index, ..data]`
+            // array, and a `match &mut`/`if &mut .. is` capture writes its
+            // payload IN PLACE — so two bindings sharing the array share every
+            // write, whatever the payload's type: `mut b = a` of an
+            // `Option<List<i32>>` showed `b`'s push in `a`, and of an
+            // `Option<i32>` showed `b`'s `+= 5` in `a`. Natively every binding
+            // is its own value. A payload-less enum has nothing to write in
+            // place (a write through a view replaces the whole value), and a
+            // backed one is a bare number or string: both stay scalar copies.
+            Type::Enum(id, _) => self.enums.get(id).is_some_and(|enum_| {
+                enum_.backing.is_none()
+                    && enum_
+                        .variants
+                        .iter()
+                        .any(|variant| !variant.data_type_ids.is_empty())
+            }),
             _ => false,
         }
     }
@@ -28156,10 +28253,21 @@ impl<'src> Analyzer<'src> {
     /// for every copy and move question here — `let ys = xs as List<i32>`
     /// copies as `let ys = xs` does. (Writing through one is refused at the
     /// walk, §7.1.)
+    ///
+    /// A payload-less VARIANT named bare (`None`, `Shape::Dot`) is a `Local`
+    /// too, but it names no storage: each use is a fresh value, exactly as
+    /// `Some(x)` is. Read as a place it took rule 1's copy once B691 made a
+    /// payload enum an aggregate — `mut out: Option<T> = None` cloned the
+    /// literal it had just built.
     fn is_place_expr(&self, expr_id: Id) -> bool {
         match self.expr_id_to_expr_map.get(&expr_id) {
-            Some(Expr::Local(_) | Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _))
-            | Some(Expr::Index(_, _)) => true,
+            Some(Expr::Local(binding)) => !matches!(
+                self.expr_id_to_expr_map.get(binding),
+                Some(Expr::EnumVariant(..))
+            ),
+            Some(Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _)) | Some(Expr::Index(_, _)) => {
+                true
+            }
             Some(Expr::Ascribe(inner)) => self.is_place_expr(*inner),
             _ => false,
         }
@@ -28203,7 +28311,32 @@ impl<'src> Analyzer<'src> {
         match self.expr_id_to_expr_map.get(&expr_id) {
             Some(Expr::Dereference(_)) => true,
             Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
+            Some(Expr::Tuple(_)) => self.tuple_of_capture_places(expr_id).is_some(),
             _ => self.is_place_expr(expr_id),
+        }
+    }
+
+    /// B691: a TUPLE LITERAL whose every element names storage —
+    /// `match (self, other)`, the shape a derived `PartialEq` over an enum
+    /// writes — is a pattern subject over those places, not a fresh value: the
+    /// tuple is a temporary the patterns take apart, and each capture binds a
+    /// piece of an element's storage. So its captures are the capture pass's
+    /// (copied, or shared when nothing can write the element), and rule 1 takes
+    /// no copy of the elements themselves (`compute_clone_sites`). Read as a
+    /// construction it copied BOTH operands, whole, on every comparison once an
+    /// enum with a payload became an aggregate. `None` for any other tuple: one
+    /// fresh element makes the literal a construction, as before.
+    fn tuple_of_capture_places(&self, expr_id: Id) -> Option<&[Id]> {
+        match self.expr_id_to_expr_map.get(&expr_id) {
+            Some(Expr::Tuple(element_ids))
+                if !element_ids.is_empty()
+                    && element_ids
+                        .iter()
+                        .all(|element_id| self.is_capture_subject_place(*element_id)) =>
+            {
+                Some(element_ids)
+            }
+            _ => None,
         }
     }
 
@@ -28218,6 +28351,12 @@ impl<'src> Analyzer<'src> {
     /// ROOT walk needs no alias analysis holds here because the receiver is
     /// right there in the call.
     fn capture_subject_places(&self, subject_id: Id) -> Vec<Id> {
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
+            return element_ids
+                .iter()
+                .flat_map(|element_id| self.capture_subject_places(*element_id))
+                .collect();
+        }
         let Some(Expr::Call(call_id)) = self.expr_id_to_expr_map.get(&subject_id) else {
             return vec![subject_id];
         };
@@ -28510,6 +28649,12 @@ impl<'src> Analyzer<'src> {
     /// resource program pays for, and widening it moves goldens for a gain
     /// nothing has asked for.
     fn share_subject_is_stable(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
+        // B691: a tuple of places is stable when every element is.
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
+            return element_ids
+                .iter()
+                .all(|element_id| self.share_subject_is_stable(*element_id, written_roots));
+        }
         if self.readonly_root(subject_id).is_some() {
             return true;
         }
@@ -28542,6 +28687,12 @@ impl<'src> Analyzer<'src> {
     /// (and the SHARE elision that rides on it — the two sets are disjoint,
     /// since `share_subject_is_stable` admits no writable-view root).
     fn subject_is_writable_view(&self, subject_id: Id) -> bool {
+        // B691: a tuple of places is written through when any element is.
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
+            return element_ids
+                .iter()
+                .any(|element_id| self.subject_is_writable_view(*element_id));
+        }
         // B97: a `borrows` CALL is a writable view when the projection it
         // returns is `&mut` — the arm is total for the same construction
         // reason, since that is the only way the write reaches the receiver.
@@ -36112,6 +36263,9 @@ impl<'src> Analyzer<'src> {
         // first argument over one) every write of them.
         let module_mut = self.module_mut_bindings();
         let module_writes: std::cell::OnceCell<ModuleWrites> = std::cell::OnceCell::new();
+        // B691: the tuple literals, and those a pattern takes apart.
+        let mut tuples = Vec::new();
+        let mut pattern_tuples: HashSet<Id> = HashSet::default();
         // M19 T1b: a reused module's decisions are restored below. Every
         // position this loop `consider`s is a sub-expression of the entry it
         // is standing on, so skipping the expression skips exactly the rows
@@ -36140,10 +36294,22 @@ impl<'src> Analyzer<'src> {
                 // A construction's slots are field initializations (rule 1 names
                 // them outright): each one installs its value in a new aggregate
                 // that outlives the literal, so a place read there copies.
-                Expr::List(element_ids) | Expr::Tuple(element_ids) => {
+                Expr::List(element_ids) => {
                     for element_id in element_ids {
                         consider(self, *element_id, None);
                     }
+                }
+                // B691: except a tuple of places that a pattern takes apart —
+                // its captures are the capture pass's (`tuple_of_capture_places`).
+                // Which tuples those are is known only once every subject is
+                // seen, so the tuples wait for the end of the walk.
+                Expr::Tuple(element_ids) => tuples.push((*expr_id, element_ids)),
+                Expr::Match(subject_id, _)
+                | Expr::Is(subject_id, _)
+                | Expr::Destructure(subject_id, _)
+                    if self.tuple_of_capture_places(*subject_id).is_some() =>
+                {
+                    pattern_tuples.insert(*subject_id);
                 }
                 Expr::StructInitializer(_struct_id, assignments) => {
                     for value_id in assignments.values() {
@@ -36341,6 +36507,14 @@ impl<'src> Analyzer<'src> {
                     }
                 }
                 _ => {}
+            }
+        }
+        for (tuple_id, element_ids) in tuples {
+            if pattern_tuples.contains(&tuple_id) {
+                continue;
+            }
+            for element_id in element_ids {
+                consider(self, *element_id, None);
             }
         }
         // Phase 2 — the type filter and the per-instantiation question, exactly
@@ -72142,6 +72316,15 @@ impl<'src> Analyzer<'src> {
                             }
                         }
                     }
+                }
+                // E360: a path through a FUNCTION — `editor::reader(..)` with
+                // the function `editor` imported and the module of the same
+                // name not. Nothing answered here, so the access stayed
+                // unresolved and only its cascade printed ("could not be
+                // resolved", at the enclosing call and binding), never the
+                // cause.
+                Type::Function(function_id) => {
+                    self.refuse_a_path_through_a_function(id, function_id, member_name);
                 }
                 _ => {}
             }

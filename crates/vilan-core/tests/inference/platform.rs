@@ -223,6 +223,32 @@ fn a_fence_on_a_generic_promises_every_instantiation() {
     );
 }
 
+/// B690: an overloaded operator is a call the platform walk follows — the
+/// call graph held no edge at one, so an impl's body reached only through
+/// `==` was never colored and a browser build admitted a `@process` read.
+#[test]
+fn b690_an_operators_impl_is_colored_like_a_called_function() {
+    assert_fails_browser_with(
+        r#"
+        import std::compare::PartialEq;
+        import std::fs::stat;
+
+        struct Disk { path: str }
+
+        impl Disk with PartialEq {
+            fun eq(self, other: Disk): bool {
+                stat(self.path).is_some() == stat(other.path).is_some()
+            }
+        }
+
+        fun main() {
+            print(Disk { path = "a" } == Disk { path = "b" });
+        }
+        "#,
+        "requires the `@process` platform",
+    );
+}
+
 #[test]
 fn a_fence_on_a_method_checks_like_a_functions() {
     assert_fails_browser_with(

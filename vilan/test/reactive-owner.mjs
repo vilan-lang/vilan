@@ -345,7 +345,7 @@ function release_under(handle, ambient) {
 	if ($ah[0] === 0) {
 		const release = $ah[1];
 		handle[3].v = [ 1 ];
-		releasing_turns.v.push(ambient);
+		releasing_turns.v.push(__clone(ambient));
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;
@@ -417,7 +417,7 @@ function advance(self, carried) {
 	let $E = null;
 	if (!(is_disposed(self))) {
 		const held = self[0].v;
-		self[0].v = [ self[1] + 1, no_cleanups, false, carried ];
+		self[0].v = [ self[1] + 1, no_cleanups, false, __clone(carried) ];
 		const $v = held[3];
 		let $w = null;
 		if ($v[0] === 0) {
@@ -544,7 +544,7 @@ function reconnect(tracker, lists, target) {
 			next.push(__clone(__at(held, index, "std/src/reactive.vl:1712:15")));
 			$T = undefined;
 		} else {
-			next.push([ dependency[0], dependency[1](relay_for(tracker, target)) ]);
+			next.push([ __clone(dependency[0]), dependency[1](relay_for(tracker, target)) ]);
 			$T = undefined;
 		}
 		$T;
@@ -623,7 +623,7 @@ function attach_tracker(tracker, target) {
 		tracker[0].v[3] = true;
 		let edges = [  ];
 		for (const dependency of read) {
-			edges.push([ dependency[0], dependency[1](relay_for(tracker, target)) ]);
+			edges.push([ __clone(dependency[0]), dependency[1](relay_for(tracker, target)) ]);
 		}
 		lists2.v[2] = edges;
 		tracker[0].v[3] = false;
@@ -671,7 +671,7 @@ function place_subscription(subscription, site) {
 	return subscription;
 }
 function also_releasing(handle, release) {
-	const previous = handle[3].v;
+	const previous = __clone(handle[3].v);
 	handle[3].v = [ 0, () => {
 		release();
 		const $aF = previous;

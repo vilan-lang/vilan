@@ -52,7 +52,11 @@ pub enum IndirectReason {
 /// A resolved call site within a function or closure body.
 #[derive(Clone, Copy, Debug)]
 pub struct Call {
-    /// The `Expr::Call` entity id (also the key into [`Program::function_calls`]).
+    /// The `Expr::Call` entity id (also the key into [`Program::function_calls`]),
+    /// or — for a call the source does not spell as one — the expression that
+    /// makes it: a `for .. in` loop over an iterator (its `next`), an
+    /// overloaded binary operator (B690). Those have no `function_calls` entry;
+    /// their dispatch record and substitution are keyed by the same id.
     pub call_id: Id,
     pub target: CallTarget,
 }
@@ -1081,6 +1085,22 @@ impl<'a, 'src> Collector<'a, 'src> {
             Expr::Binary(_, lhs, rhs) => {
                 self.walk(*lhs);
                 self.walk(*rhs);
+                // B690: an overloaded operator IS a call — the emitter lowers
+                // `a > b` to `PartialOrd::gt`, `a + b` to the impl's `add`,
+                // `"v=" + value` (a bounded `T: Display`) to its `to_string` —
+                // and an edge this graph does not hold is code nothing walks
+                // to. Emission's binding walk is the sharpest consumer: a
+                // module `const let` read only inside an operator's impl was
+                // never declared, and the first comparison threw
+                // `ReferenceError`. Recorded like the iterator protocol's
+                // `next` above: anchored at the expression itself, with the
+                // same dispatch precedence a call takes.
+                if let Some(target) = operator_target(self.program, id) {
+                    self.calls.push(Call {
+                        call_id: id,
+                        target,
+                    });
+                }
             }
             Expr::Unary(_, operand) | Expr::Reference(operand, _) | Expr::Dereference(operand) => {
                 self.walk(*operand)
@@ -1261,6 +1281,40 @@ fn resolve_target(program: &Program, call_id: Id) -> CallTarget {
         // result of another call): an indirect call through that value.
         _ => CallTarget::Indirect(IndirectReason::Value),
     }
+}
+
+/// B690: what a binary operator calls, when it calls anything — the three
+/// channels the analyzer records and the emitter reads (`transformer.rs`'s
+/// `Expr::Binary` arm), in the emitter's precedence:
+///
+/// - a re-dispatched operator (`generic_dispatch` keyed by the binary — an
+///   operand bounded by a trait, a concrete receiver whose operator method is
+///   an inherited trait DEFAULT, a `self` operand inside a default body);
+/// - a concatenation whose right operand is a bounded generic rendered through
+///   its bound's `to_string` (`concat_render_dispatch`, B176) — read by
+///   [`crate::async_infer::dispatch_at`] as a dispatch of that member on the
+///   constraint;
+/// - an operator the operand's own impl declares (`binary_op_dispatch`), a
+///   direct call.
+///
+/// `None` for a native operator, which calls nothing.
+fn operator_target(program: &Program, binary_id: Id) -> Option<CallTarget> {
+    match program.generic_dispatch.get(&binary_id) {
+        Some(GenericDispatch::OnConstraint(..)) => {
+            return Some(CallTarget::Indirect(IndirectReason::GenericMember));
+        }
+        Some(GenericDispatch::OnType(..)) => {
+            return Some(CallTarget::Indirect(IndirectReason::TraitDispatch));
+        }
+        None => {}
+    }
+    if program.concat_render_dispatch.contains_key(&binary_id) {
+        return Some(CallTarget::Indirect(IndirectReason::GenericMember));
+    }
+    program
+        .binary_op_dispatch
+        .get(&binary_id)
+        .map(|method| CallTarget::Function(*method))
 }
 
 /// Classifies the entity a call's `Expr::Local` subject points at.

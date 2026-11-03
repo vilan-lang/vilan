@@ -223,7 +223,7 @@ function release_under(handle, ambient) {
 	if ($H[0] === 0) {
 		const release = $H[1];
 		handle[3].v = [ 1 ];
-		releasing_turns.v.push(ambient);
+		releasing_turns.v.push(__clone(ambient));
 		__with_finally(release, () => {
 			__list_pop(releasing_turns.v);
 			return;

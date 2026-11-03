@@ -2852,10 +2852,34 @@ fn helper_source(name: &str) -> &'static str {
         // -1)` quietly returns `s[0..k]`, the complement of the request; and it
         // clamps `end` past the length rather than saying so. One rule replaces
         // all three guesses: `0 <= start <= end <= len`, refused otherwise.
+        //
+        // B695 (strings.md, "A cut inside a surrogate pair"): a bound that falls
+        // between the two halves of a pair moves back to the pair's start, so
+        // no cut answers half a character — natively the half is
+        // unrepresentable, and flooring keeps `s.substring(0, k) +
+        // s.substring(k, s.len())` equal to `s` at every `k`.
         "__substring" => {
             "function __substring(text, start, end) {\n\
-             \tif (0 <= start && start <= end && end <= text.length) return text.substring(start, end);\n\
+             \tif (0 <= start && start <= end && end <= text.length) return text.substring(__code_point_floor(text, start), __code_point_floor(text, end));\n\
              \tthrow \"substring out of range: the length is \" + text.length + \" but the range is \" + start + \"..\" + end + \" — substring requires 0 <= start <= end <= len and never clamps or swaps; to drop a known affix use strip_prefix/strip_suffix, and for the rest of the string pass s.len() as the end\";\n\
+             }\n\
+             function __code_point_floor(text, at) {\n\
+             \treturn at > 0 && (text.charCodeAt(at) & 0xFC00) === 0xDC00 && (text.charCodeAt(at - 1) & 0xFC00) === 0xD800 ? at - 1 : at;\n\
+             }"
+        }
+        // B695: `split` and `replace` over an EMPTY pattern cut between every
+        // code UNIT on the host — `"😀".split("")` is two lone halves — where
+        // natively they cut between characters. Over code points on both: the
+        // helper is emitted only where the pattern is not a non-empty literal.
+        "__str_split" => {
+            "function __str_split(text, separator) {\n\
+             \treturn separator === \"\" ? Array.from(text) : text.split(separator);\n\
+             }"
+        }
+        "__str_replace" => {
+            "function __str_replace(text, from, to) {\n\
+             \tif (from !== \"\") return text.replaceAll(from, to);\n\
+             \treturn text === \"\" ? to : to + Array.from(text).join(to) + to;\n\
              }"
         }
         // `List.pop(): Option<T>` — removes and returns the last element (no clone:
@@ -2872,10 +2896,14 @@ fn helper_source(name: &str) -> &'static str {
             "function __list_sort_by(list, compare) {\n\treturn list.slice().sort(compare);\n}"
         }
         // `List.to_array<const N>(self): Option<[T; N]>` (A172) — `Some` of a
-        // copy when the length is `N`, `None` otherwise. A copy for the reason
-        // `sort_by`'s is one: `self` is by value and the array grows apart.
+        // copy when the length is `N`, `None` otherwise: the array and the list
+        // grow apart. A DEEP copy, because `self` is a loan (bare, not `own`,
+        // so the caller hands the list itself) and the answer is a fresh value
+        // nothing else copies: a shallow `slice()` shared every aggregate
+        // element with the list, which `unwrap`'s payload copy hid until B691
+        // let the caller's copy stand in for it.
         "__list_to_array" => {
-            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.slice() ] : [ 1 ];\n}"
+            "function __list_to_array(list, length) {\n\treturn list.length === length ? [ 0, list.map(__clone) ] : [ 1 ];\n}"
         }
         // `Option.take(&mut self): Option<T>` — snapshot the slot (a structural
         // copy, not a deep clone: the payload MOVES out), then rewrite it to `None`
@@ -11124,9 +11152,33 @@ impl<'src> Transformer<'src> {
             Intrinsic::StrContains => native_method(&mut args, "includes"),
             Intrinsic::StrStartsWith => native_method(&mut args, "startsWith"),
             Intrinsic::StrEndsWith => native_method(&mut args, "endsWith"),
-            Intrinsic::StrReplace => native_method(&mut args, "replaceAll"),
+            Intrinsic::StrReplace => {
+                let arguments: Vec<js::Node> = args.collect();
+                if matches!(arguments.get(1), Some(js::Node::String(pattern)) if !pattern.is_empty())
+                {
+                    native_method(&mut arguments.into_iter(), "replaceAll")
+                } else {
+                    self.used_helpers.insert("__str_replace");
+                    js::Node::Call(
+                        Box::new(js::Node::Local("__str_replace".to_string())),
+                        arguments,
+                    )
+                }
+            }
             Intrinsic::StrRepeat => native_method(&mut args, "repeat"),
-            Intrinsic::StrSplit => native_method(&mut args, "split"),
+            Intrinsic::StrSplit => {
+                let arguments: Vec<js::Node> = args.collect();
+                if matches!(arguments.get(1), Some(js::Node::String(pattern)) if !pattern.is_empty())
+                {
+                    native_method(&mut arguments.into_iter(), "split")
+                } else {
+                    self.used_helpers.insert("__str_split");
+                    js::Node::Call(
+                        Box::new(js::Node::Local("__str_split".to_string())),
+                        arguments,
+                    )
+                }
+            }
             // NOT `native_method`: JS `substring` clamps negatives to 0 and
             // SWAPS an inverted pair, so `s.substring(offset, -1)` silently
             // returns the prefix — the complement of what was asked for. The
@@ -11197,6 +11249,7 @@ impl<'src> Transformer<'src> {
             // substitution reached is an analyzer bug, not a program).
             Intrinsic::ListToArray => {
                 self.used_helpers.insert("__list_to_array");
+                self.used_helpers.insert("__clone");
                 let length = call_expr_id
                     .and_then(|id| self.list_to_array_length(id))
                     .expect("internal: `to_array`'s `N` is a length under every instance");
@@ -16105,6 +16158,9 @@ const RESERVED_NAMES: &[&str] = &[
     "__list_pop",
     "__list_sort_by",
     "__list_to_array",
+    "__str_split",
+    "__str_replace",
+    "__code_point_floor",
     "__option_take",
     "__option_replace",
     "__map_get",

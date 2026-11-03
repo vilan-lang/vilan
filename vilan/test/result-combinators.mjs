@@ -130,7 +130,7 @@ function unwrap_or2(self, fallback) {
 	const $v = self;
 	let $w = null;
 	if ($v[0] === 0) {
-		const x = __clone($v[1]);
+		const x = $v[1];
 		$w = x;
 	} else {
 		$w = __clone(fallback);
@@ -152,7 +152,7 @@ function and(self, b) {
 	const $z = self;
 	let $A = null;
 	if ($z[0] === 0) {
-		$A = b;
+		$A = __clone(b);
 	} else {
 		const e = $z[1];
 		$A = [ 1, __clone(e) ];
@@ -166,7 +166,7 @@ function or(self, b) {
 		const x = $B[1];
 		$C = [ 0, __clone(x) ];
 	} else {
-		$C = b;
+		$C = __clone(b);
 	}
 	return $C;
 }
