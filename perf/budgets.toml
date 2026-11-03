@@ -47,180 +47,180 @@ subjects = [
 subject = "example:math"
 counter = "instructions:u"
 class = "reference"
-ceiling = 249_511_737
-measured_at = "v0.53.0's seal"
+ceiling = 253_769_532
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:watch"
 counter = "instructions:u"
 class = "reference"
-ceiling = 309_249_054
-measured_at = "v0.53.0's seal"
+ceiling = 314_149_361
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:browser"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_320_729_931
-measured_at = "v0.53.0's seal"
+ceiling = 1_375_578_923
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:fullstack"
 counter = "instructions:u"
 class = "reference"
-ceiling = 2_777_348_943
-measured_at = "v0.53.0's seal"
+ceiling = 2_880_321_414
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:router"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_428_627_939
-measured_at = "v0.53.0's seal"
+ceiling = 1_503_823_964
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_474_489_112
-measured_at = "v0.53.0's seal"
+ceiling = 1_532_164_365
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:ssr"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_135_735_765
-measured_at = "v0.53.0's seal"
+ceiling = 3_272_041_178
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:canvas"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_334_447_168
-measured_at = "v0.53.0's seal"
+ceiling = 1_388_526_909
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:rpc"
 counter = "instructions:u"
 class = "reference"
-ceiling = 1_548_674_718
-measured_at = "v0.53.0's seal"
+ceiling = 1_571_209_914
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:todo"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_775_899_646
-measured_at = "v0.53.0's seal"
+ceiling = 3_932_007_088
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:walkthrough"
 counter = "instructions:u"
 class = "reference"
-ceiling = 3_940_795_609
-measured_at = "v0.53.0's seal"
+ceiling = 4_120_203_163
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 7_168_811_916
-measured_at = "v0.53.0's seal"
+ceiling = 7_386_570_809
+measured_at = "v0.54.0's seal"
 
 [[row]]
 subject = "example:math"
 counter = "callgrind"
 class = "ci"
-ceiling = 263_771_320
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 268_541_010
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 325_234_676
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 330_665_222
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_381_489_478
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_437_896_891
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 2_897_341_758
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 3_008_461_116
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_490_527_360
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_570_622_674
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_538_671_054
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_598_615_345
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_277_232_758
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 3_414_211_585
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_395_562_584
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_450_620_263
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_614_434_653
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 1_638_621_579
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_941_073_589
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 4_100_186_274
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_108_340_550
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 4_296_174_503
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 7_453_824_040
-measured_at = "v0.53.0's seal (ci rows from CI's perf job at c50a0a5893)"
+ceiling = 7_665_128_772
+measured_at = "v0.54.0's seal (ci rows from CI's perf job at 5ecf4cca20)"
 tolerance = 0.005
 
 [[growth]]
@@ -228,173 +228,12 @@ small = 160
 large = 320
 max_ratio = 2.3
 
-[[bump]]
-subject = "example:browser"
-class = "reference"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0134 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0134 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:router"
-class = "reference"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0140 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:router"
-class = "ci"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0140 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "reference"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0137 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "ci"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0137 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:canvas"
-class = "reference"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0137 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:canvas"
-class = "ci"
-ratio = 1.017
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0137 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:ssr"
-class = "reference"
-ratio = 1.014
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0105 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.014
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0105 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.012
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0091 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.012
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0088 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:todo"
-class = "reference"
-ratio = 1.012
-reason = "A178 S1+S2: std::web::style's Length became data and every program importing style analyzes it; the lane bumped this subject's ci class only - lane b689 found the reference class already red on next's own std at x1.011 of the v0.53.0 ceiling (the seal re-measures)"
-item = "A178"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "reference"
-ratio = 1.012
-reason = "A178 S1+S2: std::web::style's Length became data and every program importing style analyzes it; the lane bumped this subject's ci class only - lane b689 found the reference class already red on next's own std at x1.011 of the v0.53.0 ceiling (the seal re-measures)"
-item = "A178"
-
-[[bump]]
-subject = "example:fullstack"
-class = "ci"
-ratio = 1.01
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0069 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "genapp:46"
-class = "ci"
-ratio = 1.009
-reason = "A178 S1+S2: std::web::style's Length became data (the Unit and Role enums, the four operators, conversions, comparisons, dp) and every program importing style analyzes it; measured x1.0059 of the base v0.53.0 on the lane's box"
-item = "A178"
-
-[[bump]]
-subject = "example:math"
-class = "reference"
-ratio = 1.01
-reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0072 of next's std (7911d954) under the lane's build on the lane's box"
-item = "B689"
-
-[[bump]]
-subject = "example:math"
-class = "ci"
-ratio = 1.01
-reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0072 of next's std (7911d954) under the lane's build on the lane's box"
-item = "B689"
-
-[[bump]]
-subject = "example:watch"
-class = "reference"
-ratio = 1.01
-reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0071 of next's std (7911d954) under the lane's build on the lane's box"
-item = "B689"
-
-[[bump]]
-subject = "example:watch"
-class = "ci"
-ratio = 1.01
-reason = "B689/M182: std::hash_map's HashMap moved onto two tables with peek/modify/update and NativeMap gained lend/lend_mut, which every program analyzes through the prelude's std; measured x1.0071 of next's std (7911d954) under the lane's build on the lane's box"
-item = "B689"
-
-[[bump]]
-subject = "example:fullstack"
-class = "reference"
-ratio = 1.01
-reason = "B693: std::reactive::store_core's StoreSome::assume stands a keeper feed on its variant's flag (defer_to_owner, store_switch's flag touches), which every program reaching the store core analyzes; measured x1.0005 of next's std (f9fcc6ce) under the lane's build on the lane's box, where next's own std already stood at x1.0099 of the v0.53.0 ceiling"
-item = "B693"
-
-[[bump]]
-subject = "example:fullstack"
-class = "ci"
-ratio = 1.01
-reason = "A179: std::rpc's dial honours the ambient CancelSignal (dial_attempt, the abort listener, DialFailure::Cancelled) and gained dial_within + two RpcError arms, which every program reaching std::rpc analyzes; CI's perf job read x1.0155 of the ceiling at the merge 79a620f9 where the limit stood at x1.0150 (A178's bump already on the row)"
-item = "A179"
-
-[[bump]]
-subject = "example:rpc"
-class = "ci"
-ratio = 1.01
-reason = "A179: std::rpc's dial honours the ambient CancelSignal (dial_attempt, the abort listener, DialFailure::Cancelled) and gained dial_within + two RpcError arms, which every program reaching std::rpc analyzes; CI's perf job read x1.0096 of the ceiling at the merge 79a620f9 where the limit stood at x1.0050"
-item = "A179"
-
 [[e121]]
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 1500
-green_seals = 0
-blocking = false
+green_seals = 3
+blocking = true
 mandate = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
 
@@ -402,32 +241,32 @@ series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x 
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 0
-blocking = false
+green_seals = 3
+blocking = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
 
 [[e121]]
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 600
-green_seals = 0
-blocking = false
+green_seals = 3
+blocking = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - re-anchored in the same method body, `Channel::create` - the keystroke is at `get_client().get_safe()!.create_channel(org, name)` (the org parameter arrived with organizations, kolt@38a7ac9), hover on `create_channel(org, name)`, and the Find References probe moved from `fun global()` (gone) to `fun ids(talk` (`Channel::ids`, the mirrored store's key-set reader, used in four files none open); the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
 
 [[e121]]
 scenario = "model.vl keystroke, importers open"
 metric = "cpu_ms"
 target_ms = 3000
-green_seals = 0
-blocking = false
+green_seals = 3
+blocking = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the model.vl keystroke's new anchor (`create_channel(org, name)` in `Channel::create`) with client.vl, channel.vl and views.vl open beside it as before; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
 
 [[e121]]
 scenario = "css keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 1300
-green_seals = 0
-blocking = false
+green_seals = 3
+blocking = true
 mandate = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
 
@@ -435,245 +274,7 @@ series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x 
 scenario = "parse break"
 metric = "diagnostics_cpu_ms"
 target_ms = 2500
-green_seals = 0
-blocking = false
+green_seals = 3
+blocking = true
 mandate = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - re-anchored from `channel_name.adopt(channel.current_name());` (gone from channel.vl with organizations, kolt@38a7ac9) to `let name = Channel { id }.current_name(g.talk());` in the same channel.vl (the hover card's channel arm) - a statement over the `talk.channels().at(id)` boundary, the `(` opened before it as before; the repair row (`parse repair`) is the undo of the same edit; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
-
-[[bump]]
-subject = "example:math"
-class = "ci"
-ratio = 1.01
-reason = "B688 + B677 door 2 + E356 (lane solver-56): the analyzer asks the per-file scope rule for every inherent block outside its type's module, answers the implied owner_scope clause at every closure type whose result is View, and reads every own-self builder call - checks that run on every program, math included (no std reach beyond the prelude); CI's perf job read x1.0153 of the ceiling at next 24f99565 (the five-lane merge) where the limit stood at x1.0150"
-item = "B688"
-
-[[bump]]
-subject = "example:router"
-class = "ci"
-ratio = 1.01
-reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list (path_root/path_child/store_path_steps, the entry points materializing it), which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; CI's perf job read x1.0223 of the ceiling at next 24f99565 (the five-lane merge) where the limit stood at x1.0221"
-item = "M186"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.01
-reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list (path_root/path_child/store_path_steps, the entry points materializing it), which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; CI's perf job read x1.0196 of the ceiling at next 24f99565 (the five-lane merge) where the limit stood at x1.0191"
-item = "M186"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.01
-reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list (path_root/path_child/store_path_steps, the entry points materializing it), which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; CI's perf job read x1.0187 of the ceiling at next 24f99565 (the five-lane merge) where the limit stood at x1.0171"
-item = "M186"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.01
-reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list, which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; the row sat EXACTLY at its limit after the five-lane merge and flipped on run-to-run noise of 0.03 % (CI read x1.0171 of the ceiling at next be85965f, limit x1.0171)"
-item = "M186"
-
-[[bump]]
-subject = "example:watch"
-class = "ci"
-ratio = 1.01
-reason = "M186 (lane m186) + solver-56's checks: std::reactive::store_core's handles carry a Shared<StorePathStep> cons-list, which every program reaching the store core analyzes, beside B688/B677/E356's per-program checks; the row sat EXACTLY at its limit after the five-lane merge and flipped on run-to-run noise of 0.03 % (CI read x1.0150 of the ceiling at next be85965f, limit x1.0150)"
-item = "M186"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): std's `str::debug` and `__substring` grew (E346's one-pass escaper, B695's code-point floor - every program compiling std analyzes them), an enum with a payload is copied at every value seam (B691), and the leaf-admission rule (A182); CI read x1.0289 of the ceiling at next c1cfaedf where the limit stood at x1.0221"
-item = "B691"
-
-[[bump]]
-subject = "example:router"
-class = "ci"
-ratio = 1.015
-reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0424 of the ceiling at next c1cfaedf where the limit stood at x1.0323 - 1.015 rather than 1.01 because 1.01 would leave a 0.02 % margin on a row that has flipped on noise before"
-item = "B691"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0277 of the ceiling at next c1cfaedf where the limit stood at x1.0221"
-item = "B691"
-
-[[bump]]
-subject = "example:canvas"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0285 of the ceiling at next c1cfaedf where the limit stood at x1.0221"
-item = "B691"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0287 of the ceiling at next c1cfaedf where the limit stood at x1.0272"
-item = "B691"
-
-[[bump]]
-subject = "genapp:46"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 1 (tooling-56 E346 + solver-56 B691/B695 + lang-56b A181/A182 + incr-56): as example:browser's row; CI read x1.0162 of the ceiling at next c1cfaedf where the limit stood at x1.0140"
-item = "B691"
-
-[[bump]]
-subject = "example:fullstack"
-class = "ci"
-ratio = 1.01
-reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0082 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
-item = "M176"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.01
-reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0086 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
-item = "M176"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.01
-reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0073 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
-item = "M176"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.01
-reason = "M176/M177: std::http gained the body stream (BodyReader, the one-way claim, the shared refusal) and the multipart/form-data parser (Multipart, Part, PartReader), which every program reaching std::http analyzes; measured x1.0073 of next's std (ed9f0db9) under the lane's release build on the lane's box, both stds read from outside a checkout"
-item = "M176"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.01
-reason = "M191 (lane std-56): HashMap and HashSet over the one-table NativeMap<K, V> - the map helpers' new names and layout, slot/get_or_insert and the pending-mark table - which every program reaching std's maps analyzes; CI read x1.0280 of the ceiling at next cbcddd34 where the limit stood at x1.0272 (http-56's M176 row on the same subject is a separate, measured cause)"
-item = "M191"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.015
-reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0408 of the ceiling at next 67111085 where the limit stood at x1.0323 - 1.015 rather than 1.01 because 1.01 would leave a 0.2 % margin"
-item = "M187"
-
-[[bump]]
-subject = "example:fullstack"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0384 of the ceiling at next 67111085 where the limit stood at x1.0355"
-item = "M187"
-
-[[bump]]
-subject = "example:router"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0537 of the ceiling at next 67111085 where the limit stood at x1.0478"
-item = "M187"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0390 of the ceiling at next 67111085 where the limit stood at x1.0323"
-item = "M187"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0418 of the ceiling at next 67111085 where the limit stood at x1.0396"
-item = "M187"
-
-[[bump]]
-subject = "example:canvas"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0395 of the ceiling at next 67111085 where the limit stood at x1.0323"
-item = "M187"
-
-[[bump]]
-subject = "genapp:46"
-class = "ci"
-ratio = 1.01
-reason = "Order 56 wave 2 (ui-56 M187/E345 + http-56 M176/M177): std's regions (close_with/retire_row and the run helpers), the reactive trace's location threaded through every UI binding and stage constructor (E345), and std::http's body stream + multipart - every program compiling std analyzes them; CI read x1.0283 of the ceiling at next 67111085 where the limit stood at x1.0242"
-item = "M187"
-
-[[bump]]
-subject = "example:browser"
-class = "reference"
-ratio = 1.02
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0415 of the ceiling where the limit stood at x1.0272"
-item = "M187"
-
-[[bump]]
-subject = "example:fullstack"
-class = "reference"
-ratio = 1.025
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0370 of the ceiling where the limit stood at x1.0201"
-item = "M187"
-
-[[bump]]
-subject = "example:router"
-class = "reference"
-ratio = 1.03
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0526 of the ceiling where the limit stood at x1.0272"
-item = "M187"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "reference"
-ratio = 1.02
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0391 of the ceiling where the limit stood at x1.0272"
-item = "M187"
-
-[[bump]]
-subject = "example:ssr"
-class = "reference"
-ratio = 1.025
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0435 of the ceiling where the limit stood at x1.0241"
-item = "M187"
-
-[[bump]]
-subject = "example:canvas"
-class = "reference"
-ratio = 1.02
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0405 of the ceiling where the limit stood at x1.0272"
-item = "M187"
-
-[[bump]]
-subject = "example:rpc"
-class = "reference"
-ratio = 1.01
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0145 of the ceiling where the limit stood at x1.0100"
-item = "M187"
-
-[[bump]]
-subject = "example:todo"
-class = "reference"
-ratio = 1.025
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0415 of the ceiling where the limit stood at x1.0221"
-item = "M187"
-
-[[bump]]
-subject = "example:walkthrough"
-class = "reference"
-ratio = 1.03
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0453 of the ceiling where the limit stood at x1.0221"
-item = "M187"
-
-[[bump]]
-subject = "genapp:46"
-class = "reference"
-ratio = 1.025
-reason = "Order 56 seal on 0b6118f9 (the reference class, judged by the seal; the ci rows carry the same causes): std grew for every browser program - E346's str::debug, B691's enum copies, B695's code-point floor, A181/A182's admission rule, M191's one-table map, M187's region helpers, E345's location threading through every binding and stage, M176/M177's body stream + multipart; the editor's keystroke fell 21 % the same order (incr-56); the seal read x1.0304 of the ceiling where the limit stood at x1.0100"
-item = "M187"
