@@ -1703,13 +1703,26 @@ fn helper_source(name: &str) -> &'static str {
         // M164: one request's answer, with a CANCELLATION ended quietly — node
         // ignores the promise a `createServer` callback returns, so a refused
         // body's `AbortError` would otherwise be an unhandled rejection, which
-        // ends the process. Any other failure is rethrown, unchanged.
+        // ends the process. M179: any other failure (a handler's panic) is
+        // reported ONCE, in the line an unobserved task's failure prints (the
+        // native server's executor prints the same one), and answered `500`
+        // with `Connection: close` when the response has not started — cut off
+        // when it has — and the server goes on serving.
         "__http_respond" => {
-            "async function __http_respond(body) {\n\
+            "async function __http_respond(response, body) {\n\
              \ttry {\n\
              \t\tawait body();\n\
              \t} catch (error) {\n\
-             \t\tif (!error || error.name !== \"AbortError\") throw error;\n\
+             \t\tif (error && error.name === \"AbortError\") return;\n\
+             \t\tconsole.error(\"unhandled task error (spawned in an http request handler): \" + String(error));\n\
+             \t\tif (!response.headersSent) {\n\
+             \t\t\tresponse.statusCode = 500;\n\
+             \t\t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
+             \t\t\tresponse.setHeader(\"Connection\", \"close\");\n\
+             \t\t\tresponse.end(\"internal server error\");\n\
+             \t\t} else if (!response.writableEnded) {\n\
+             \t\t\tresponse.destroy();\n\
+             \t\t}\n\
              \t}\n\
              }"
         }

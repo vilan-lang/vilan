@@ -145,6 +145,13 @@ user about the firewall). A server meant for this machine only (a desktop
 app's own, a dev tool, a test) binds the loopback: `.host("127.0.0.1")`, or
 `"::1"` for IPv6. `url()` then names that address.
 
+**A handler that panics is answered `500`.** The panic is reported once on
+stderr — `unhandled task error (spawned in an http request handler):
+panicked at <site>: <message>`, the line any unobserved task's failure
+prints — and the client gets `500 Internal Server Error` with `Connection:
+close` (a response that had already started streaming is cut off instead).
+The server goes on serving the next request, on both backends.
+
 **Request bodies: capped, and read when the handler asks.** A handler runs
 on the request's head. The body stays on the wire until the handler calls
 `bytes()` or `body()`; the first call reads it whole, and a later one

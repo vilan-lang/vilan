@@ -63,7 +63,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::bytes::Bytes;
-use crate::executor::{Boxed, IoSource, Parked, raise_cancelled, register_io, spawn};
+use crate::executor::{
+    Boxed, Failure, IoSource, Parked, caught, raise_cancelled, raise_failure, register_io, spawn,
+};
 use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
 
@@ -1202,6 +1204,26 @@ impl Response {
         self.0.connection.stage.set(Stage::Closing);
     }
 
+    /// M179: the handler FAILED. A response whose head has not gone out answers
+    /// `500` with `Connection: close` — what node's `__http_respond` writes — and
+    /// one already streaming is cut off where it stands (`destroy`, the flush
+    /// kept), so its reader sees it end short rather than wait for an end that
+    /// will not come. An ended response is left alone.
+    fn fail(&self) {
+        if self.0.ended.get() {
+            return;
+        }
+        if !self.0.head_sent.get() {
+            self.set_status_code(500);
+            self.set_header("Content-Type", "text/plain");
+            self.set_header("Connection", "close");
+            self.end("internal server error");
+        } else {
+            self.0.ended.set(true);
+            self.0.connection.destroy();
+        }
+    }
+
     /// `response.on("close", callback)` — the connection ended. For a
     /// never-ended streaming response that is the client going away, which is
     /// the event `std::http`'s `ResponseStream::on_close` exists for.
@@ -1286,6 +1308,26 @@ fn termination_requested() -> bool {
 }
 
 // ----------------------------------------------------------------- server ---
+
+/// `__http_respond(response, body)` (M164 + M179) — one request's answer. A
+/// cancellation travels on and settles the spawned task quietly, as before; a
+/// PANIC first answers the request (`Response::fail`: `500`, or a started stream
+/// cut off) and then travels on, so the task's unobserved-failure line reports
+/// it ONCE — `unhandled task error (spawned in an http request handler):
+/// panicked at <site>: <message>`, the line node's helper prints — and the
+/// server goes on serving. Before, the response was left open and the client
+/// waited until it gave up.
+pub async fn respond(response: Response, body: Boxed<()>) {
+    match caught(body).await {
+        Ok(()) => {}
+        Err(failure) => {
+            if !matches!(failure, Failure::Cancelled) {
+                response.fail();
+            }
+            raise_failure(failure);
+        }
+    }
+}
 
 /// The request handler a server is built with: `createServer`'s callback.
 ///

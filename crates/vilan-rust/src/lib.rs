@@ -10837,20 +10837,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let limit = self.value_argument(argument_ids, 1, depth)?;
                 return Ok(Some(format!("({request}).body_left_unread({limit})")));
             }
-            // M164: one request's answer. The JS helper exists to keep a
-            // cancellation from reaching node unhandled; here the callback is
-            // already a spawned task, where a cancellation settles quietly, so
-            // the call IS the body's future (the call site awaits it).
+            // M164 + M179: one request's answer. The callback is already a
+            // spawned task, where a cancellation settles quietly; the runtime's
+            // `respond` answers a PANIC `500` (or cuts a started response off)
+            // and raises it on, so the task reports it once, as node's helper
+            // does (the call site awaits it).
             ExternBinding::Function {
                 module: None,
                 symbol: "__http_respond",
             } => {
-                return Ok(Some(self.pinned_body_argument(
-                    argument_ids,
-                    0,
-                    depth,
-                    span,
-                )?));
+                let response = self.place_argument(argument_ids, 0, depth)?;
+                let body = self.pinned_body_argument(argument_ids, 1, depth, span)?;
+                return Ok(Some(format!(
+                    "vilan_rt::http::respond(({response}).clone(), {body})"
+                )));
             }
             // `new TextDecoder()` / `new TextEncoder()` — both stateless for
             // the one encoding vilan has.
