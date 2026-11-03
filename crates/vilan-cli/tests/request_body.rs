@@ -88,7 +88,11 @@ impl Built {
             }
             Backend::Native => Command::new(&self.native_binary),
         };
-        command.current_dir(&self.staged);
+        // M164's measuring condition, so a peak-RSS pin reads the process and
+        // not glibc's per-thread arenas.
+        command
+            .current_dir(&self.staged)
+            .env("MALLOC_ARENA_MAX", "1");
         Server::spawn(&mut command)
     }
 
@@ -821,5 +825,456 @@ fn m164_the_server_a_mount_and_a_route_each_set_the_cap_on_both_backends() {
             a_service_mount_takes_its_mounts_cap,
         ),
         ("the upload route's shape", the_upload_route_shape),
+    ]);
+}
+
+// ------------------------------------------------------------ the stream ---
+
+/// M176's program: the body read as a STREAM. `/hash` hashes it as it arrives —
+/// sha-256 over the sha-256s of its 256 KiB blocks, so the digest does not
+/// depend on how the pieces fell, and only one block is ever held — reading
+/// `next(65536)`; `/hash-huge` reads with a `size` far past any body;
+/// `/pieces` reports how many pieces a read took; `/count` reads under the
+/// default 1 MiB cap; `/partial` reads ten bytes and answers; the two
+/// `/..-then-..` routes read one body both ways.
+const STREAM_SERVER: &str = r#"import std::io::print;
+import std::bytes::Bytes;
+import std::crypto::sha256;
+import std::http::{ BodyReader, Request, Response, Server, refused_body_census };
+
+fun hashed(reader: BodyReader, size: usize): Response {
+	let block_size = 262144usize;
+	let block = Bytes::alloc(block_size);
+	mut filled = 0usize;
+	mut total = 0usize;
+	mut digests = Bytes::alloc(0);
+	for {
+		let wanted = if block_size - filled < size { block_size - filled } else { size };
+		let piece = match reader.next(wanted) {
+			Some(let piece) => piece,
+			None => jump break,
+		};
+		block.copy_into(piece, filled);
+		filled = filled + piece.len();
+		total = total + piece.len();
+		if filled == block_size {
+			digests = Bytes::concat(digests, sha256(block));
+			filled = 0;
+		}
+	}
+	if filled > 0 {
+		digests = Bytes::concat(digests, sha256(block.slice(0, filled)));
+	}
+	Response::builder().body(i"len={total} sha={sha256(digests).to_hex()}").build()
+}
+
+fun counted(reader: BodyReader, size: usize): Response {
+	mut pieces = 0;
+	mut total = 0usize;
+	mut largest = 0usize;
+	for {
+		let piece = match reader.next(size) {
+			Some(let piece) => piece,
+			None => jump break,
+		};
+		pieces = pieces + 1;
+		total = total + piece.len();
+		if piece.len() > largest {
+			largest = piece.len();
+		}
+	}
+	let after = match reader.next(size) {
+		Some(let _piece) => "more",
+		None => "none",
+	};
+	Response::builder().body(i"pieces={pieces} len={total} largest={largest} after={after}").build()
+}
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.on_request(|request| {
+			let path = request.path();
+			if path == "/census" {
+				ret Response::builder().body(i"refused_read={refused_body_census()}").build();
+			}
+			if path == "/hash" {
+				ret hashed(request.max_body_bytes(100 * 1024 * 1024).body_stream(), 65536);
+			}
+			if path == "/hash-huge" {
+				ret hashed(request.max_body_bytes(100 * 1024 * 1024).body_stream(), 1073741824);
+			}
+			if path == "/pieces-huge" {
+				ret counted(request.body_stream(), 1073741824);
+			}
+			if path == "/pieces-7" {
+				ret counted(request.body_stream(), 7);
+			}
+			if path == "/count" {
+				ret counted(request.body_stream(), 65536);
+			}
+			if path == "/partial" {
+				let reader = request.body_stream();
+				let first = reader.next(10);
+				ret Response::builder().body(i"took={first.unwrap().len()}").build();
+			}
+			if path == "/stream-then-bytes" {
+				let reader = request.body_stream();
+				let _first = reader.next(4);
+				let all = request.bytes();
+				ret Response::builder().body(i"read both ways: {all.len()}").build();
+			}
+			if path == "/bytes-then-stream" {
+				let all = request.body();
+				let _reader = request.body_stream();
+				ret Response::builder().body(i"read both ways: {all}").build();
+			}
+			if path == "/stream-twice" {
+				let first = request.body_stream().next(5).unwrap();
+				let rest = request.body_stream().next(100).unwrap();
+				ret Response::builder().body(i"first={first.len()} rest={rest.len()}").build();
+			}
+			Response::builder().code(404).body("no route").build()
+		})
+		.on_start(|server| ANNOUNCE)
+		.build()
+		.start();
+}
+"#;
+
+fn stream_server() -> String {
+    STREAM_SERVER.replace("ANNOUNCE", ANNOUNCE_PORT)
+}
+
+/// `/hash`'s digest of `data`, computed here: sha-256 over the sha-256s of its
+/// 256 KiB blocks.
+fn block_digest(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digests = Vec::new();
+    for block in data.chunks(256 * 1024) {
+        digests.extend_from_slice(&Sha256::digest(block));
+    }
+    let digest = Sha256::digest(&digests);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("len={} sha={hex}", data.len())
+}
+
+/// `length` bytes that are not all one value (an xorshift), so a piece lost,
+/// repeated or reordered changes the digest.
+fn varied_bytes(length: usize) -> Vec<u8> {
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..length)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// A process's peak resident set (`VmHWM`), in kB — `None` off Linux, where
+/// there is no `/proc` to read it from.
+fn peak_rss_kb(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("VmHWM:")
+            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+    })
+}
+
+/// Sends `data` as the body of a POST to `path` from a second thread, in 64 KiB
+/// writes, while this thread reads the response.
+fn uploaded(port: u16, path: &str, data: Vec<u8>) -> Result<String, String> {
+    let mut stream = connect(port)?;
+    stream
+        .write_all(post_head(path, data.len()).as_bytes())
+        .map_err(|error| format!("send the head: {error}"))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|error| format!("a second handle on the socket: {error}"))?;
+    let sender = std::thread::spawn(move || {
+        for piece in data.chunks(64 * 1024) {
+            if writer.write_all(piece).is_err() {
+                return;
+            }
+        }
+    });
+    let response = read_response(&mut stream);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    sender.join().expect("the sending thread");
+    response
+}
+
+/// M176's measurement: a 64 MiB upload hashed from the stream, against the
+/// whole-body read's cost (M164: 25 MiB read whole is ~25 MB natively and
+/// ~56 MB on node). The figure is the server's PEAK resident set grown over
+/// the upload — `VmHWM`, after a small upload has paid for every lazy start-up
+/// cost — and the bounds are the backends' own: natively the stream holds a
+/// slice and a block (measured ~0.5 MB), so 8 MiB is generous; node allocates
+/// a fresh buffer per socket read and frees them when its collector gets to
+/// them, so its peak is the collector's lag, not what the stream holds
+/// (measured ~20-30 MB, where node's own `on("data")` counting loop measures
+/// ~41 MB) — bounded at 48 MiB, under the upload itself and far under the
+/// whole read's two-and-a-bit times it. Off Linux the digest is still checked
+/// and the figure is not read.
+fn the_upload_is_hashed_at_a_bounded_cost(built: &Built, backend: Backend) -> Result<(), String> {
+    let mut server = built.spawn(backend);
+    let port = server.port();
+    let outcome = (|| {
+        let warm = varied_bytes(300 * 1024);
+        let response = uploaded(port, "/hash", warm.clone())?;
+        expect_body(&response, &block_digest(&warm))?;
+        let before = peak_rss_kb(server.id());
+        let upload = varied_bytes(64 * MIB);
+        let expected = block_digest(&upload);
+        let response = uploaded(port, "/hash", upload)?;
+        expect_status(&response, "HTTP/1.1 200 OK")?;
+        expect_body(&response, &expected)?;
+        let (Some(before), Some(after)) = (before, peak_rss_kb(server.id())) else {
+            return Ok(());
+        };
+        let grown = after - before;
+        let bound = match backend {
+            Backend::Native => 8 * 1024,
+            Backend::Node => 48 * 1024,
+        };
+        eprintln!(
+            "{backend:?}: a 64 MiB upload hashed from the stream grew the peak by {grown} kB"
+        );
+        if grown > bound {
+            return Err(format!(
+                "a 64 MiB upload read as a stream grew the server's peak by {grown} kB (bound \
+                 {bound} kB)"
+            ));
+        }
+        Ok(())
+    })();
+    server.stop();
+    outcome
+}
+
+#[test]
+fn m176_a_64_mib_upload_is_hashed_from_the_stream_at_a_bounded_cost_on_both_backends() {
+    let built = Built::new("request_body_stream_cost", &stream_server());
+    let mut failures = Vec::new();
+    for backend in [Backend::Node, Backend::Native] {
+        if let Err(failure) = the_upload_is_hashed_at_a_bounded_cost(&built, backend) {
+            failures.push(format!("{backend:?}: {failure}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The whole body arrives through the stream, in order, whatever the piece
+/// size: a 3 MiB upload hashed at 64 KiB pieces and with a `size` far past the
+/// body.
+fn the_stream_carries_the_whole_body(port: u16, _backend: Backend) -> Result<(), String> {
+    let upload = varied_bytes(3 * MIB + 12345);
+    let expected = block_digest(&upload);
+    expect_body(&uploaded(port, "/hash", upload.clone())?, &expected)?;
+    expect_body(&uploaded(port, "/hash-huge", upload)?, &expected)
+}
+
+/// `/pieces-..`'s answer, as `(pieces, total, largest, after)`.
+fn pieces_of(response: &str) -> Result<(usize, usize, usize, String), String> {
+    let field = |name: &str| {
+        body_of(response)
+            .split(' ')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+            .map(str::to_string)
+            .ok_or_else(|| format!("no `{name}` in:\n{response}"))
+    };
+    let number = |name: &str| {
+        field(name)?
+            .parse::<usize>()
+            .map_err(|error| format!("`{name}`: {error}"))
+    };
+    Ok((
+        number("pieces")?,
+        number("len")?,
+        number("largest")?,
+        field("after")?,
+    ))
+}
+
+/// A `next(size)` larger than the body answers what there is, then `None` —
+/// and `None` again after the end. A small size splits what arrived and never
+/// hands out more than it asked for; an empty body ends at once.
+fn a_size_past_the_body_answers_what_there_is(port: u16, _backend: Backend) -> Result<(), String> {
+    let response = exchange(port, &post_head("/pieces-huge", 1000), &[b'a'; 1000])?;
+    let (pieces, total, _largest, after) = pieces_of(&response)?;
+    if pieces == 0 || total != 1000 || after != "none" {
+        return Err(format!(
+            "expected the 1000 bytes and then `None`, twice:\n{response}"
+        ));
+    }
+    let response = exchange(port, &post_head("/pieces-7", 100), &[b'a'; 100])?;
+    let (pieces, total, largest, after) = pieces_of(&response)?;
+    if pieces < 15 || total != 100 || largest != 7 || after != "none" {
+        return Err(format!(
+            "expected 100 bytes in pieces of at most 7, then `None`:\n{response}"
+        ));
+    }
+    let response = exchange(port, &post_head("/pieces-huge", 0), b"")?;
+    expect_body(&response, "pieces=0 len=0 largest=0 after=none")
+}
+
+/// A chunked body is decoded through the stream: the pieces are the data, not
+/// the framing.
+fn a_chunked_body_streams_decoded(port: u16, _backend: Backend) -> Result<(), String> {
+    let data = varied_bytes(200 * 1024);
+    let mut wire = Vec::new();
+    let mut offset = 0;
+    // Uneven chunks: one byte, a prime, a block, the rest.
+    for size in [1usize, 4093, 65536, data.len()] {
+        let size = size.min(data.len() - offset);
+        if size == 0 {
+            break;
+        }
+        wire.extend_from_slice(format!("{size:x}\r\n").as_bytes());
+        wire.extend_from_slice(&data[offset..offset + size]);
+        wire.extend_from_slice(b"\r\n");
+        offset += size;
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    let response = exchange(port, &chunked_head("/hash"), &wire)?;
+    expect_status(&response, "HTTP/1.1 200 OK")?;
+    expect_body(&response, &block_digest(&data))
+}
+
+/// A declared `Content-Length` over the cap is refused at the stream's first
+/// read, before a byte of the body is sent.
+fn a_declared_body_over_the_cap_is_refused_at_the_first_read(
+    port: u16,
+    _backend: Backend,
+) -> Result<(), String> {
+    let response = exchange(port, &post_head_keep_alive("/count", 2 * MIB), b"")?;
+    expect_status(&response, "HTTP/1.1 413 Content Too Large")?;
+    expect_header(&response, "Connection: close")?;
+    expect_body(&response, DEFAULT_REFUSAL)
+}
+
+/// The cap MID-STREAM: a chunked body read piece by piece is refused at the
+/// chunk that crosses 1 MiB — after the handler has read most of a mebibyte —
+/// with the same `413`, and the server reads none of what the client keeps
+/// writing after it (the census, B687: the writer stalls).
+fn the_cap_refuses_mid_stream_and_the_writer_stalls(
+    port: u16,
+    _backend: Backend,
+) -> Result<(), String> {
+    let before = refused_body_read(port)?;
+    let outcome = streamed(port, &chunked_head("/count"), 64 * MIB, true)?;
+    expect_status(&outcome, "HTTP/1.1 413 Content Too Large")?;
+    expect_body(&outcome, DEFAULT_REFUSAL)?;
+    let after = refused_body_read(port)?;
+    if after != before {
+        return Err(format!(
+            "the server read {} body bytes after refusing the stream",
+            after - before
+        ));
+    }
+    Ok(())
+}
+
+/// A body is read whole or as a stream, not both: either order is refused
+/// `500` with a sentence naming both calls, and the handler ends there (its
+/// own answer, which says `read both ways`, never goes out).
+fn a_body_is_read_one_way(port: u16, _backend: Backend) -> Result<(), String> {
+    let response = exchange(port, &post_head("/stream-then-bytes", 10), b"0123456789")?;
+    expect_status(&response, "HTTP/1.1 500 Internal Server Error")?;
+    expect_body(
+        &response,
+        "`Request::bytes()` or `body()` was called after `Request::body_stream()` had started \
+         reading the body as a stream: a request body is read whole or as a stream, not both",
+    )?;
+    let response = exchange(port, &post_head("/bytes-then-stream", 10), b"0123456789")?;
+    expect_status(&response, "HTTP/1.1 500 Internal Server Error")?;
+    expect_body(
+        &response,
+        "`Request::body_stream()` was called after `Request::bytes()` or `body()` had read the \
+         body whole: a request body is read whole or as a stream, not both",
+    )?;
+    // Two readers of one stream are one stream: the second continues.
+    let response = exchange(port, &post_head("/stream-twice", 10), b"0123456789")?;
+    expect_body(&response, "first=5 rest=5")
+}
+
+/// A stream the handler leaves unfinished is an unread body (M164's rule):
+/// within the cap it is drained — on node the connection stays alive and a
+/// request pipelined behind it is answered; natively it is discarded before
+/// the close — and past it, chunked, the connection closes with the census
+/// still at zero.
+fn an_unfinished_stream_is_discarded_as_an_unread_body(
+    port: u16,
+    backend: Backend,
+) -> Result<(), String> {
+    let body = vec![b'a'; 200 * 1024];
+    let mut wire = format!(
+        "POST /partial HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    wire.extend_from_slice(&body);
+    wire.extend_from_slice(b"POST /partial HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello world!");
+    let mut stream = connect(port)?;
+    stream
+        .write_all(&wire)
+        .map_err(|error| format!("send: {error}"))?;
+    let response = read_response(&mut stream)?;
+    let answered = response.matches("took=10").count();
+    let expected = match backend {
+        Backend::Node => 2,
+        Backend::Native => 1,
+    };
+    if answered != expected {
+        return Err(format!(
+            "expected {expected} answer(s) on the connection, got {answered}:\n{response}"
+        ));
+    }
+    let before = refused_body_read(port)?;
+    let outcome = streamed(port, &chunked_head("/partial"), 4 * MIB, true)?;
+    expect_status(&outcome, "HTTP/1.1 200 OK")?;
+    expect_header(&outcome, "Connection: close")?;
+    expect_body(&outcome, "took=10")?;
+    let after = refused_body_read(port)?;
+    if after != before {
+        return Err(format!(
+            "the server read {} body bytes of a stream it had left",
+            after - before
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn m176_a_body_read_as_a_stream_on_both_backends() {
+    let built = Built::new("request_body_stream", &stream_server());
+    built.check(&[
+        (
+            "the stream carries the whole body",
+            the_stream_carries_the_whole_body,
+        ),
+        (
+            "a size past the body answers what there is",
+            a_size_past_the_body_answers_what_there_is,
+        ),
+        (
+            "a chunked body streams decoded",
+            a_chunked_body_streams_decoded,
+        ),
+        (
+            "a declared body over the cap is refused at the first read",
+            a_declared_body_over_the_cap_is_refused_at_the_first_read,
+        ),
+        (
+            "the cap refuses mid-stream and the writer stalls",
+            the_cap_refuses_mid_stream_and_the_writer_stalls,
+        ),
+        ("a body is read one way", a_body_is_read_one_way),
+        (
+            "an unfinished stream is discarded as an unread body",
+            an_unfinished_stream_is_discarded_as_an_unread_body,
+        ),
     ]);
 }

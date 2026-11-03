@@ -1209,10 +1209,26 @@ fn close_helper_dependencies(helpers: &mut Vec<&'static str>) {
         helpers.push("__db_bind");
         added = true;
     }
+    // M164/M176: every body read and the extern refusal answer a refusal
+    // through `__http_refusal`, which cancels through `__http_cancel`.
+    if helpers.iter().any(|helper| {
+        matches!(
+            *helper,
+            "__http_read_body" | "__http_body_next" | "__http_refuse"
+        )
+    }) && !helpers.contains(&"__http_refusal")
+    {
+        helpers.push("__http_refusal");
+        added = true;
+    }
+    if helpers.contains(&"__http_refusal") && !helpers.contains(&"__http_cancel") {
+        helpers.push("__http_cancel");
+        added = true;
+    }
     // M164: a refused or unread-over-the-cap body lingers its connection.
     if helpers
         .iter()
-        .any(|helper| matches!(*helper, "__http_read_body" | "__http_body_left_unread"))
+        .any(|helper| matches!(*helper, "__http_refusal" | "__http_body_left_unread"))
         && !helpers.contains(&"__http_linger")
     {
         helpers.push("__http_linger");
@@ -1334,6 +1350,10 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__local_get",
         "__response_header",
         "__http_read_body",
+        "__http_body_next",
+        "__http_claim_body",
+        "__http_refuse",
+        "__http_find",
         "__http_body_left_unread",
         "__http_respond",
         "__http_refused_body_census",
@@ -1598,44 +1618,22 @@ fn helper_source(name: &str) -> &'static str {
         // kept on the request object, so a later `bytes()` answers the same
         // promise; at most `limit` bytes — a declared `Content-Length` over it is
         // refused before a byte of the body is read, a chunked body is counted
-        // per `data` event and refused at the chunk that crosses it. A refusal
-        // answers `413` with `Connection: close` — node destroys the socket once
-        // it is flushed, and the stream is paused, so the rest is never read —
-        // under RFC 9110's phrase (node's table still says `Payload Too Large`;
-        // the native server says the RFC's, so the two answer one status line),
-        // and rejects with an `AbortError`: the handler ends as a cancelled task
-        // does, and `__http_respond` keeps that quiet. A client that goes away
-        // mid-body (`error`, node's `aborted`) ends it the same way — before
-        // M164 that rejection reached node unhandled and ended the process. The
-        // `error` listener stays on: node raises a request's `error` only to a
-        // listener, and a second one with none would.
+        // per `data` event and refused at the chunk that crosses it. A refusal is
+        // `__http_refusal`'s `413`, and the read rejects with its `AbortError`:
+        // the handler ends as a cancelled task does, and `__http_respond` keeps
+        // that quiet. A client that goes away mid-body (`error`, node's
+        // `aborted`) ends it the same way — before M164 that rejection reached
+        // node unhandled and ended the process. The `error` listener stays on:
+        // node raises a request's `error` only to a listener, and a second one
+        // with none would.
         "__http_read_body" => {
             "function __http_read_body(request, response, limit) {\n\
              \tif (request.__vilan_body !== undefined) return request.__vilan_body;\n\
              \trequest.__vilan_body = new Promise((resolve, reject) => {\n\
-             \t\tconst over = (message) => {\n\
-             \t\t\tconst error = new Error(message);\n\
-             \t\t\terror.name = \"AbortError\";\n\
-             \t\t\treturn error;\n\
-             \t\t};\n\
-             \t\tconst refuse = () => {\n\
-             \t\t\trequest.removeAllListeners(\"data\");\n\
-             \t\t\trequest.pause();\n\
-             \t\t\tif (!response.headersSent) {\n\
-             \t\t\t\tresponse.statusCode = 413;\n\
-             \t\t\t\tresponse.statusMessage = \"Content Too Large\";\n\
-             \t\t\t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
-             \t\t\t\tresponse.setHeader(\"Connection\", \"close\");\n\
-             \t\t\t\t__http_linger(request);\n\
-             \t\t\t\tresponse.end(\"the request body is larger than \" + limit + \" bytes\");\n\
-             \t\t\t} else {\n\
-             \t\t\t\trequest.socket.destroy();\n\
-             \t\t\t}\n\
-             \t\t\treject(over(\"the request body is larger than \" + limit + \" bytes\"));\n\
-             \t\t};\n\
-             \t\trequest.on(\"error\", () => reject(over(\"the client went away before the request body arrived\")));\n\
+             \t\tconst refuse = () => reject(__http_refusal(request, response, 413, \"the request body is larger than \" + limit + \" bytes\"));\n\
+             \t\trequest.on(\"error\", () => reject(__http_cancel(\"the client went away before the request body arrived\")));\n\
              \t\tif (request.readableEnded || response.writableEnded) {\n\
-             \t\t\treject(over(\"the request body was read after the request was answered\"));\n\
+             \t\t\treject(__http_cancel(\"the request body was read after the request was answered\"));\n\
              \t\t\treturn;\n\
              \t\t}\n\
              \t\tconst declared = request.headers[\"content-length\"];\n\
@@ -1659,18 +1657,177 @@ fn helper_source(name: &str) -> &'static str {
              \treturn request.__vilan_body;\n\
              }"
         }
+        // M176: `std::http`'s request body as a STREAM — `BodyReader::next`. The
+        // first call starts it (the cap's declared-length check, then the
+        // listeners); every call queues a waiter and pumps. The pump answers
+        // waiters from what has arrived — at most `size` bytes each, a node
+        // chunk split with `subarray` when it is longer (two disjoint views, so
+        // neither is ever overwritten) — and RESUMES the request only while a
+        // waiter has nothing to take, pausing it again the moment none is
+        // waiting: a paused `IncomingMessage` stops node's parser reading the
+        // socket once its buffer fills, so the client's writes stall rather
+        // than the server buffering an upload nobody asked for yet. Every piece
+        // is counted against `limit` as it arrives (`__http_refusal`'s `413`,
+        // mid-stream too: the rest is never read); a client gone mid-body, a
+        // refusal, or a read after the answer FAILS the stream, and every
+        // waiter, then and later, rejects with that cancellation. The end is
+        // `[ 1 ]` (`None`), a piece `[ 0, chunk ]`.
+        "__http_body_next" => {
+            "function __http_body_next(request, response, limit, size) {\n\
+             \tlet stream = request.__vilan_stream;\n\
+             \tif (stream === undefined) {\n\
+             \t\tstream = request.__vilan_stream = { chunks: [], ended: false, failure: null, waiters: [] };\n\
+             \t\tstream.pump = () => {\n\
+             \t\t\twhile (stream.waiters.length > 0) {\n\
+             \t\t\t\tif (stream.failure !== null) {\n\
+             \t\t\t\t\tstream.waiters.shift().reject(stream.failure);\n\
+             \t\t\t\t} else if (stream.chunks.length > 0) {\n\
+             \t\t\t\t\tconst waiter = stream.waiters.shift();\n\
+             \t\t\t\t\tconst chunk = stream.chunks[0];\n\
+             \t\t\t\t\tif (chunk.length <= waiter.size) {\n\
+             \t\t\t\t\t\tstream.chunks.shift();\n\
+             \t\t\t\t\t\twaiter.resolve([ 0, chunk ]);\n\
+             \t\t\t\t\t} else {\n\
+             \t\t\t\t\t\tstream.chunks[0] = chunk.subarray(waiter.size);\n\
+             \t\t\t\t\t\twaiter.resolve([ 0, chunk.subarray(0, waiter.size) ]);\n\
+             \t\t\t\t\t}\n\
+             \t\t\t\t} else if (stream.ended) {\n\
+             \t\t\t\t\tstream.waiters.shift().resolve([ 1 ]);\n\
+             \t\t\t\t} else {\n\
+             \t\t\t\t\trequest.resume();\n\
+             \t\t\t\t\treturn;\n\
+             \t\t\t\t}\n\
+             \t\t\t}\n\
+             \t\t\tif (!stream.ended && stream.failure === null) request.pause();\n\
+             \t\t};\n\
+             \t\tstream.fail = (error) => {\n\
+             \t\t\tif (stream.failure === null) stream.failure = error;\n\
+             \t\t\tstream.chunks.length = 0;\n\
+             \t\t\tstream.pump();\n\
+             \t\t};\n\
+             \t\tconst declared = request.headers[\"content-length\"];\n\
+             \t\tif (request.readableEnded || response.writableEnded) {\n\
+             \t\t\tstream.fail(__http_cancel(\"the request body was read after the request was answered\"));\n\
+             \t\t} else if (declared !== undefined && Number(declared) > limit) {\n\
+             \t\t\t__http_refusal(request, response, 413, \"the request body is larger than \" + limit + \" bytes\");\n\
+             \t\t} else {\n\
+             \t\t\tlet total = 0;\n\
+             \t\t\trequest.on(\"error\", () => stream.fail(__http_cancel(\"the client went away before the request body arrived\")));\n\
+             \t\t\trequest.on(\"data\", (chunk) => {\n\
+             \t\t\t\ttotal += chunk.length;\n\
+             \t\t\t\tif (total > limit) {\n\
+             \t\t\t\t\t__http_refusal(request, response, 413, \"the request body is larger than \" + limit + \" bytes\");\n\
+             \t\t\t\t\treturn;\n\
+             \t\t\t\t}\n\
+             \t\t\t\tstream.chunks.push(chunk);\n\
+             \t\t\t\tstream.pump();\n\
+             \t\t\t});\n\
+             \t\t\trequest.once(\"end\", () => {\n\
+             \t\t\t\tstream.ended = true;\n\
+             \t\t\t\tstream.pump();\n\
+             \t\t\t});\n\
+             \t\t}\n\
+             \t}\n\
+             \treturn new Promise((resolve, reject) => {\n\
+             \t\tstream.waiters.push({ size, resolve, reject });\n\
+             \t\tstream.pump();\n\
+             \t});\n\
+             }"
+        }
+        // M176: the one-way-of-reading claim (`std::http`'s `claim_read`): the
+        // first claim sticks to the request object — every copy of the vilan
+        // `Request` is one host request — and the earlier one is answered.
+        "__http_claim_body" => {
+            "function __http_claim_body(request, how) {\n\
+             \tconst earlier = request.__vilan_claim ?? \"\";\n\
+             \tif (earlier === \"\") request.__vilan_claim = how;\n\
+             \treturn earlier;\n\
+             }"
+        }
+        // A cancellation, as `__http_respond` recognises one.
+        "__http_cancel" => {
+            "function __http_cancel(message) {\n\
+             \tconst error = new Error(message);\n\
+             \terror.name = \"AbortError\";\n\
+             \treturn error;\n\
+             }"
+        }
+        // M164/M176: every refusal of a request — a body over its cap (`413`),
+        // a malformed form (`400`), a handler reading one body two ways
+        // (`500`) — answered the one way. The body stops here: the `data`
+        // listeners go, the request pauses, and `__http_linger` stops the
+        // socket and keeps the answer from being overtaken by a reset. The
+        // status goes out with `Connection: close` — node destroys the socket
+        // once it is flushed — and RFC 9110's phrase for a `413` (node's table
+        // still says `Payload Too Large`; the native server says the RFC's, so
+        // the two answer one status line). A response already under way cannot
+        // become a refusal, so its socket is cut instead. A `5xx` is the
+        // server's own fault and is written to stderr too. Answers the
+        // cancellation the caller rejects (or throws) with, after failing a
+        // stream in progress with it, so a later `next` ends the same way.
+        "__http_refusal" => {
+            "function __http_refusal(request, response, status, message) {\n\
+             \trequest.removeAllListeners(\"data\");\n\
+             \trequest.pause();\n\
+             \tif (status >= 500) console.error(\"std::http: \" + message);\n\
+             \tif (!response.headersSent) {\n\
+             \t\tresponse.statusCode = status;\n\
+             \t\tif (status === 413) response.statusMessage = \"Content Too Large\";\n\
+             \t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
+             \t\tresponse.setHeader(\"Connection\", \"close\");\n\
+             \t\t__http_linger(request);\n\
+             \t\tresponse.end(message);\n\
+             \t} else {\n\
+             \t\trequest.socket.destroy();\n\
+             \t}\n\
+             \tconst error = __http_cancel(message);\n\
+             \tif (request.__vilan_stream !== undefined) request.__vilan_stream.fail(error);\n\
+             \treturn error;\n\
+             }"
+        }
+        // `std::http`'s `refuse`: the refusal, thrown — the handler ends there.
+        "__http_refuse" => {
+            "function __http_refuse(request, response, status, message) {\n\
+             \tthrow __http_refusal(request, response, status, message);\n\
+             }"
+        }
+        // M177: where `needle` next occurs in `haystack` at or after `from` —
+        // `Buffer.indexOf` over the same memory, which takes a byte sequence
+        // where `Uint8Array.indexOf` takes one element. `[ 1 ]` (`None`) when it
+        // does not.
+        "__http_find" => {
+            "function __http_find(haystack, needle, from) {\n\
+             \tconst at = Buffer.from(haystack.buffer, haystack.byteOffset, haystack.byteLength).indexOf(needle, from);\n\
+             \treturn at < 0 ? [ 1 ] : [ 0, at ];\n\
+             }"
+        }
         // M164's keep-alive rule: an UNREAD body the connection should not drain
         // — declared over the cap, or chunked (no length to bound the drain by).
         // A body within the cap is left to node, which discards it and keeps the
         // connection; `request.complete` is a body that already arrived whole.
+        // M176: a STREAM the handler left unfinished is the same body, with the
+        // stream's hold on it let go first (its listeners and what it buffered).
+        // Node discards an unread body itself only when nothing ever read from
+        // it (`_consuming`), so a started stream within the cap is resumed here
+        // with no listener left — node's own discard, by hand.
         "__http_body_left_unread" => {
             "function __http_body_left_unread(request, limit) {\n\
-             \tif (request.__vilan_body !== undefined || request.complete) return false;\n\
+             \tconst stream = request.__vilan_stream;\n\
+             \tif (stream !== undefined) {\n\
+             \t\trequest.removeAllListeners(\"data\");\n\
+             \t\tstream.chunks.length = 0;\n\
+             \t\tif (stream.ended || stream.failure !== null) return false;\n\
+             \t}\n\
+             \tif (request.__vilan_body !== undefined || request.complete) {\n\
+             \t\tif (stream !== undefined) request.resume();\n\
+             \t\treturn false;\n\
+             \t}\n\
              \tconst declared = request.headers[\"content-length\"];\n\
              \tconst leaves = declared === undefined\n\
              \t\t? request.headers[\"transfer-encoding\"] !== undefined\n\
              \t\t: Number(declared) > limit;\n\
              \tif (leaves) __http_linger(request);\n\
+             \telse if (stream !== undefined) request.resume();\n\
              \treturn leaves;\n\
              }"
         }

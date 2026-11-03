@@ -106,8 +106,12 @@ impl Request {
 	fun method(self): str
 	fun body(self): str      // the body as text, read on the first call
 	fun bytes(self): Bytes   // the same body raw (binary POSTs)
+	fun body_stream(self): BodyReader   // the body a piece at a time
 	fun max_body_bytes(own self, limit: usize): Request   // this request's cap (a route's)
 	fun header(self, name: str): Option<str>   // a request header, case-insensitive
+}
+impl BodyReader {
+	async fun next(self, size: usize): Option<Bytes>   // at most `size` bytes; None at the end
 }
 impl Response {
 	fun builder(): ResponseBuilder
@@ -206,9 +210,58 @@ one within the cap is drained (node discards it and keeps the connection
 alive for the client's next request; the native server, which closes every
 connection, discards it before the close so the client reads its response
 rather than a reset), and one over the cap, or chunked, is not — the
-response says `Connection: close` and the connection is closed. The body is
-read whole into memory when it is read; streaming it as it arrives is not
-here yet.
+response says `Connection: close` and the connection is closed.
+
+**Reading a body as a stream.** `bytes()` holds the whole body in memory
+at once, which is the right shape for a form or a JSON call and the wrong
+one for an upload. `body_stream()` reads it a piece at a time instead:
+`next(size)` answers the next piece — at most `size` bytes, whatever has
+arrived up to that — and `None` once the body has ended, so an upload
+costs a piece of memory rather than its whole size:
+
+```vilan,norun
+import std::http::{ Request, Response, Server };
+
+fun upload(request: Request): Response {
+	let reader = request.max_body_bytes(1024 * 1024 * 1024).body_stream();
+	mut total = 0usize;
+	for {
+		let piece = match reader.next(65536) {
+			Some(let piece) => piece,
+			None => jump break,
+		};
+		total = total + piece.len();   // write it to a file, hash it, parse it
+	}
+	Response::builder().body(i"received {total} bytes").build()
+}
+
+fun main() {
+	Server::builder().port(3000).on_request(|request| upload(request)).build().start();
+}
+```
+
+A short piece does not mean the end — only `None` does. The connection
+reads only as far as the calls ask, so a client sending faster than the
+handler reads is made to wait rather than buffered. The cap is the same
+cap, counted as the pieces arrive: a declared `Content-Length` over it is
+refused at the first `next`, and a chunked body at the piece that crosses
+it, with whatever the handler has already read behind it — the same `413`,
+and the handler ends at that `next`. A stream the handler leaves
+unfinished is treated as an unread body (drained within the cap, closed
+past it).
+
+A body is read **whole or as a stream, not both**: `bytes()`/`body()`
+after `body_stream()`, or the other way round, is a fault in the handler.
+It is answered `500 Internal Server Error` with a sentence naming both
+calls, the same sentence goes to the server's stderr, and the handler ends
+there. A second `body_stream()` is a second reader of the one stream.
+
+Measured on Linux, one 64 MiB upload hashed from the stream grows the
+native server's peak memory by under a mebibyte, where reading 25 MiB whole
+costs 25 MB; on node the stream holds one socket read at a time and the
+peak is the garbage collector's lag behind node's own read buffers (about
+20–30 MB, below a bare `on("data")` loop's), where reading 25 MiB whole
+costs 54 MB.
 
 `Request::header` reads one header off the request, and the conditional
 request built on it ships whole. `etag_of` mints a **strong validator** for

@@ -86,6 +86,12 @@ impl Server {
         self.port
     }
 
+    /// The server process's id — what a pin that reads the process's own
+    /// accounting (`/proc/<id>/status`) needs.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Everything the server has written to stdout, including whatever arrived
     /// after the announcement.
     ///
