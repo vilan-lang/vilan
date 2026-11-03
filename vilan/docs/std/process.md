@@ -1199,24 +1199,25 @@ impl KeyDecoder {
 }
 ```
 
-The loop reads like `read_line`'s, and ends on the keys the program chooses
-(a leg's comma-separated patterns are an or-pattern):
+`for key in keys` walks the keys through `next` and ends with the input
+(`None`); the loop LOANS the handle, so raw mode is restored after the loop, on
+both backends. It ends earlier on the keys the program chooses (a leg's
+comma-separated patterns are an or-pattern):
 
 ```vilan,norun
 import std::debug::Debug;
 import std::io::{ print, write };
-import std::option::Option::{ self, None, Some };
 import std::process::{ Key, keys };
 
 fun main() {
 	let keys = keys();
 	mut row = 0;
-	for {
-		match keys.next() {
-			Some(Key::Char("q")), Some(Key::Ctrl("c")), Some(Key::Escape), None => jump break,
-			Some(Key::Up) => row -= 1,
-			Some(Key::Down) => row += 1,
-			Some(let other) => print(other.debug()),
+	for key in keys {
+		match key {
+			Key::Char("q"), Key::Ctrl("c"), Key::Escape => jump break,
+			Key::Up => row -= 1,
+			Key::Down => row += 1,
+			let other => print(other.debug()),
 		}
 		write(i"\rrow {row}   ");
 	}

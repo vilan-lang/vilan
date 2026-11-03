@@ -1,0 +1,91 @@
+// F154: a `str`-backed enum's `.value()` read at RUN time natively. The
+// synthesized `value()` matches its receiver over the variants' strings,
+// and the receiver is `self` - a LOAN, `&Rc<str>` natively - which `&*`
+// left at `&Rc<str>`: rustc refused every leg (E0308), so A178's `Unit` had
+// to be a plain enum. The same for a hand-written `match self` over the
+// variants. Read through a method, directly off a call, off a struct field
+// and off a list element; printed (the value and the variant); matched
+// after; an int-backed `match self` is the control.
+import std::io::print;
+
+enum Unit {
+	Px = "px",
+	Rem = "rem",
+	Pct = "%",
+}
+
+impl Unit {
+	fun suffix(self): str {
+		self.value()
+	}
+
+	fun relative(self): bool {
+		match self {
+			Unit::Px => false,
+			Unit::Rem, Unit::Pct => true,
+		}
+	}
+}
+
+enum Level {
+	Low = 1,
+	High,
+}
+
+impl Level {
+	fun loud(self): bool {
+		match self {
+			Level::Low => false,
+			Level::High => true,
+		}
+	}
+}
+
+struct Length {
+	amount: f64,
+	unit: Unit,
+}
+
+impl Length {
+	fun text(self): str {
+		i"{self.amount}{self.unit.value()}"
+	}
+}
+
+fun pick(n: i32): Unit {
+	if n == 0 {
+		Unit::Px
+	} else if n == 1 {
+		Unit::Rem
+	} else {
+		Unit::Pct
+	}
+}
+
+fun main() {
+	let unit = pick(1);
+	print(unit.suffix());
+	print(pick(2).value());
+	print(unit);
+	print(unit.relative());
+	print(pick(0).relative());
+	let length = Length { amount = 1.5, unit = pick(2) };
+	print(length.text());
+	let units = [pick(0), pick(1), pick(2)];
+	mut joined = "";
+	for each in units {
+		joined = i"{joined}{each.value()};";
+	}
+	print(joined);
+	match unit {
+		Unit::Px => print("matched px"),
+		Unit::Rem => print("matched rem"),
+		Unit::Pct => print("matched pct"),
+	}
+	print(match Unit::parse(unit.value()) {
+		Some(let back) => back == unit,
+		None => false,
+	});
+	print(Level::High.loud());
+	print(Level::Low.loud());
+}
