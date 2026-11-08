@@ -155,6 +155,29 @@ const CENSUS: &[(&str, usize, &str)] = &[
          a `KeySlots`, counted in `hash_map_cell.vl`)",
     ),
     (
+        "reactive/lens.vl",
+        20,
+        "E + O (A185 S1, the reactive lens). E, minted by the lens and reached \
+         through every copy of its handle, every slot and every feed: a lens's \
+         six (`Lens::over`: its own structure, the handler with its slot table, \
+         each slot's notifications by id, the tap list, the next tap id, the \
+         truth check), five again for a nested lens (`ItemSlot::sequence`: the \
+         same less the structure, which lives inside the outer item and is \
+         reached through a `Port`), a slot's two (`fresh_cells`: its watched \
+         parts and its handle count, shared by every handle on the slot, by a \
+         feed that holds its id and by the release that reads the count), \
+         `index_by`'s map from key to slot id (written by its tap, read by \
+         `KeyIndex::find` and its release) and `rows()`'s slot ids in order \
+         (written by its tap, read by `LensRows`). O, a feed's tap state, \
+         released with the feed (its owner, or `release()`): `items()`'s three \
+         (what is about to leave, the runs of moves a write gathers, the moves \
+         of a run still to skip), `index_by`'s keys about to leave, and \
+         `entries()`'s value about to leave. The frame-scoped out-values of a \
+         lent read (`peek_storage`, `holds`, `update`, `plan`, a part's `get`, \
+         the index's `key_at`) are `mut` locals their closure writes, not \
+         cells — six the lab's library carried and std's copy does not.",
+    ),
+    (
         "reactive/store_core.vl",
         7,
         "E: a store's cells, all minted by the store and reached through every \
@@ -375,7 +398,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 258,
+        total, 278,
         "the total number of `Shared` construction sites in std changed"
     );
 

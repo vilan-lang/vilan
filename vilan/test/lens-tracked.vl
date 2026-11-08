@@ -1,0 +1,51 @@
+// `std::reactive::lens` (A185 S1): tracked reads over slots and parts (A142 §7): a body that reads several lens
+// sources depends on exactly those, by their identities.
+import std::io::assert;
+import std::reactive::lens::sequence;
+import std::reactive::{ Flow, SequenceCell, Source, derive };
+import std::shared::Shared;
+
+[derive(PartialEq)]
+struct Task {
+	title: str,
+	status: str,
+}
+
+fun main() {
+	let list = sequence([
+		Task { title = "a", status = "open" },
+		Task { title = "b", status = "open" },
+		Task { title = "c", status = "open" },
+	]);
+	let second = list.slot(1);
+	let title = second.part("title", |task| task.title);
+	let status = second.part("status", |task| task.status);
+	let runs: Shared<i32> = Shared::new(0);
+	let label = derive(|| {
+		runs.write() += 1;
+		i"{title.track().unwrap_or("?")} [{status.track().unwrap_or("?")}]"
+	}).memo();
+	assert(label.get() == "b [open]", "the tracked body read both parts");
+	let seeded = runs.read();
+
+	list.edit(0, "title", |task| task.title = "A");
+	list.insert_at(0, Task { title = "new", status = "open" });
+	assert(
+		label.get() == "b [open]" && runs.read() == seeded,
+		"another row's edit and an insert above do not re-run it",
+	);
+
+	second.edit("status", |task| task.status = "done");
+	assert(
+		label.get() == "b [done]" && runs.read() == seeded + 1,
+		"one part's edit re-runs it once",
+	);
+
+	list.remove_at(2);
+	assert(
+		label.get() == "? [?]" && runs.read() == seeded + 2,
+		"the row's deletion re-runs it once",
+	);
+
+	print("tracked: all passed");
+}

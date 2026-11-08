@@ -1,0 +1,82 @@
+// `std::reactive::lens` (A185 S1): a lens inside a lens: `list.slot(1).sequence(..)` (reactive-lens.md, nesting).
+import std::io::assert;
+import std::reactive::lens::sequence;
+import std::reactive::{ SequenceCell, Source, batch };
+import std::shared::Shared;
+
+[derive(PartialEq)]
+struct Section {
+	title: str,
+	items: List<str>,
+}
+
+fun main() {
+	let sections = sequence([
+		Section { title = "Todo", items = ["a", "b", "c"] },
+		Section { title = "Doing", items = ["x", "y"] },
+	]);
+	let doing = sections.slot(1);
+	let empty: List<str> = [];
+	let items = doing
+		.sequence(
+			"items",
+			empty,
+			|section, read| read(&section.items),
+			|section, change| change(&mut section.items),
+		);
+
+	let y = items.slot(1);
+	let y_runs: Shared<i32> = Shared::new(0);
+	let title_runs: Shared<i32> = Shared::new(0);
+	let items_runs: Shared<i32> = Shared::new(0);
+	let todo_runs: Shared<i32> = Shared::new(0);
+	let _a = y.on_change(|_item| y_runs.write() += 1);
+	let _b = doing.part("title", |section| section.title).on_change(|_t| title_runs.write() += 1);
+	let _c = doing
+		.part("items", |section| section.items.len())
+		.on_change(|_n| items_runs.write() += 1);
+	let _d = sections.slot(0).on_change(|_section| todo_runs.write() += 1);
+
+	// An inner insert: the inner slot follows; the outer item's `items` part
+	// hears it; its title and the other section do not.
+	items.insert_at(0, "w");
+	assert(
+		sections.peek(|held| held[1].items) == ["w", "x", "y"],
+		"the write landed inside the outer item",
+	);
+	assert(
+		y.at() == Some(2) && y.get() == Some("y") && y_runs.read() == 0,
+		"the inner slot followed, silently",
+	);
+	assert(
+		items_runs.read() == 1 && title_runs.read() == 0 && todo_runs.read() == 0,
+		"only the items part of that section woke",
+	);
+
+	// The OUTER list shifts: the inner lens follows its section.
+	sections.insert_at(0, Section { title = "Inbox", items = [] });
+	y.set("Y");
+	assert(
+		sections.peek(|held| held[2].items) == ["w", "x", "Y"],
+		"an inner write lands in the moved section",
+	);
+	assert(y_runs.read() == 1, "the inner slot woke for its own write");
+
+	// One turn across both levels.
+	batch(|| {
+		sections.remove_at(0);
+		items.push("z");
+		doing.edit("title", |section| section.title = "In progress");
+	});
+	assert(
+		sections.peek(|held| held[1].items) == ["w", "x", "Y", "z"],
+		"the turn's inner write landed",
+	);
+	assert(title_runs.read() == 1, "the title woke once");
+
+	// The outer item is deleted: the inner lens reads empty, its slots read None.
+	sections.remove_at(1);
+	assert(items.size() == 0 && y.get() == None, "an inner lens whose item is gone reads empty");
+
+	print("nested: all passed");
+}
