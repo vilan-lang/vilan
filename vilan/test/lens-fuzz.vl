@@ -1,0 +1,288 @@
+// `std::reactive::lens` (A185 S1): L1 and L8 under random writes. Thousands of
+// inserts, deletes, bulk splices, replacing splices, moves and replaces against a
+// plain model, with every followed slot checked after every write. The
+// positional table is kept in blocks that split and empty; this is its proof.
+//
+// Beside the slots: std's `map` and `filter` over `items()` (the value feed),
+// the row feed's ops replayed onto a mirror (L8: a turn's changes replay in
+// order, and the mirror's slots read the model), and an index by key that must
+// find every item where the model has it.
+import std::io::panic;
+import std::reactive::lens::{ ItemSlot, Positional, sequence };
+import std::reactive::{ CollFlow, CollPipe, DeltaSource, SeqOp, SequenceCell, Source };
+
+struct Random {
+	state: i32,
+}
+
+impl Random {
+	/// The next number in 0..below.
+	fun next(&mut self, below: usize): usize {
+		// A small linear congruential step, kept inside 31 bits.
+		self.state = (self.state * 1103 + 12345) % 2147483;
+		if self.state < 0 {
+			self.state = -self.state;
+		}
+		self.state.as_usize() % below
+	}
+}
+
+struct Followed {
+	slot: ItemSlot<List<i32>, usize, i32, Positional>,
+	/// The id the slot should read, or -1 once its item is gone.
+	id: i32,
+}
+
+fun check(list: List<i32>, followed: List<Followed>, step: i32, what: str) {
+	for held in followed {
+		if held.id == -1 {
+			if held.slot.get() != None {
+				panic(i"step {step} ({what}): a dead slot reads {held.slot.get().debug()}");
+			}
+		} else {
+			mut found: Option<usize> = None;
+			mut at: usize = 0;
+			for id in list {
+				if id == held.id {
+					found = Some(at);
+				}
+				at += 1;
+			}
+			if held.slot.at() != found || held.slot.get() != Some(held.id) {
+				panic(i"step {step} ({what}): the slot of {held.id} is at {held.slot.at().debug()} reading {held.slot.get().debug()}, the model says {found.debug()}");
+			}
+		}
+	}
+}
+
+fun run(seed: i32, steps: i32) {
+	mut random = Random { state = seed };
+	mut model: List<i32> = [];
+	mut next_id = 0;
+	for next_id < 40 {
+		model.push(next_id);
+		next_id += 1;
+	}
+	let list = sequence(model);
+	// std's operators over the lens: the derivative law, checked after every write.
+	let tripled = list.items().map(|id| id * 3).memo();
+	let evens = list.items().filter(|id| id % 2 == 0).memo();
+	// The row feed, replayed onto a mirror of slots by its ops alone.
+	let rows = list.rows();
+	let cursor = rows.cursor();
+	mut mirror = rows.get();
+	// An index by the items' own ids.
+	let by_id = list.index_by(|id| *id);
+	mut followed: List<Followed> = [];
+	mut step = 0;
+	for step < steps {
+		let size = model.len();
+		let choice = random.next(100);
+		mut what = "";
+		if choice < 14 && size > 0 {
+			// Follow a new slot.
+			what = "follow";
+			let at = random.next(size);
+			followed.push(Followed { slot = list.slot(at), id = model[at] });
+		} else if choice < 40 {
+			what = "insert";
+			let at = random.next(size + 1);
+			list.insert_at(at, next_id);
+			model.insert(at, next_id);
+			next_id += 1;
+		} else if choice < 60 && size > 0 {
+			what = "remove";
+			let at = random.next(size);
+			let gone = model.remove(at);
+			list.remove_at(at);
+			mark_gone(&mut followed, gone);
+		} else if choice < 66 {
+			// A bulk insert, long enough to split a block more than once.
+			what = "bulk insert";
+			let at = random.next(size + 1);
+			let count = 1 + random.next(400);
+			mut run: List<i32> = [];
+			mut made: usize = 0;
+			for made < count {
+				run.push(next_id);
+				model.insert(at + made, next_id);
+				next_id += 1;
+				made += 1;
+			}
+			list.splice(at, 0, run);
+		} else if choice < 72 && size > 1 {
+			// A bulk delete, often across blocks.
+			what = "bulk remove";
+			let at = random.next(size);
+			let count = 1 + random.next(size - at);
+			mut taken: usize = 0;
+			for taken < count {
+				let gone = model.remove(at);
+				mark_gone(&mut followed, gone);
+				taken += 1;
+			}
+			list.splice(at, count, []);
+		} else if choice < 80 && size > 0 {
+			// A replacing splice: one `Splice` change, of different counts.
+			what = "replacing splice";
+			let at = random.next(size);
+			let count = 1 + random.next(smaller(size - at, 6));
+			mut taken: usize = 0;
+			for taken < count {
+				let gone = model.remove(at);
+				mark_gone(&mut followed, gone);
+				taken += 1;
+			}
+			let arriving = random.next(7);
+			mut run: List<i32> = [];
+			mut made: usize = 0;
+			for made < arriving {
+				run.push(next_id);
+				model.insert(at + made, next_id);
+				next_id += 1;
+				made += 1;
+			}
+			list.splice(at, count, run);
+		} else if choice < 90 && size > 1 {
+			what = "move";
+			let from = random.next(size);
+			let to = random.next(size);
+			if from != to {
+				let moved = model.remove(from);
+				model.insert(to, moved);
+				list.move_item(from, to);
+			}
+		} else if size > 0 {
+			// A replace: another item now sits there, and the slot reads it.
+			what = "replace";
+			let at = random.next(size);
+			let old = model[at];
+			model[at] = next_id;
+			list.replace(at, next_id);
+			mut index: usize = 0;
+			for index < followed.len() {
+				if followed[index].id == old {
+					followed[index].id = next_id;
+				}
+				index += 1;
+			}
+			next_id += 1;
+		}
+		if list.all() != model {
+			panic(i"step {step} ({what}): the list and the model differ");
+		}
+		check(model, followed, step, what);
+		if tripled.get() != model.map(|id| id * 3) {
+			panic(i"step {step} ({what}): map over the lens fell out of step");
+		}
+		if evens.get() != model.filter(|id| id % 2 == 0) {
+			panic(i"step {step} ({what}): filter over the lens fell out of step");
+		}
+		for op in rows.since(cursor) {
+			replay(&mut mirror, op);
+		}
+		if step % 25 == 0 {
+			check_rows(model, mirror, step, what);
+			check_index(model, by_id.find(model[random.next(model.len())]), step, what);
+			if rows.get().len() != model.len() {
+				panic(i"step {step} ({what}): the row feed holds {rows.get().len()} slots for {model.len()} items");
+			}
+		}
+		step += 1;
+	}
+	print(i"fuzz seed {seed}: {steps} writes, {followed.len()} slots, {model.len()} items held at the end");
+}
+
+fun smaller(first: usize, second: usize): usize {
+	if first < second {
+		first
+	} else {
+		second
+	}
+}
+
+/// Apply one op of the row feed to a mirror of its slots.
+fun replay(
+	mirror: &mut List<ItemSlot<List<i32>, usize, i32, Positional>>,
+	op: SeqOp<ItemSlot<List<i32>, usize, i32, Positional>>,
+) {
+	match op {
+		SeqOp::Splice(let at, let removed, let inserted) => {
+			mut taken: usize = 0;
+			for taken < removed.len() {
+				mirror.remove(at);
+				taken += 1;
+			}
+			mut offset: usize = 0;
+			for slot in inserted {
+				mirror.insert(at + offset, slot);
+				offset += 1;
+			}
+		},
+		SeqOp::SetAt(let at, let _old, let slot) => mirror[at] = slot,
+		SeqOp::Reset(let all) => mirror = all,
+		SeqOp::Move(let from, let count, let to) => {
+			mut run: List<ItemSlot<List<i32>, usize, i32, Positional>> = [];
+			mut taken: usize = 0;
+			for taken < count {
+				run.push(mirror.remove(from));
+				taken += 1;
+			}
+			mut offset: usize = 0;
+			for slot in run {
+				mirror.insert(to + offset, slot);
+				offset += 1;
+			}
+		},
+	}
+}
+
+/// L8: the mirror the row feed's ops built reads the model, slot by slot.
+fun check_rows(
+	model: List<i32>,
+	mirror: List<ItemSlot<List<i32>, usize, i32, Positional>>,
+	step: i32,
+	what: str,
+) {
+	if mirror.len() != model.len() {
+		panic(i"step {step} ({what}): the replayed rows hold {mirror.len()} slots for {model.len()} items");
+	}
+	mut at: usize = 0;
+	for slot in mirror {
+		if slot.get() != Some(model[at]) || slot.at() != Some(at) {
+			panic(i"step {step} ({what}): replayed row {at} reads {slot.get().debug()} at {slot.at().debug()}, the model holds {model[at]}");
+		}
+		at += 1;
+	}
+}
+
+/// The index finds an item's slot where the model has the item.
+fun check_index(
+	model: List<i32>,
+	found: Option<ItemSlot<List<i32>, usize, i32, Positional>>,
+	step: i32,
+	what: str,
+) {
+	found is Some(let slot) else panic(i"step {step} ({what}): the index lost an item");
+	slot.at() is Some(let at) else panic(i"step {step} ({what}): the index holds a dead slot");
+	if slot.get() != Some(model[at]) {
+		panic(i"step {step} ({what}): the index's slot reads {slot.get().debug()}, the model holds {model[at]} there");
+	}
+}
+
+fun mark_gone(followed: &mut List<Followed>, gone: i32) {
+	mut index: usize = 0;
+	for index < followed.len() {
+		if followed[index].id == gone {
+			followed[index].id = -1;
+		}
+		index += 1;
+	}
+}
+
+fun main() {
+	run(1, 3000);
+	run(7, 3000);
+	run(42, 3000);
+	print("fuzz: all passed");
+}

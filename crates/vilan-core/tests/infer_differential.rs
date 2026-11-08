@@ -184,6 +184,8 @@ const FOLDS: &[&str] = &[
     "iterator-adapters.vl",
     "json-roundtrip.vl",
     "keyword-members.vl",
+    "lens-keyed.vl",
+    "lens-laws.vl",
     "list-sort.vl",
     "macro-block.vl",
     "map.vl",

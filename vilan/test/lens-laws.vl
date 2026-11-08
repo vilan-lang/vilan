@@ -1,0 +1,418 @@
+// `std::reactive::lens` (A185 S1): the paper's laws (`reactive-lens.md` §3) on
+// std's own signals and turns, then what S1 adds to the lab's library — one
+// `Splice` per splice (R16), the turn a write from an observer joins, the counts
+// a feed and an index give back, and the wrapper types (R10).
+import std::hash_map::HashMap;
+import std::io::assert;
+import std::reactive::lens::{ Change, KeyedLens, SequenceLens, Stage, keyed, sequence };
+import std::reactive::{
+	CollFlow,
+	CollPipe,
+	DeltaSource,
+	Disposable,
+	SeqOp,
+	SequenceCell,
+	SignalCell,
+	Source,
+	batch,
+	comp,
+};
+import std::shared::Shared;
+
+[derive(PartialEq)]
+struct Task {
+	title: str,
+	status: str,
+}
+
+fun tasks(): List<Task> {
+	[
+		Task { title = "a", status = "open" },
+		Task { title = "b", status = "open" },
+		Task { title = "c", status = "open" },
+	]
+}
+
+struct Holder {
+	names: SequenceLens<List<str>, str>,
+	ages: KeyedLens<HashMap<str, i32>, str, i32>,
+}
+
+fun ages_of(): HashMap<str, i32> {
+	mut ages: HashMap<str, i32> = HashMap::new();
+	ages.insert("bo", 4);
+	ages
+}
+
+fun row_arrived_reads<S: Source<Option<str>>>(op: SeqOp<S>): List<Option<str>> {
+	match op {
+		SeqOp::Splice(let _at, let _gone, let arrived) => arrived.map(|slot| slot.get()),
+		_ => [],
+	}
+}
+
+fun main() {
+	// L1 + L4: a slot follows its item; an insert above it wakes nothing.
+	let list = sequence(["foo", "bar", "baz"]);
+	let bar = list.slot(1);
+	let heard: Shared<List<Option<str>>> = Shared::new([]);
+	let _watch = bar.on_change(|value| heard.write().push(value));
+	list.insert_at(0, "qux");
+	assert(bar.get() == Some("bar"), "L1: the slot still reads its item");
+	assert(bar.at() == Some(2), "L1: and knows where it went");
+	assert(list.peek(|held| held[1]) == "foo", "position 1 is now foo");
+	assert(heard.read().len() == 0, "L4: an insert above a slot does not wake it");
+
+	// L2 + L3: inside one turn, a write through a slot after an insert lands on
+	// the slot's item, and the observer runs once, at the settle.
+	let rows = sequence(["a", "b", "c"]);
+	let c = rows.slot(2);
+	let runs: Shared<i32> = Shared::new(0);
+	let _count = c.on_change(|_value| runs.write() += 1);
+	batch(|| {
+		rows.insert_at(0, "z");
+		c.set("C!");
+		c.set("C!!");
+		assert(runs.read() == 0, "L3: nothing runs inside the turn");
+	});
+	assert(rows.all() == ["z", "a", "b", "C!!"], "L2: the writes landed on c, not on b");
+	assert(runs.read() == 1, "L3: one run for the turn");
+
+	// L6: a deleted item's slot reads None and wakes once.
+	rows.remove_at(3);
+	assert(c.get() == None, "L6: the slot reads None");
+	assert(runs.read() == 2, "L6: and woke once to say so");
+	rows.push("d");
+	assert(c.get() == None, "L1: a new item at the old position is not the slot's item");
+
+	// L4, parts: an edit of one part wakes that part and the item, not the other
+	// part, and not another row.
+	let board = sequence(tasks());
+	let first = board.slot(0);
+	let second = board.slot(1);
+	let titles: Shared<i32> = Shared::new(0);
+	let statuses: Shared<i32> = Shared::new(0);
+	let others: Shared<i32> = Shared::new(0);
+	let title = second.part("title", |task| task.title);
+	let status = second.part("status", |task| task.status);
+	let _a = title.on_change(|_text| titles.write() += 1);
+	let _b = status.on_change(|_text| statuses.write() += 1);
+	let _c = first.part("title", |task| task.title).on_change(|_text| others.write() += 1);
+	second.edit("title", |task| task.title = "B");
+	assert(title.get() == Some("B"), "the part reads the edit");
+	assert(
+		titles.read() == 1 && statuses.read() == 0 && others.read() == 0,
+		"L4: only the edited part woke",
+	);
+	board.insert_at(0, Task { title = "new", status = "open" });
+	second.edit("status", |task| task.status = "done");
+	assert(board.peek(|held| held[2].status) == "done", "L2: the edit followed the row");
+	assert(titles.read() == 1 && statuses.read() == 1, "L4: only the status woke");
+
+	// L7: a reset ends every positional slot.
+	board.update(|held| {
+		held = tasks();
+		(void, [Change::Reset])
+	});
+	assert(second.get() == None, "L7: a positional slot dies at a reset");
+
+	// The whole value and the length, as sources.
+	let whole: Shared<i32> = Shared::new(0);
+	let lengths: Shared<i32> = Shared::new(0);
+	let _d = board.on_change(|_all| whole.write() += 1);
+	let _e = board.length().on_change(|_n| lengths.write() += 1);
+	board.replace(0, Task { title = "x", status = "open" });
+	assert(
+		whole.read() == 1 && lengths.read() == 0,
+		"a replace wakes the whole value, not the length",
+	);
+	board.push(Task { title = "y", status = "open" });
+	assert(whole.read() == 2 && lengths.read() == 1, "a push wakes both");
+
+	// A move keeps the slot: the same item, a new place, no wake of its value.
+	let order = sequence(["a", "b", "c", "d"]);
+	let d = order.slot(3);
+	let d_runs: Shared<i32> = Shared::new(0);
+	let _h = d.on_change(|_value| d_runs.write() += 1);
+	order.move_item(3, 0);
+	assert(order.all() == ["d", "a", "b", "c"], "the move happened");
+	assert(
+		d.at() == Some(0) && d.get() == Some("d") && d_runs.read() == 0,
+		"the slot went with its item, silently",
+	);
+	order.move_item(0, 9);
+	assert(
+		order.all() == ["a", "b", "c", "d"] && d.at() == Some(3),
+		"a move past the end lands at the end",
+	);
+
+	// The diff door: a whole new list keeps the slots of the items both hold.
+	let people2 = sequence(["ann", "bob", "cy", "dee"]);
+	let bob2 = people2.slot(1);
+	let dee2 = people2.slot(3);
+	let cy2 = people2.slot(2);
+	people2.reconcile_by_key(["dee", "zed", "bob", "ann"], |name| *name);
+	assert(people2.all() == ["dee", "zed", "bob", "ann"], "the list became the new list");
+	assert(bob2.at() == Some(2) && dee2.at() == Some(0), "kept items keep their slots");
+	assert(cy2.get() == None, "an item that left ends its slot");
+
+	// std's operators over a lens: the changes arrive as ops.
+	let numbers = sequence([1, 2, 3, 4]);
+	let doubled = numbers.items().map(|n| n * 2).memo();
+	let evens = numbers.items().filter(|n| n % 2 == 0).memo();
+	assert(
+		doubled.get() == [2, 4, 6, 8] && evens.get() == [2, 4],
+		"the operators seed from the lens",
+	);
+	numbers.insert_at(1, 10);
+	numbers.remove_at(0);
+	numbers.replace(3, 5);
+	assert(numbers.all() == [10, 2, 3, 5], "the writes landed");
+	assert(doubled.get() == [20, 4, 6, 10], "map follows the lens");
+	assert(evens.get() == [10, 2], "filter follows the lens");
+
+	// A list that is also looked up by id: an index by key, kept by a tap.
+	let tabs = sequence(tasks());
+	let by_title = tabs.index_by(|task| task.title);
+	let b = by_title.find("b");
+	assert(
+		b.map(|slot| slot.at()) == Some(Some(1)),
+		"the index finds the slot of the item under a key",
+	);
+	tabs.insert_at(0, Task { title = "first", status = "open" });
+	tabs.remove_at(3);
+	assert(
+		by_title.find("first").map(|slot| slot.at()) == Some(Some(0)),
+		"an inserted item is indexed",
+	);
+	assert(by_title.find("c").map(|slot| slot.at()) == None, "a deleted item leaves the index");
+	assert(
+		by_title.find("b").map(|slot| slot.at()) == Some(Some(2)),
+		"and the others are found where they are now",
+	);
+	tabs.edit(2, "title", |task| task.title = "B");
+	assert(
+		by_title
+			.find("b")
+			.map(|slot| slot.at())
+			== None
+			&& by_title.find("B").map(|slot| slot.at()) == Some(Some(2)),
+		"an edit that changes the key re-indexes the item",
+	);
+
+	// A slot's position, as a source.
+	let places: Shared<List<Option<usize>>> = Shared::new([]);
+	let first_tab = tabs.slot(0);
+	let _i = first_tab.index().on_change(|place| places.write().push(place));
+	tabs.insert_at(0, Task { title = "zero", status = "open" });
+	assert(
+		places.read().len() == 1 && first_tab.at() == Some(1),
+		"a slot's position is a source that follows the shifts",
+	);
+
+	// Lifetime: a slot is counted by its handles and released with the last one.
+	let held = sequence(["p", "q", "r"]);
+	let one = held.slot(1);
+	let two = held.slot(1);
+	assert(one.id == two.id, "two asks for one item are one slot");
+	one.release();
+	assert(two.get() == Some("q") && two.at() == Some(1), "the slot lives while a handle holds it");
+	two.release();
+	assert(two.get() == None && two.at() == None, "the last release ends it");
+	held.insert_at(0, "o");
+	assert(
+		held.slot(2).get() == Some("q") && held.slot(2).id != one.id,
+		"a new ask makes a new slot; the old entry is free",
+	);
+	let feed = held.rows();
+	assert(feed.get().len() == 4, "rows() holds a slot per item");
+	feed.release();
+	assert(held.taps.read().len() == 0, "releasing the feed lets its tap and its slots go");
+
+	// Made inside an owner scope, a slot and a feed go with the owner.
+	let scoped = sequence(["m", "n"]);
+	let ((inner, feed2), owner) = comp(|| (scoped.slot(1), scoped.rows()));
+	assert(inner.get() == Some("n") && scoped.taps.read().len() == 1, "alive while the owner is");
+	owner.dispose();
+	assert(inner.get() == None && scoped.taps.read().len() == 0, "released with the owner");
+	assert(feed2.get().len() == 0, "the feed let its slots go");
+
+	// One write is one op to a consumer: a replacing splice is a Delete and an
+	// Insert at one address to the handler, and ONE Splice to the op feed (T4's
+	// find: two ops tore down a row the second brought back under `each`).
+	let one_write = sequence([1, 2, 3]);
+	let feed3 = one_write.items();
+	let cursor = feed3.cursor();
+	one_write.splice(0, 1, [9]);
+	let ops = feed3.since(cursor);
+	assert(ops.len() == 1, "a replacing splice is one op");
+	assert(
+		ops[0] is SeqOp::Splice(let at, let left, let arrived)
+			&& at == 0
+			&& left == [1]
+			&& arrived == [9],
+		"and it carries what left and what arrived",
+	);
+	one_write.splice(1, 2, [7, 8, 6]);
+	let again = feed3.since(cursor);
+	assert(
+		again.len() == 1
+			&& again[0] is SeqOp::Splice(let at2, let left2, let arrived2)
+			&& at2 == 1
+			&& left2 == [2, 3]
+			&& arrived2 == [7, 8, 6],
+		"so is a splice that takes and inserts different counts",
+	);
+
+	// The keyed handler, under the same lens.
+	let ages: HashMap<str, i32> = HashMap::new();
+	let people = keyed(ages);
+	let ada = people.slot("ada");
+	let bob = people.slot("bob");
+	let ada_runs: Shared<i32> = Shared::new(0);
+	let bob_runs: Shared<i32> = Shared::new(0);
+	let _f = ada.on_change(|_age| ada_runs.write() += 1);
+	let _g = bob.on_change(|_age| bob_runs.write() += 1);
+	assert(ada.get() == None, "a key's slot exists before the key");
+	people.put("ada", 36);
+	assert(
+		ada.get() == Some(36) && ada_runs.read() == 1 && bob_runs.read() == 0,
+		"only ada's slot woke",
+	);
+	people.remove("ada");
+	assert(ada.get() == None && ada_runs.read() == 2, "the slot reads the removal");
+	people.put("ada", 37);
+	assert(ada.get() == Some(37) && ada_runs.read() == 3, "and follows the key when it returns");
+
+	// R16: one splice is ONE change to a tap, whatever it takes and inserts.
+	let spliced = sequence([1, 2, 3, 4]);
+	let heard_changes: Shared<List<Change<usize>>> = Shared::new([]);
+	let before_changes: Shared<i32> = Shared::new(0);
+	let _tap = spliced.tap(|_change| before_changes.write() += 1, |change, stage| {
+		assert(stage is Stage::Exact, "a shape write is exact");
+		heard_changes.write().push(change);
+	});
+	spliced.splice(1, 2, [7, 8, 9]);
+	spliced.push(5);
+	spliced.remove_at(0);
+	// Suffixed: an integer literal in an enum payload is not inferred from the
+	// list's declared element type, nor from `==`'s other operand (§19's find).
+	let one_each: List<Change<usize>> = [
+		Change::Splice(1usize, 2usize, 3usize),
+		Change::Splice(5usize, 0usize, 1usize),
+		Change::Splice(0usize, 1usize, 0usize),
+	];
+	assert(heard_changes.read() == one_each, "R16: each splice is one Splice change");
+	assert(before_changes.read() == 3, "and `before` heard each once, ahead of the write");
+
+	// R16 in the handler: a replacing splice ends the slots of what left, keeps
+	// the slots beyond it, and gives the arrivals no slot of what left.
+	let table = sequence(["a", "b", "c", "d", "e"]);
+	let b_slot = table.slot(1);
+	let e_slot = table.slot(4);
+	table.splice(1, 2, ["x", "y", "z"]);
+	assert(
+		b_slot.get() == None && e_slot.get() == Some("e") && e_slot.at() == Some(5),
+		"the splice moved the slots in one step",
+	);
+	assert(table.slot(1).get() == Some("x"), "an arrival gets a slot of its own");
+
+	// The count wakes only when a splice changes it; the shape wakes for both.
+	let sizes: Shared<i32> = Shared::new(0);
+	let shapes: Shared<i32> = Shared::new(0);
+	let _size = table.length().on_change(|_n| sizes.write() += 1);
+	let _shape = table.slot(0).index().on_change(|_at| shapes.write() += 1);
+	table.splice(0, 1, ["A"]);
+	assert(
+		sizes.read() == 0 && shapes.read() == 1,
+		"an equal-count splice leaves the length asleep and moves the shape",
+	);
+	table.splice(0, 1, ["A", "A2"]);
+	assert(sizes.read() == 1 && shapes.read() == 2, "a growing splice wakes both");
+
+	// The row feed: a replacing splice is one op, carrying the slots that left
+	// and the slots that arrived.
+	let rowed = sequence(["p", "q", "r"]);
+	let rows = rowed.rows();
+	let row_cursor = rows.cursor();
+	let q_row = rows.get()[1];
+	rowed.splice(1, 1, ["Q", "Q2"]);
+	let row_ops = rows.since(row_cursor);
+	assert(row_ops.len() == 1, "a replacing splice is one row op");
+	assert(
+		row_ops[0] is SeqOp::Splice(let row_at, let row_gone, let row_arrived)
+			&& row_at == 1
+			&& row_gone == [q_row]
+			&& row_arrived.len() == 2,
+		"with the slot that left and the two that arrived",
+	);
+	assert(
+		row_arrived_reads(row_ops[0]) == [Some("Q"), Some("Q2")],
+		"the arrived slots read the arrivals",
+	);
+	rows.release();
+
+	// An index gives its slots back with its release.
+	let indexed = sequence(["k", "l"]);
+	let by_name = indexed.index_by(|name| *name);
+	let l_found = by_name.find("l");
+	assert(l_found.map(|slot| slot.get()) == Some(Some("l")), "the index holds l's slot");
+	by_name.release();
+	assert(
+		l_found.map(|slot| slot.get()) == Some(None) && indexed.taps.read().len() == 0,
+		"released, the index let its tap and its slots go",
+	);
+
+	// A write from inside an observer joins the turn being drained, as a
+	// `SignalCell`'s write does (`settle_together`): two writes, one run.
+	let trigger = SignalCell::new(0);
+	let echo = sequence([0]);
+	let echo_runs: Shared<i32> = Shared::new(0);
+	let _echo = echo.on_change(|_all| echo_runs.write() += 1);
+	let _relay = trigger.on_change(|value| {
+		echo.replace(0, value);
+		echo.push(value);
+	});
+	batch(|| trigger.set(1));
+	assert(echo.all() == [1, 1], "the observer's writes landed");
+	assert(echo_runs.read() == 1, "and settled with the drain they ran in: one run for two writes");
+
+	// The keyed handler reads a splice of a key as its replace.
+	let scores: HashMap<str, i32> = HashMap::new();
+	let board2 = keyed(scores);
+	board2.put("ada", 1);
+	let ada_score = board2.slot("ada");
+	let ada_wakes: Shared<i32> = Shared::new(0);
+	let _ada = ada_score.on_change(|_score| ada_wakes.write() += 1);
+	let score_feed = board2.entries();
+	let score_cursor = score_feed.cursor();
+	board2.update(|held| {
+		held.insert("ada", 2);
+		(void, [Change::Splice("ada", 1, 1)])
+	});
+	assert(
+		ada_score.get() == Some(2) && ada_wakes.read() == 1,
+		"a keyed splice wakes the key's slot",
+	);
+	assert(score_feed.since(score_cursor).len() == 1, "and is one map op");
+
+	// R10: the wrapper types name two parameters (three for a key), and infer.
+	let wrapped = Holder {
+		names = SequenceLens::over(["x", "y"]),
+		ages = KeyedLens::over(ages_of()),
+	};
+	let y_slot = wrapped.names.slot(1);
+	wrapped.names.insert_at(0, "w");
+	assert(
+		y_slot.get() == Some("y") && y_slot.at() == Some(2) && wrapped.names.size() == 3,
+		"a SequenceLens is the sequence lens",
+	);
+	wrapped.ages.put("cy", 9);
+	assert(
+		wrapped.ages.slot("cy").get() == Some(9) && wrapped.ages.length().get() == 2,
+		"a KeyedLens is the keyed lens",
+	);
+	assert(wrapped.names.lens().all() == ["w", "x", "y"], "lens() hands out the full lens");
+
+	print("laws: all passed");
+}

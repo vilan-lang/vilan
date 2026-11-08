@@ -48,6 +48,7 @@
 - [Reactive](std/reactive.md)
 - [Transient sources](std/transient.md)
 - [Stores](std/store.md)
+- [Lenses](std/lens.md)
 - [Style](std/style.md)
 - [RPC](std/rpc.md)
 - [Browser modules](std/browser.md)

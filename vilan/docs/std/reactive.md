@@ -3,7 +3,9 @@
 Signals, effects, ownership, turns, and the higher-level cells. Concepts and
 usage patterns: the [reactive guide](../guide/reactive.md). The fine-grained
 version of a whole struct — a handle per field, generated from the type — is a
-[store](store.md).
+[store](store.md). A reactive wrapper for a structure of your own, with slots
+that follow their items, is a [lens](lens.md) (`std::reactive::lens`, imported
+by name).
 
 Import what you use:
 
