@@ -4368,3 +4368,26 @@ export impl SignalCell<type T: Debug> with Debug {
 		"SignalCell(" + self.get().debug() + ")"
 	}
 }
+
+// `settle_together` sits last so that std's other locations, which goldens and
+// panic messages quote, do not move for it.
+
+/// Run `body` so the notifications it makes settle together, in the turn that is
+/// already open when there is one — the ambient turn, or the turn being DRAINED
+/// when `body` runs inside an observer — and in a fresh turn of its own otherwise.
+/// `batch` alone opens and drains a fresh turn whenever no turn is AMBIENT, which
+/// from inside an observer (a stored closure: no ambient turn, §8.4) settles each
+/// write on the spot instead of with the drain it belongs to — where a
+/// `SignalCell::notify` from the same place joins the draining turn.
+[internal("the lens's notifications join the turn a `SignalCell`'s would (A185)")]
+export fun settle_together(body: (sync || void) context turn_scope) {
+	match turn_scope.get_safe() {
+		Some(let current) => turn_scope.run(current, body),
+		None => {
+			match draining_turns.read().last() {
+				Some(let draining) => turn_scope.run(draining, body),
+				None => batch(body),
+			}
+		},
+	}
+}

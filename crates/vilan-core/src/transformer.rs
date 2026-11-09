@@ -3876,6 +3876,8 @@ struct Transformer<'src> {
     // Expressions already evaluated into a temp, which every occurrence names
     // instead of re-evaluating: a compound assignment's INDEXED target subscript,
     // walked once for the write and once for the synthesized re-read (B105).
+    // Scoped to that one statement (B713): an id is walked again each time its
+    // body is emitted, and a stale entry named another emission's temp.
     hoisted_values: HashMap<Id, js::Node<'src>>,
     /// G24: while a closure SNAPSHOT is being written out, the compile-time
     /// value each binding it closed over held — substituted wherever the body
@@ -5615,6 +5617,192 @@ impl<'src> Transformer<'src> {
         )));
     }
 
+    /// An assignment statement, after its compound subscripts are hoisted
+    /// (`hoist_compound_target`): the overwritten value's drop (R2), the new
+    /// value, and the write in whichever form the target place needs.
+    fn walk_assignment(
+        &mut self,
+        id: Id,
+        target_id: Id,
+        value_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
+        // R2 (destruction.md §5): assigning onto a place that still holds
+        // a resource drops the OLD value first, then moves the new one in.
+        // The analyzer flagged the assignment and resolved the overwritten
+        // value's type; three target shapes reach here and each names the
+        // same storage the write is about to clobber — a resource `Local`,
+        // (B94) the synthetic `Dereference` of a writable view, whose
+        // pointee is the caller's value, and (B99) a COMPONENT projection,
+        // whose read is the drop's operand. The drop reads that storage
+        // before the write clobbers it — and, on the view path, before
+        // `__replace` truncates the payload out from under it (B89) — so
+        // the target place is read HERE, in source order, ahead of the
+        // new value's own effects.
+        let overwrite_drop = match self.program.overwrite_drops.get(&id) {
+            Some(&type_id) => {
+                let target = target_id;
+                let overwritten = match self.program.entity_map.get(&target) {
+                    Some(Expr::Local(binding)) => Some(js::Node::Local(self.ng.name_for(*binding))),
+                    Some(Expr::Dereference(operand)) => {
+                        let operand = *operand;
+                        self.walk_entity(operand, block)
+                    }
+                    Some(Expr::Field(_, _, _) | Expr::TupleIndex(_, _, _) | Expr::Index(_, _)) => {
+                        self.walk_entity(target, block)
+                    }
+                    _ => None,
+                };
+                overwritten.and_then(|overwritten| self.resource_drop_of(type_id, overwritten))
+            }
+            None => None,
+        };
+        // B151: the new value is computed BEFORE the old one is
+        // destroyed. Emitting the drop first left a window between the
+        // destructor and the write that a throwing right-hand side
+        // escaped through, and the scope-end `finally` then walked over
+        // the corpse — a double `close()` on the JS backend and a double
+        // free on a native one. R2's sentence survives the move: it
+        // promises the old value drops before the new one is MOVED IN,
+        // and the drop still sits between the two.
+        let mut evaluated: Vec<js::Node<'src>> = Vec::new();
+        let value = self
+            .walk_entity(value_id, &mut evaluated)
+            .unwrap_or(js::Node::Void);
+        let value = self.maybe_clone(value_id, value);
+        let value = match overwrite_drop {
+            None => {
+                block.append(&mut evaluated);
+                value
+            }
+            // An INERT right-hand side — a tree of literals and reads of
+            // locals, needing no prelude — can neither throw nor observe
+            // the destructor, so the two orders are indistinguishable and
+            // the drop stays where it was. This is what keeps every
+            // existing R2 golden byte-identical: the corpus writes
+            // constructor literals.
+            Some(drop) if evaluated.is_empty() && Self::node_is_inert(&value) => {
+                block.push(drop);
+                value
+            }
+            Some(drop) => {
+                block.append(&mut evaluated);
+                let name = self.ng.next_name();
+                block.push(js::Node::ConstVariable(js::Variable {
+                    name: name.clone(),
+                    value: Box::new(value),
+                }));
+                block.push(drop);
+                js::Node::Local(name)
+            }
+        };
+        // B538: a tuple target a JS destructuring pattern cannot spell —
+        // an element (`(list[0], x) = ..`, whose read is `__at`), a
+        // nested tuple (`((x, y), z)`), or a tuple-typed element (`(p,
+        // z)`, a reslice) — is the value in a temporary and one
+        // ordinary write per leaf, at the leaf's flat offset. A tuple
+        // of plain places keeps the destructuring it always had.
+        if let Some(Expr::Tuple(_)) = self.program.entity_map.get(&target_id)
+            && !self.tuple_target_destructures(target_id)
+        {
+            let temporary = self.ng.next_name();
+            block.push(js::Node::ConstVariable(js::Variable {
+                name: temporary.clone(),
+                value: Box::new(value),
+            }));
+            self.assign_tuple_target_leaves(target_id, &js::Node::Local(temporary), 0, block);
+            return None;
+        }
+        // Writing a *whole value* through a view. A `Shared` write is a
+        // single-slot view (`cell.v`): rebind the slot, so every handle to
+        // the cell sees the new value (`cell.v = value`). An ordinary
+        // aggregate view REPLACES the pointee's contents in place
+        // (`__replace`), so the target and its aliases update rather than
+        // rebinding a local.
+        // A primitive view's `*c` is a `[0]` slot write — the normal path.
+        if let Some(Expr::Dereference(operand)) = self.program.entity_map.get(&target_id) {
+            if self.is_shared_write(*operand) {
+                // Take the `v` slot directly rather than walking the
+                // call: a SCALAR pointee now lowers the call to the
+                // `(base, key)` pair, and assigning to the pair would
+                // write the pair, not the cell.
+                let operand = *operand;
+                let slot = self
+                    .shared_write_slot(operand, block)
+                    .or_else(|| self.walk_entity(operand, block))
+                    .unwrap_or(js::Node::Void);
+                return Some(js::Node::Assignment(Box::new(slot), Box::new(value)));
+            }
+            if !self.derefs_scalar_view(*operand) {
+                // `Object.assign` was the write for years and is a MERGE:
+                // it copies the value's slots over the pointee's and
+                // leaves any TRAILING slot the value does not reach
+                // standing (backlog B89). Every aggregate whose width can
+                // shrink is wrong under it — an enum reassigned to a
+                // shorter variant keeps the old payload in the tail
+                // (unreachable through the enum's API, but present), and a
+                // `&mut List<T>` written with a shorter list keeps its old
+                // elements outright (`len` still counts them). The write
+                // means REPLACE, so it emits replace.
+                let base = self.walk_entity(*operand, block).unwrap_or(js::Node::Void);
+                self.used_helpers.insert("__replace");
+                return Some(js::Node::Call(
+                    Box::new(js::Node::Local("__replace".to_string())),
+                    vec![base, value],
+                ));
+            }
+        }
+        // `pair.0 = v` on a multi-slot (tuple-typed) element: write
+        // each slot of the region from the value (evaluated once).
+        // Statically-known width keeps this plain slot assignments —
+        // the const-eval interpreter runs them like any other write.
+        if let Some(&Expr::TupleIndex(subject_id, baked_offset, baked_width)) =
+            self.program.entity_map.get(&target_id)
+            && let (offset, width) = self.tuple_index_slot(target_id, (baked_offset, baked_width))
+            && width > 1
+        {
+            let subject = self
+                .walk_entity(subject_id, block)
+                .unwrap_or(js::Node::Void);
+            let value_name = self.ng.next_name();
+            block.push(js::Node::ConstVariable(js::Variable {
+                name: value_name.clone(),
+                value: Box::new(value),
+            }));
+            for slot in 0..width {
+                block.push(js::Node::Assignment(
+                    Box::new(js::Node::PropertyIndex(
+                        Box::new(subject.clone()),
+                        Box::new(js::Node::Number((offset + slot).to_string(), None)),
+                    )),
+                    Box::new(js::Node::PropertyIndex(
+                        Box::new(js::Node::Local(value_name.clone())),
+                        Box::new(js::Node::Number(slot.to_string(), None)),
+                    )),
+                ));
+            }
+            return None;
+        }
+        // `list[i] = v` — the checked write (`__at_put`): writing never
+        // creates a slot (growth is `push`), so an out-of-bounds write
+        // panics. The read side is `__at`; an assignment target can't
+        // be a call, so the write gets its own helper.
+        if let Some(&Expr::Index(subject_id, index_id)) = self.program.entity_map.get(&target_id) {
+            let subject = self
+                .walk_entity(subject_id, block)
+                .unwrap_or(js::Node::Void);
+            let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+            let location = self.subscript_location(target_id, block);
+            self.used_helpers.insert("__at_put");
+            return Some(js::Node::Call(
+                Box::new(js::Node::Local("__at_put".to_string())),
+                vec![subject, index, value, location],
+            ));
+        }
+        let target = self.walk_entity(target_id, block).unwrap_or(js::Node::Void);
+        Some(js::Node::Assignment(Box::new(target), Box::new(value)))
+    }
+
     /// The compound-assignment subscript hoist (B105). `x[i] op= v` desugars to
     /// `x[i] = x[i] op v`, and the two `x[i]`s are two independent walks of the
     /// same source place — so every effectful subscript in the target ran TWICE
@@ -5625,28 +5813,35 @@ impl<'src> Transformer<'src> {
     /// The compound-ness comes from the analyzer's own record rather than from
     /// the shape: `ys[f()] = ys[g()] + 1` has the same shape and two genuinely
     /// different subscripts.
+    ///
+    /// Answers the ids it entered in `hoisted_values`: the temps belong to this
+    /// one statement, and the caller takes them out again once it is written
+    /// (B713).
+    #[must_use]
     fn hoist_compound_target(
         &mut self,
         target_id: Id,
         value_id: Id,
         block: &mut Vec<js::Node<'src>>,
-    ) {
+    ) -> Vec<Id> {
         // The re-read is the synthesized left operand of the desugared binary. An
         // OVERLOADED operator keeps this shape — its dispatch is a side map
         // (`binary_op_dispatch`), not a different expression — and a VIEW target
         // wraps both halves alike in R5's synthetic `Dereference`, under which the
         // analyzer's mark sits.
+        let mut hoisted = Vec::new();
         let Some(&Expr::Binary(_, left_id, _)) = self.program.entity_map.get(&value_id) else {
-            return;
+            return hoisted;
         };
         let reread_id = match self.program.entity_map.get(&left_id) {
             Some(&Expr::Dereference(operand)) => operand,
             _ => left_id,
         };
         if !self.program.compound_rereads.contains(&reread_id) {
-            return;
+            return hoisted;
         }
-        self.hoist_compound_place(target_id, reread_id, block);
+        self.hoist_compound_place(target_id, reread_id, &mut hoisted, block);
+        hoisted
     }
 
     /// The two place spines in lockstep — they are the same source place walked
@@ -5666,6 +5861,7 @@ impl<'src> Transformer<'src> {
         &mut self,
         target_id: Id,
         reread_id: Id,
+        hoisted: &mut Vec<Id>,
         block: &mut Vec<js::Node<'src>>,
     ) {
         let matched = match (
@@ -5697,7 +5893,7 @@ impl<'src> Transformer<'src> {
         let Some((target_subject, reread_subject, index)) = matched else {
             return;
         };
-        self.hoist_compound_place(target_subject, reread_subject, block);
+        self.hoist_compound_place(target_subject, reread_subject, hoisted, block);
         if let Some((target_index, reread_index)) = index
             && self.expr_has_side_effects(target_index)
         {
@@ -5712,6 +5908,7 @@ impl<'src> Transformer<'src> {
             let temp = js::Node::Local(name);
             self.hoisted_values.insert(target_index, temp.clone());
             self.hoisted_values.insert(reread_index, temp);
+            hoisted.extend([target_index, reread_index]);
         }
     }
 
@@ -8874,196 +9071,18 @@ impl<'src> Transformer<'src> {
                 // twice. Evaluate each one here, first, into a temp both walks
                 // name; source order puts the subscript ahead of everything the
                 // write does, the drop below included.
-                self.hoist_compound_target(*target_id, *value_id, block);
-                // R2 (destruction.md §5): assigning onto a place that still holds
-                // a resource drops the OLD value first, then moves the new one in.
-                // The analyzer flagged the assignment and resolved the overwritten
-                // value's type; three target shapes reach here and each names the
-                // same storage the write is about to clobber — a resource `Local`,
-                // (B94) the synthetic `Dereference` of a writable view, whose
-                // pointee is the caller's value, and (B99) a COMPONENT projection,
-                // whose read is the drop's operand. The drop reads that storage
-                // before the write clobbers it — and, on the view path, before
-                // `__replace` truncates the payload out from under it (B89) — so
-                // the target place is read HERE, in source order, ahead of the
-                // new value's own effects.
-                let overwrite_drop = match self.program.overwrite_drops.get(&id) {
-                    Some(&type_id) => {
-                        let target = *target_id;
-                        let overwritten = match self.program.entity_map.get(&target) {
-                            Some(Expr::Local(binding)) => {
-                                Some(js::Node::Local(self.ng.name_for(*binding)))
-                            }
-                            Some(Expr::Dereference(operand)) => {
-                                let operand = *operand;
-                                self.walk_entity(operand, block)
-                            }
-                            Some(
-                                Expr::Field(_, _, _)
-                                | Expr::TupleIndex(_, _, _)
-                                | Expr::Index(_, _),
-                            ) => self.walk_entity(target, block),
-                            _ => None,
-                        };
-                        overwritten
-                            .and_then(|overwritten| self.resource_drop_of(type_id, overwritten))
-                    }
-                    None => None,
-                };
-                // B151: the new value is computed BEFORE the old one is
-                // destroyed. Emitting the drop first left a window between the
-                // destructor and the write that a throwing right-hand side
-                // escaped through, and the scope-end `finally` then walked over
-                // the corpse — a double `close()` on the JS backend and a double
-                // free on a native one. R2's sentence survives the move: it
-                // promises the old value drops before the new one is MOVED IN,
-                // and the drop still sits between the two.
-                let mut evaluated: Vec<js::Node<'src>> = Vec::new();
-                let value = self
-                    .walk_entity(*value_id, &mut evaluated)
-                    .unwrap_or(js::Node::Void);
-                let value = self.maybe_clone(*value_id, value);
-                let value = match overwrite_drop {
-                    None => {
-                        block.append(&mut evaluated);
-                        value
-                    }
-                    // An INERT right-hand side — a tree of literals and reads of
-                    // locals, needing no prelude — can neither throw nor observe
-                    // the destructor, so the two orders are indistinguishable and
-                    // the drop stays where it was. This is what keeps every
-                    // existing R2 golden byte-identical: the corpus writes
-                    // constructor literals.
-                    Some(drop) if evaluated.is_empty() && Self::node_is_inert(&value) => {
-                        block.push(drop);
-                        value
-                    }
-                    Some(drop) => {
-                        block.append(&mut evaluated);
-                        let name = self.ng.next_name();
-                        block.push(js::Node::ConstVariable(js::Variable {
-                            name: name.clone(),
-                            value: Box::new(value),
-                        }));
-                        block.push(drop);
-                        js::Node::Local(name)
-                    }
-                };
-                // B538: a tuple target a JS destructuring pattern cannot spell —
-                // an element (`(list[0], x) = ..`, whose read is `__at`), a
-                // nested tuple (`((x, y), z)`), or a tuple-typed element (`(p,
-                // z)`, a reslice) — is the value in a temporary and one
-                // ordinary write per leaf, at the leaf's flat offset. A tuple
-                // of plain places keeps the destructuring it always had.
-                if let Some(Expr::Tuple(_)) = self.program.entity_map.get(target_id)
-                    && !self.tuple_target_destructures(*target_id)
-                {
-                    let temporary = self.ng.next_name();
-                    block.push(js::Node::ConstVariable(js::Variable {
-                        name: temporary.clone(),
-                        value: Box::new(value),
-                    }));
-                    self.assign_tuple_target_leaves(
-                        *target_id,
-                        &js::Node::Local(temporary),
-                        0,
-                        block,
-                    );
-                    return None;
+                // B713: the temps are this STATEMENT's, keyed by expression id —
+                // and one id is walked again every time its body is emitted (each
+                // instantiation of a generic, each copy of a default method), so
+                // an entry left standing makes the next emission's hoist name the
+                // previous emission's temp instead of evaluating its own. Scoped
+                // to the statement: in before the write, out after it.
+                let hoisted = self.hoist_compound_target(*target_id, *value_id, block);
+                let lowered = self.walk_assignment(id, *target_id, *value_id, block);
+                for hoisted_id in hoisted {
+                    self.hoisted_values.remove(&hoisted_id);
                 }
-                // Writing a *whole value* through a view. A `Shared` write is a
-                // single-slot view (`cell.v`): rebind the slot, so every handle to
-                // the cell sees the new value (`cell.v = value`). An ordinary
-                // aggregate view REPLACES the pointee's contents in place
-                // (`__replace`), so the target and its aliases update rather than
-                // rebinding a local.
-                // A primitive view's `*c` is a `[0]` slot write — the normal path.
-                if let Some(Expr::Dereference(operand)) = self.program.entity_map.get(target_id) {
-                    if self.is_shared_write(*operand) {
-                        // Take the `v` slot directly rather than walking the
-                        // call: a SCALAR pointee now lowers the call to the
-                        // `(base, key)` pair, and assigning to the pair would
-                        // write the pair, not the cell.
-                        let operand = *operand;
-                        let slot = self
-                            .shared_write_slot(operand, block)
-                            .or_else(|| self.walk_entity(operand, block))
-                            .unwrap_or(js::Node::Void);
-                        return Some(js::Node::Assignment(Box::new(slot), Box::new(value)));
-                    }
-                    if !self.derefs_scalar_view(*operand) {
-                        // `Object.assign` was the write for years and is a MERGE:
-                        // it copies the value's slots over the pointee's and
-                        // leaves any TRAILING slot the value does not reach
-                        // standing (backlog B89). Every aggregate whose width can
-                        // shrink is wrong under it — an enum reassigned to a
-                        // shorter variant keeps the old payload in the tail
-                        // (unreachable through the enum's API, but present), and a
-                        // `&mut List<T>` written with a shorter list keeps its old
-                        // elements outright (`len` still counts them). The write
-                        // means REPLACE, so it emits replace.
-                        let base = self.walk_entity(*operand, block).unwrap_or(js::Node::Void);
-                        self.used_helpers.insert("__replace");
-                        return Some(js::Node::Call(
-                            Box::new(js::Node::Local("__replace".to_string())),
-                            vec![base, value],
-                        ));
-                    }
-                }
-                // `pair.0 = v` on a multi-slot (tuple-typed) element: write
-                // each slot of the region from the value (evaluated once).
-                // Statically-known width keeps this plain slot assignments —
-                // the const-eval interpreter runs them like any other write.
-                if let Some(&Expr::TupleIndex(subject_id, baked_offset, baked_width)) =
-                    self.program.entity_map.get(target_id)
-                    && let (offset, width) =
-                        self.tuple_index_slot(*target_id, (baked_offset, baked_width))
-                    && width > 1
-                {
-                    let subject = self
-                        .walk_entity(subject_id, block)
-                        .unwrap_or(js::Node::Void);
-                    let value_name = self.ng.next_name();
-                    block.push(js::Node::ConstVariable(js::Variable {
-                        name: value_name.clone(),
-                        value: Box::new(value),
-                    }));
-                    for slot in 0..width {
-                        block.push(js::Node::Assignment(
-                            Box::new(js::Node::PropertyIndex(
-                                Box::new(subject.clone()),
-                                Box::new(js::Node::Number((offset + slot).to_string(), None)),
-                            )),
-                            Box::new(js::Node::PropertyIndex(
-                                Box::new(js::Node::Local(value_name.clone())),
-                                Box::new(js::Node::Number(slot.to_string(), None)),
-                            )),
-                        ));
-                    }
-                    return None;
-                }
-                // `list[i] = v` — the checked write (`__at_put`): writing never
-                // creates a slot (growth is `push`), so an out-of-bounds write
-                // panics. The read side is `__at`; an assignment target can't
-                // be a call, so the write gets its own helper.
-                if let Some(&Expr::Index(subject_id, index_id)) =
-                    self.program.entity_map.get(target_id)
-                {
-                    let subject = self
-                        .walk_entity(subject_id, block)
-                        .unwrap_or(js::Node::Void);
-                    let index = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
-                    let location = self.subscript_location(*target_id, block);
-                    self.used_helpers.insert("__at_put");
-                    return Some(js::Node::Call(
-                        Box::new(js::Node::Local("__at_put".to_string())),
-                        vec![subject, index, value, location],
-                    ));
-                }
-                let target = self
-                    .walk_entity(*target_id, block)
-                    .unwrap_or(js::Node::Void);
-                js::Node::Assignment(Box::new(target), Box::new(value))
+                return lowered;
             }
             Expr::Parameter(_) => {
                 return None;

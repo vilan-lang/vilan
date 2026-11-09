@@ -1185,7 +1185,13 @@ const PLATFORM_BOUND_REQUIRED: &[&str] = &[
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
 /// agree on for a reason that is not the program's, named with the reason.
-const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[];
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
+    "lens-rope.vl",
+    "prints its own wall-clock timings (`std::time::now_millis`), which no two \
+     runs agree on; every other line is node's natively since B709. It reaches \
+     the platform list through `std::time` alone; `vilan-cli/tests/reactive_lens.rs` \
+     runs it under node (A185 S2)",
+)];
 
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
@@ -1578,7 +1584,7 @@ fn the_default_suite_is_byte_identical_on_both_backends() {
     );
 }
 
-/// I5 ruling 2: the one program [`OUTSIDE_THE_DIFFERENTIAL`] names does what
+/// I5 ruling 2: `usize-underflow.vl`, which [`OUTSIDE_THE_DIFFERENTIAL`] names, does what
 /// the book says on each backend — JS prints the negative value and exits 0, a
 /// native debug build panics on the subtraction — and the enumeration leaves it
 /// out, so the sweep cannot call it broken.
@@ -2433,6 +2439,207 @@ const DESTRUCTURE_PROBE: &str = concat!(
     "\t}\n",
     "}\n",
 );
+
+/// B709: a guard clause's captures outlive it natively. A guard whose `else`
+/// diverges (R15) — or an else-less `if` whose then-block does (B187) —
+/// publishes its captures to the rest of the block, and the emission had been
+/// `if let Some(x) = .. {} else { break; }`, so every read below the guard
+/// named a binding rustc had never seen (E0425) where node printed the value.
+/// It kept `std::reactive::lens` off the native backend. One probe per shape,
+/// each asserting node's bytes on both backends.
+fn assert_guard_probe(file: &str, source: &str, expected: &str) {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "{file}: a guard's captures must reach the rest of the block on both backends"
+    );
+}
+
+#[test]
+fn b709_a_guard_that_returns_keeps_its_binding_natively() {
+    assert_guard_probe(
+        "native_probe_b709_guard_ret.vl",
+        concat!(
+            "import std::{ io::print, option::Option::{ self, None, Some } };\n",
+            "\n",
+            "fun doubled(value: Option<i32>) {\n",
+            "\tvalue is Some(let found) else ret;\n",
+            "\tprint(found * 2);\n",
+            "}\n",
+            "\n",
+            "fun shout(value: Option<str>): str {\n",
+            "\tvalue is Some(let text) else ret \"none\";\n",
+            "\ttext + \"!\"\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tdoubled(Some(21));\n",
+            "\tdoubled(None);\n",
+            "\tprint(shout(Some(\"hi\")));\n",
+            "\tprint(shout(None));\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+        "42\nhi!\nnone\n",
+    );
+}
+
+#[test]
+fn b709_a_guard_that_breaks_keeps_its_binding_natively() {
+    assert_guard_probe(
+        "native_probe_b709_guard_break.vl",
+        concat!(
+            "import std::{ io::print, option::Option::{ self, None, Some } };\n",
+            "\n",
+            "fun until_none(values: List<Option<i32>>): i32 {\n",
+            "\tmut total = 0;\n",
+            "\tfor value in values {\n",
+            "\t\tvalue is Some(let found) else jump break;\n",
+            "\t\ttotal = total + found;\n",
+            "\t}\n",
+            "\ttotal\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(until_none([Some(1), Some(2), None, Some(10)]));\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+        "3\n",
+    );
+}
+
+#[test]
+fn b709_a_guard_that_continues_keeps_its_binding_natively() {
+    assert_guard_probe(
+        "native_probe_b709_guard_continue.vl",
+        concat!(
+            "import std::{ io::print, option::Option::{ self, None, Some } };\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut total = 0;\n",
+            "\tfor value in [Some(\"a\"), None, Some(\"b\")] {\n",
+            "\t\tvalue is Some(let text) else jump continue;\n",
+            "\t\tprint(text + \"?\");\n",
+            "\t\ttotal = total + text.len();\n",
+            "\t}\n",
+            "\tprint(total);\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+        "a?\nb?\n2\n",
+    );
+}
+
+#[test]
+fn b709_a_tuple_and_a_nested_pattern_guard_keep_their_bindings_natively() {
+    assert_guard_probe(
+        "native_probe_b709_guard_tuple.vl",
+        concat!(
+            "import std::{ io::print, option::Option::{ self, None, Some } };\n",
+            "\n",
+            "fun pair_sum(value: Option<(i32, str)>) {\n",
+            "\tvalue is Some((let number, let label)) else ret;\n",
+            "\tprint(i\"{label}={number + 1}\");\n",
+            "}\n",
+            "\n",
+            "fun inner(value: Option<Option<i32>>): i32 {\n",
+            "\tvalue is Some(Some(let found)) else ret -1;\n",
+            "\tfound\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tpair_sum(Some((3, \"three\")));\n",
+            "\tpair_sum(None);\n",
+            "\tprint(inner(Some(Some(7))));\n",
+            "\tprint(inner(Some(None)));\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+        "three=4\n7\n-1\n",
+    );
+}
+
+#[test]
+fn b709_a_guard_in_a_closure_keeps_its_binding_natively() {
+    assert_guard_probe(
+        "native_probe_b709_guard_closure.vl",
+        concat!(
+            "import std::{ io::print, option::Option::{ self, None, Some } };\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet offset = 100;\n",
+            "\tlet report = |value: Option<i32>| {\n",
+            "\t\tvalue is Some(let found) else ret;\n",
+            "\t\tprint(found + offset);\n",
+            "\t};\n",
+            "\treport(Some(1));\n",
+            "\treport(None);\n",
+            "\treport(Some(2));\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+        "101\n102\n",
+    );
+}
+
+/// The shapes that are no single `let … else`: a chain of tests (a let-chain
+/// whose captures are lifted out of its arm), a `then` branch that runs before
+/// the continuation, a `mut` capture the continuation rebinds, and B187's
+/// negated else-less `if`.
+#[test]
+fn b709_a_chained_a_then_and_a_negated_guard_keep_their_bindings_natively() {
+    assert_guard_probe(
+        "native_probe_b709_guard_shapes.vl",
+        concat!(
+            "import std::{ io::print, option::Option::{ self, None, Some } };\n",
+            "\n",
+            "fun chained(left: Option<i32>, right: Option<i32>) {\n",
+            "\tleft is Some(let a) && a > 0 && right is Some(let b) else ret;\n",
+            "\tprint(a + b);\n",
+            "}\n",
+            "\n",
+            "fun then_form(value: Option<i32>) {\n",
+            "\tvalue is Some(let found) then print(found) else ret;\n",
+            "\tprint(found + 1);\n",
+            "}\n",
+            "\n",
+            "fun rebound(value: Option<i32>) {\n",
+            "\tvalue is Some(mut count) else ret;\n",
+            "\tcount = count + 10;\n",
+            "\tprint(count);\n",
+            "}\n",
+            "\n",
+            "fun negated(left: Option<i32>, right: Option<i32>): i32 {\n",
+            "\tif !(left is Some(let x) && right is Some(let y)) {\n",
+            "\t\tret -1;\n",
+            "\t}\n",
+            "\tx * y\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tchained(Some(1), Some(2));\n",
+            "\tchained(Some(-1), Some(2));\n",
+            "\tchained(Some(1), None);\n",
+            "\tthen_form(Some(7));\n",
+            "\tthen_form(None);\n",
+            "\trebound(Some(1));\n",
+            "\tprint(negated(Some(3), Some(4)));\n",
+            "\tprint(negated(None, Some(4)));\n",
+            "}\n",
+            "\n",
+            "main();\n",
+        ),
+        "3\n7\n8\n11\n12\n-1\n",
+    );
+}
 
 /// B569 S1: assignment keeps every position whose value is discarded — a
 /// statement, a block's tail, a `match` arm, a closure's expression body and

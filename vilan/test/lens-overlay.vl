@@ -1,0 +1,235 @@
+// `std::reactive::lens::loaded` (A185 S5): the optimistic overlay beside a bare
+// sequence lens (R12). A proposal never writes the lens; a delete hides; an
+// insert is a provisional row that keeps its place by its neighbours' keys; only
+// a confirmation (the server's word) writes the lens, and a confirmed insert is
+// matched to the server's row by the key the server answers with.
+import std::io::assert;
+import std::reactive::lens::SequenceLens;
+import std::reactive::lens::loaded::{ Overlay, Row };
+import std::reactive::{ Flow, SequenceCell, Source };
+import std::shared::Shared;
+
+[derive(PartialEq)]
+struct Card {
+	id: str,
+	title: str,
+}
+
+fun card(id: str, title: str): Card {
+	Card { id, title }
+}
+
+fun ids(cards: List<Card>): List<str> {
+	mut out: List<str> = [];
+	for item in cards {
+		out.push(item.id);
+	}
+	out
+}
+
+fun row_keys(rows: List<Row<Card, str>>): List<str> {
+	mut out: List<str> = [];
+	for row in rows {
+		out.push(row.slot is Some(let _slot) then row.key else i"({row.key})");
+	}
+	out
+}
+
+fun main() {
+	let board = SequenceLens::over([card("a", "A"), card("b", "B"), card("c", "C")]);
+	let overlay = Overlay::beside(board, |item: &Card| item.id);
+	let rows = overlay.rows();
+	let rows_runs: Shared<i32> = Shared::new(0);
+	let _rows = rows.on_change(|_rows| rows_runs.write() += 1);
+
+	// --- An edit reaches its row's view, never the row feed.
+	let b = board.slot(1);
+	let b_view = overlay.view(b);
+	let b_runs: Shared<i32> = Shared::new(0);
+	let _b = b_view.on_change(|_item| b_runs.write() += 1);
+	let edit = overlay.propose(b, card("b", "B2")).unwrap();
+	assert(
+		b_view.get() == Some(card("b", "B2")) && b.get() == Some(card("b", "B")),
+		"an edit shows, the lens is untouched",
+	);
+	assert(
+		b_runs.read() == 1 && rows_runs.read() == 0,
+		"an edit wakes its view once and not the row feed",
+	);
+	assert(
+		overlay.reject(edit) && b_view.get() == Some(card("b", "B")) && b_runs.read() == 2,
+		"rejected",
+	);
+
+	// --- A provisional row: shown where it was asked for, held nowhere.
+	let insert = overlay.propose_insert(2, card("x", "X"));
+	assert(ids(overlay.shown()) == ["a", "b", "x", "c"], "the insert shows at position 2");
+	assert(ids(board.all()) == ["a", "b", "c"], "and is not in the lens");
+	assert(row_keys(rows.get()) == ["a", "b", "(x)", "c"], "the row feed lists it, with no slot");
+	assert(rows_runs.read() == 1, "the row feed woke once for it");
+	let x_view = overlay.view_key("x");
+	let x_runs: Shared<i32> = Shared::new(0);
+	let _x = x_view.on_change(|_item| x_runs.write() += 1);
+	assert(
+		x_view.get() == Some(card("x", "X")) && overlay.is_pending_key("x").get(),
+		"its view by key shows it, pending",
+	);
+
+	// The lens changes under it: a row arrives at the top, the row above it moves
+	// down. It stays below its neighbour.
+	board.insert_at(0, card("z", "Z"));
+	board.move_item(2, 3);
+	assert(ids(board.all()) == ["z", "a", "c", "b"], "the server reordered");
+	assert(
+		ids(overlay.shown()) == ["z", "a", "c", "b", "x"],
+		"the provisional row followed the row above it",
+	);
+
+	// An insert next to a hidden row is placed by the rows SHOWN around it (what
+	// the user saw): showing the hidden row again does not move the insert.
+	let hide_a = overlay.propose_delete(board.slot(1)).unwrap();
+	let after_hidden = overlay.propose_insert(1, card("y", "Y"));
+	assert(ids(overlay.shown()) == ["z", "y", "c", "b", "x"], "y shows where a was");
+	assert(overlay.reject(hide_a), "the hide is refused");
+	assert(
+		ids(overlay.shown()) == ["z", "y", "a", "c", "b", "x"],
+		"a shows again in its place, y still right below z",
+	);
+	assert(
+		overlay.reject(after_hidden) && ids(overlay.shown()) == ["z", "a", "c", "b", "x"],
+		"a refused insert leaves no row",
+	);
+
+	// --- Confirmed with the key the client minted: it lands in the lens where it
+	// is shown, and its view does not wake.
+	let runs_before = rows_runs.read();
+	assert(overlay.confirm(insert), "the insert is confirmed");
+	assert(
+		ids(board.all()) == ["z", "a", "c", "b", "x"],
+		"it landed in the lens where it was shown",
+	);
+	assert(row_keys(rows.get()) == ["z", "a", "c", "b", "x"], "the row has a slot now");
+	assert(rows_runs.read() == runs_before + 1, "the row feed woke once for the landing");
+	assert(
+		x_view.get() == Some(card("x", "X")) && x_runs.read() == 0,
+		"the row's view did not wake",
+	);
+	assert(overlay.pending().get() == 0, "nothing pending");
+
+	// --- The server echoes the row (a push under the same key) before it
+	// confirms: one row, not two, and the confirmation adds nothing.
+	let echo = overlay.propose_insert(0, card("e", "E"));
+	assert(ids(overlay.shown()) == ["e", "z", "a", "c", "b", "x"], "e shows at the top");
+	board.push(card("e", "E, stored"));
+	assert(
+		ids(overlay.shown()) == ["z", "a", "c", "b", "x", "e"],
+		"the pushed row IS the row: one e, where the server put it",
+	);
+	assert(
+		overlay.view_key("e").get() == Some(card("e", "E")),
+		"showing the proposal on top of the server's copy",
+	);
+	assert(overlay.confirm(echo), "confirmed");
+	assert(
+		ids(board.all()) == ["z", "a", "c", "b", "x", "e"] && board.peek(|list| list[5].title) == "E",
+		"no second e; the confirmed value is the server's word",
+	);
+
+	// --- The server mints the key: the provisional row is replaced, where it
+	// stood, by the server's row under the server's key.
+	let temporary = overlay.propose_insert(1, card("tmp-1", "New"));
+	assert(
+		ids(overlay.shown()) == ["z", "tmp-1", "a", "c", "b", "x", "e"],
+		"the provisional row, under a temporary key",
+	);
+	assert(overlay.confirm_with(temporary, card("s-9", "New")), "confirmed with the server's row");
+	assert(
+		ids(board.all()) == ["z", "s-9", "a", "c", "b", "x", "e"],
+		"the server's row landed where the provisional one stood",
+	);
+	assert(
+		overlay.view_key("tmp-1").get() == None && !overlay.is_pending_key("tmp-1").get(),
+		"the temporary key is gone",
+	);
+	// The same, but the server's row arrived first, under its own key: until the
+	// confirmation names it, the two cannot be matched and both show.
+	let temporary = overlay.propose_insert(0, card("tmp-2", "Other"));
+	board.push(card("s-10", "Other"));
+	assert(
+		ids(overlay.shown()) == ["tmp-2", "z", "s-9", "a", "c", "b", "x", "e", "s-10"],
+		"both show until the confirmation",
+	);
+	assert(overlay.confirm_with(temporary, card("s-10", "Other")), "the confirmation names s-10");
+	assert(ids(board.all()) == ["z", "s-9", "a", "c", "b", "x", "e", "s-10"], "no second s-10");
+	assert(
+		ids(overlay.shown()) == ids(board.all()),
+		"the provisional row is gone, nothing pending shows",
+	);
+
+	// --- A refused insert: the provisional row leaves, the lens never had it.
+	let refused = overlay.propose_insert(0, card("no", "No"));
+	assert(overlay.shown()[0] == card("no", "No"), "shown");
+	assert(
+		overlay.reject(refused)
+			&& overlay.shown()[0] == card("z", "Z")
+			&& ids(board.all())[0] == "z",
+		"gone, and never held",
+	);
+
+	// --- The server removes a row with an edit pending: the row is gone; the
+	// edit's answer settles the count and brings nothing back.
+	let c = board.slot(3);
+	let c_view = overlay.view(c);
+	let doomed_edit = overlay.propose(c, card("c", "C, edited")).unwrap();
+	board.remove_at(3);
+	assert(
+		c_view.get() == None && overlay.view_key("c").get() == None,
+		"the server's removal wins over a local edit",
+	);
+	assert(overlay.confirm(doomed_edit), "the edit's answer is still taken");
+	assert(
+		overlay
+			.pending()
+			.get()
+			== 0
+			&& overlay.view_key("c").get() == None
+			&& !ids(board.all()).contains("c"),
+		"and does not bring the row back",
+	);
+
+	// --- An edit and a delete on one row, answered in either order.
+	let x = overlay.held("x").unwrap();
+	let renamed = overlay.propose(x, card("x", "X2")).unwrap();
+	let removed = overlay.propose_delete(x).unwrap();
+	assert(overlay.view(x).get() == None, "the newer change, the delete, shows");
+	assert(
+		overlay.reject(removed) && overlay.view(x).get() == Some(card("x", "X2")),
+		"the delete refused: the edit shows",
+	);
+	assert(
+		overlay.confirm(renamed) && x.get() == Some(card("x", "X2")),
+		"the edit confirmed: the lens holds it",
+	);
+	let renamed = overlay.propose(x, card("x", "X3")).unwrap();
+	let removed = overlay.propose_delete(x).unwrap();
+	assert(overlay.confirm(removed), "the delete confirmed first");
+	assert(x.get() == None && overlay.held("x") == None, "the lens let the row go");
+	assert(
+		overlay.reject(renamed) && overlay.pending().get() == 0 && overlay
+			.view_key("x")
+			.get()
+			== None,
+		"the late refusal of the older edit changes nothing",
+	);
+
+	// --- What answers nothing.
+	let gone = board.slot(0);
+	board.remove_at(0);
+	assert(
+		overlay.propose(gone, card("z", "Z")) == None && overlay.propose_delete(gone) == None,
+		"a slot whose item is gone takes no proposal",
+	);
+	assert(!overlay.confirm(999) && !overlay.reject(999), "an unknown id is not pending");
+
+	print("overlay: all passed");
+}

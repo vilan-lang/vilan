@@ -1,0 +1,95 @@
+import std::shared::Shared;
+
+// B713: a compound assignment through an impure subscript hoists the subscript
+// into a temp both halves of `x = x op v` name. The temp was recorded by
+// EXPRESSION ID and never taken out again, and one expression id is emitted
+// once per instantiation of a generic body (and once per impl that inherits a
+// default method) — so the second emission's hoist read the first emission's
+// temp: `const $c = $b;`, with `$b` declared in another function, a
+// `ReferenceError` at run time. Each shape below is emitted twice and must
+// declare its own temp each time.
+
+struct Table<H> {
+	cells: List<Cell>,
+	handler: H,
+}
+
+struct Cell {
+	users: i32,
+}
+
+fun table<H>(handler: H): Shared<Table<H>> {
+	Shared::new(Table { cells = [Cell { users = 0 }, Cell { users = 0 }], handler })
+}
+
+// The filed shape: a generic function indexing through a `write()` place.
+fun bump<H>(table: Shared<Table<H>>, id: i32) {
+	table.write().cells[id.as_usize()].users += 1;
+}
+
+// A closure inside a generic body: the closure is emitted inside each
+// instantiation, and its statement is the same expression id in both.
+fun bump_later<H>(table: Shared<Table<H>>, id: i32): || void {
+	|| {
+		table.write().cells[id.as_usize()].users += 10;
+	}
+}
+
+// Two hoists in one statement, nested, root first.
+fun bump_grid<T>(grid: Shared<List<List<i32>>>, tag: T, row: i32, column: i32) {
+	grid.write()[row.as_usize()][column.as_usize()] += 100;
+}
+
+// A default trait method: its body is emitted once per implementing type.
+trait Bumps {
+	fun table(self): Shared<List<Cell>>;
+	fun bump_at(self, id: i32) {
+		self.table().write()[id.as_usize()].users += 1000;
+	}
+}
+
+struct One {
+	cells: Shared<List<Cell>>,
+}
+
+struct Two {
+	cells: Shared<List<Cell>>,
+	name: str,
+}
+
+impl One with Bumps {
+	fun table(self): Shared<List<Cell>> {
+		self.cells
+	}
+}
+
+impl Two with Bumps {
+	fun table(self): Shared<List<Cell>> {
+		self.cells
+	}
+}
+
+fun main() {
+	let a = table(1);
+	let b = table("x");
+	bump(a, 0);
+	bump(b, 1);
+	print(i"generic: {a.read().cells[0].users} {b.read().cells[1].users}");
+
+	let later_a = bump_later(a, 1);
+	let later_b = bump_later(b, 0);
+	later_a();
+	later_b();
+	print(i"closure: {a.read().cells[1].users} {b.read().cells[0].users}");
+
+	let grid: Shared<List<List<i32>>> = Shared::new([[1, 2], [3, 4]]);
+	bump_grid(grid, 1, 0, 1);
+	bump_grid(grid, "y", 1, 0);
+	print(i"nested: {grid.read()[0][1]} {grid.read()[1][0]}");
+
+	let one = One { cells = Shared::new([Cell { users = 0 }]) };
+	let two = Two { cells = Shared::new([Cell { users = 0 }]), name = "two" };
+	one.bump_at(0);
+	two.bump_at(0);
+	print(i"default method: {one.cells.read()[0].users} {two.cells.read()[0].users} {two.name}");
+}

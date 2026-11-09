@@ -1,0 +1,262 @@
+// `std::reactive::lens::loaded` (A185 S5) on REAL tasks: a superseded fetch is
+// cancelled, an owner that goes drops the reply, pages fetch and retry, and std's
+// own `.transient()` and `TaskSource` feed a loaded list.
+//
+// Every ordering is the HARNESS's: "the server" holds each reply behind a gate
+// this program opens, and every wait is a poll until a condition holds, never a
+// sleep of some length that is meant to outlast another. A task proves it was
+// cancelled by its poll count: a live task polls once per tick, as the canary
+// that measures the ticks does, and a cancelled one stops.
+import std::hash_map::HashMap;
+import std::io::{ assert, panic };
+import std::reactive::lens::loaded::{ Edge, Loaded, Page };
+import std::reactive::transient::{ TaskSource, Transient, TransientState };
+import std::reactive::{ Flow, Owner, SequenceCell, SignalCell, Source, run_with_owner };
+import std::shared::Shared;
+import std::time::sleep;
+
+[derive(PartialEq)]
+struct Msg {
+	id: i32,
+	text: str,
+}
+
+fun m(id: i32, text: str): Msg {
+	Msg { id, text }
+}
+
+fun held(feed: Loaded<Msg, i32, str>): List<i32> {
+	mut out: List<i32> = [];
+	for item in feed.items().all() {
+		out.push(item.id);
+	}
+	out
+}
+
+fun ready(state: TransientState<i32, str>): bool {
+	state is TransientState::Ready(let _token)
+}
+
+/// The server's switchboard: which replies may go, how often each waiting call
+/// has polled, and which calls finished.
+struct Server {
+	open: Shared<HashMap<i32, bool>>,
+	polls: Shared<HashMap<i32, i32>>,
+	finished: Shared<HashMap<i32, bool>>,
+}
+
+fun server(): Server {
+	Server {
+		open = Shared::new(HashMap::new()),
+		polls = Shared::new(HashMap::new()),
+		finished = Shared::new(HashMap::new()),
+	}
+}
+
+impl Server {
+	fun release(self, call: i32) {
+		self.open.write().insert(call, true);
+	}
+
+	fun polled(self, call: i32): i32 {
+		self.polls.read().get(call).unwrap_or(0)
+	}
+
+	fun done(self, call: i32): bool {
+		self.finished.read().contains_key(call)
+	}
+
+	/// Hold call `call` until its gate opens, then answer `reply`.
+	fun answer<R>(self, call: i32, reply: R): R {
+		for !self.open.read().contains_key(call) {
+			self.polls.write().insert(call, self.polled(call) + 1);
+			sleep(1);
+		}
+		self.finished.write().insert(call, true);
+		reply
+	}
+}
+
+/// A search: call `100 + asked` answers it. A top-level function, so the task
+/// the pipe's body spawns runs in that run's nursery (a closure literal made in
+/// `main` would carry `main`'s ambient nursery, which is none).
+fun search(calls: Server, asked: i32): Result<List<Msg>, str> {
+	calls.answer(100 + asked, Ok([m(asked, i"result for {asked}"), m(100, "shared row")]))
+}
+
+/// Poll until `ready` holds. A bound turns a hang into a failure that names it.
+fun until(what: str, ready: || bool) {
+	mut ticks = 0;
+	for !ready() {
+		if ticks > 5000 {
+			panic(i"never happened: {what}");
+		}
+		sleep(1);
+		ticks += 1;
+	}
+}
+
+/// Let `ticks` ticks pass: what a live waiting call would spend polling as many
+/// times.
+fun ticks(count: i32) {
+	mut passed = 0;
+	for passed < count {
+		sleep(1);
+		passed += 1;
+	}
+}
+
+async fun main() {
+	let calls = server();
+
+	// === A slow load superseded by a newer one: the slow one is CANCELLED (it
+	// stops polling and never finishes, even once its gate opens) and the newer
+	// one lands by key.
+	let feed: Loaded<Msg, i32, str> = Loaded::new(|item: &Msg| item.id);
+	feed.fetch(|| calls.answer(1, Ok([m(1, "a"), m(2, "b")])));
+	assert(feed.items().size() == 0 && !ready(feed.phase().get()), "nothing yet");
+	calls.release(1);
+	until("the first load lands", || ready(feed.phase().get()));
+	assert(held(feed) == [1, 2], "the first load's rows");
+	let second = feed.items().slot(1);
+	feed.fetch(|| calls.answer(2, Ok([m(1, "SLOW")])));
+	until("call 2 is waiting", || calls.polled(2) > 0);
+	feed.fetch(|| calls.answer(3, Ok([m(1, "a"), m(2, "b2")])));
+	let stopped = calls.polled(2);
+	ticks(20);
+	assert(calls.polled(2) == stopped, "the superseded call stopped polling: it was cancelled");
+	calls.release(3);
+	until("the newer load lands", || second.get() == Some(m(2, "b2")));
+	calls.release(2);
+	ticks(20);
+	assert(!calls.done(2), "the superseded call never finished, its gate open or not");
+	assert(
+		feed.items().peek(|list| list[0].text) == "a" && second.at() == Some(1),
+		"the newer load landed; the slot survived",
+	);
+	feed.fetch(|| calls.answer(4, Err("server error")));
+	calls.release(4);
+	until("the failure lands", || feed.phase().get() is TransientState::Failed(let _e, let _s));
+	match feed.phase().get() {
+		TransientState::Failed(let error, let stale) => assert(
+			error == "server error" && stale != None && held(feed) == [1, 2],
+			"Failed, with the stale token, the rows kept",
+		),
+		_ => assert(false, "the phase is Failed"),
+	}
+
+	// === A page that fails, retried with a real task; then the newer end.
+	feed.fetch_older(|| calls.answer(5, Err("timeout")));
+	assert(feed.older().get() == Edge::Loading, "the older end is loading");
+	calls.release(5);
+	until("the page fails", || feed.older().get() == Edge::Failed("timeout"));
+	assert(held(feed) == [1, 2], "the page failed, the rows stayed");
+	feed.fetch_older(|| calls.answer(6, Ok(Page {
+		items = [m(-1, "older"), m(1, "a")],
+		more = false,
+	})));
+	calls.release(6);
+	until("the retry lands", || feed.older().get() == Edge::End);
+	assert(held(feed) == [-1, 1, 2], "the retry landed once, no duplicate");
+	feed.fetch_newer(|| calls.answer(7, Ok(Page { items = [m(9, "late")], more = true })));
+	until("call 7 is waiting", || calls.polled(7) > 0);
+	feed.fetch_newer(|| calls.answer(8, Ok(Page { items = [m(3, "c")], more = false })));
+	let stopped = calls.polled(7);
+	calls.release(8);
+	calls.release(7);
+	until("the newer page lands", || feed.newer().get() == Edge::End);
+	ticks(20);
+	assert(
+		held(feed) == [-1, 1, 2, 3] && calls.polled(7) == stopped && !calls.done(7),
+		"the superseded page was cancelled; only the newer one landed",
+	);
+
+	// === An optimistic edit confirmed by a real round trip, while a reload lands
+	// in between: the view keeps the edit until the server answers, and wakes
+	// once.
+	let row = feed.items().slot(2);
+	let view = feed.overlay().view(row);
+	let runs: Shared<i32> = Shared::new(0);
+	let _watch = view.on_change(|_item| runs.write() += 1);
+	let edit = feed.overlay().propose(row, m(2, "edited")).unwrap();
+	let overlay = feed.overlay();
+	let _sent = async {
+		let _taken = calls.answer(9, true);
+		let _confirmed = overlay.confirm(edit);
+	};
+	feed.fetch(|| calls.answer(10, Ok([
+		m(-1, "older"),
+		m(1, "a"),
+		m(2, "b2 (before the edit)"),
+		m(3, "c"),
+	])));
+	calls.release(10);
+	until("the reload lands", || row.get() == Some(m(2, "b2 (before the edit)")));
+	assert(
+		view.get() == Some(m(2, "edited")) && feed.overlay().pending().get() == 1,
+		"the reload landed under the pending edit",
+	);
+	calls.release(9);
+	until("the confirmation lands", || feed.overlay().pending().get() == 0);
+	assert(row.get() == Some(m(2, "edited")) && view.get() == Some(m(2, "edited")), "confirmed");
+	assert(runs.read() == 1, "the view woke once: the edit; not the reload, not the confirm");
+
+	// === A load made under an owner is cancelled when the owner goes, and its
+	// reply dropped.
+	let page = Owner::new();
+	let on_page: Loaded<Msg, i32, str> = run_with_owner(page, || Loaded::new(|item: &Msg| item.id));
+	on_page.fetch(|| calls.answer(11, Ok([m(9, "late")])));
+	until("call 11 is waiting", || calls.polled(11) > 0);
+	page.dispose();
+	let stopped = calls.polled(11);
+	calls.release(11);
+	ticks(20);
+	assert(
+		calls.polled(11) == stopped && !calls.done(11) && on_page.items().size() == 0,
+		"the owner's end cancelled the load and dropped its reply",
+	);
+
+	// === std's `.transient()` over a search pipe, followed by a loaded list: three
+	// queries in a row, the older ones answered LAST; only the newest lands, and
+	// the row every answer shares keeps its slot.
+	let query = SignalCell::new(1);
+	let results: Transient<List<Msg>, str> = query
+		.derive(|asked| async search(calls, asked))
+		.transient();
+	let found: Loaded<Msg, i32, str> = Loaded::new(|item: &Msg| item.id);
+	let _following = found.follow(results);
+	calls.release(101);
+	until("the first search lands", || held(found) == [1, 100]);
+	let shared = found.items().slot(1);
+	let shared_runs: Shared<i32> = Shared::new(0);
+	let _s = shared.on_change(|_item| shared_runs.write() += 1);
+	query.set(2);
+	until("search 2 is waiting", || calls.polled(102) > 0);
+	query.set(3);
+	calls.release(103);
+	until("the newest search lands", || held(found) == [3, 100]);
+	calls.release(102);
+	ticks(20);
+	assert(held(found) == [3, 100], "the superseded search never landed");
+	assert(!calls.done(102), "the superseded search was cancelled with its run");
+	assert(
+		shared.at() == Some(1)
+			&& shared.get() == Some(m(100, "shared row"))
+			&& shared_runs.read() == 0,
+		"the shared row kept its slot and never woke",
+	);
+	assert(ready(found.phase().get()), "Ready");
+
+	// === One task, as std's `TaskSource`, followed the same way.
+	let once: Loaded<Msg, i32, str> = Loaded::new(|item: &Msg| item.id);
+	let _once = once.follow(TaskSource::new(async calls.answer(200, Ok([
+		m(2, "two"),
+		m(100, "shared row"),
+	]))));
+	assert(!ready(once.phase().get()) && once.items().size() == 0, "the task is pending");
+	calls.release(200);
+	until("the task lands", || ready(once.phase().get()));
+	assert(held(once) == [2, 100], "a TaskSource lands too");
+
+	print("loaded tasks: all passed");
+}

@@ -1,0 +1,158 @@
+// `std::reactive::lens` (A185 S2): the SET shape. `Membership` is what a set
+// offers; `set(..)` / `SetLens::over(..)` is its lens, keyed by member. A
+// member's slot is its presence (`Source<bool>`), the length wakes for joins and
+// leaves, `members()` is std's `SetOp` feed, and `reconcile_set` is the diff door.
+import std::hash_set::HashSet;
+import std::io::assert;
+import std::reactive::lens::{ Change, Membership, SetLens, set };
+import std::reactive::{ DeltaSource, SetFlow, SetOp, Source };
+import std::shared::Shared;
+
+/// A set kept as a sorted list: a second `Membership` beside `HashSet`, which
+/// leaves `count` to the trait's default.
+struct Tags {
+	held: List<str>,
+}
+
+impl Tags with Membership<str> {
+	fun contains(self, member: str): bool {
+		self.held.contains(member)
+	}
+
+	fun members(self): List<str> {
+		self.held
+	}
+
+	fun add(&mut self, member: str) {
+		if !self.held.contains(member) {
+			self.held.push(member);
+		}
+	}
+
+	fun remove(&mut self, member: str) {
+		mut kept: List<str> = [];
+		for held in self.held {
+			if held != member {
+				kept.push(held);
+			}
+		}
+		self.held = kept;
+	}
+}
+
+fun describe(op: SetOp<str>): str {
+	match op {
+		SetOp::Add(let member) => i"add {member}",
+		SetOp::Remove(let member) => i"remove {member}",
+		SetOp::Reset(let all) => i"reset {all.len()}",
+	}
+}
+
+fun described(ops: List<SetOp<str>>): List<str> {
+	ops.map(|op| describe(op))
+}
+
+fun main() {
+	// A plain set keeps its own methods beside the trait's.
+	mut plain: HashSet<str> = HashSet::new();
+	plain.insert("a");
+	plain.remove("a");
+	assert(!plain.contains("a") && plain.len() == 0, "HashSet's own members still answer");
+
+	// A member's slot exists before the member, and follows it in and out.
+	let tags = set(plain);
+	let urgent = tags.slot("urgent");
+	let later = tags.slot("later");
+	let urgent_seen: Shared<List<bool>> = Shared::new([]);
+	let later_runs: Shared<i32> = Shared::new(0);
+	let _u = urgent.on_change(|on| urgent_seen.write().push(on));
+	let _l = later.on_change(|_on| later_runs.write() += 1);
+	assert(!urgent.get(), "absent before it joins");
+	assert(tags.add("urgent"), "a new member is added");
+	assert(!tags.add("urgent"), "a held member writes nothing");
+	assert(tags.add("other"), "another member");
+	assert(tags.remove("urgent"), "a held member leaves");
+	assert(!tags.remove("urgent"), "an absent member writes nothing");
+	assert(tags.add("urgent"), "it returns");
+	assert(
+		urgent_seen.read() == [true, false, true],
+		"the slot heard join, leave and return, and no repeat",
+	);
+	assert(later_runs.read() == 0, "another member's slot slept through all of it");
+	assert(urgent.get() && tags.contains("other") && !tags.contains("later"), "presence reads");
+
+	// The length wakes when members join or leave, not for a repeat.
+	let lengths: Shared<i32> = Shared::new(0);
+	let _n = tags.length().on_change(|_n| lengths.write() += 1);
+	tags.add("other");
+	assert(lengths.read() == 0, "a repeat leaves the length asleep");
+	tags.add("later");
+	assert(lengths.read() == 1 && tags.length().get() == 3, "a join wakes it");
+	assert(later_runs.read() == 1 && later.get(), "and wakes that member's slot");
+
+	// The members as std's `SetOp` feed.
+	let feed = tags.members();
+	let cursor = feed.cursor();
+	tags.remove("other");
+	tags.add("new");
+	assert(
+		described(feed.since(cursor)) == ["remove other", "add new"],
+		"one op per change, in order",
+	);
+	let after = feed.cursor();
+	// A write that names several changes replays them in order (L8).
+	tags.update(|held| {
+		held.add("x");
+		held.remove("x");
+		held.add("y");
+		(
+			void,
+			[Change::Insert("x", 1usize), Change::Delete("x", 1usize), Change::Insert("y", 1usize)]
+		)
+	});
+	assert(
+		described(feed.since(after)) == ["add x", "remove x", "add y"],
+		"an update's changes, replayed",
+	);
+	let reset_at = feed.cursor();
+	tags.update(|_held| (void, [Change::Reset]));
+	assert(described(feed.since(reset_at)) == ["reset 4"], "a reset carries the whole set");
+	assert(feed.get() == tags.all() && tags.all().len() == 4, "the feed reads the set");
+
+	// std's set flow opens over the feed: the snapshot, then the drained ops.
+	let flow_feed = tags.members();
+	let flow = flow_feed.open();
+	assert((flow.snapshot)().len() == 4, "the flow's snapshot is the set");
+	tags.remove("y");
+	assert(described((flow.drain)()) == ["remove y"], "the flow drains one op");
+	(flow.release)();
+	flow_feed.release();
+
+	// The diff door: one turn, members both hold write nothing.
+	let whole_runs: Shared<i32> = Shared::new(0);
+	let _w = tags.on_change(|_all| whole_runs.write() += 1);
+	let urgent_before = urgent_seen.read().len();
+	let changed = feed.cursor();
+	mut next: HashSet<str> = HashSet::new();
+	next.insert("urgent");
+	next.insert("fresh");
+	tags.reconcile_set(next);
+	assert(tags.all() == next, "the set became the new set");
+	assert(whole_runs.read() == 1, "in one turn");
+	assert(urgent_seen.read().len() == urgent_before, "a member both hold did not wake");
+	// Three runs: its join, the `Reset` (which wakes every slot) and its leaving.
+	assert(later_runs.read() == 3 && !later.get(), "a member that left woke once");
+	assert(described(feed.since(changed)).len() == 3, "two left and one joined");
+	feed.release();
+	assert(tags.lens().tapped() == 0, "released, the feed let its tap go");
+
+	// A structure that leaves `count` to the trait's default.
+	let custom = SetLens::over(Tags { held = ["b"] });
+	let a = custom.slot("a");
+	custom.add("a");
+	assert(a.get() && custom.length().get() == 2, "a second set shape joins the same way");
+	custom.reconcile_set(["c"].to_set());
+	assert(!a.get() && custom.peek(|held| held.held) == ["c"], "and reconciles");
+
+	print("set: all passed");
+}

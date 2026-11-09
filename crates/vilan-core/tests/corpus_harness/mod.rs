@@ -71,6 +71,7 @@ macro_rules! corpus_manifest {
             async_await => "async-await.vl",
             async_promise_all => "async-promise-all.vl",
             await_postfix => "await-postfix.vl",
+            b713 => "b713.vl",
             backed_enum_keys => "backed-enum-keys.vl",
             blanket_impl => "blanket-impl.vl",
             bool => "bool.vl",
@@ -127,6 +128,17 @@ macro_rules! corpus_manifest {
             json_roundtrip => "json-roundtrip.vl",
             key_decoder => "key-decoder.vl",
             keyword_members => "keyword-members.vl",
+            lens_fuzz => "lens-fuzz.vl",
+            lens_keyed => "lens-keyed.vl",
+            lens_laws => "lens-laws.vl",
+            lens_loaded => "lens-loaded.vl",
+            lens_loaded_tasks => "lens-loaded-tasks.vl",
+            lens_nested => "lens-nested.vl",
+            lens_rope => "lens-rope.vl",
+            lens_set => "lens-set.vl",
+            lens_sorted => "lens-sorted.vl",
+            lens_overlay => "lens-overlay.vl",
+            lens_tracked => "lens-tracked.vl",
             lift_chain => "lift-chain.vl",
             list_build_infer => "list-build-infer.vl",
             list_cell => "list-cell.vl",
@@ -241,6 +253,12 @@ pub const NOT_RUN: &[(&str, &str)] = &[
     ("crypto.vl", "host WebCrypto: a fresh random draw per run"),
     ("db.vl", "host database: touches the filesystem"),
     ("process-env.vl", "reads the host environment and argv"),
+    (
+        "lens-rope.vl",
+        "host clock: the exhibit prints its own timings (`now_millis`); \
+         `vilan-cli/tests/reactive_lens.rs` runs it under node and reads every \
+         other line exactly",
+    ),
     // Sequential runs agree; the divergence appeared only under the 8-way
     // parallelism the release gate used to run its own loop with, which is the
     // proof that it is scheduling and not codegen. E32's rule applies — a

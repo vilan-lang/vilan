@@ -2575,6 +2575,88 @@ fn b419_the_supertrait_is_provided_at_the_arguments_the_clause_reaches_it_throug
     );
 }
 
+/// B715 (found by A185 S2, which split `Resizable<T>` into `Indexed<T>` and
+/// `Resizable<T> with Indexed<T>`): a SUPERTRAIT's default reached through a
+/// one-block subtrait impl ran with the supertrait's `T` unbound, because the
+/// default's substitution selected the block that NAMES the declaring trait
+/// and a one-block impl names only the subtrait. A `&item` of a `str` then
+/// lowered as a value where the reader, typed at `str`, took a place: `text.len()`
+/// read `undefined`, with no diagnostic. Through a generic bound on the subtrait.
+#[test]
+fn b715_a_supertrait_default_through_a_one_block_subtrait_impl_lends_a_str() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Read<T> {
+            fun item(self): Option<T>;
+            fun lend(self, read: |&T| void) {
+                if self.item() is Some(let item) {
+                    read(&item);
+                }
+            }
+        }
+        trait Write<T> with Read<T> { fun put(&mut self, value: T); }
+        struct Cell { held: str }
+        impl Cell with Write<str> {
+            fun item(self): Option<str> { Some(self.held) }
+            fun put(&mut self, value: str) { self.held = value; }
+        }
+        fun length_of<S: Write<str>>(value: S): usize {
+            mut out: usize = 0;
+            value.lend(|text| out = text.len());
+            out
+        }
+        fun main() {
+            print(length_of(Cell { held = "abc" }));
+        }
+        "#,
+        "3\n",
+    );
+}
+
+/// B715, the other two ways to reach the default: on the concrete value, and
+/// through a bound on the SUPERTRAIT itself; and at a numeric argument, whose
+/// view is a place too.
+#[test]
+fn b715_a_supertrait_default_through_a_one_block_impl_on_a_value_and_a_supertrait_bound() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        trait Read<T> {
+            fun item(self): Option<T>;
+            fun lend(self, read: |&T| void) {
+                if self.item() is Some(let item) {
+                    read(&item);
+                }
+            }
+        }
+        trait Write<T> with Read<T> { fun put(&mut self, value: T); }
+        struct Words { held: str }
+        impl Words with Write<str> {
+            fun item(self): Option<str> { Some(self.held) }
+            fun put(&mut self, value: str) { self.held = value; }
+        }
+        struct Count { held: i32 }
+        impl Count with Write<i32> {
+            fun item(self): Option<i32> { Some(self.held) }
+            fun put(&mut self, value: i32) { self.held = value; }
+        }
+        fun read_bound<S: Read<i32>>(value: S): i32 {
+            mut out = 0;
+            value.lend(|number| out = *number + 1);
+            out
+        }
+        fun main() {
+            mut out: usize = 0;
+            Words { held = "four" }.lend(|text| out = text.len());
+            print(out);
+            print(read_bound(Count { held = 41 }));
+        }
+        "#,
+        "4\n42\n",
+    );
+}
+
 #[test]
 fn b243_the_split_impl_still_works() {
     // A49's recipe, kept green: making `Source` a clause trait of its own was

@@ -1,0 +1,123 @@
+// `std::reactive::lens` (A185 S1): the keyed side — std's map operators over a
+// keyed lens, its length, its diff door — and the planned write and its truth
+// check (R7) on a sequence, `Splice` included (R16).
+import std::hash_map::HashMap;
+import std::io::assert;
+import std::reactive::lens::{ Change, explain_sequence, keyed, sequence, sequence_checked };
+import std::reactive::{ MapFlow, MapPipe, SequenceCell, Source, batch };
+import std::shared::Shared;
+
+fun main() {
+	// std's map operators follow a keyed lens through its entries feed.
+	let ages: HashMap<str, i32> = HashMap::new();
+	let people = keyed(ages);
+	people.put("ada", 36);
+	people.put("bob", 41);
+	let adults = people.entries().filter(|_name, age| age >= 40).memo();
+	let next_year = people.entries().map_values(|age: i32| age + 1).memo();
+	assert(adults.len() == 1 && adults.get("bob") == Some(41), "filter seeded");
+	assert(next_year.get("ada") == Some(37), "map seeded");
+	people.put("cy", 52);
+	people.put("ada", 40);
+	people.remove("bob");
+	assert(
+		adults.len() == 2 && adults.get("ada") == Some(40) && adults.get("bob") == None,
+		"filter followed put, replace and remove",
+	);
+	assert(next_year.get("cy") == Some(53) && next_year.get("bob") == None, "map followed");
+
+	// Length wakes for arrivals and departures, not for a replace.
+	let lengths: Shared<i32> = Shared::new(0);
+	let _l = people.length().on_change(|_n| lengths.write() += 1);
+	people.put("ada", 41);
+	assert(lengths.read() == 0 && people.length().get() == 2, "a replace leaves the length asleep");
+	people.put("dee", 29);
+	assert(lengths.read() == 1 && people.length().get() == 3, "an arrival wakes it");
+
+	// The diff door for keys: equal values are left alone.
+	let ada = people.slot("ada");
+	let ada_runs: Shared<i32> = Shared::new(0);
+	let _a = ada.on_change(|_v| ada_runs.write() += 1);
+	mut wanted: HashMap<str, i32> = HashMap::new();
+	wanted.insert("ada", 41);
+	wanted.insert("eve", 33);
+	people.reconcile_keyed(wanted);
+	assert(
+		people
+			.all()
+			.len()
+			== 2
+			&& people.all().get("eve") == Some(33)
+			&& people.all().get("cy") == None,
+		"the map became the new map",
+	);
+	assert(ada_runs.read() == 0, "an unchanged key did not wake");
+
+	// A planned write is exact: the op feed sees what left.
+	let list = sequence_checked(["a", "b", "c", "d"]);
+	let mirror = list.items().map(|v| v).memo();
+	let took = list.plan(Change::Delete(1usize, 2usize), |held| {
+		let gone = [held[1], held[2]];
+		held.splice(1, 2, []);
+		gone
+	});
+	assert(took == ["b", "c"] && list.all() == ["a", "d"], "the planned write ran and answered");
+	assert(mirror.get() == ["a", "d"], "the mirror followed it by one splice");
+
+	// The truth check: an update that names the wrong change is refused.
+	let runs: Shared<i32> = Shared::new(0);
+	let _watch = list.on_change(|_all| runs.write() += 1);
+	list.update(|held| {
+		held.insert(0, "z");
+		(void, [Change::Insert(0usize, 1usize)])
+	});
+	assert(list.all() == ["z", "a", "d"] && runs.read() == 1, "an honest update lands");
+	// A lie, asked of the check directly (std cannot catch a panic): the write
+	// inserts at 0 but says 2; a wrong count; a change left unnamed.
+	let before = ["z", "a", "d"];
+	assert(
+		explain_sequence(&before, &["y", "z", "a", "d"], [Change::Insert(2usize, 1usize)]) is Some(let _why),
+		"a wrong position is caught",
+	);
+	assert(
+		explain_sequence(&before, &["y", "z", "a", "d"], [Change::Insert(0usize, 2usize)]) is Some(let _why2),
+		"a wrong count is caught",
+	);
+	assert(
+		explain_sequence(&before, &["z", "A", "d"], [Change::Edit(2usize, "x")]) is Some(let _why3),
+		"an edit at the wrong row is caught",
+	);
+	assert(
+		explain_sequence(&before, &["y", "z", "a", "d"], [
+			Change::Insert(0usize, 1usize),
+		])
+			== None,
+		"the honest change passes",
+	);
+	// A splice, honest and not: one taken and two put in at 1.
+	assert(
+		explain_sequence(&before, &["z", "p", "q", "d"], [
+			Change::Splice(1usize, 1usize, 2usize),
+		])
+			== None,
+		"an honest splice passes",
+	);
+	assert(
+		explain_sequence(&before, &["z", "p", "q", "d"], [Change::Splice(1usize, 1usize, 1usize)]) is Some(let _why4),
+		"a splice with the wrong count is caught",
+	);
+	assert(
+		explain_sequence(&before, &["z", "p", "q", "d"], [Change::Splice(2usize, 1usize, 2usize)]) is Some(let _why5),
+		"a splice at the wrong address is caught",
+	);
+	// And through the checked lens: a planned splice lands and the mirror follows.
+	list.plan(Change::Splice(1usize, 1usize, 2usize), |held| {
+		held.splice(1, 1, ["p", "q"]);
+	});
+	assert(
+		list.all() == ["z", "p", "q", "d"] && mirror.get() == ["z", "p", "q", "d"],
+		"a planned splice is one exact op",
+	);
+
+	print("keyed: all passed");
+}

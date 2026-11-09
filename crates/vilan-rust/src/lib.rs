@@ -65,8 +65,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
-    AdaptedInstance, Backing, BackingValue, CopyDecision, Expr, ExprIfBranch, ExprMatchLeg,
-    ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    AdaptedInstance, Backing, BackingValue, ContinuationPath, CopyDecision, Expr, ExprIfBranch,
+    ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
 };
 use vilan_core::captures::{mutates_its_receiver, reads_its_receiver_in_place};
 use vilan_core::error::Error;
@@ -5563,6 +5563,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn statement(&mut self, id: Id, depth: usize) -> Result<String, Error> {
         self.expecting_nothing(|emitter| match emitter.program.entity_map.get(&id) {
             Some(Expr::Void) | None => Ok(String::new()),
+            Some(Expr::If(_)) if emitter.program.guard_continuations.contains_key(&id) => {
+                emitter.guard_clause(id, depth)
+            }
             Some(Expr::If(_)) | Some(Expr::For(_, _)) | Some(Expr::ForEach(_, _, _)) => {
                 emitter.expression(id, depth)
             }
@@ -8930,36 +8933,51 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             return Ok(None);
         }
+        let conjuncts: Vec<PathConjunct> = conjuncts
+            .into_iter()
+            .map(|conjunct| {
+                if self.is_condition_captures(conjunct).is_some() {
+                    PathConjunct::Test(conjunct)
+                } else {
+                    PathConjunct::Holds(conjunct, true)
+                }
+            })
+            .collect();
+        let (parts, captured) = self.let_chain_parts(&conjuncts, depth)?;
+        Ok(Some((format!("if {}", parts.join(" && ")), captured)))
+    }
+
+    /// The parts of a let-chain head, one per conjunct: a capturing `is`-test
+    /// is a `let`, its subject copied as `if let` copies one (F20), and every
+    /// other conjunct is the boolean it is (negated where it must FAIL). The
+    /// captures are registered in [`Emitter::is_captures`] as each `let`
+    /// binds them, for the conjuncts to its right and the body; the caller
+    /// releases them, and an error here releases what it had registered.
+    fn let_chain_parts(
+        &mut self,
+        conjuncts: &[PathConjunct],
+        depth: usize,
+    ) -> Result<(Vec<String>, Vec<Id>), Error> {
         let mut parts = Vec::new();
         let mut captured = Vec::new();
         for conjunct in conjuncts {
-            let part = match self.is_condition_captures(conjunct) {
-                Some((subject, pattern, bindings)) => {
-                    let subject_text = self.expression(subject, depth);
-                    let subject_text = match subject_text {
-                        Ok(text) => self.copy_a_pattern_subject(subject, text),
-                        Err(error) => {
-                            self.release_captures(&captured);
-                            return Err(error);
+            let part = match *conjunct {
+                PathConjunct::Test(test) => match self.capturing_let(test, depth) {
+                    Ok((text, bindings)) => {
+                        for binding in &bindings {
+                            self.is_captures.insert(*binding);
                         }
-                    };
-                    let subject_type = self.settled_value_type(subject);
-                    let pattern_text = self.pattern(&pattern, subject_type, self.span_of(conjunct));
-                    let pattern_text = match pattern_text {
-                        Ok(text) => text,
-                        Err(error) => {
-                            self.release_captures(&captured);
-                            return Err(error);
-                        }
-                    };
-                    for binding in &bindings {
-                        self.is_captures.insert(*binding);
+                        captured.extend(bindings);
+                        text
                     }
-                    captured.extend(bindings);
-                    format!("let {pattern_text} = {subject_text}")
-                }
-                None => match self.expression(conjunct, depth) {
-                    Ok(text) => format!("({text})"),
+                    Err(error) => {
+                        self.release_captures(&captured);
+                        return Err(error);
+                    }
+                },
+                PathConjunct::Holds(condition, holds) => match self.expression(condition, depth) {
+                    Ok(text) if holds => format!("({text})"),
+                    Ok(text) => format!("!({text})"),
                     Err(error) => {
                         self.release_captures(&captured);
                         return Err(error);
@@ -8968,7 +8986,151 @@ impl<'a, 'src> Emitter<'a, 'src> {
             };
             parts.push(part);
         }
-        Ok(Some((format!("if {}", parts.join(" && ")), captured)))
+        Ok((parts, captured))
+    }
+
+    /// One capturing `is`-test as a let-chain's `let PATTERN = SUBJECT`, with
+    /// the captures it binds.
+    fn capturing_let(&mut self, test: Id, depth: usize) -> Result<(String, Vec<Id>), Error> {
+        let (subject, pattern, bindings) = self
+            .is_condition_captures(test)
+            .expect("a `PathConjunct::Test` is a capturing `is`-test");
+        let subject_text = self.expression(subject, depth)?;
+        let subject_text = self.copy_a_pattern_subject(subject, subject_text);
+        let subject_type = self.settled_value_type(subject);
+        let pattern_text = self.pattern(&pattern, subject_type, self.span_of(test))?;
+        Ok((format!("let {pattern_text} = {subject_text}"), bindings))
+    }
+
+    /// The conjuncts that hold, all of them, exactly when `condition`
+    /// evaluates to `holds` — De Morgan down the boolean spine, the walk the
+    /// analyzer's own path captures follow (B195, R15): `a && b` holds by both
+    /// holding, `a || b` fails by both failing, and `!a` swaps the polarity.
+    /// A capturing `is`-test that has to HOLD is a [`PathConjunct::Test`];
+    /// everything else (a test that has to fail, any other expression, an
+    /// operator an impl overloads) is the boolean it evaluates to.
+    fn path_conjuncts(&self, condition: Id, holds: bool, out: &mut Vec<PathConjunct>) {
+        let dispatched = self.program.binary_op_dispatch.contains_key(&condition);
+        match self.program.entity_map.get(&condition) {
+            Some(&Expr::Binary(BinaryOp::And, left, right)) if holds && !dispatched => {
+                self.path_conjuncts(left, true, out);
+                self.path_conjuncts(right, true, out);
+            }
+            Some(&Expr::Binary(BinaryOp::Or, left, right)) if !holds && !dispatched => {
+                self.path_conjuncts(left, false, out);
+                self.path_conjuncts(right, false, out);
+            }
+            Some(&Expr::Unary('!', operand)) => self.path_conjuncts(operand, !holds, out),
+            Some(Expr::Is(..)) if holds && self.is_condition_captures(condition).is_some() => {
+                out.push(PathConjunct::Test(condition));
+            }
+            _ => out.push(PathConjunct::Holds(condition, holds)),
+        }
+    }
+
+    /// B709: a guard clause — an `if` whose captures the analyzer published
+    /// past it ([`Program::guard_continuations`]): R15's `opt is Some(let v)
+    /// else ret;` and B187's `if !(opt is Some(let v)) { ret; }`. On JS a
+    /// capture is an accessor at every read and the `if` needs nothing; a Rust
+    /// binding lives in the scope of the `if let` that binds it, and the
+    /// emission this replaced — `if let Some(v) = .. {} else { return; }` —
+    /// left every read below the guard naming a binding rustc had never seen
+    /// (E0425), which kept `std::reactive::lens` off this backend.
+    ///
+    /// So the guard is the binding's declaration. One capturing test with
+    /// nothing to run when it holds is Rust's own `let … else`:
+    ///
+    /// ```text
+    /// `opt is Some(let v) else ret;`  →  `let Some(v) = opt else { return; };`
+    /// ```
+    ///
+    /// and every other shape — a chain of tests and conditions, a `then`
+    /// branch — is the same declaration over a let-chain, the captures lifted
+    /// out of the arm the condition binds them in:
+    ///
+    /// ```text
+    /// `a is Some(let x) && b is Some(let y) else ret;`
+    ///     →  `let (x, y) = if let Some(x) = a && let Some(y) = b { (x, y) } else { return; };`
+    /// ```
+    ///
+    /// The diverging block is the `else` (R15) or the then-block (B187); the
+    /// analyzer published the captures only after proving it diverges on every
+    /// path, which is what lets it stand where Rust wants a `!`.
+    fn guard_clause(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        let path = self.program.guard_continuations[&id];
+        let Some(Expr::If(ExprIfBranch::If(condition, then_block, next))) =
+            self.program.entity_map.get(&id).cloned()
+        else {
+            unreachable!("a guard continuation is recorded on an `if`")
+        };
+        let (continuation, diverging) = match (path, next.map(|next| *next)) {
+            (ContinuationPath::WhenTrue, Some(ExprIfBranch::Else(otherwise))) => {
+                (Some(then_block), otherwise)
+            }
+            (ContinuationPath::WhenFalse, None) => (None, then_block),
+            _ => unreachable!("R15 guards an `else`, B187 an else-less `if`"),
+        };
+        let pad = Self::indent(depth);
+        let mut diverging_body = String::new();
+        self.emit_block(&diverging.0, diverging.1, &mut diverging_body, depth + 1)?;
+        let diverging_text = format!(
+            "{{
+{diverging_body}{pad}}}"
+        );
+        let mut conjuncts = Vec::new();
+        self.path_conjuncts(
+            condition,
+            matches!(path, ContinuationPath::WhenTrue),
+            &mut conjuncts,
+        );
+        let runs_nothing = continuation.as_ref().is_none_or(|(statements, tail)| {
+            statements.is_empty()
+                && matches!(self.program.entity_map.get(tail), Some(Expr::Void) | None)
+        });
+        if let [PathConjunct::Test(test)] = conjuncts[..]
+            && runs_nothing
+        {
+            let (binding, _) = self.capturing_let(test, depth)?;
+            return Ok(format!("{binding} else {diverging_text};"));
+        }
+        let (parts, captured) = self.let_chain_parts(&conjuncts, depth)?;
+        let mut body = String::new();
+        let walked = match &continuation {
+            Some((statements, tail)) => self.emit_block(statements, *tail, &mut body, depth + 1),
+            None => Ok(()),
+        };
+        self.release_captures(&captured);
+        walked?;
+        let names: Vec<String> = captured
+            .iter()
+            .map(|binding| self.binding_name(*binding))
+            .collect();
+        let binders: Vec<String> = captured
+            .iter()
+            .map(|binding| {
+                let mutable = self
+                    .program
+                    .variables
+                    .get(binding)
+                    .is_some_and(|variable| variable.mutable);
+                let name = self.binding_name(*binding);
+                if mutable { format!("mut {name}") } else { name }
+            })
+            .collect();
+        let (lifted, declared) = match (&names[..], &binders[..]) {
+            ([name], [binder]) => (name.clone(), binder.clone()),
+            _ => (
+                format!("({})", names.join(", ")),
+                format!("({})", binders.join(", ")),
+            ),
+        };
+        let inner = Self::indent(depth + 1);
+        Ok(format!(
+            "let {declared} = if {} {{
+{body}{inner}{lifted}
+{pad}}} else {diverging_text};",
+            parts.join(" && ")
+        ))
     }
 
     /// Releases the `is` captures a let-chain registered (F91).
@@ -17059,6 +17221,15 @@ fn describe(resolved: &Type) -> String {
 }
 
 /// Every binding a pattern introduces, in source order.
+/// One conjunct of a let-chain head ([`Emitter::let_chain_parts`]).
+#[derive(Clone, Copy)]
+enum PathConjunct {
+    /// A capturing `is`-test that has to hold: a `let PATTERN = SUBJECT`.
+    Test(Id),
+    /// Any other condition, and whether it has to hold (`true`) or fail.
+    Holds(Id, bool),
+}
+
 fn collect_pattern_bindings(pattern: &ExprPattern, out: &mut Vec<Id>) {
     vilan_core::captures::pattern_bindings(pattern, out);
 }

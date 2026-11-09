@@ -1,0 +1,475 @@
+// `std::reactive::lens` (A185 S2): a REAL rope as the exhibit. Lines of text in
+// chunks of a bounded size, split and merged by a bulk splice that re-cuts only
+// the chunks a span touches. The rope holds no reactive code: its whole cost
+// under the lens is `Indexed` and `Resizable` below. Slots survive splits and
+// merges, a 5,000-line paste is ONE change, and `rows()`, `items()` and
+// `index_by` follow it. The two timing lines are the exhibit's measurements;
+// `reactive_lens.rs` reads every other line exactly.
+import std::io::assert;
+import std::reactive::lens::{ Change, Indexed, Resizable, Stage, sequence };
+import std::reactive::{ CollFlow, CollPipe, DeltaSource, SeqOp, SequenceCell, Source };
+import std::shared::Shared;
+import std::time::now_millis;
+
+/// Lines of text in chunks. Every chunk holds at most `cap` lines and, unless it
+/// is the only one, at least half of that.
+struct Rope {
+	chunks: List<List<str>>,
+	/// The position of each chunk's first line.
+	starts: List<usize>,
+	cap: usize,
+	total: usize,
+	/// How many splices made more chunks than they consumed, and fewer.
+	splits: i32,
+	merges: i32,
+}
+
+fun smaller(left: usize, right: usize): usize {
+	if left < right {
+		left
+	} else {
+		right
+	}
+}
+
+impl Rope {
+	fun new(cap: usize, lines: List<str>): Rope {
+		mut rope = Rope { chunks = [], starts = [], cap, total = 0, splits = 0, merges = 0 };
+		rope.splice(0, 0, lines);
+		rope.splits = 0;
+		rope
+	}
+
+	/// The chunk holding line `at` (below the total), and the line's index in it.
+	fun seat(self, at: usize): (usize, usize) {
+		mut low: usize = 0;
+		mut high = self.starts.len();
+		for high - low > 1 {
+			let middle = (low + high) / 2;
+			if self.starts[middle] <= at {
+				low = middle;
+			} else {
+				high = middle;
+			}
+		}
+		(low, at - self.starts[low])
+	}
+
+	/// Recompute the starts of the chunks from `from` on.
+	fun restart(&mut self, from: usize) {
+		for self.starts.len() > from {
+			self.starts.pop();
+		}
+		mut running = if from == 0 {
+			0
+		} else {
+			self.starts[from - 1] + self.chunks[from - 1].len()
+		};
+		mut chunk = from;
+		for chunk < self.chunks.len() {
+			self.starts.push(running);
+			running += self.chunks[chunk].len();
+			chunk += 1;
+		}
+	}
+
+	/// Cut `lines` into chunks of near-equal size, none over the cap.
+	fun cut(self, lines: List<str>): List<List<str>> {
+		let held = lines.len();
+		if held == 0 {
+			ret [];
+		}
+		let pieces = (held + self.cap - 1) / self.cap;
+		let base = held / pieces;
+		let longer = held % pieces;
+		mut out: List<List<str>> = [];
+		mut piece: List<str> = [];
+		mut made: usize = 0;
+		for line in lines {
+			piece.push(line);
+			let size = if made < longer { base + 1 } else { base };
+			if piece.len() == size {
+				out.push(piece);
+				piece = [];
+				made += 1;
+			}
+		}
+		out
+	}
+
+	fun chunk_count(self): usize {
+		self.chunks.len()
+	}
+
+	/// Every chunk within its bounds, and the starts and the total in step.
+	fun balanced(self): bool {
+		mut running: usize = 0;
+		mut chunk: usize = 0;
+		for chunk < self.chunks.len() {
+			let size = self.chunks[chunk].len();
+			if size > self.cap || size == 0 || self.starts[chunk] != running {
+				ret false;
+			}
+			if self.chunks.len() > 1 && size * 2 < self.cap {
+				ret false;
+			}
+			running += size;
+			chunk += 1;
+		}
+		running == self.total && self.starts.len() == self.chunks.len()
+	}
+
+	fun lines(self): List<str> {
+		mut out: List<str> = [];
+		for chunk in self.chunks {
+			out.push_many(chunk);
+		}
+		out
+	}
+}
+
+impl Rope with Indexed<str> {
+	fun count(self): usize {
+		self.total
+	}
+
+	fun item(self, at: usize): Option<str> {
+		if at >= self.total {
+			ret None;
+		}
+		let (chunk, index) = self.seat(at);
+		self.chunks[chunk].get(index)
+	}
+
+	fun lend(self, at: usize, read: |&str| void) {
+		if at >= self.total {
+			ret;
+		}
+		let (chunk, index) = self.seat(at);
+		read(&self.chunks[chunk][index]);
+	}
+}
+
+impl Rope with Resizable<str> {
+	/// The bulk splice: the chunks the span touches are cut again with what
+	/// arrives, together with one neighbour when what is left would be under half
+	/// a chunk (the merge). Every other chunk is untouched.
+	fun splice(&mut self, at: usize, removed: usize, inserted: List<str>) {
+		let start = smaller(at, self.total);
+		let taking = smaller(removed, self.total - start);
+		if taking == 0 && inserted.len() == 0 {
+			ret;
+		}
+		if self.chunks.len() == 0 {
+			self.chunks = self.cut(inserted);
+			self.total = inserted.len();
+			self.restart(0);
+			ret;
+		}
+		// The window of chunks [from, last) the span touches.
+		let (first, offset) = if start < self.total {
+			self.seat(start)
+		} else {
+			(self.chunks.len() - 1, self.chunks[self.chunks.len() - 1].len())
+		};
+		mut from = first;
+		mut last = first + 1;
+		for last < self.chunks.len() && self.starts[last] < start + taking {
+			last += 1;
+		}
+		// head + inserted + tail.
+		mut fresh: List<str> = [];
+		mut index: usize = 0;
+		for index < offset {
+			fresh.push(self.chunks[first][index]);
+			index += 1;
+		}
+		fresh.push_many(inserted);
+		let tail_from = start + taking;
+		let window_end = self.starts[last - 1] + self.chunks[last - 1].len();
+		mut line = tail_from;
+		for line < window_end {
+			let (chunk, inner) = self.seat(line);
+			fresh.push(self.chunks[chunk][inner]);
+			line += 1;
+		}
+		// The merge: a remainder under half a chunk takes in a neighbour.
+		for fresh.len() * 2 < self.cap && (from > 0 || last < self.chunks.len()) {
+			if from > 0 {
+				from -= 1;
+				mut joined = self.chunks[from];
+				joined.push_many(fresh);
+				fresh = joined;
+			} else {
+				fresh.push_many(self.chunks[last]);
+				last += 1;
+			}
+		}
+		let pieces = self.cut(fresh);
+		let consumed = last - from;
+		if pieces.len() > consumed {
+			self.splits += 1;
+		}
+		if pieces.len() < consumed {
+			self.merges += 1;
+		}
+		mut gone: usize = 0;
+		for gone < consumed {
+			self.chunks.remove(from);
+			gone += 1;
+		}
+		mut placed: usize = 0;
+		for piece in pieces {
+			self.chunks.insert(from + placed, piece);
+			placed += 1;
+		}
+		self.total = self.total - taking + inserted.len();
+		self.restart(from);
+	}
+
+	/// One line replaced in place: no chunk is cut.
+	fun put(&mut self, at: usize, value: str) {
+		if at >= self.total {
+			ret;
+		}
+		let (chunk, index) = self.seat(at);
+		self.chunks[chunk][index] = value;
+	}
+
+	fun change(&mut self, at: usize, with: |&mut str| void) {
+		if at >= self.total {
+			ret;
+		}
+		let (chunk, index) = self.seat(at);
+		with(&mut self.chunks[chunk][index]);
+	}
+}
+
+fun lines(prefix: str, count: usize): List<str> {
+	mut out: List<str> = [];
+	mut index: usize = 0;
+	for index < count {
+		out.push(i"{prefix}{index}");
+		index += 1;
+	}
+	out
+}
+
+fun splits_and_merges() {
+	// 20 lines in chunks of at most 8: three chunks.
+	let text = sequence(Rope::new(8, lines("l", 20)));
+	assert(
+		text.peek(|rope| rope.chunk_count()) == 3 && text.peek(|rope| rope.balanced()),
+		"20 lines cut into 3 chunks",
+	);
+	let l5 = text.slot(5);
+	let l17 = text.slot(17);
+	let runs5: Shared<i32> = Shared::new(0);
+	let runs17: Shared<i32> = Shared::new(0);
+	let _a = l5.on_change(|_line| runs5.write() += 1);
+	let _b = l17.on_change(|_line| runs17.write() += 1);
+
+	// A split: 10 lines into the first chunk.
+	text.splice(2, 0, lines("new", 10));
+	assert(text.peek(|rope| rope.splits) == 1, "the insert split a chunk");
+	assert(text.peek(|rope| rope.balanced()), "chunks stay in bounds after the split");
+	assert(l5.at() == Some(15) && l5.get() == Some("l5"), "l5 follows its line through the split");
+	assert(l17.at() == Some(27) && l17.get() == Some("l17"), "l17 follows too");
+	assert(runs5.read() == 0 && runs17.read() == 0, "an insert above wakes neither");
+
+	// A merge: delete most of the text around l5, but not l5.
+	text.splice(3, 11, []);
+	assert(text.peek(|rope| rope.merges) >= 1, "the delete merged chunks");
+	assert(text.peek(|rope| rope.balanced()), "chunks stay in bounds after the merge");
+	assert(l5.at() == Some(4) && l5.get() == Some("l5"), "l5 follows its line through the merge");
+	assert(runs5.read() == 0, "a delete next to l5 does not wake it");
+
+	// A delete over l5 ends its slot; l17 is untouched.
+	text.splice(4, 1, []);
+	assert(l5.get() == None && runs5.read() == 1, "l5 reads None and woke once");
+	assert(l17.get() == Some("l17") && runs17.read() == 0, "l17 did not wake");
+
+	// A write through a slot lands in the rope, in place, wherever the line is.
+	let chunks_before = text.peek(|rope| rope.chunk_count());
+	l17.set("L17");
+	assert(text.all().contains("L17") && runs17.read() == 1, "a slot write lands and wakes once");
+	assert(text.peek(|rope| rope.chunk_count()) == chunks_before, "a one-line write cut no chunk");
+
+	// Deleting everything but the slot's line merges down to one chunk.
+	let held = l17.at().unwrap_or(0);
+	text.splice(held + 1, text.size(), []);
+	text.splice(0, held, []);
+	assert(
+		text.all() == ["L17"] && text.peek(|rope| rope.chunk_count()) == 1,
+		"one line, one chunk",
+	);
+	assert(l17.at() == Some(0) && runs17.read() == 1, "l17 survived every merge, asleep");
+	print("rope: splits and merges kept every slot");
+}
+
+/// Bulk splices of every size at every place, against a plain list: the rope's
+/// own correctness, before anything reactive is asked of it.
+fun random_splices() {
+	mut rope = Rope::new(8, lines("r", 40));
+	mut model = lines("r", 40);
+	mut seed: usize = 11;
+	mut step: usize = 0;
+	for step < 600 {
+		seed = (seed * 75 + 74) % 65537;
+		let at = seed % (model.len() + 1);
+		seed = (seed * 75 + 74) % 65537;
+		let removed = seed % 13;
+		seed = (seed * 75 + 74) % 65537;
+		let arriving = lines(i"s{step}-", seed % 15);
+		rope.splice(at, removed, arriving);
+		model.splice(at, smaller(removed, model.len() - at), arriving);
+		assert(rope.lines() == model, i"step {step}: the rope is the model");
+		assert(rope.balanced(), i"step {step}: the chunks are in bounds");
+		step += 1;
+	}
+	assert(rope.splits > 0 && rope.merges > 0, "the walk split and merged");
+	print("rope: 600 random bulk splices kept the rope whole");
+}
+
+fun the_paste() {
+	let text = sequence(Rope::new(64, lines("l", 300)));
+	let l250 = text.slot(250);
+	let runs: Shared<i32> = Shared::new(0);
+	let _a = l250.on_change(|_line| runs.write() += 1);
+	let seen: Shared<List<Change<usize>>> = Shared::new([]);
+	let befores: Shared<i32> = Shared::new(0);
+	let _tap = text.tap(|_change| befores.write() += 1, |change, _stage: Stage| seen
+		.write()
+		.push(change));
+	let whole: Shared<i32> = Shared::new(0);
+	let lengths: Shared<i32> = Shared::new(0);
+	let _w = text.on_change(|_rope| whole.write() += 1);
+	let _l = text.length().on_change(|_n| lengths.write() += 1);
+	let rows = text.rows();
+	let row_cursor = rows.cursor();
+	let calls: Shared<i32> = Shared::new(0);
+	let widths = text
+		.items()
+		.map(|line| {
+			calls.write() += 1;
+			line.len()
+		})
+		.memo();
+	let by_line = text.index_by(|line| *line);
+	assert(calls.read() == 300 && rows.get().len() == 300, "the feeds seeded 300 lines");
+
+	text.splice(1, 0, lines("paste", 5000));
+	assert(seen.read() == [Change::Splice(1usize, 0usize, 5000usize)], "the paste is ONE change");
+	assert(befores.read() == 1, "the tap's before ran once");
+	assert(
+		text.size() == 5300 && text.peek(|rope| rope.balanced()),
+		"5,000 lines arrived, chunks in bounds",
+	);
+	assert(
+		l250.at() == Some(5250) && l250.get() == Some("l250") && runs.read() == 0,
+		"l250 moved by 5,000 asleep",
+	);
+	assert(
+		whole.read() == 1 && lengths.read() == 1,
+		"the whole value and the length woke once each",
+	);
+	let row_ops = rows.since(row_cursor);
+	assert(
+		row_ops.len() == 1
+			&& row_ops[0] is SeqOp::Splice(let row_at, let _gone, let arrived)
+			&& row_at == 1
+			&& arrived.len() == 5000,
+		"rows(): one op with 5,000 rows",
+	);
+	assert(
+		calls.read() == 5300 && widths.get().len() == 5300,
+		"items(): the map ran for the 5,000 arrivals alone",
+	);
+	assert(
+		by_line.find("paste4999").map(|slot| slot.at()) == Some(Some(5000)),
+		"index_by found the last pasted line",
+	);
+	assert(
+		by_line.find("l250").map(|slot| slot == l250) == Some(true),
+		"and the index's slot is l250's own",
+	);
+
+	// Cutting the paste out again is one change too, and the rows and the
+	// index let the lines go.
+	text.splice(1, 5000, []);
+	assert(
+		seen.read().len() == 2 && text.size() == 300 && text.peek(|rope| rope.balanced()),
+		"the cut is one change",
+	);
+	assert(
+		rows.get().len() == 300 && widths.get().len() == 300 && by_line.find("paste0") == None,
+		"the feeds followed the cut",
+	);
+	assert(l250.at() == Some(250) && runs.read() == 0, "l250 is back, asleep");
+	rows.release();
+	by_line.release();
+	print("rope: a 5000-line paste is one change");
+}
+
+/// The measurements: a 5,000-line paste into 20,000 lines with `rows()`, a
+/// `map` over `items()` and an index attached, then 2,000 single-line edits
+/// under the same, checked against a plain list at the end.
+fun timings() {
+	let text = sequence(Rope::new(64, lines("b", 20000)));
+	let rows = text.rows();
+	let widths = text.items().map(|line| line.len()).memo();
+	let by_line = text.index_by(|line| *line);
+	let pasted = lines("p", 5000);
+	let paste_start = now_millis();
+	text.splice(10000, 0, pasted);
+	let paste_ms = now_millis() - paste_start;
+	assert(
+		text.size() == 25000 && rows.get().len() == 25000 && widths.get().len() == 25000,
+		"the paste landed everywhere",
+	);
+
+	mut model = text.all();
+	mut seed: usize = 7;
+	mut step: usize = 0;
+	let edits_start = now_millis();
+	for step < 2000 {
+		seed = (seed * 75 + 74) % 65537;
+		let at = seed % text.size();
+		let kind = step % 3;
+		if kind == 0 {
+			text.insert_at(at, i"edit{step}");
+			model.insert(at, i"edit{step}");
+		} else if kind == 1 {
+			text.replace(at, i"set{step}");
+			model[at] = i"set{step}";
+		} else {
+			text.remove_at(at);
+			model.remove(at);
+		}
+		step += 1;
+	}
+	let edits_ms = now_millis() - edits_start;
+	assert(text.all() == model, "2,000 edits: the rope is the model");
+	assert(text.peek(|rope| rope.balanced()), "and its chunks are in bounds");
+	assert(
+		rows.get().len() == model.len() && widths.get().len() == model.len(),
+		"the rows and the map followed every edit",
+	);
+	assert(model.contains("edit1998"), "the walk kept its next-to-last insert");
+	assert(
+		by_line.find("edit1998").map(|slot| slot.get()) == Some(Some("edit1998")),
+		"the index followed",
+	);
+	rows.release();
+	by_line.release();
+	print(i"rope timing: a 5000-line paste into 20000 lines with rows, a map and an index attached: {paste_ms} ms");
+	print(i"rope timing: 2000 single-line edits under the same: {edits_ms} ms");
+}
+
+fun main() {
+	random_splices();
+	splits_and_merges();
+	the_paste();
+	timings();
+	print("rope: all passed");
+}

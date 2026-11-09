@@ -1,0 +1,178 @@
+// `std::reactive::lens` (A185 S2): the READ-ONLY sequence shape. A sorted index
+// decides where an item lands, so it implements `Indexed` and not `Resizable`:
+// its lens (`indexed(..)`) has slots, parts, `rows()`, `items()`, `length()` and
+// `index_by`, and is written only through `update` and `plan`, beside the
+// mutator that knows where the item went. (That it has no `splice` is a build
+// failure, pinned by `reactive_lens.rs`.)
+import std::io::assert;
+import std::reactive::lens::{ Change, Indexed, SequenceLens, indexed };
+import std::reactive::{ CollFlow, CollPipe, DeltaSource, SeqOp, Source };
+import std::shared::Shared;
+
+/// Numbers kept in order. No reactive code: the structure's mutators return the
+/// changes they made (§4.2), because only the structure knows where an item
+/// landed.
+struct SortedIndex {
+	items: List<i32>,
+}
+
+impl SortedIndex {
+	/// Where `value` goes: after every item not greater than it.
+	fun place(self, value: i32): usize {
+		mut low: usize = 0;
+		mut high = self.items.len();
+		for low < high {
+			let middle = (low + high) / 2;
+			if self.items[middle] <= value {
+				low = middle + 1;
+			} else {
+				high = middle;
+			}
+		}
+		low
+	}
+
+	fun insert(&mut self, value: i32): Change<usize> {
+		let at = self.place(value);
+		self.items.insert(at, value);
+		Change::Insert(at, 1)
+	}
+
+	/// Where `value` is held, if it is.
+	fun position(self, value: i32): Option<usize> {
+		let at = self.place(value);
+		if at == 0 || self.items[at - 1] != value {
+			ret None;
+		}
+		Some(at - 1)
+	}
+
+	fun remove_at(&mut self, at: usize) {
+		self.items.remove(at);
+	}
+
+	/// The item at `at` takes a new value and moves to keep the order. The same
+	/// item: a `Move` then a `Replace`, so a slot on it survives.
+	fun reprice(&mut self, at: usize, value: i32): List<Change<usize>> {
+		self.items.remove(at);
+		let to = self.place(value);
+		self.items.insert(to, value);
+		if to == at {
+			ret [Change::Replace(at)];
+		}
+		[Change::Move(at, to), Change::Replace(to)]
+	}
+}
+
+impl SortedIndex with Indexed<i32> {
+	fun count(self): usize {
+		self.items.len()
+	}
+
+	fun item(self, at: usize): Option<i32> {
+		self.items.get(at)
+	}
+}
+
+fun ordered(values: List<i32>): bool {
+	mut at: usize = 1;
+	for at < values.len() {
+		if values[at - 1] > values[at] {
+			ret false;
+		}
+		at += 1;
+	}
+	true
+}
+
+fun main() {
+	let index = indexed(SortedIndex { items = [10, 20, 30, 40] });
+	let thirty = index.slot(2);
+	let thirty_runs: Shared<i32> = Shared::new(0);
+	let _a = thirty.on_change(|_v| thirty_runs.write() += 1);
+	let lengths: Shared<i32> = Shared::new(0);
+	let _l = index.length().on_change(|_n| lengths.write() += 1);
+	let calls: Shared<i32> = Shared::new(0);
+	let doubled = index
+		.items()
+		.map(|value| {
+			calls.write() += 1;
+			value * 2
+		})
+		.memo();
+	let rows = index.rows();
+	let row_cursor = rows.cursor();
+	let by_value = index.index_by(|value| *value);
+	assert(calls.read() == 4 && rows.get().len() == 4, "the feeds seeded four");
+
+	// The structure decides where 25 goes and says so: through `update`, one
+	// change and one op.
+	index.update(|held| (void, [held.insert(25)]));
+	assert(index.all() == [10, 20, 25, 30, 40], "25 landed in order");
+	assert(thirty.at() == Some(3) && thirty_runs.read() == 0, "the slot on 30 moved to 3 silently");
+	assert(lengths.read() == 1 && index.length().get() == 5, "the length woke once");
+	assert(calls.read() == 5 && doubled.get() == [20, 40, 50, 60, 80], "the map ran for 25 alone");
+	let row_ops = rows.since(row_cursor);
+	assert(
+		row_ops.len() == 1
+			&& row_ops[0] is SeqOp::Splice(let row_at, let _gone, let arrived)
+			&& row_at == 2
+			&& arrived.len() == 1,
+		"one row arrived at 2",
+	);
+	assert(by_value.find(25).map(|slot| slot.at()) == Some(Some(2)), "the index found 25 at 2");
+	assert(by_value.find(30).map(|slot| slot.at()) == Some(Some(3)), "and 30 at 3");
+
+	// A delete the caller can locate first goes through `plan`: exact, so the map
+	// hears what left without re-running anything.
+	let before_delete = calls.read();
+	let twenty = index.peek(|held| held.position(20)).unwrap_or(99);
+	index.plan(Change::Delete(twenty, 1usize), |held| held.remove_at(twenty));
+	assert(index.all() == [10, 25, 30, 40], "20 left");
+	assert(
+		calls.read() == before_delete && doubled.get() == [20, 50, 60, 80],
+		"the map dropped 40 without a run",
+	);
+	assert(
+		by_value.find(20) == None && by_value.find(40).map(|slot| slot.at()) == Some(Some(3)),
+		"the index let 20 go",
+	);
+
+	// 30 becomes 5: the item moves to the front, and its slot goes with it.
+	let at = thirty.at().unwrap_or(99);
+	index.update(|held| (void, held.reprice(at, 5)));
+	assert(index.all() == [5, 10, 25, 40] && ordered(index.all()), "repriced and still in order");
+	assert(
+		thirty.at() == Some(0) && thirty.get() == Some(5) && thirty_runs.read() == 1,
+		"the slot followed its item and woke once",
+	);
+	assert(
+		doubled.get() == [10, 20, 50, 80],
+		"the map is right (two changes in one update reach it as one reset)",
+	);
+	assert(rows.get()[0] == thirty, "the row followed its item to the front");
+	assert(
+		by_value.find(5).map(|slot| slot.at()) == Some(Some(0)) && by_value.find(30) == None,
+		"the index re-keyed it",
+	);
+
+	// A part of an item, as on any sequence lens.
+	let first_digit = index.slot(3).part("tens", |value| *value / 10);
+	assert(first_digit.get() == Some(4), "a part reads through the read-only shape");
+
+	// The wrapper (R10) over the same shape.
+	let wrapped = SequenceLens::indexed(SortedIndex { items = [1, 3] });
+	assert(wrapped.length().get() == 2 && wrapped.all() == [1, 3], "the wrapper reads");
+	let wrapped_rows = wrapped.rows();
+	wrapped.update(|held| (void, [held.insert(2)]));
+	assert(wrapped_rows.get().len() == 3, "the wrapper's rows follow an update");
+	wrapped_rows.release();
+	rows.release();
+	by_value.release();
+	assert(
+		index.tapped() == 1,
+		"released, the rows and the index let their taps go; the value feed keeps its own",
+	);
+
+	print("sorted: all passed");
+}

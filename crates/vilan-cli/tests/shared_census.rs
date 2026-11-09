@@ -155,6 +155,45 @@ const CENSUS: &[(&str, usize, &str)] = &[
          a `KeySlots`, counted in `hash_map_cell.vl`)",
     ),
     (
+        "reactive/lens.vl",
+        10,
+        "E + O (A185 S1, S3's slim path). E, minted by the lens and reached \
+         through every copy of its handle, every slot and every feed: a lens's \
+         three (`lens_over`: the CORE every handle is a pointer to, holding the \
+         storage, the access, the one notification, the tap list, the next tap \
+         id and the truth check; the WATCH, holding the handler with its slot \
+         table, each slot's entry by id and the length's and positions' cells, \
+         kept apart from the core because the taps capture it and the core holds \
+         the taps; and, for `Lens::over`, the structure itself, which a nested \
+         lens reaches through a `Port` instead), `index_by`'s map from key to \
+         slot id (written by its tap, read by `KeyIndex::find` and its release) \
+         and `rows()`'s slot ids in order (written by its tap, read by \
+         `LensRows`). O, a feed's tap state, released with the feed (its owner, \
+         or `release()`): `items()`'s three (what is about to leave, the runs of \
+         moves a write gathers, the moves of a run still to skip), `index_by`'s \
+         keys about to leave, and `entries()`'s value about to leave. S3 folded \
+         S1's six per lens into the core and the watch and a slot's two \
+         (`fresh_cells`) into its entry in the watch's table, so a slot costs \
+         no cell until something listens. The frame-scoped out-values of a lent \
+         read (`peek_storage`, `update`, `plan`, a part's `get`, the index's \
+         `key_at`) are `mut` locals their closure writes, not cells.",
+    ),
+    (
+        "reactive/lens/loaded.vl",
+        11,
+        "E + O (A185 S5). E, minted by a constructor and reached through every \
+         copy of its handle: the overlay's LEDGER, five (the entries by row key, \
+         their opening order, each pending proposal's row, each row's cells, the \
+         next proposal id), which `view`'s and `rows()`'s derive bodies, \
+         `Loaded` and the server's answer all reach; `Loaded`'s two (the claims \
+         by token, and the nurseries of the tasks it started, which `fetch` \
+         writes and the owner's `retire` cancels); `LoadedMap`'s three (each \
+         key's phase cell, each key's claim, the next token). O, `follow`'s \
+         token of the reply it is waiting for, written and read by the \
+         subscription's observer across runs and released with the \
+         subscription's owner",
+    ),
+    (
         "reactive/store_core.vl",
         7,
         "E: a store's cells, all minted by the store and reached through every \
@@ -375,7 +414,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 258,
+        total, 279,
         "the total number of `Shared` construction sites in std changed"
     );
 

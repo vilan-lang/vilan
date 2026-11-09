@@ -64,6 +64,20 @@ const EXCLUDED: &[(&str, &str)] = &[
          evaluator has no typed array; the JS and native backends are the \
          program's two observers (F33)",
     ),
+    (
+        "lens-fuzz.vl",
+        "fuel, not a capability: the walk is 9,000 seeded writes over a list of \
+         about a thousand items, each checked against a model, which exhausts the \
+         50M-step budget every program here shares; the other four lens programs \
+         run both ways, and `vilan-cli/tests/reactive_lens.rs` runs this one under \
+         node and reads its exit code (A185 S1)",
+    ),
+    (
+        "lens-loaded-tasks.vl",
+        "async + host timers (real tasks: `sleep` polls, nurseries cancelled) — \
+         `vilan-cli/tests/reactive_lens.rs` runs it under node and reads its exit \
+         code (A185 S5)",
+    ),
     ("async-await.vl", "async"),
     ("async-promise-all.vl", "async"),
     (
@@ -99,6 +113,12 @@ const EXCLUDED: &[(&str, &str)] = &[
     (
         "file.vl",
         "async + host filesystem (`node:fs/promises` handles)",
+    ),
+    (
+        "lens-rope.vl",
+        "host clock (`Date.now`): the exhibit prints its own timings; \
+         `vilan-cli/tests/reactive_lens.rs` runs it under node and reads every \
+         other line exactly (A185 S2)",
     ),
     (
         "time.vl",

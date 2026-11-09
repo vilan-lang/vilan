@@ -247,6 +247,77 @@ fn r15_a_guards_binding_reaches_the_rest_of_the_block() {
     );
 }
 
+/// B709: every guard whose captures reach past it is RECORDED, by its `if`,
+/// with the path its continuation runs on — the record a backend with lexical
+/// bindings restructures the guard by (the Rust emitter's `let … else`). Both
+/// publishing forms, each divergence leaf a statement guard takes, a chain,
+/// a guard in a closure; and the guards that publish NOTHING are not recorded:
+/// a non-diverging `else`, the keyword `if` with an empty then-block, and a
+/// guard whose test captures nothing.
+#[test]
+fn b709_a_published_guard_is_recorded_with_its_continuation_path() {
+    use vilan_core::analyzer::ContinuationPath::{WhenFalse, WhenTrue};
+    let recorded = guard_continuations(
+        r#"
+        import std::io::{ panic, print };
+
+        fun guards(found: Option<i32>, other: Option<i32>, pair: Option<(i32, i32)>) {
+            for x in [found, other] {
+                x is Some(let skipped) else jump continue;
+                x is Some(let stopped) else jump break;
+                print(skipped + stopped);
+            }
+            pair is Some((let a, let b)) else ret;
+            found is Some(let n) && other is Some(let m) else ret;
+            found is Some(let shown) then print(shown) else panic("none");
+            if !(found is Some(let negated)) {
+                ret;
+            }
+            let inner = |value: Option<i32>| {
+                value is Some(let held) else ret;
+                print(held);
+            };
+            inner(found);
+            print(a + b + n + m + shown + negated);
+        }
+
+        fun publishes_nothing(found: Option<i32>) {
+            found is Some(let n) else print("none");
+            if found is Some(let k) {} else { ret; }
+            found is None else ret;
+            if !(found is None) {
+                ret;
+            }
+        }
+
+        fun main() {
+            guards(Some(1), Some(2), Some((3, 4)));
+            publishes_nothing(None);
+        }
+        main();
+        "#,
+    );
+    let expected: Vec<(String, _)> = [
+        ("x is Some(let skipped) else jump continue", WhenTrue),
+        ("x is Some(let stopped) else jump break", WhenTrue),
+        ("pair is Some((let a, let b)) else ret", WhenTrue),
+        (
+            "found is Some(let n) && other is Some(let m) else ret",
+            WhenTrue,
+        ),
+        (
+            "found is Some(let shown) then print(shown) else panic(\"none\")",
+            WhenTrue,
+        ),
+        ("if !(found is Some(let negated)) {", WhenFalse),
+        ("value is Some(let held) else ret", WhenTrue),
+    ]
+    .into_iter()
+    .map(|(text, path)| (text.to_string(), path))
+    .collect();
+    assert_eq!(recorded, expected);
+}
+
 /// A NON-diverging `else` proves nothing about the path past the statement:
 /// the capture stays the then-block's (B171), and a read after it misses.
 #[test]
