@@ -264,4 +264,6 @@ fun main() {
   `confirm_with` names it (above).
 - **Not a stale arm.** std's `TransientState` has none; a dropped connection is
   `Failed(error, Some(token))`.
-- **JS only, for now**, like the lens (tracker B709).
+- **JS only, for now.** The lens itself builds natively; this module's
+  generic `open` and `compose` do not yet (the native backend refuses them by
+  name).

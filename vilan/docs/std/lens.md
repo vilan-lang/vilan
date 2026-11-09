@@ -576,6 +576,7 @@ handle: it follows nothing from then on, and a new ask makes a new slot.
   about what a `ListCell`'s do. It still holds more memory than a `ListCell`
   (about twice, for a small list): its handle, its access closures and its
   empty tables.
-- **JS only, for now.** The native backend does not build a program that uses
-  the lens yet: it drops the binding of a `.. is Some(let at) else ret;` guard
-  (tracker B709).
+- **Native, with one gap.** A program over the lens builds on the native
+  backend and prints what node prints (since B709). Its cells are not all
+  released there yet: a lens program ends with counted cells still live, a
+  cycle a counted cell cannot break where JS's collector does.
