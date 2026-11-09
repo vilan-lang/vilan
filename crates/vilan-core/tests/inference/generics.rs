@@ -11213,3 +11213,188 @@ fn b659_a_literal_tail_takes_the_rets_numeric_type() {
         "this `ret` returns str, but the closure's body yields i32",
     );
 }
+
+// --- B713: a hoisted temp belongs to its statement, not to its expression ----
+//
+// A compound assignment through an impure subscript evaluates the subscript once
+// into a temp both halves of `x = x op v` name (B105). The temp was recorded by
+// EXPRESSION ID and never taken out, and one id is emitted once per instantiation
+// of a generic body and once per impl inheriting a default method — so the second
+// emission's hoist read the first's temp (`const $c = $b;`, `$b` declared in
+// another function) and threw a `ReferenceError`. Each shape: its run, and the
+// emission's own temps.
+
+/// Every generated `$name` a top-level function of `js` reads is one it
+/// declares itself — a temp minted in another function is the B713 shape. The
+/// emission is split at the column-zero `function ` headers, which is how the
+/// transformer prints them.
+fn assert_every_temp_is_declared_where_it_is_read(js: &str) {
+    let mut functions: Vec<String> = Vec::new();
+    for line in js.lines() {
+        if line.starts_with("function ") || line.starts_with("async function ") {
+            functions.push(String::new());
+        }
+        if let Some(function) = functions.last_mut() {
+            function.push_str(line);
+            function.push('\n');
+        }
+    }
+    let mut checked = 0;
+    for function in &functions {
+        let names: Vec<&str> = function
+            .split(|character: char| {
+                !(character.is_ascii_alphanumeric() || character == '$' || character == '_')
+            })
+            .filter(|word| word.len() > 1 && word.starts_with('$'))
+            .collect();
+        for name in names {
+            let declared = ["const ", "let "]
+                .iter()
+                .any(|keyword| function.contains(&format!("{keyword}{name} ")));
+            assert!(
+                declared,
+                "`{name}` is read where it is never declared:\n{function}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 0,
+        "no generated temp was read at all — the check passed vacuously:\n{js}"
+    );
+}
+
+const B713_TABLE: &str = r#"
+    import std::shared::Shared;
+    struct Table<H> { cells: List<Cell>, handler: H }
+    struct Cell { users: i32 }
+    fun table<H>(handler: H): Shared<Table<H>> {
+        Shared::new(Table { cells = [Cell { users = 0 }, Cell { users = 0 }], handler })
+    }
+"#;
+
+#[test]
+fn b713_two_instantiations_of_a_generic_each_declare_their_hoisted_index() {
+    // The filed repro: one generic, two instantiations, both run.
+    let source = format!(
+        "{B713_TABLE}
+        fun bump<H>(table: Shared<Table<H>>, id: i32) {{
+            table.write().cells[id.as_usize()].users += 1;
+        }}
+        fun main() {{
+            let a = table(1);
+            let b = table(\"x\");
+            bump(a, 0);
+            bump(b, 1);
+            print(i\"{{a.read().cells[0].users}} {{b.read().cells[1].users}}\");
+        }}
+        "
+    );
+    let js =
+        compile(&source).unwrap_or_else(|errors| panic!("expected a clean compile: {errors:#?}"));
+    // The two instantiations render identically once each declares its own
+    // temp, so the second joins the first (`push_or_share`). Under the defect
+    // the second read the first's temp, rendered differently, and was emitted
+    // as `bump2` — so the share is itself the emission's half of the claim.
+    assert!(
+        !js.contains("function bump2("),
+        "the second instantiation renders differently from the first:\n{js}"
+    );
+    assert_every_temp_is_declared_where_it_is_read(&js);
+    assert_compiles_and_runs(&source, "1 1\n");
+}
+
+#[test]
+fn b713_a_closure_in_a_generic_declares_its_hoisted_index_per_instantiation() {
+    let source = format!(
+        "{B713_TABLE}
+        fun bump_later<H>(table: Shared<Table<H>>, id: i32): || void {{
+            || {{
+                table.write().cells[id.as_usize()].users += 10;
+            }}
+        }}
+        fun main() {{
+            let a = table(1);
+            let b = table(\"x\");
+            let later_a = bump_later(a, 1);
+            let later_b = bump_later(b, 0);
+            later_a();
+            later_b();
+            print(i\"{{a.read().cells[1].users}} {{b.read().cells[0].users}}\");
+        }}
+        "
+    );
+    let js =
+        compile(&source).unwrap_or_else(|errors| panic!("expected a clean compile: {errors:#?}"));
+    assert_every_temp_is_declared_where_it_is_read(&js);
+    assert_compiles_and_runs(&source, "10 10\n");
+}
+
+#[test]
+fn b713_every_hoist_of_a_nested_target_is_per_instantiation() {
+    // Two subscripts in one place, each its own temp, root first — in both
+    // emissions, and the second's do not alias the first's.
+    let source = r#"
+        import std::shared::Shared;
+        fun bump_grid<T>(grid: Shared<List<List<i32>>>, tag: T, row: i32, column: i32) {
+            grid.write()[row.as_usize()][column.as_usize()] += 100;
+        }
+        fun main() {
+            let grid: Shared<List<List<i32>>> = Shared::new([[1, 2], [3, 4]]);
+            bump_grid(grid, 1, 0, 1);
+            bump_grid(grid, "y", 1, 0);
+            print(i"{grid.read()[0][1]} {grid.read()[1][0]}");
+        }
+    "#;
+    let js =
+        compile(source).unwrap_or_else(|errors| panic!("expected a clean compile: {errors:#?}"));
+    assert_every_temp_is_declared_where_it_is_read(&js);
+    assert_compiles_and_runs(source, "102 103\n");
+}
+
+#[test]
+fn b713_a_default_method_declares_its_hoisted_index_in_every_impl() {
+    // A default method's body is emitted once per implementing type: the same
+    // expression ids, two functions.
+    let source = r#"
+        import std::shared::Shared;
+        struct Cell { users: i32 }
+        trait Bumps {
+            fun table(self): Shared<List<Cell>>;
+            fun bump_at(self, id: i32) {
+                self.table().write()[id.as_usize()].users += 1000;
+            }
+        }
+        struct One { cells: Shared<List<Cell>> }
+        struct Two { cells: Shared<List<Cell>>, name: str }
+        impl One with Bumps {
+            fun table(self): Shared<List<Cell>> { self.cells }
+        }
+        impl Two with Bumps {
+            fun table(self): Shared<List<Cell>> { self.cells }
+        }
+        fun main() {
+            let one = One { cells = Shared::new([Cell { users = 0 }]) };
+            let two = Two { cells = Shared::new([Cell { users = 0 }]), name = "two" };
+            one.bump_at(0);
+            two.bump_at(0);
+            print(i"{one.cells.read()[0].users} {two.cells.read()[0].users} {two.name}");
+        }
+    "#;
+    let js =
+        compile(source).unwrap_or_else(|errors| panic!("expected a clean compile: {errors:#?}"));
+    assert_every_temp_is_declared_where_it_is_read(&js);
+    assert_compiles_and_runs(source, "1000 1000 two\n");
+}
+
+#[test]
+fn b713_the_corpus_program_prints_what_it_claims() {
+    // The corpus byte gate holds `vilan/test/b713.vl`'s emission and the
+    // differentials compare two builds' output with each other — neither reads
+    // what it prints, and a program that threw identically in both builds passes
+    // both. Its output is asserted here.
+    assert_compiles_and_runs(
+        include_str!("../../../../vilan/test/b713.vl"),
+        "generic: 1 1\nclosure: 10 10\nnested: 102 103\ndefault method: 1000 1000 two\n",
+    );
+}
