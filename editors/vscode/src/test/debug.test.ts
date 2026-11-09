@@ -286,3 +286,53 @@ test('package.json contributes the vilan debugger and vilan breakpoints', () => 
         assert.equal(resolveAdapterLaunch({ ...snippet.body, program: '/work/app' }, CONTEXT).ok, true);
     }
 });
+
+const GENERIC = {
+    preLaunchTask: 'desktop: dev',
+    postDebugTask: 'desktop: stop',
+    presentation: { hidden: false, order: 2 },
+    internalConsoleOptions: 'neverOpen',
+};
+
+// E361: VS Code reads its generic attributes from the RESOLVED configuration.
+test('the generic attributes survive both resolutions', () => {
+    const configuration = {
+        type: 'vilan',
+        request: 'launch',
+        program: '/work/app/src/main.vl',
+        ...GENERIC,
+    };
+    const dap = resolveAdapterLaunch(configuration, CONTEXT);
+    assert.ok(dap.ok);
+    const js = resolveAdapterLaunch({ ...configuration, adapter: 'js-debug' }, CONTEXT);
+    assert.ok(js.ok);
+    for (const outcome of [dap, js, { ok: true as const, configuration: resolved(configuration) }]) {
+        assert.ok(outcome.ok);
+        for (const [key, value] of Object.entries(GENERIC)) {
+            assert.deepEqual(outcome.configuration[key], value, key);
+        }
+    }
+});
+
+test('the extension\'s own fields win over a user-supplied value', () => {
+    const configuration = {
+        type: 'vilan',
+        request: 'launch',
+        program: '/work/app/src/main.vl',
+        port: 1,
+        runtimeExecutable: 'evil',
+        sourceMaps: false,
+        ...GENERIC,
+    };
+    const dap = resolveAdapterLaunch(configuration, CONTEXT);
+    assert.ok(dap.ok);
+    assert.equal(dap.configuration.port, CONTEXT.port);
+    assert.equal(dap.configuration.type, 'vilan');
+    const js = resolved(configuration);
+    assert.equal(js.type, 'node');
+    assert.equal(js.runtimeExecutable, CONTEXT.vilan);
+    assert.equal(js.sourceMaps, true);
+    // The vilan-only fields do not reach node as a second program.
+    assert.equal(js.program, undefined);
+    assert.equal(js.args, undefined);
+});

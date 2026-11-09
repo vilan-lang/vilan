@@ -76,6 +76,23 @@ export type Resolved =
 /// own default.
 export const INSPECT_HOST = '127.0.0.1';
 
+/// The attributes of a launch configuration the extension does not own, for
+/// the resolved one to carry on: VS Code reads its generic attributes
+/// (`preLaunchTask`, `postDebugTask`, `presentation`, `serverReadyAction`, ...)
+/// from the RESOLVED configuration, so a configuration built from a fixed field
+/// list silently drops them (E361). `exclude` names the fields that must not
+/// pass through; the caller's own fields are written after the spread.
+function passThrough(
+    configuration: VilanLaunchConfiguration,
+    exclude: string[],
+): Record<string, unknown> {
+    const rest: Record<string, unknown> = { ...configuration };
+    for (const key of exclude) {
+        delete rest[key];
+    }
+    return rest;
+}
+
 /// Resolves a `vilan` launch configuration for vilan-dap (an empty one — F5
 /// with no `launch.json` — debugs the active `.vl` file): the configuration
 /// stays a `vilan` one, completed with what the adapter needs to start the
@@ -110,6 +127,7 @@ export function resolveAdapterLaunch(
         };
     }
     const resolved: Record<string, unknown> = {
+        ...passThrough(configuration, ['vilanPath']),
         type: 'vilan',
         request: 'launch',
         name: configuration.name ?? 'Debug vilan program',
@@ -167,6 +185,17 @@ export function resolveLaunch(
         ...context.stdDirectories.map((directory) => `${trimSlash(directory)}/**`),
     ];
     const resolved: Record<string, unknown> = {
+        // The vilan-only fields name the program for `vilan run`, which the
+        // runtime arguments above carry; handed to node they would be a second
+        // `program`/`args`/`entry` and an unknown `adapter`.
+        ...passThrough(configuration, [
+            'program',
+            'args',
+            'entry',
+            'watch',
+            'vilanPath',
+            'adapter',
+        ]),
         type: 'node',
         request: 'launch',
         name: configuration.name ?? 'Debug vilan program',
