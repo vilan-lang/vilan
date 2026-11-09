@@ -194,11 +194,7 @@ impl Statement {
         self.database.with(|connection| {
             let bound = bind(parameters);
             let mut statement = connection.prepare_cached(&self.sql)?;
-            let names: Vec<Str> = statement
-                .column_names()
-                .into_iter()
-                .map(str_new)
-                .collect::<Vec<_>>();
+            let names: Vec<Str> = statement.column_names().map(str_new).collect::<Vec<_>>();
             let mut rows = statement.query(rusqlite::params_from_iter(bound.iter()))?;
             let mut out = Vec::new();
             while let Some(row) = rows.next()? {
