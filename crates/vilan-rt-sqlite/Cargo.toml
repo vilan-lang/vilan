@@ -23,7 +23,7 @@ publish = false
 
 [dependencies]
 vilan-rt = { path = "../vilan-rt" }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # The workspace clippy exception list (root Cargo.toml, backlog N21).
 [lints]

@@ -371,7 +371,7 @@ DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: libsqlite3-sys 0.35.0, rusqlite 0.37.0
+Covers: libsqlite3-sys 0.39.1, rusqlite 0.41.1
 
 Copyright (c) 2014 The rusqlite developers
 
@@ -597,7 +597,7 @@ DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: hashbrown 0.14.5, hashbrown 0.15.5, hashbrown 0.17.1
+Covers: hashbrown 0.14.5, hashbrown 0.17.1
 
 Copyright (c) 2016 Amanieu d'Antras
 
@@ -1603,7 +1603,34 @@ SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: vilan-cli 0.53.1, vilan-core 0.53.1, vilan-embedded 0.53.1, vilan-ide 0.53.1, vilan-image 0.53.1, vilan-image-wasm 0.53.1, vilan-lsp 0.53.1, vilan-rt 0.53.1, vilan-rt-crypto 0.53.1, vilan-rt-image 0.53.1, vilan-rt-signal 0.53.1, vilan-rt-sqlite 0.53.1, vilan-rt-term 0.53.1, vilan-rust 0.53.1, vilan-wasm 0.53.1, block2 0.6.2, dispatch2 0.3.1, objc2-encode 4.1.0, objc2 0.6.4, r-efi 5.3.0, tower-lsp-macros 0.9.0, windows-link 0.2.1, windows-sys 0.61.2
+Covers: sqlite-wasm-rs 0.6.2
+
+MIT License
+
+Copyright (c) 2024 Spxg
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+MIT License
+
+Covers: vilan-cli 0.54.0, vilan-core 0.54.0, vilan-embedded 0.54.0, vilan-ide 0.54.0, vilan-image 0.54.0, vilan-image-wasm 0.54.0, vilan-lsp 0.54.0, vilan-rt 0.54.0, vilan-rt-crypto 0.54.0, vilan-rt-image 0.54.0, vilan-rt-signal 0.54.0, vilan-rt-sqlite 0.54.0, vilan-rt-term 0.54.0, vilan-rust 0.54.0, vilan-wasm 0.54.0, block2 0.6.2, dispatch2 0.3.1, objc2-encode 4.1.0, objc2 0.6.4, r-efi 5.3.0, rsqlite-vfs 0.2.0, tower-lsp-macros 0.9.0, windows-link 0.2.1, windows-sys 0.61.2
 
 MIT License
 
@@ -1770,7 +1797,7 @@ DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: adler2 2.0.1, async-trait 0.1.89, ctrlc 3.5.2, displaydoc 0.2.6, itoa 1.0.18, once_cell 1.21.4, pin-project-internal 1.1.13, pin-project-lite 0.2.17, pin-project 1.1.13, proc-macro2 1.0.106, quote 1.0.45, rustversion 1.0.23, serde 1.0.228, serde_core 1.0.228, serde_derive 1.0.228, serde_json 1.0.150, serde_repr 0.1.20, syn 2.0.117, unicode-ident 1.0.24, wasip2 1.0.4+wasi-0.2.12, wit-bindgen 0.57.1, zmij 1.0.21
+Covers: adler2 2.0.1, async-trait 0.1.89, ctrlc 3.5.2, displaydoc 0.2.6, itoa 1.0.18, once_cell 1.21.4, pin-project-internal 1.1.13, pin-project-lite 0.2.17, pin-project 1.1.13, proc-macro2 1.0.106, quote 1.0.45, rustversion 1.0.23, serde 1.0.228, serde_core 1.0.228, serde_derive 1.0.228, serde_json 1.0.150, serde_repr 0.1.20, syn 2.0.117, syn 3.0.10, thiserror-impl 2.0.21, thiserror 2.0.21, unicode-ident 1.0.24, wasip2 1.0.4+wasi-0.2.12, wit-bindgen 0.57.1, zmij 1.0.21
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -2179,7 +2206,7 @@ THE SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: hashlink 0.10.0
+Covers: hashlink 0.12.2
 
 This work is derived in part from the `linked-hash-map` crate, Copyright (c)
 2015 The Rust Project Developers
@@ -2307,7 +2334,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 --------------------------------------------------------------------------------
 zlib License
 
-Covers: foldhash 0.1.5
+Covers: foldhash 0.2.0
 
 Copyright (c) 2024 Orson Peters
 
