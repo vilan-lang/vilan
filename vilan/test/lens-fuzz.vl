@@ -18,8 +18,10 @@ struct Random {
 impl Random {
 	/// The next number in 0..below.
 	fun next(&mut self, below: usize): usize {
-		// A small linear congruential step, kept inside 31 bits.
-		self.state = (self.state * 1103 + 12345) % 2147483;
+		// A small linear congruential step. The state stays under 65,521, so the
+		// product stays under 2^27: no i32 overflow on any backend (B709's lane
+		// found the first modulus, 2,147,483, let the product pass 2^31).
+		self.state = (self.state * 1103 + 12345) % 65521;
 		if self.state < 0 {
 			self.state = -self.state;
 		}

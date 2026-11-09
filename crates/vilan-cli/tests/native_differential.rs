@@ -1134,20 +1134,10 @@ const DEFAULT_SUITE: &[&str] = &[
 /// corpus keeps its JS golden, and
 /// [`an_underflowing_usize_is_outside_the_differential_by_name`] pins the
 /// native half.
-const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[
-    (
-        "usize-underflow.vl",
-        "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
-    ),
-    (
-        "lens-fuzz.vl",
-        "its `Random::next` overflows `i32` (`self.state * 1103` past 2^31 once the state \
-         passes 1,946,953), which a conforming program does not do (spec §7.2a): JS carries \
-         the exact product, a native debug build panics `attempt to multiply with \
-         overflow`. The program's own defect, found when B709 let `std::reactive::lens` \
-         build natively; it leaves this list when its generator stays inside `i32`",
-    ),
-];
+const OUTSIDE_THE_DIFFERENTIAL: &[(&str, &str)] = &[(
+    "usize-underflow.vl",
+    "a `usize` subtracted past zero is unspecified: -1 on JS, a debug panic natively",
+)];
 
 /// The corpus's ASYNC programs (tracker J6, lane native-b-38).
 ///

@@ -152,9 +152,9 @@ fn the_lens_laws_hold() {
 fn the_positional_table_survives_random_writes() {
     assert_eq!(
         build_and_run("lens-fuzz.vl"),
-        "fuzz seed 1: 3000 writes, 343 slots, 1234 items held at the end\n\
-         fuzz seed 7: 3000 writes, 423 slots, 1012 items held at the end\n\
-         fuzz seed 42: 3000 writes, 501 slots, 859 items held at the end\n\
+        "fuzz seed 1: 3000 writes, 386 slots, 2200 items held at the end\n\
+         fuzz seed 7: 3000 writes, 456 slots, 580 items held at the end\n\
+         fuzz seed 42: 3000 writes, 421 slots, 880 items held at the end\n\
          fuzz: all passed\n",
         "the walk's arithmetic moved: the generator is seeded, so a different \
          count is a different walk, not a golden"

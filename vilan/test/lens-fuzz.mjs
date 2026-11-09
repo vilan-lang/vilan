@@ -1066,7 +1066,7 @@ function detached_nursery() {
 	return __nursery_new_detached();
 }
 function next(self, below) {
-	self[0] = (self[0] * 1103 + 12345) % 2147483;
+	self[0] = (self[0] * 1103 + 12345) % 65521;
 	if (self[0] < 0) {
 		self[0] = -(self[0]);
 	}
@@ -1078,7 +1078,7 @@ function check(list, followed, step, what) {
 		if (held[1] === -(1)) {
 			if (!(eq3(get4(held[0]), [ 1 ]))) {
 				(() => {
-					throw __panic("step " + step + " (" + what + "): a dead slot reads " + debug(get4(held[0])), "lens-fuzz.vl:40:5");
+					throw __panic("step " + step + " (" + what + "): a dead slot reads " + debug(get4(held[0])), "lens-fuzz.vl:42:5");
 				})();
 			}
 			$eD = undefined;
@@ -1093,7 +1093,7 @@ function check(list, followed, step, what) {
 			}
 			if (!(eq4(at2(held[0]), found)) || !(eq3(get4(held[0]), [ 0, held[1] ]))) {
 				(() => {
-					throw __panic("step " + step + " (" + what + "): the slot of " + held[1] + " is at " + debug(at2(held[0])) + " reading " + debug(get4(held[0])) + ", the model says " + debug(found), "lens-fuzz.vl:52:5");
+					throw __panic("step " + step + " (" + what + "): the slot of " + held[1] + " is at " + debug(at2(held[0])) + " reading " + debug(get4(held[0])) + ", the model says " + debug(found), "lens-fuzz.vl:54:5");
 				})();
 			}
 			$eD = undefined;
@@ -1112,10 +1112,10 @@ function run(seed3, steps, $a, $b) {
 	const list = sequence(__clone(model), $a);
 	const tripled = memo(map(items(list, $b), (id, $M, $N) => {
 		return id * 3;
-	}), $a, $b, "lens-fuzz.vl:68:46");
+	}), $a, $b, "lens-fuzz.vl:70:46");
 	const evens = memo2(filter(items(list, $b), (id, $bM, $bN) => {
 		return id % 2 === 0;
-	}), $a, $b, "lens-fuzz.vl:69:52");
+	}), $a, $b, "lens-fuzz.vl:71:52");
 	const rows2 = rows(list, $b);
 	const cursor4 = cursor3(rows2);
 	let mirror = get2(rows2);
@@ -1132,17 +1132,17 @@ function run(seed3, steps, $a, $b) {
 		if (choice < 14 && size3 > 0) {
 			what = "follow";
 			const at3 = next(random, size3);
-			followed.push([ slot(list, at3, $b), __at(model, at3, "lens-fuzz.vl:86:56") ]);
+			followed.push([ slot(list, at3, $b), __at(model, at3, "lens-fuzz.vl:88:56") ]);
 		} else if (choice < 40) {
 			what = "insert";
 			const at4 = next(random, size3 + 1);
 			insert_at(list, at4, next_id, $a);
-			__insert_at(model, at4, next_id, "lens-fuzz.vl:91:10");
+			__insert_at(model, at4, next_id, "lens-fuzz.vl:93:10");
 			next_id = next_id + 1;
 		} else if (choice < 60 && size3 > 0) {
 			what = "remove";
 			const at5 = next(random, size3);
-			const gone = __remove_at(model, at5, "lens-fuzz.vl:96:21");
+			const gone = __remove_at(model, at5, "lens-fuzz.vl:98:21");
 			remove_at(list, at5, $a);
 			mark_gone(followed, gone);
 		} else if (choice < 66) {
@@ -1153,7 +1153,7 @@ function run(seed3, steps, $a, $b) {
 			let made = 0;
 			while (made < count2) {
 				run2.push(next_id);
-				__insert_at(model, at6 + made, next_id, "lens-fuzz.vl:108:11");
+				__insert_at(model, at6 + made, next_id, "lens-fuzz.vl:110:11");
 				next_id = next_id + 1;
 				made = made + 1;
 			}
@@ -1164,7 +1164,7 @@ function run(seed3, steps, $a, $b) {
 			const count3 = 1 + next(random, size3 - at7);
 			let taken = 0;
 			while (taken < count3) {
-				const gone2 = __remove_at(model, at7, "lens-fuzz.vl:120:22");
+				const gone2 = __remove_at(model, at7, "lens-fuzz.vl:122:22");
 				mark_gone(followed, gone2);
 				taken = taken + 1;
 			}
@@ -1175,7 +1175,7 @@ function run(seed3, steps, $a, $b) {
 			const count4 = 1 + next(random, smaller(size3 - at8, 6));
 			let taken2 = 0;
 			while (taken2 < count4) {
-				const gone3 = __remove_at(model, at8, "lens-fuzz.vl:132:22");
+				const gone3 = __remove_at(model, at8, "lens-fuzz.vl:134:22");
 				mark_gone(followed, gone3);
 				taken2 = taken2 + 1;
 			}
@@ -1184,7 +1184,7 @@ function run(seed3, steps, $a, $b) {
 			let made2 = 0;
 			while (made2 < arriving) {
 				run3.push(next_id);
-				__insert_at(model, at8 + made2, next_id, "lens-fuzz.vl:141:11");
+				__insert_at(model, at8 + made2, next_id, "lens-fuzz.vl:143:11");
 				next_id = next_id + 1;
 				made2 = made2 + 1;
 			}
@@ -1194,21 +1194,21 @@ function run(seed3, steps, $a, $b) {
 			const from = next(random, size3);
 			const to = next(random, size3);
 			if (from !== to) {
-				const moved = __remove_at(model, from, "lens-fuzz.vl:151:23");
-				__insert_at(model, to, moved, "lens-fuzz.vl:152:11");
+				const moved = __remove_at(model, from, "lens-fuzz.vl:153:23");
+				__insert_at(model, to, moved, "lens-fuzz.vl:154:11");
 				move_item(list, from, to, $a);
 			}
 			$es = undefined;
 		} else if (size3 > 0) {
 			what = "replace";
 			const at9 = next(random, size3);
-			const old = __at(model, at9, "lens-fuzz.vl:159:14");
-			__at_put(model, at9, next_id, "lens-fuzz.vl:160:4");
+			const old = __at(model, at9, "lens-fuzz.vl:161:14");
+			__at_put(model, at9, next_id, "lens-fuzz.vl:162:4");
 			replace(list, at9, next_id, $a);
 			let index = 0;
 			while (index < followed.length) {
-				if (__at(followed, index, "lens-fuzz.vl:164:8")[1] === old) {
-					__at(followed, index, "lens-fuzz.vl:165:6")[1] = next_id;
+				if (__at(followed, index, "lens-fuzz.vl:166:8")[1] === old) {
+					__at(followed, index, "lens-fuzz.vl:167:6")[1] = next_id;
 				}
 				index = index + 1;
 			}
@@ -1217,7 +1217,7 @@ function run(seed3, steps, $a, $b) {
 		$es;
 		if (!(eq(all(list), model))) {
 			(() => {
-				throw __panic("step " + step + " (" + what + "): the list and the model differ", "lens-fuzz.vl:172:4");
+				throw __panic("step " + step + " (" + what + "): the list and the model differ", "lens-fuzz.vl:174:4");
 			})();
 		}
 		check(model, followed, step, what);
@@ -1225,14 +1225,14 @@ function run(seed3, steps, $a, $b) {
 			return id * 3;
 		})))) {
 			(() => {
-				throw __panic("step " + step + " (" + what + "): map over the lens fell out of step", "lens-fuzz.vl:176:4");
+				throw __panic("step " + step + " (" + what + "): map over the lens fell out of step", "lens-fuzz.vl:178:4");
 			})();
 		}
 		if (!(eq(get6(evens), filter2(model, (id) => {
 			return id % 2 === 0;
 		})))) {
 			(() => {
-				throw __panic("step " + step + " (" + what + "): filter over the lens fell out of step", "lens-fuzz.vl:179:4");
+				throw __panic("step " + step + " (" + what + "): filter over the lens fell out of step", "lens-fuzz.vl:181:4");
 			})();
 		}
 		for (const op of since3(rows2, cursor4)) {
@@ -1241,10 +1241,10 @@ function run(seed3, steps, $a, $b) {
 		let $eV = null;
 		if (step % 25 === 0) {
 			check_rows(model, mirror, step, what);
-			check_index(model, find(by_id, __at(model, next(random, model.length), "lens-fuzz.vl:186:34")), step, what);
+			check_index(model, find(by_id, __at(model, next(random, model.length), "lens-fuzz.vl:188:34")), step, what);
 			if (get2(rows2).length !== model.length) {
 				(() => {
-					throw __panic("step " + step + " (" + what + "): the row feed holds " + get2(rows2).length + " slots for " + model.length + " items", "lens-fuzz.vl:188:5");
+					throw __panic("step " + step + " (" + what + "): the row feed holds " + get2(rows2).length + " slots for " + model.length + " items", "lens-fuzz.vl:190:5");
 				})();
 			}
 			$eV = undefined;
@@ -1272,12 +1272,12 @@ function replay(mirror, op) {
 		const inserted = $eP[3];
 		let taken = 0;
 		while (taken < removed.length) {
-			__remove_at(mirror, at3, "lens-fuzz.vl:213:12");
+			__remove_at(mirror, at3, "lens-fuzz.vl:215:12");
 			taken = taken + 1;
 		}
 		let offset = 0;
 		for (const slot2 of inserted) {
-			__insert_at(mirror, at3 + offset, __clone(slot2), "lens-fuzz.vl:218:12");
+			__insert_at(mirror, at3 + offset, __clone(slot2), "lens-fuzz.vl:220:12");
 			offset = offset + 1;
 		}
 		$eQ = undefined;
@@ -1285,7 +1285,7 @@ function replay(mirror, op) {
 		const at4 = $eP[1];
 		const _old = $eP[2];
 		const slot3 = $eP[3];
-		$eQ = __at_put(mirror, at4, __clone(slot3), "lens-fuzz.vl:222:47");
+		$eQ = __at_put(mirror, at4, __clone(slot3), "lens-fuzz.vl:224:47");
 	} else if ($eP[0] === 2) {
 		const all2 = $eP[1];
 		$eQ = __replace(mirror, __clone(all2));
@@ -1296,12 +1296,12 @@ function replay(mirror, op) {
 		let run2 = [  ];
 		let taken2 = 0;
 		while (taken2 < count2) {
-			run2.push(__remove_at(mirror, from, "lens-fuzz.vl:228:21"));
+			run2.push(__remove_at(mirror, from, "lens-fuzz.vl:230:21"));
 			taken2 = taken2 + 1;
 		}
 		let offset2 = 0;
 		for (const slot4 of run2) {
-			__insert_at(mirror, to + offset2, __clone(slot4), "lens-fuzz.vl:233:12");
+			__insert_at(mirror, to + offset2, __clone(slot4), "lens-fuzz.vl:235:12");
 			offset2 = offset2 + 1;
 		}
 		$eQ = undefined;
@@ -1311,14 +1311,14 @@ function replay(mirror, op) {
 function check_rows(model, mirror, step, what) {
 	if (mirror.length !== model.length) {
 		(() => {
-			throw __panic("step " + step + " (" + what + "): the replayed rows hold " + mirror.length + " slots for " + model.length + " items", "lens-fuzz.vl:248:3");
+			throw __panic("step " + step + " (" + what + "): the replayed rows hold " + mirror.length + " slots for " + model.length + " items", "lens-fuzz.vl:250:3");
 		})();
 	}
 	let at3 = 0;
 	for (const slot2 of mirror) {
-		if (!(eq3(get4(slot2), [ 0, __at(model, at3, "lens-fuzz.vl:252:25") ])) || !(eq4(at2(slot2), [ 0, at3 ]))) {
+		if (!(eq3(get4(slot2), [ 0, __at(model, at3, "lens-fuzz.vl:254:25") ])) || !(eq4(at2(slot2), [ 0, at3 ]))) {
 			(() => {
-				throw __panic("step " + step + " (" + what + "): replayed row " + at3 + " reads " + debug(get4(slot2)) + " at " + debug(at2(slot2)) + ", the model holds " + __at(model, at3, "lens-fuzz.vl:253:120"), "lens-fuzz.vl:253:4");
+				throw __panic("step " + step + " (" + what + "): replayed row " + at3 + " reads " + debug(get4(slot2)) + " at " + debug(at2(slot2)) + ", the model holds " + __at(model, at3, "lens-fuzz.vl:255:120"), "lens-fuzz.vl:255:4");
 			})();
 		}
 		at3 = at3 + 1;
@@ -1330,7 +1330,7 @@ function check_index(model, found, step, what) {
 
 	} else {
 		(() => {
-			throw __panic("step " + step + " (" + what + "): the index lost an item", "lens-fuzz.vl:266:31");
+			throw __panic("step " + step + " (" + what + "): the index lost an item", "lens-fuzz.vl:268:31");
 		})();
 	}
 	const $eU = at2($eT[1]);
@@ -1338,20 +1338,20 @@ function check_index(model, found, step, what) {
 
 	} else {
 		(() => {
-			throw __panic("step " + step + " (" + what + "): the index holds a dead slot", "lens-fuzz.vl:267:33");
+			throw __panic("step " + step + " (" + what + "): the index holds a dead slot", "lens-fuzz.vl:269:33");
 		})();
 	}
-	if (!(eq3(get4($eT[1]), [ 0, __at(model, $eU[1], "lens-fuzz.vl:268:24") ]))) {
+	if (!(eq3(get4($eT[1]), [ 0, __at(model, $eU[1], "lens-fuzz.vl:270:24") ]))) {
 		(() => {
-			throw __panic("step " + step + " (" + what + "): the index\'s slot reads " + debug(get4($eT[1])) + ", the model holds " + __at(model, $eU[1], "lens-fuzz.vl:269:95") + " there", "lens-fuzz.vl:269:3");
+			throw __panic("step " + step + " (" + what + "): the index\'s slot reads " + debug(get4($eT[1])) + ", the model holds " + __at(model, $eU[1], "lens-fuzz.vl:271:95") + " there", "lens-fuzz.vl:271:3");
 		})();
 	}
 }
 function mark_gone(followed, gone) {
 	let index = 0;
 	while (index < followed.length) {
-		if (__at(followed, index, "lens-fuzz.vl:276:6")[1] === gone) {
-			__at(followed, index, "lens-fuzz.vl:277:4")[1] = -(1);
+		if (__at(followed, index, "lens-fuzz.vl:278:6")[1] === gone) {
+			__at(followed, index, "lens-fuzz.vl:279:4")[1] = -(1);
 		}
 		index = index + 1;
 	}
