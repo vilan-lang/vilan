@@ -21,6 +21,12 @@
 //!   row feed recording a replacing splice as two ops at "a replacing splice is
 //!   one op" / "one row op"; the length woken by an equal-count splice; the
 //!   keyed handler ignoring a `Splice`; an index whose release keeps its slots.
+//!   S3's slim path, each proven on the S3 section alone: a slot cell not kept
+//!   on its first ask reds at "one slot, one cell"; the length's cell not kept
+//!   at "a length asked through one handle"; `landed` deciding ONCE per write
+//!   whether a slot exists at "the second change moved the slot the first
+//!   change's tap made"; `Resizable::shift`'s default landing the item back at
+//!   `from` at "the default shift moved the item".
 //! - `lens-keyed.vl`: `explain_sequence` ignoring a `Splice`'s counts reds at
 //!   "an honest splice passes".
 //! - `lens-nested.vl`: an inner write landing as a `Replace` of the outer item
@@ -102,7 +108,9 @@ fn build_and_run(source: &str) -> String {
 /// one `Splice` per splice to a tap, to the handler, to the value feed and to
 /// the row feed (R16), the length asleep for an equal-count splice, a write from
 /// an observer joining the drained turn, the keyed handler's `Splice`, an
-/// index's release, and the wrapper types (R10).
+/// index's release, and the wrapper types (R10); then S3's: cells made on the
+/// first ask and shared by every handle, a slot a tap makes mid-write, and
+/// `Resizable::shift`'s default.
 #[test]
 fn the_lens_laws_hold() {
     assert_eq!(build_and_run("lens-laws.vl"), "laws: all passed\n");
