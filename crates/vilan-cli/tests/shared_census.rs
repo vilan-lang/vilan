@@ -179,6 +179,21 @@ const CENSUS: &[(&str, usize, &str)] = &[
          `key_at`) are `mut` locals their closure writes, not cells.",
     ),
     (
+        "reactive/lens/loaded.vl",
+        11,
+        "E + O (A185 S5). E, minted by a constructor and reached through every \
+         copy of its handle: the overlay's LEDGER, five (the entries by row key, \
+         their opening order, each pending proposal's row, each row's cells, the \
+         next proposal id), which `view`'s and `rows()`'s derive bodies, \
+         `Loaded` and the server's answer all reach; `Loaded`'s two (the claims \
+         by token, and the nurseries of the tasks it started, which `fetch` \
+         writes and the owner's `retire` cancels); `LoadedMap`'s three (each \
+         key's phase cell, each key's claim, the next token). O, `follow`'s \
+         token of the reply it is waiting for, written and read by the \
+         subscription's observer across runs and released with the \
+         subscription's owner",
+    ),
+    (
         "reactive/store_core.vl",
         7,
         "E: a store's cells, all minted by the store and reached through every \
@@ -399,7 +414,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 268,
+        total, 279,
         "the total number of `Shared` construction sites in std changed"
     );
 

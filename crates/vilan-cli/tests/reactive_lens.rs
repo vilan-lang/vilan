@@ -1,9 +1,9 @@
 //! `std::reactive::lens` — the reactive lens (tracker A185 S1,
 //! `proposal/reactive-lens.md`), its laws RUN.
 //!
-//! The pins are five corpus programs, `vilan/test/lens-{laws,fuzz,nested,keyed,
-//! tracked}.vl`, so the byte gate compiles them on every run and every corpus
-//! differential runs them. But the byte gate compares BYTES and the
+//! The pins are corpus programs, `vilan/test/lens-{laws,fuzz,nested,keyed,
+//! tracked}.vl` and S5's `lens-{loaded,overlay,loaded-tasks}.vl`, so the byte
+//! gate compiles them on every run and every corpus differential runs them. But the byte gate compares BYTES and the
 //! differentials compare one run against another: a program that panics
 //! identically twice passes both. The assertions are the programs' own
 //! `panic`s, so each is built here against THIS tree's std, run under node, and
@@ -35,6 +35,21 @@
 //! - `lens-tracked.vl`: a deletion that wakes no slot reds at "the row's
 //!   deletion re-runs it once"; an edit addressed one row low at "another row's
 //!   edit and an insert above do not re-run it".
+//!
+//! S5's three are against `std/src/reactive/lens/loaded.vl`:
+//!
+//! - `lens-loaded.vl`: `settle` ignoring the token reds at "2: the superseded
+//!   reply is dropped"; a confirmation landing whether or not a newer one was
+//!   confirmed at "5: the late, older ack does not walk the row back to A";
+//!   `view` without its `distinct` at "1: a confirm of the value shown woke the
+//!   flag and the lens's slot, not the view"; `propose_delete` writing the lens
+//!   (the lab's wrong turn, which R12 rules out) at "4: the lens keeps the row".
+//! - `lens-overlay.vl`: a confirmed insert landing at the top reds at "it landed
+//!   in the lens where it was shown"; a provisional row still listed once the
+//!   lens holds its key at "the pushed row IS the row".
+//! - `lens-loaded-tasks.vl`: `fetch` not cancelling the load it supersedes reds
+//!   at "the superseded call stopped polling: it was cancelled"; `retire` not
+//!   cancelling at "the owner's end cancelled the load and dropped its reply".
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -156,13 +171,45 @@ fn tracked_reads_depend_on_exactly_the_parts_read() {
     assert_eq!(build_and_run("lens-tracked.vl"), "tracked: all passed\n");
 }
 
+/// S5's eight scenarios (`proposal/reactive-lens.md` §16.2) with the server
+/// driven by hand: phases beside the rows, latest-wins by token, a refresh that
+/// keeps slots, pages with no duplicate rows, the keyed collection, and the
+/// overlay on top, R12's hidden delete included.
+#[test]
+fn a_loaded_list_holds_the_eight_scenarios() {
+    assert_eq!(build_and_run("lens-loaded.vl"), "loaded: all passed\n");
+}
+
+/// The overlay beside a bare lens: provisional rows and their places, a
+/// confirmed insert matched by the server's key, a server removal outranking a
+/// local edit, and two changes on one row answered in either order.
+#[test]
+fn the_overlay_never_writes_the_lens() {
+    assert_eq!(build_and_run("lens-overlay.vl"), "overlay: all passed\n");
+}
+
+/// The loaded list on real tasks: a superseded fetch and page cancelled, an
+/// owner's end dropping the reply, and std's `.transient()` and `TaskSource`
+/// followed. Ordered by gates the program opens, never by sleep lengths.
+#[test]
+fn a_loaded_list_cancels_what_it_supersedes() {
+    assert_eq!(
+        build_and_run("lens-loaded-tasks.vl"),
+        "loaded tasks: all passed\n"
+    );
+}
+
 /// R17: the lens is reached by name (`import std::reactive::lens::{ .. }`) and
 /// NOT re-exported from `std::reactive`, until its analysis cost is paid down —
 /// a program that never names it must not pay for it (T4 measured 13–18% more
 /// instructions to check every reactive example with the module in the
 /// reactive closure). The perf gate's rows are the measurement; this is the
 /// cheap guard on the one line that would undo it. No other std module may
-/// import it either, since any import puts it in that module's closure.
+/// import it either, since any import puts it in that module's closure — except
+/// the lens's OWN submodules under `reactive/lens/` (S5's `loaded`), which a
+/// program reaches only by naming the lens's path, so their closure is paid by
+/// exactly the programs that already pay for the lens. Those submodules are
+/// held to the same rule in turn: no file outside the lens's tree may name them.
 #[test]
 fn std_reaches_the_lens_only_by_name() {
     let source_root = std_dir().join("src");
@@ -179,6 +226,7 @@ fn std_reaches_the_lens_only_by_name() {
             }
             if path.extension().is_none_or(|extension| extension != "vl")
                 || path.ends_with("reactive/lens.vl")
+                || path.starts_with(source_root.join("reactive/lens"))
             {
                 continue;
             }
