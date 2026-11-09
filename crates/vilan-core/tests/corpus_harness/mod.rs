@@ -71,6 +71,7 @@ macro_rules! corpus_manifest {
             async_await => "async-await.vl",
             async_promise_all => "async-promise-all.vl",
             await_postfix => "await-postfix.vl",
+            b713 => "b713.vl",
             backed_enum_keys => "backed-enum-keys.vl",
             blanket_impl => "blanket-impl.vl",
             bool => "bool.vl",

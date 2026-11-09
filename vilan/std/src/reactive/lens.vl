@@ -1055,10 +1055,7 @@ fun follow_id<S, A, H: Handler<A>>(
 	for watch.read().cells.len() <= entry {
 		watch.write().cells.push(SlotCells { woke = None, parts = [], users = 0 });
 	}
-	// The index is bound first: `cells[id.as_usize()].users += 1` through a
-	// `write()` emits a hoisted index temporary that is never declared (B713, a
-	// miscompile across two instantiations of one generic).
-	watch.write().cells[entry].users += 1;
+	watch.write().cells[id.as_usize()].users += 1;
 	id
 }
 
