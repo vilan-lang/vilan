@@ -546,6 +546,15 @@ fun main() {
 key will replace both. Make the inner lens once per slot and part and share it:
 two inner lenses over one part do not see each other's writes.
 
+## Async data
+
+Data that arrives from a server is a lens plus a phase, side by side:
+[std::reactive::lens::loaded](loaded.md). A refresh lands by key, so rows keep
+their slots and a failure never blanks them; pages splice in at either end
+with no duplicate rows; and optimistic changes are an OVERLAY beside the lens,
+never a write to it, so a delete hides its row and a rejected delete shows it
+again in its own slot.
+
 ## Lifetime
 
 A slot is counted by its handles. Made inside an owner scope — a view, a row,

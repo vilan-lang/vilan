@@ -1,0 +1,1290 @@
+// `std::reactive::lens::loaded` — async and transient data over the reactive lens
+// (tracker A185 S5, `proposal/reactive-lens.md` §16): a collection loaded from a
+// server, its pages, and the optimistic overlay beside it.
+//
+// Three rules shape it:
+//
+// - **The phase sits beside the data, not around it.** A loaded collection is a
+//   lens plus a phase cell in std's own `TransientState` arms, whose payload is the
+//   TOKEN of the load whose rows the lens holds. The rows stay readable in every
+//   phase, so a refresh or a failure never blanks them.
+// - **Latest wins by token.** Every load and every page takes a token, and a reply
+//   whose token is no longer the claim is dropped. A load lands through
+//   `reconcile_by_key`, so rows both lists hold keep their slots.
+// - **An optimistic write is an overlay BESIDE the lens, never a write to it
+//   (R12).** The lens holds the server's word and nothing else. The overlay holds,
+//   per row key, the changes waiting for the server; readers that should see them
+//   read THROUGH the overlay (`view`, `rows`). An optimistic delete HIDES the row:
+//   the lens keeps the item, so a rejected delete simply un-hides it, in the same
+//   slot. Only the server's word writes the lens: a load, a page, a push, or a
+//   confirmation (the server took the change, so it is the server's word now).
+//
+// **Reached by name (R17).** `import std::reactive::lens::loaded::{ .. }`. Nothing
+// in std imports this module, so a program that does not name it does not analyze
+// it, and it does not change the lens.
+//
+// **Cancellation.** A task this module starts (`fetch`, `fetch_older`,
+// `fetch_newer`) runs in a DETACHED nursery the collection holds, and is cancelled
+// when a newer one supersedes it or the collection's owner goes. That nursery is
+// std's `detached_nursery`, the same one a pipe run owns its tasks through; an
+// application holds such work with `OwnedNursery`, which a value shared by every
+// copy of a handle cannot hold (it is a resource).
+import pkg::compare::PartialEq;
+import pkg::hash::Hashable;
+import pkg::hash_map::HashMap;
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::lens::{
+	ItemSlot,
+	KeyIndex,
+	KeyedLens,
+	LensRows,
+	Positional,
+	SequenceLens,
+	SlotIndex,
+};
+import pkg::reactive::transient::{ TransientSource, TransientState };
+import pkg::reactive::{
+	Flow,
+	MemoCell,
+	SequenceCell,
+	SignalCell,
+	Source,
+	Subscription,
+	batch,
+	defer_to_owner,
+	derive,
+	register_with_owner,
+};
+import pkg::result::Result::{ self, Err, Ok };
+import pkg::shared::Shared;
+import pkg::task::{ Nursery, ambient_nursery, detached_nursery };
+
+// === The ledger: changes waiting for the server ===============================
+
+/// One local change waiting for the server.
+export struct Proposal<T> {
+	id: i32,
+	/// What the row shows if the server agrees. `None` hides the row (a delete).
+	value: Option<T>,
+	/// The row was not held when this was proposed: a provisional row.
+	insert: bool,
+}
+
+/// What the overlay holds for one row while it has changes pending.
+export struct Entry<K, T> {
+	/// The changes, oldest first.
+	proposals: List<Proposal<T>>,
+	/// The newest proposal on this row the server confirmed. An older one still
+	/// pending is superseded by it, and no longer shows.
+	confirmed: i32,
+	/// Where a provisional row stands: the key of the shown row above it and of the
+	/// one below it when it was proposed.
+	above: Option<K>,
+	below: Option<K>,
+}
+
+/// One row's notifications, made on the first ask and kept for the key.
+export struct RowCells {
+	/// Fires when what the overlay holds for the row changes.
+	woke: SignalCell<i32>,
+	/// Whether the row has a change pending.
+	pending: SignalCell<bool>,
+}
+
+/// What ending one proposal did, for the overlay that owns the lens to act on.
+export struct Ended<K, T> {
+	key: K,
+	value: Option<T>,
+	insert: bool,
+	/// The proposal is now the server's word on the row: the owner writes it into
+	/// the lens. False for a rejection, and for a confirmation a newer confirmed
+	/// proposal already superseded (acknowledgements may arrive out of order).
+	lands: bool,
+}
+
+/// The bookkeeping of optimistic writes, by row key, shared by the sequence and the
+/// keyed overlay. It knows nothing of the lens: what a row SHOWS is the lens's
+/// value with this on top (`over`).
+export struct Ledger<K: Hashable, T> {
+	entries: Shared<HashMap<K, Entry<K, T>>>,
+	/// The keys with an entry, in the order their entries opened.
+	order: Shared<List<K>>,
+	/// Each pending proposal's row.
+	owners: Shared<HashMap<i32, K>>,
+	cells: Shared<HashMap<K, RowCells>>,
+	/// How many proposals are pending.
+	count: SignalCell<i32>,
+	/// Fires when a row is hidden or shown, or a provisional row comes or goes:
+	/// what an overlay-aware row feed rides.
+	layout: SignalCell<i32>,
+	next_id: Shared<i32>,
+}
+
+export impl Ledger<type K: PartialEq + Hashable, type T> {
+	fun new(): Ledger<K, T> {
+		Ledger {
+			entries = Shared::new(HashMap::new()),
+			order = Shared::new([]),
+			owners = Shared::new(HashMap::new()),
+			cells = Shared::new(HashMap::new()),
+			count = SignalCell::new(0),
+			layout = SignalCell::new(0),
+			next_id = Shared::new(0),
+		}
+	}
+
+	/// The row's cells, made on the first ask.
+	fun row(self, key: K): RowCells {
+		if self.cells.read().get(key) is Some(let held) {
+			ret held;
+		}
+		let made = RowCells { woke = SignalCell::new(0), pending = SignalCell::new(false) };
+		self.cells.write().insert(key, made);
+		made
+	}
+
+	/// Whether the row has a change pending.
+	fun has(self, key: K): bool {
+		self.entries.read().contains_key(key)
+	}
+
+	/// The rows with changes pending, in the order their first change was made.
+	fun keys(self): List<K> {
+		self.order.read()
+	}
+
+	/// Propose `value` for the row (`None`: hide it). `insert` when the row is not
+	/// held; `above` and `below` say where a provisional row stands.
+	fun open(
+		self,
+		key: K,
+		value: Option<T>,
+		insert: bool,
+		above: Option<K>,
+		below: Option<K>,
+	): i32 {
+		let id = self.next_id.read() + 1;
+		self.next_id.write() = id;
+		let ledger = self;
+		batch(|| {
+			let cells = ledger.row(key);
+			let found = ledger.entries.read().get(key);
+			mut entry = match found {
+				Some(let held) => held,
+				None => {
+					ledger.order.write().push(key);
+					cells.pending.set(true);
+					Entry { proposals = [], confirmed = 0, above, below }
+				},
+			};
+			if insert {
+				entry.above = above;
+				entry.below = below;
+			}
+			entry.proposals.push(Proposal { id, value, insert });
+			ledger.entries.write().insert(key, entry);
+			ledger.owners.write().insert(id, key);
+			ledger.count.set(ledger.count.get() + 1);
+			cells.woke.notify();
+			if insert || value is None {
+				ledger.layout.notify();
+			}
+		});
+		id
+	}
+
+	/// End proposal `id`: the server took it (`accepted`) or refused it. `None` for
+	/// an id that is not pending.
+	fun close(self, id: i32, accepted: bool): Option<Ended<K, T>> {
+		let key = match self.owners.read().get(id) {
+			Some(let held) => held,
+			None => ret None,
+		};
+		let found = self.entries.read().get(key);
+		found is Some(let held) else ret None;
+		mut entry = held;
+		mut ended: Option<Proposal<T>> = None;
+		mut kept: List<Proposal<T>> = [];
+		for proposal in entry.proposals {
+			if proposal.id == id {
+				ended = Some(proposal);
+			} else {
+				kept.push(proposal);
+			}
+		}
+		ended is Some(let proposal) else ret None;
+		let lands = accepted && id > entry.confirmed;
+		if lands {
+			entry.confirmed = id;
+		}
+		entry.proposals = kept;
+		let ledger = self;
+		let settled = kept.len() == 0;
+		batch(|| {
+			let cells = ledger.row(key);
+			ledger.owners.write().remove(id);
+			if settled {
+				ledger.entries.write().remove(key);
+				mut order: List<K> = [];
+				for held_key in ledger.order.read() {
+					if held_key != key {
+						order.push(held_key);
+					}
+				}
+				ledger.order.write() = order;
+				cells.pending.set(false);
+			} else {
+				ledger.entries.write().insert(key, entry);
+			}
+			ledger.count.set(ledger.count.get() - 1);
+			cells.woke.notify();
+			if proposal.insert || proposal.value is None {
+				ledger.layout.notify();
+			}
+		});
+		Some(Ended { key, value = proposal.value, insert = proposal.insert, lands })
+	}
+
+	/// The proposal that shows on the row: its newest one no confirmation
+	/// superseded. `None` when nothing pending shows (the row shows the lens).
+	fun showing(self, key: K): Option<Proposal<T>> {
+		self.entries.read().get(key) is Some(let entry) else ret None;
+		mut out: Option<Proposal<T>> = None;
+		for proposal in entry.proposals {
+			if proposal.id > entry.confirmed {
+				out = Some(proposal);
+			}
+		}
+		out
+	}
+
+	/// Whether any pending change on the row made it provisional.
+	fun provisional(self, key: K): bool {
+		self.entries.read().get(key) is Some(let entry) else ret false;
+		mut out = false;
+		for proposal in entry.proposals {
+			if proposal.insert {
+				out = true;
+			}
+		}
+		out
+	}
+
+	/// What the row shows, given what the lens holds for it (`held`):
+	///
+	/// - nothing pending shows: the lens's value;
+	/// - a pending delete: nothing (the row is hidden);
+	/// - a pending value: that value, while the lens holds the row or the row is
+	///   provisional. A row the server removed is gone, an edit pending on it or
+	///   not: the server's word on whether a row exists outranks a local edit.
+	fun over(self, key: K, held: Option<T>): Option<T> {
+		match self.showing(key) {
+			None => held,
+			Some(let proposal) => match proposal.value {
+				None => None,
+				Some(let value) => {
+					if held is Some(let _item) || self.provisional(key) {
+						Some(value)
+					} else {
+						None
+					}
+				},
+			},
+		}
+	}
+
+	/// Whether the row is hidden by a pending delete.
+	fun hides(self, key: K): bool {
+		if self.showing(key) is Some(let proposal) {
+			ret proposal.value is None;
+		}
+		false
+	}
+
+	/// Where a provisional row stood when it was proposed.
+	fun anchors(self, key: K): (Option<K>, Option<K>) {
+		match self.entries.read().get(key) {
+			Some(let entry) => (entry.above, entry.below),
+			None => (None, None),
+		}
+	}
+}
+
+// === The overlay over a sequence lens =========================================
+
+/// One row as the overlay shows it: its key, and its slot in the lens when the lens
+/// holds it (a provisional row has none).
+export struct Row<T, K> {
+	key: K,
+	slot: Option<ItemSlot<List<T>, usize, T, Positional>>,
+}
+
+/// Two rows are the same row when they have the same key and the same slot.
+export impl Row<type T, type K: PartialEq> with PartialEq {
+	fun eq(self, other: Row<T, K>): bool {
+		self.key == other.key && self.slot == other.slot
+	}
+}
+
+/// Optimistic writes beside a sequence lens, by row key (R12). The lens is never
+/// written by a proposal: readers see the proposals through `view`, `view_key`,
+/// `rows` and `shown`.
+export struct Overlay<T, K: Hashable> {
+	lens: SequenceLens<List<T>, T>,
+	key: |&T| K,
+	ledger: Ledger<K, T>,
+	/// The lens's rows by key (R14): where a key is held now, in one lookup.
+	index: KeyIndex<List<T>, T, K>,
+	/// The lens's slots in order: what the overlay-aware row feed rides.
+	feed: LensRows<List<T>, T>,
+	/// A source on the lens's shape (items arriving, leaving or moving).
+	shape: SlotIndex<List<T>, usize, T, Positional>,
+}
+
+export impl Overlay<type T: PartialEq, type K: PartialEq + Hashable> {
+	/// An overlay beside `lens`, whose rows are told apart by `key`. Made under an
+	/// owner, the index and row feed it keeps on the lens are released with it.
+	fun beside(lens: SequenceLens<List<T>, T>, key: |&T| K): Overlay<T, K> {
+		// Bound first, under the impl's `K`: a `Ledger::new()` written in the
+		// literal's field is checked against `Overlay`'s DECLARED bounds, which
+		// lack `PartialEq`, and refused (a checker defect, reported with S5).
+		let ledger: Ledger<K, T> = Ledger::new();
+		Overlay {
+			lens,
+			key,
+			ledger,
+			index = lens.index_by(key),
+			feed = lens.rows(),
+			shape = lens.lens().slot_of(-1).index(),
+		}
+	}
+
+	/// The lens the overlay sits beside: the server's word, untouched by proposals.
+	fun lens(self): SequenceLens<List<T>, T> {
+		self.lens
+	}
+
+	/// The slot of the row with this key, when the lens holds it.
+	fun held(self, key: K): Option<ItemSlot<List<T>, usize, T, Positional>> {
+		self.index.find(key)
+	}
+
+	fun key_of(self, slot: ItemSlot<List<T>, usize, T, Positional>): Option<K> {
+		let key = self.key;
+		slot.get().map(|item| key(&item))
+	}
+
+	// --- Proposing ------------------------------------------------------------
+
+	/// Show `value` in the slot's row, pending the server. The lens is not written.
+	/// `None` when the slot's item is gone.
+	fun propose(self, slot: ItemSlot<List<T>, usize, T, Positional>, value: T): Option<i32> {
+		self.key_of(slot) is Some(let key) else ret None;
+		Some(self.ledger.open(key, Some(value), false, None, None))
+	}
+
+	/// HIDE the slot's row, pending the server. The lens keeps the item, and the
+	/// slot keeps following it: a rejection shows it again in the same slot.
+	fun propose_delete(self, slot: ItemSlot<List<T>, usize, T, Positional>): Option<i32> {
+		self.key_of(slot) is Some(let key) else ret None;
+		Some(self.ledger.open(key, None, false, None, None))
+	}
+
+	/// Show a new row at shown position `at`, pending the server: a PROVISIONAL row
+	/// under `value`'s own key, which no slot follows. It keeps its place by its
+	/// neighbours' keys while the lens changes under it. A key the lens already
+	/// holds is an edit of that row instead.
+	fun propose_insert(self, at: usize, value: T): i32 {
+		let key = (self.key)(&value);
+		if self.held(key) is Some(let _slot) {
+			ret self.ledger.open(key, Some(value), false, None, None);
+		}
+		let shown = self.shown_rows();
+		let above = if at > 0 && at <= shown.len() { Some(shown[at - 1].key) } else { None };
+		let below = shown.get(at).map(|row| row.key);
+		self.ledger.open(key, Some(value), true, above, below)
+	}
+
+	// --- The server's answer ----------------------------------------------------
+
+	/// The server took the change. When it is the newest confirmed change on its
+	/// row, it is the server's word now and lands in the lens: a value replaces the
+	/// held item, a delete removes it, an insert is inserted where its provisional
+	/// row stands. Answers whether `id` was pending.
+	fun confirm(self, id: i32): bool {
+		self.answer(id, true, None)
+	}
+
+	/// The server took the change and answered with its own copy of the row
+	/// (`item`): that copy lands instead of the proposed value. For an insert this
+	/// is how the server's key is learned: the provisional row is replaced by
+	/// `item`, under `item`'s key, where the provisional row stood (or nowhere new,
+	/// when the lens already holds that key: a push or a load brought it first).
+	fun confirm_with(self, id: i32, item: T): bool {
+		self.answer(id, true, Some(item))
+	}
+
+	/// The server refused the change. Nothing is written: the row shows the lens
+	/// again, and a hidden row is shown again in its own slot.
+	fun reject(self, id: i32): bool {
+		self.answer(id, false, None)
+	}
+
+	fun answer(self, id: i32, accepted: bool, reply: Option<T>): bool {
+		let overlay = self;
+		mut answered = false;
+		batch(|| {
+			// Where a provisional row would land in the lens is read BEFORE its
+			// proposal ends: ending it may take the row off the shown list.
+			let landing = match overlay.ledger.owners.read().get(id) {
+				Some(let key) => overlay.landing(key),
+				None => 0,
+			};
+			overlay.ledger.close(id, accepted) is Some(let ended) else ret;
+			answered = true;
+			if !ended.lands {
+				ret;
+			}
+			let landed = match reply {
+				Some(let item) => Some(item),
+				None => ended.value,
+			};
+			let lens = overlay.lens;
+			match landed {
+				None => {
+					if overlay.held(ended.key) is Some(let slot) && slot.at() is Some(let at) {
+						lens.remove_at(at);
+					}
+				},
+				Some(let item) => {
+					let server_key = (overlay.key)(&item);
+					let target = if overlay.held(ended.key) is Some(let slot) {
+						slot.at()
+					} else {
+						overlay.held(server_key).and_then(|slot| slot.at())
+					};
+					match target {
+						Some(let at) => {
+							if lens.peek(|list| list.get(at)) != Some(item) {
+								lens.replace(at, item);
+							}
+						},
+						None => {
+							if ended.insert {
+								lens.insert_at(landing, item);
+							}
+						},
+					}
+				},
+			}
+		});
+		answered
+	}
+
+	/// Where a provisional row with this key lands in the LENS: below every held
+	/// row shown above it.
+	fun landing(self, key: K): usize {
+		mut at: usize = 0;
+		for row in self.compose(true) {
+			if row.key == key {
+				ret at;
+			}
+			if row.slot is Some(let _slot) {
+				at += 1;
+			}
+		}
+		at
+	}
+
+	// --- Reading through the overlay -----------------------------------------
+
+	/// What the slot's row shows: the pending value on top of the lens's, or `None`
+	/// while it is hidden or once it is gone. A source that wakes only when what it
+	/// shows changes.
+	fun view(self, slot: ItemSlot<List<T>, usize, T, Positional>): MemoCell<Option<T>> {
+		let ledger = self.ledger;
+		let key = self.key;
+		derive(|| {
+			match slot.track() {
+				Some(let item) => {
+					let id = key(&item);
+					let _woke = ledger.row(id).woke.track();
+					ledger.over(id, Some(item))
+				},
+				None => None,
+			}
+		}).distinct().memo()
+	}
+
+	/// What the row with this key shows, held or provisional: what renders a row of
+	/// `rows()`. A source that wakes only when what it shows changes.
+	fun view_key(self, key: K): MemoCell<Option<T>> {
+		let ledger = self.ledger;
+		let index = self.index;
+		let shape = self.shape;
+		derive(|| {
+			let _woke = ledger.row(key).woke.track();
+			let _shape = shape.track();
+			let held = match index.find(key) {
+				Some(let slot) => slot.track(),
+				None => None,
+			};
+			ledger.over(key, held)
+		}).distinct().memo()
+	}
+
+	/// The rows as shown, for `each` keyed by `row.key`: the lens's rows in order
+	/// without the hidden ones, and the provisional rows where they stand. It
+	/// wakes when the lens's shape changes or a row is hidden, shown, or proposed,
+	/// and not for an edit: an edit reaches a row through `view`.
+	fun rows(self): MemoCell<List<Row<T, K>>> {
+		let overlay = self;
+		let feed = self.feed;
+		let layout = self.ledger.layout;
+		derive(|| {
+			let _slots = feed.track();
+			let _layout = layout.track();
+			overlay.compose(false)
+		}).distinct().memo()
+	}
+
+	/// The rows as shown now, not tracked.
+	fun shown_rows(self): List<Row<T, K>> {
+		self.compose(false)
+	}
+
+	/// The values as shown now, not tracked.
+	fun shown(self): List<T> {
+		mut out: List<T> = [];
+		for row in self.compose(false) {
+			let held = match row.slot {
+				Some(let slot) => slot.get(),
+				None => None,
+			};
+			if self.ledger.over(row.key, held) is Some(let value) {
+				out.push(value);
+			}
+		}
+		out
+	}
+
+	/// The shown rows: every held row in the lens's order, each provisional row
+	/// placed by its neighbours, and then the hidden rows taken out (unless
+	/// `with_hidden`: a provisional row may stand next to a hidden one).
+	fun compose(self, with_hidden: bool): List<Row<T, K>> {
+		let key = self.key;
+		mut all: List<Row<T, K>> = [];
+		for slot in self.feed.get() {
+			if slot.get() is Some(let item) {
+				all.push(Row { key = key(&item), slot = Some(slot) });
+			}
+		}
+		for row_key in self.ledger.keys() {
+			if self.ledger.provisional(row_key)
+				&& self.index.find(row_key) is None
+				&& self.ledger.over(row_key, None) is Some(let _value) {
+				let (above, below) = self.ledger.anchors(row_key);
+				let at = landing_among(all, above, below);
+				all.insert(at, Row { key = row_key, slot = None });
+			}
+		}
+		if with_hidden {
+			ret all;
+		}
+		mut out: List<Row<T, K>> = [];
+		for row in all {
+			if !self.ledger.hides(row.key) {
+				out.push(row);
+			}
+		}
+		out
+	}
+
+	// --- Pending ----------------------------------------------------------------
+
+	/// Whether the slot's row has a change pending, as a source.
+	fun is_pending(self, slot: ItemSlot<List<T>, usize, T, Positional>): MemoCell<bool> {
+		match self.key_of(slot) {
+			Some(let key) => self.is_pending_key(key),
+			None => MemoCell { cell = SignalCell::new(false) },
+		}
+	}
+
+	/// Whether the row with this key has a change pending, as a source: for a
+	/// provisional row, which has no slot.
+	fun is_pending_key(self, key: K): MemoCell<bool> {
+		MemoCell { cell = self.ledger.row(key).pending }
+	}
+
+	/// How many changes are pending, as a source.
+	fun pending(self): MemoCell<i32> {
+		MemoCell { cell = self.ledger.count }
+	}
+}
+
+/// Where a provisional row stands among `rows`: below the row that was above it,
+/// else above the row that was below it, else at the end when it had a row above
+/// it (that row is gone), else at the top.
+fun landing_among<T, K: PartialEq>(
+	rows: List<Row<T, K>>,
+	above: Option<K>,
+	below: Option<K>,
+): usize {
+	if above is Some(let key) && position_of(rows, key) is Some(let at) {
+		ret at + 1;
+	}
+	if below is Some(let key) && position_of(rows, key) is Some(let at) {
+		ret at;
+	}
+	if above is Some(let _gone) {
+		ret rows.len();
+	}
+	0
+}
+
+fun position_of<T, K: PartialEq>(rows: List<Row<T, K>>, key: K): Option<usize> {
+	mut at: usize = 0;
+	for row in rows {
+		if row.key == key {
+			ret Some(at);
+		}
+		at += 1;
+	}
+	None
+}
+
+// === Phases and tokens ========================================================
+
+/// One end of a paged collection.
+export enum Edge<E> {
+	/// More may be asked for.
+	Idle,
+	/// A page is on its way.
+	Loading,
+	/// The server said there is nothing more this way.
+	End,
+	/// The last page failed; asking again retries it.
+	Failed(E),
+}
+
+export impl Edge<type E: PartialEq> with PartialEq {
+	fun eq(self, other: Edge<E>): bool {
+		match (self, other) {
+			(Edge::Idle, Edge::Idle) => true,
+			(Edge::Loading, Edge::Loading) => true,
+			(Edge::End, Edge::End) => true,
+			(Edge::Failed(let mine), Edge::Failed(let theirs)) => mine == theirs,
+			_ => false,
+		}
+	}
+}
+
+/// One page of items, and whether the server holds more beyond it.
+export struct Page<T> {
+	items: List<T>,
+	more: bool,
+}
+
+/// The claims in flight. 0 is "nothing claimed".
+export struct Claims {
+	next: i32,
+	load: i32,
+	older: i32,
+	newer: i32,
+}
+
+/// The tasks in flight, when this module started them.
+export struct Running {
+	load: Option<Nursery>,
+	older: Option<Nursery>,
+	newer: Option<Nursery>,
+}
+
+/// Whether two phases say the same thing to a watcher. A `Failed` is always news.
+fun same_phase<E>(first: TransientState<i32, E>, second: TransientState<i32, E>): bool {
+	match (first, second) {
+		(TransientState::Pending, TransientState::Pending) => true,
+		(TransientState::Absent, TransientState::Absent) => true,
+		(TransientState::Ready(let mine), TransientState::Ready(let theirs)) => mine == theirs,
+		(TransientState::Refreshing(let mine), TransientState::Refreshing(let theirs)) => mine == theirs,
+		_ => false,
+	}
+}
+
+fun set_phase<E>(cell: SignalCell<TransientState<i32, E>>, next: TransientState<i32, E>) {
+	if !same_phase(cell.get(), next) {
+		cell.set(next);
+	}
+}
+
+/// Whether two edges say the same thing to a watcher. A `Failed` is always news.
+fun set_edge<E>(cell: SignalCell<Edge<E>>, next: Edge<E>) {
+	let same = match (cell.get(), next) {
+		(Edge::Idle, Edge::Idle) => true,
+		(Edge::Loading, Edge::Loading) => true,
+		(Edge::End, Edge::End) => true,
+		_ => false,
+	};
+	if !same {
+		cell.set(next);
+	}
+}
+
+fun cancel(task: Option<Nursery>) {
+	if task is Some(let running) {
+		running.cancel();
+	}
+}
+
+// === A loaded list ============================================================
+
+/// A list loaded from a server: the lens holds the server's rows, the phase says
+/// where the whole list stands, each end says where its pages stand, and the
+/// overlay holds the optimistic changes on top.
+export struct Loaded<T, K: Hashable, E> {
+	lens: SequenceLens<List<T>, T>,
+	changes: Overlay<T, K>,
+	key: |&T| K,
+	/// `Ready(token)`: the rows are load `token`'s.
+	state: SignalCell<TransientState<i32, E>>,
+	older_edge: SignalCell<Edge<E>>,
+	newer_edge: SignalCell<Edge<E>>,
+	claims: Shared<Claims>,
+	running: Shared<Running>,
+}
+
+export impl Loaded<type T: PartialEq, type K: PartialEq + Hashable, type E> {
+	/// An empty list, `Pending`, whose rows are told apart by `key`. Made under an
+	/// owner, it drops whatever is in flight (and cancels the tasks it started)
+	/// when the owner goes.
+	fun new(key: |&T| K): Loaded<T, K, E> {
+		let empty: List<T> = [];
+		let lens = SequenceLens::over(empty);
+		let feed: Loaded<T, K, E> = Loaded {
+			lens,
+			changes = Overlay::beside(lens, key),
+			key,
+			state = SignalCell::new(TransientState::Pending),
+			older_edge = SignalCell::new(Edge::Idle),
+			newer_edge = SignalCell::new(Edge::Idle),
+			claims = Shared::new(Claims { next = 0, load = 0, older = 0, newer = 0 }),
+			running = Shared::new(Running { load = None, older = None, newer = None }),
+		};
+		defer_to_owner(|| feed.retire());
+		feed
+	}
+
+	/// The server's rows, as the lens holds them: slots, parts, `rows()`,
+	/// `items()`. Proposals are NOT in it; read through `overlay()` to see them.
+	fun items(self): SequenceLens<List<T>, T> {
+		self.lens
+	}
+
+	/// The optimistic overlay beside the rows.
+	fun overlay(self): Overlay<T, K> {
+		self.changes
+	}
+
+	/// Where the whole list stands. The payload is the token of the load whose
+	/// rows are held: `Ready(t)`, `Refreshing(t)` while a newer load is on its way,
+	/// `Failed(error, Some(t))` when one failed (or the connection dropped).
+	fun phase(self): MemoCell<TransientState<i32, E>> {
+		MemoCell { cell = self.state }
+	}
+
+	/// Where the older end's pages stand.
+	fun older(self): MemoCell<Edge<E>> {
+		MemoCell { cell = self.older_edge }
+	}
+
+	/// Where the newer end's pages stand.
+	fun newer(self): MemoCell<Edge<E>> {
+		MemoCell { cell = self.newer_edge }
+	}
+
+	fun claim(self): i32 {
+		let token = self.claims.read().next + 1;
+		self.claims.write().next = token;
+		token
+	}
+
+	// --- Loads ------------------------------------------------------------------
+
+	/// Start a load of the whole list: the rows stay, the phase says `Refreshing`
+	/// (or `Pending` before the first). A load in flight is superseded. Answers the
+	/// token its reply must carry.
+	fun load(self): i32 {
+		let token = self.claim();
+		self.claims.write().load = token;
+		set_phase(self.state, self.state.get().refreshed());
+		token
+	}
+
+	/// The reply to load `token`. Dropped (answers false) when a newer load, a
+	/// resync or the owner's end superseded it. A list lands by key: rows both
+	/// lists hold keep their slots, the overlay stays on top, and the pages asked
+	/// for before it are dropped (they were asked of the old list).
+	fun settle(self, token: i32, reply: Result<List<T>, E>): bool {
+		if token == 0 || self.claims.read().load != token {
+			ret false;
+		}
+		self.claims.write().load = 0;
+		let feed = self;
+		match reply {
+			Ok(let list) => batch(|| {
+				feed.lens.lens().reconcile_by_key(list, feed.key);
+				feed.drop_pages();
+				set_phase(feed.state, TransientState::Ready(token));
+			}),
+			Err(let error) => set_phase(self.state, self.state.get().failed(error)),
+		}
+		true
+	}
+
+	/// The connection dropped: nothing in flight will land, the rows stay, and the
+	/// phase says they are stale (`Failed(error, Some(last))`).
+	fun disconnected(self, error: E) {
+		self.retire();
+		set_phase(self.state, self.state.get().failed(error));
+	}
+
+	/// The connection is back with the server's whole list: one load, landed now.
+	fun resync(self, list: List<T>) {
+		let token = self.load();
+		let _landed = self.settle(token, Ok(list));
+	}
+
+	/// Drop every claim, and cancel the tasks in flight: nothing asked so far
+	/// lands. What the owner's end runs.
+	fun retire(self) {
+		self.claims.write().load = 0;
+		self.drop_pages();
+		let running = self.running.read();
+		cancel(running.load);
+		cancel(running.older);
+		cancel(running.newer);
+		self.running.write() = Running { load = None, older = None, newer = None };
+	}
+
+	fun drop_pages(self) {
+		self.claims.write().older = 0;
+		self.claims.write().newer = 0;
+		if self.older_edge.get() is Edge::Loading {
+			self.older_edge.set(Edge::Idle);
+		}
+		if self.newer_edge.get() is Edge::Loading {
+			self.newer_edge.set(Edge::Idle);
+		}
+	}
+
+	// --- Pages ------------------------------------------------------------------
+
+	/// Ask for the page before the first row. `None` once the older end is done.
+	fun request_older(self): Option<i32> {
+		self.request(true)
+	}
+
+	/// Ask for the page after the last row. `None` once the newer end is done.
+	fun request_newer(self): Option<i32> {
+		self.request(false)
+	}
+
+	fun request(self, older: bool): Option<i32> {
+		let edge = if older { self.older_edge } else { self.newer_edge };
+		if edge.get() is Edge::End {
+			ret None;
+		}
+		let token = self.claim();
+		if older {
+			self.claims.write().older = token;
+		} else {
+			self.claims.write().newer = token;
+		}
+		set_edge(edge, Edge::Loading);
+		Some(token)
+	}
+
+	/// The older page asked for as `token`: a run spliced in at the top.
+	fun prepend_page(self, token: i32, reply: Result<Page<T>, E>): bool {
+		self.settle_page(true, token, reply)
+	}
+
+	/// The newer page asked for as `token`: a run spliced in at the bottom.
+	fun append_page(self, token: i32, reply: Result<Page<T>, E>): bool {
+		self.settle_page(false, token, reply)
+	}
+
+	fun settle_page(self, older: bool, token: i32, reply: Result<Page<T>, E>): bool {
+		let mine = if older { self.claims.read().older } else { self.claims.read().newer };
+		if token == 0 || mine != token {
+			ret false;
+		}
+		if older {
+			self.claims.write().older = 0;
+		} else {
+			self.claims.write().newer = 0;
+		}
+		let edge = if older { self.older_edge } else { self.newer_edge };
+		let feed = self;
+		match reply {
+			Ok(let page) => batch(|| {
+				let key = feed.key;
+				// A row already held (the page overlaps what is held, or repeats a
+				// row) is the server's word on that row, not a second row.
+				mut taken: HashMap<K, bool> = HashMap::new();
+				mut fresh: List<T> = [];
+				for item in page.items {
+					let id = key(&item);
+					if feed.changes.held(id) is Some(let _slot) {
+						feed.receive(item);
+					} else if !taken.contains_key(id) {
+						taken.insert(id, true);
+						fresh.push(item);
+					}
+				}
+				let at = if older { 0 } else { feed.lens.size() };
+				feed.lens.splice(at, 0, fresh);
+				set_edge(edge, if page.more { Edge::Idle } else { Edge::End });
+			}),
+			Err(let error) => edge.set(Edge::Failed(error)),
+		}
+		true
+	}
+
+	// --- The server's word on one row ---------------------------------------------
+
+	/// The server says this row holds `item` (a push). It lands in the lens, UNDER
+	/// any change pending on the row: the row keeps showing the change, and a
+	/// rejection shows `item`. A row not held arrives at the newer end.
+	fun receive(self, item: T) {
+		let id = (self.key)(&item);
+		match self.changes.held(id).and_then(|slot| slot.at()) {
+			Some(let at) => {
+				if self.lens.peek(|list| list.get(at)) != Some(item) {
+					self.lens.replace(at, item);
+				}
+			},
+			None => self.lens.push(item),
+		}
+	}
+
+	/// The server says the row is gone. It leaves the lens; a change pending on it
+	/// no longer shows (a provisional row aside).
+	fun receive_removed(self, id: K) {
+		if self.changes.held(id).and_then(|slot| slot.at()) is Some(let at) {
+			self.lens.remove_at(at);
+		}
+	}
+
+	// --- Real tasks -------------------------------------------------------------
+
+	/// Load with a real task. A load in flight is cancelled (its IO aborts), and
+	/// its reply, should it come anyway, is dropped by its token.
+	fun fetch(self, fetch: (async || Result<List<T>, E>) context ambient_nursery) {
+		let token = self.load();
+		cancel(self.running.read().load);
+		let running = detached_nursery();
+		self.running.write().load = Some(running);
+		let feed = self;
+		ambient_nursery.run(running, || {
+			let _load = async {
+				let reply = fetch();
+				let _landed = feed.settle(token, reply);
+			};
+		});
+	}
+
+	/// Ask for the older page with a real task: a page in flight at that end is
+	/// cancelled.
+	fun fetch_older(self, fetch: (async || Result<Page<T>, E>) context ambient_nursery) {
+		self.request_older() is Some(let token) else ret;
+		cancel(self.running.read().older);
+		let running = detached_nursery();
+		self.running.write().older = Some(running);
+		let feed = self;
+		ambient_nursery.run(running, || {
+			let _page = async {
+				let reply = fetch();
+				let _landed = feed.prepend_page(token, reply);
+			};
+		});
+	}
+
+	/// Ask for the newer page with a real task: a page in flight at that end is
+	/// cancelled.
+	fun fetch_newer(self, fetch: (async || Result<Page<T>, E>) context ambient_nursery) {
+		self.request_newer() is Some(let token) else ret;
+		cancel(self.running.read().newer);
+		let running = detached_nursery();
+		self.running.write().newer = Some(running);
+		let feed = self;
+		ambient_nursery.run(running, || {
+			let _page = async {
+				let reply = fetch();
+				let _landed = feed.append_page(token, reply);
+			};
+		});
+	}
+
+	/// Follow a std transient of whole lists (`.transient()`, `TaskSource`): its
+	/// latest-wins rule picks the reply, and the list lands here by key. Made under
+	/// an owner, the subscription is released with it.
+	fun follow<S: TransientSource<List<T>, E>>(self, source: S): Subscription {
+		let feed = self;
+		let mine: Shared<i32> = Shared::new(0);
+		let watching = source.states().on_change(|state| {
+			match state {
+				TransientState::Pending => mine.write() = feed.load(),
+				TransientState::Refreshing(let _old) => mine.write() = feed.load(),
+				TransientState::Ready(let list) => {
+					if mine.read() == 0 {
+						mine.write() = feed.load();
+					}
+					let _landed = feed.settle(mine.read(), Ok(list));
+					mine.write() = 0;
+				},
+				TransientState::Failed(let error, let _stale) => {
+					if mine.read() == 0 {
+						mine.write() = feed.load();
+					}
+					let _landed = feed.settle(mine.read(), Err(error));
+					mine.write() = 0;
+				},
+				TransientState::Absent => {},
+			}
+		});
+		register_with_owner(watching)
+	}
+}
+
+// === A loaded keyed collection ================================================
+
+/// Optimistic writes beside a keyed lens (R12). A keyed slot follows the KEY, so a
+/// hidden record and a rejected delete stay in the same slot without help.
+export struct MapOverlay<K: Hashable, V> {
+	lens: KeyedLens<HashMap<K, V>, K, V>,
+	ledger: Ledger<K, V>,
+}
+
+export impl MapOverlay<type K: PartialEq + Hashable, type V: PartialEq> {
+	fun beside(lens: KeyedLens<HashMap<K, V>, K, V>): MapOverlay<K, V> {
+		// Bound first, as in `Overlay::beside`.
+		let ledger: Ledger<K, V> = Ledger::new();
+		MapOverlay { lens, ledger }
+	}
+
+	/// The lens the overlay sits beside: the server's word.
+	fun lens(self): KeyedLens<HashMap<K, V>, K, V> {
+		self.lens
+	}
+
+	fun holds(self, key: K): bool {
+		self.lens.peek(|map| map.contains_key(key))
+	}
+
+	/// Show `value` at `key`, pending the server: an edit when the key is held, a
+	/// provisional record when not. The lens is not written.
+	fun propose(self, key: K, value: V): i32 {
+		self.ledger.open(key, Some(value), !self.holds(key), None, None)
+	}
+
+	/// HIDE the record at `key`, pending the server. The lens keeps it.
+	fun propose_delete(self, key: K): i32 {
+		self.ledger.open(key, None, false, None, None)
+	}
+
+	/// The server took the change: when it is the newest confirmed one on its key,
+	/// it lands in the lens.
+	fun confirm(self, id: i32): bool {
+		self.answer(id, true, None)
+	}
+
+	/// The server took the change and answered with its own copy of the record.
+	fun confirm_with(self, id: i32, value: V): bool {
+		self.answer(id, true, Some(value))
+	}
+
+	/// The server refused the change. Nothing is written.
+	fun reject(self, id: i32): bool {
+		self.answer(id, false, None)
+	}
+
+	fun answer(self, id: i32, accepted: bool, reply: Option<V>): bool {
+		let overlay = self;
+		mut answered = false;
+		batch(|| {
+			overlay.ledger.close(id, accepted) is Some(let ended) else ret;
+			answered = true;
+			if !ended.lands {
+				ret;
+			}
+			let landed = match reply {
+				Some(let value) => Some(value),
+				None => ended.value,
+			};
+			let held = overlay.lens.peek(|map| map.get(ended.key));
+			match landed {
+				None => {
+					if held is Some(let _value) {
+						overlay.lens.remove(ended.key);
+					}
+				},
+				Some(let value) => {
+					if held is Some(let _value) || ended.insert {
+						if held != Some(value) {
+							overlay.lens.put(ended.key, value);
+						}
+					}
+				},
+			}
+		});
+		answered
+	}
+
+	/// What the record at `key` shows: the pending value on top of the lens's, or
+	/// `None` while it is hidden or absent. A source that wakes only when what it
+	/// shows changes.
+	fun view(self, key: K): MemoCell<Option<V>> {
+		let ledger = self.ledger;
+		let slot = self.lens.slot(key);
+		derive(|| {
+			let _woke = ledger.row(key).woke.track();
+			ledger.over(key, slot.track())
+		}).distinct().memo()
+	}
+
+	/// What the record at `key` shows now, not tracked.
+	fun shown(self, key: K): Option<V> {
+		self.ledger.over(key, self.lens.peek(|map| map.get(key)))
+	}
+
+	/// Whether the record at `key` has a change pending, as a source.
+	fun is_pending(self, key: K): MemoCell<bool> {
+		MemoCell { cell = self.ledger.row(key).pending }
+	}
+
+	/// How many changes are pending, as a source.
+	fun pending(self): MemoCell<i32> {
+		MemoCell { cell = self.ledger.count }
+	}
+}
+
+/// Records loaded one key at a time, each with its own phase, over a keyed lens:
+/// kolt's shape, records by id. A keyed slot follows the KEY, so a record that goes
+/// `Absent` and comes back wakes the same slot.
+export struct LoadedMap<K: Hashable, V, E> {
+	lens: KeyedLens<HashMap<K, V>, K, V>,
+	changes: MapOverlay<K, V>,
+	phases: Shared<HashMap<K, SignalCell<TransientState<i32, E>>>>,
+	claims: Shared<HashMap<K, i32>>,
+	next: Shared<i32>,
+}
+
+export impl LoadedMap<type K: PartialEq + Hashable, type V: PartialEq, type E> {
+	/// An empty collection. Made under an owner, it drops every load in flight when
+	/// the owner goes.
+	fun new(): LoadedMap<K, V, E> {
+		let empty: HashMap<K, V> = HashMap::new();
+		let lens = KeyedLens::over(empty);
+		let records: LoadedMap<K, V, E> = LoadedMap {
+			lens,
+			changes = MapOverlay::beside(lens),
+			phases = Shared::new(HashMap::new()),
+			claims = Shared::new(HashMap::new()),
+			next = Shared::new(0),
+		};
+		defer_to_owner(|| records.retire());
+		records
+	}
+
+	/// The server's records, as the lens holds them.
+	fun items(self): KeyedLens<HashMap<K, V>, K, V> {
+		self.lens
+	}
+
+	/// The optimistic overlay beside the records.
+	fun overlay(self): MapOverlay<K, V> {
+		self.changes
+	}
+
+	fun phase_cell(self, key: K): SignalCell<TransientState<i32, E>> {
+		if self.phases.read().get(key) is Some(let held) {
+			ret held;
+		}
+		let made: SignalCell<TransientState<i32, E>> = SignalCell::new(TransientState::Pending);
+		self.phases.write().insert(key, made);
+		made
+	}
+
+	/// Where the record at `key` stands, `Pending` until it is asked for and
+	/// answered: `Ready(token)`, `Absent` ("no such record"), `Failed`.
+	fun phase(self, key: K): MemoCell<TransientState<i32, E>> {
+		MemoCell { cell = self.phase_cell(key) }
+	}
+
+	/// Start a load of one record. Answers the token its reply must carry.
+	fun load(self, key: K): i32 {
+		let token = self.next.read() + 1;
+		self.next.write() = token;
+		self.claims.write().insert(key, token);
+		let phase = self.phase_cell(key);
+		set_phase(phase, phase.get().refreshed());
+		token
+	}
+
+	/// The reply to load `token` of `key`: `Ok(None)` is "no such record"
+	/// (`Absent`). Dropped (answers false) when a newer load of the key, or the
+	/// owner's end, superseded it.
+	fun settle(self, key: K, token: i32, reply: Result<Option<V>, E>): bool {
+		if self.claims.read().get(key) != Some(token) {
+			ret false;
+		}
+		self.claims.write().remove(key);
+		let phase = self.phase_cell(key);
+		let records = self;
+		match reply {
+			Ok(let found) => batch(|| {
+				records.receive(key, found);
+				set_phase(phase, if found is Some(let _value) {
+					TransientState::Ready(token)
+				} else {
+					TransientState::Absent
+				});
+			}),
+			Err(let error) => set_phase(phase, phase.get().failed(error)),
+		}
+		true
+	}
+
+	/// The server's word on a record, pushed (`None`: it is gone). It lands in the
+	/// lens, under any change pending on the record. The phase is `Ready(0)` (no
+	/// load asked for it) or `Absent`.
+	fun push(self, key: K, value: Option<V>) {
+		let phase = self.phase_cell(key);
+		let records = self;
+		batch(|| {
+			records.receive(key, value);
+			set_phase(phase, if value is Some(let _value) {
+				TransientState::Ready(0)
+			} else {
+				TransientState::Absent
+			});
+		});
+	}
+
+	fun receive(self, key: K, value: Option<V>) {
+		let held = self.lens.peek(|map| map.get(key));
+		if held == value {
+			ret;
+		}
+		match value {
+			Some(let record) => self.lens.put(key, record),
+			None => self.lens.remove(key),
+		}
+	}
+
+	/// Drop every load in flight. What the owner's end runs.
+	fun retire(self) {
+		self.claims.write() = HashMap::new();
+	}
+}

@@ -23,6 +23,12 @@ import std::reactive::transient::{ TransientState, TransientSource, Transient, T
 
 `std::rpc`'s `RemoteSource<T>` is a `TransientSource<T, RpcError>` too.
 
+A transient of a whole LIST replaces the list when it lands and reads `None`
+while it refreshes. A list whose rows should stay on screen and keep their
+identity through a refresh, page at either end, or show optimistic changes is a
+[loaded list](loaded.md) over a lens, which follows any `TransientSource` of
+lists with `follow`.
+
 ## TransientState
 
 | State | Meaning | `get()` | `latest()` | `is_pending()` |

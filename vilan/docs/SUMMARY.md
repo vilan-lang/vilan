@@ -49,6 +49,7 @@
 - [Transient sources](std/transient.md)
 - [Stores](std/store.md)
 - [Lenses](std/lens.md)
+- [Loaded data](std/loaded.md)
 - [Style](std/style.md)
 - [RPC](std/rpc.md)
 - [Browser modules](std/browser.md)

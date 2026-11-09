@@ -72,6 +72,12 @@ const EXCLUDED: &[(&str, &str)] = &[
          run both ways, and `vilan-cli/tests/reactive_lens.rs` runs this one under \
          node and reads its exit code (A185 S1)",
     ),
+    (
+        "lens-loaded-tasks.vl",
+        "async + host timers (real tasks: `sleep` polls, nurseries cancelled) — \
+         `vilan-cli/tests/reactive_lens.rs` runs it under node and reads its exit \
+         code (A185 S5)",
+    ),
     ("async-await.vl", "async"),
     ("async-promise-all.vl", "async"),
     (
