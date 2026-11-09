@@ -4,7 +4,7 @@
 // a feed and an index give back, and the wrapper types (R10).
 import std::hash_map::HashMap;
 import std::io::assert;
-import std::reactive::lens::{ Change, KeyedLens, SequenceLens, Stage, keyed, sequence };
+import std::reactive::lens::{ Change, KeyedLens, Resizable, SequenceLens, Stage, keyed, sequence };
 import std::reactive::{
 	CollFlow,
 	CollPipe,
@@ -42,6 +42,35 @@ fun ages_of(): HashMap<str, i32> {
 	mut ages: HashMap<str, i32> = HashMap::new();
 	ages.insert("bo", 4);
 	ages
+}
+
+/// A sequence that writes only the three required members of `Resizable`: every
+/// other member is the trait's default.
+struct Bag {
+	held: List<str>,
+}
+
+impl Bag with Resizable<str> {
+	fun count(self): usize {
+		self.held.len()
+	}
+
+	fun item(self, at: usize): Option<str> {
+		self.held.get(at)
+	}
+
+	fun splice(&mut self, at: usize, removed: usize, inserted: List<str>) {
+		mut taken: usize = 0;
+		for taken < removed {
+			self.held.remove(at);
+			taken += 1;
+		}
+		mut offset: usize = 0;
+		for value in inserted {
+			self.held.insert(at + offset, value);
+			offset += 1;
+		}
+	}
 }
 
 fun row_arrived_reads<S: Source<Option<str>>>(op: SeqOp<S>): List<Option<str>> {
@@ -227,14 +256,14 @@ fun main() {
 	let feed = held.rows();
 	assert(feed.get().len() == 4, "rows() holds a slot per item");
 	feed.release();
-	assert(held.taps.read().len() == 0, "releasing the feed lets its tap and its slots go");
+	assert(held.tapped() == 0, "releasing the feed lets its tap and its slots go");
 
 	// Made inside an owner scope, a slot and a feed go with the owner.
 	let scoped = sequence(["m", "n"]);
 	let ((inner, feed2), owner) = comp(|| (scoped.slot(1), scoped.rows()));
-	assert(inner.get() == Some("n") && scoped.taps.read().len() == 1, "alive while the owner is");
+	assert(inner.get() == Some("n") && scoped.tapped() == 1, "alive while the owner is");
 	owner.dispose();
-	assert(inner.get() == None && scoped.taps.read().len() == 0, "released with the owner");
+	assert(inner.get() == None && scoped.tapped() == 0, "released with the owner");
 	assert(feed2.get().len() == 0, "the feed let its slots go");
 
 	// One write is one op to a consumer: a replacing splice is a Delete and an
@@ -359,7 +388,7 @@ fun main() {
 	assert(l_found.map(|slot| slot.get()) == Some(Some("l")), "the index holds l's slot");
 	by_name.release();
 	assert(
-		l_found.map(|slot| slot.get()) == Some(None) && indexed.taps.read().len() == 0,
+		l_found.map(|slot| slot.get()) == Some(None) && indexed.tapped() == 0,
 		"released, the index let its tap and its slots go",
 	);
 
@@ -413,6 +442,66 @@ fun main() {
 		"a KeyedLens is the keyed lens",
 	);
 	assert(wrapped.names.lens().all() == ["w", "x", "y"], "lens() hands out the full lens");
+
+	// S3, the slim path: what nobody asked for is made on the first ask, ONCE for
+	// every handle. A slot's cell is made by its first listener, and a second
+	// handle on the slot, made before that, rides the same cell.
+	let lazy = sequence(["a", "b"]);
+	let first_handle = lazy.slot(1);
+	let second_handle = lazy.slot(1);
+	let lazy_runs: Shared<i32> = Shared::new(0);
+	let _l1 = first_handle.on_change(|_value| lazy_runs.write() += 1);
+	let _l2 = second_handle.on_change(|_value| lazy_runs.write() += 1);
+	assert(
+		first_handle.identity() == second_handle.identity(),
+		"S3: one slot, one cell, made on the first listen",
+	);
+	lazy.replace(1, "B");
+	assert(lazy_runs.read() == 2, "S3: both listeners ride the slot's one cell");
+
+	// The length's cell, asked through one copy of a handle after writes, hears a
+	// write through another copy made before the cell existed.
+	let counted = SequenceLens::over(["a"]);
+	let copied = counted;
+	counted.push("b");
+	let counts: Shared<i32> = Shared::new(0);
+	let _counts = copied.length().on_change(|_n| counts.write() += 1);
+	counted.push("c");
+	assert(
+		counts.read() == 1 && copied.length().get() == 3,
+		"S3: a length asked through one handle hears a write through another",
+	);
+
+	// A tap may make the FIRST slot in the middle of a write (a row feed over an
+	// empty list): every later change of that write must still move it.
+	let empty: List<str> = [];
+	let grown = sequence(empty);
+	let grown_rows = grown.rows();
+	grown.update(|held| {
+		held.push("x");
+		held.push("y");
+		(void, [Change::Insert(0usize, 1usize), Change::Insert(0usize, 1usize)])
+	});
+	let grown_slots = grown_rows.get();
+	assert(
+		grown_slots.len() == 2 && grown_slots[0].key() != grown_slots[1].key(),
+		"S3: the second change moved the slot the first change's tap made",
+	);
+	assert(
+		grown_slots[0].get() == Some("x") && grown_slots[1].get() == Some("y"),
+		"S3: and each row reads its own item",
+	);
+	grown_rows.release();
+
+	// `Resizable::shift`'s default (a structure that does not override it) moves
+	// one item, and the item's slot goes with it.
+	let bag = sequence(Bag { held = ["p", "q", "r", "s"] });
+	let p_slot = bag.slot(0);
+	bag.move_item(0, 2);
+	assert(bag.all() == ["q", "r", "p", "s"], "S3: the default shift moved the item");
+	assert(p_slot.at() == Some(2) && p_slot.get() == Some("p"), "S3: and its slot went with it");
+	bag.move_item(3, 0);
+	assert(bag.all() == ["s", "q", "r", "p"], "S3: leftward too");
 
 	print("laws: all passed");
 }

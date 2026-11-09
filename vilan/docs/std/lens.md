@@ -123,7 +123,8 @@ because an integer literal is not yet inferred through `Change<A>`.
 
 A structure goes under a lens by implementing its shape. `Resizable<T>` has
 three required members (`count`, `item`, `splice`) and defaults for the rest
-(`put`, `lend`, `change`), which a structure overrides when it can do better.
+(`put`, `lend`, `change`, `shift`), which a structure overrides when it can do
+better.
 The structure holds no reactive code:
 
 ```vilan
@@ -376,9 +377,13 @@ handle: it follows nothing from then on, and a new ask makes a new slot.
   and `sequence_checked` where `update` is unavoidable.
 - **Two ways to read.** `get()` is coarse and slots are fine. A view that
   indexes `get()` works, and re-renders on every write.
-- **Bare writes cost more than a `ListCell`'s**: a lens keeps a slot table, a
-  tap list and three notification cells. Where nothing watches a slot, a
-  `ListCell` is the cheaper cell.
+- **Nothing is kept for what nobody asked for.** A lens nobody follows holds its
+  structure and one notification cell: the slot table is made by the first
+  `slot`, a slot's cell by the first listener, and the length's and the
+  positions' cells by the first `length()` and `index()`. Its bare writes cost
+  about what a `ListCell`'s do. It still holds more memory than a `ListCell`
+  (about twice, for a small list): its handle, its access closures and its
+  empty tables.
 - **JS only, for now.** The native backend does not build a program that uses
   the lens yet: it drops the binding of a `.. is Some(let at) else ret;` guard
   (tracker B709).
