@@ -1230,6 +1230,58 @@ pub fn instances_minted(source: &str, function_name: &str) -> usize {
         .expect("the instance-log worker panicked")
 }
 
+/// B709: the guard clauses of the ENTRY source whose captures the analyzer
+/// published past the `if` ([`vilan_core::analyzer::Program::guard_continuations`]),
+/// in source order, each as the first line of its `if`'s text and the path its
+/// continuation runs on. Panics on a dirty analysis.
+pub fn guard_continuations(source: &str) -> Vec<(String, vilan_core::analyzer::ContinuationPath)> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean compile, got: {messages:#?}"
+            );
+            let program = program.expect("a clean analysis produces a program");
+            let mut guards: Vec<(usize, String, vilan_core::analyzer::ContinuationPath)> = program
+                .guard_continuations
+                .iter()
+                .filter(|(id, _)| {
+                    program.source_of(**id) == Some(vilan_core::analyzer::SourceId(0))
+                })
+                .map(|(id, path)| {
+                    let span = program.span_map[id];
+                    let text = leaked[span.start..span.end]
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    (span.start, text, *path)
+                })
+                .collect();
+            guards.sort_by_key(|(start, _, _)| *start);
+            guards
+                .into_iter()
+                .map(|(_, text, path)| (text, path))
+                .collect()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the guard-continuation worker panicked")
+}
+
 /// The R11 "not move-clean" diagnostics for `source`, each as
 /// `(message, primary range, note)`.
 pub fn r11_rejections(

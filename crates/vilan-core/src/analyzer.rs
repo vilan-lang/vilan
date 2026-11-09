@@ -4136,6 +4136,21 @@ impl ConditionPolarity {
     }
 }
 
+/// Which path of a guard clause's condition its continuation runs on (B709) —
+/// the path whose captures the analyzer published past the `if`
+/// ([`Program::guard_continuations`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ContinuationPath {
+    /// R15 (B459): a `then`-spelled statement whose `else` diverges —
+    /// `opt is Some(let v) else ret;`. The condition held, and the captures of
+    /// its TRUE path are in scope from the statement's end.
+    WhenTrue,
+    /// B187: an else-less `if` whose then-block diverges — `if !(opt is
+    /// Some(let v)) { ret; }`. The condition failed, and the captures of its
+    /// FALSE path are in scope from the `if`'s end.
+    WhenFalse,
+}
+
 /// A guard clause whose verdict is not yet in (B222): an else-less `if` whose
 /// condition binds captures on its FALSE path, written down while the body is
 /// walked and decided once [`DivergenceLeaves`] have settled.
@@ -4150,6 +4165,10 @@ impl ConditionPolarity {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 struct GuardContinuation<'src> {
+    /// The `if` itself, and the path its continuation runs on — recorded on
+    /// [`Program::guard_continuations`] when the verdict is yes (B709).
+    if_id: Id,
+    path: ContinuationPath,
     /// The scope the captures are published into: the one the guard is written
     /// in, which is where its continuation runs.
     scope_id: Id,
@@ -6503,6 +6522,9 @@ pub struct Analyzer<'src> {
     // B544: the `is` captures a guard published to its continuation, with the
     // offset they are visible from — a whole write there rebinds a local.
     guard_continuation_captures: HashMap<Id, usize>,
+    // B709: the guard clauses whose verdict was yes, by the `if`'s id — moved
+    // into [`Program::guard_continuations`].
+    guard_continuation_ifs: HashMap<Id, ContinuationPath>,
     // B537: where each unbound `return` read B523 steered starts — a body
     // whose last statement starts there has had its one report.
     unbound_return_starts: HashSet<(Option<SourceId>, usize)>,
@@ -8567,6 +8589,7 @@ impl<'src> Analyzer<'src> {
             divergence_leaves: DivergenceLeaves::default(),
             guard_continuations: Vec::new(),
             guard_continuation_captures: HashMap::default(),
+            guard_continuation_ifs: HashMap::default(),
             unbound_return_starts: HashSet::default(),
             calls_with_refused_arguments: HashSet::default(),
             source_trait_id: None,
@@ -42902,6 +42925,8 @@ impl<'src> Analyzer<'src> {
             && !false_path_captures.is_empty()
         {
             self.guard_continuations.push(GuardContinuation {
+                if_id: id,
+                path: ContinuationPath::WhenFalse,
                 scope_id,
                 visible_from: node.1.end,
                 diverging_statements: then_ids.clone(),
@@ -42932,6 +42957,8 @@ impl<'src> Analyzer<'src> {
             && !true_path_captures.is_empty()
         {
             self.guard_continuations.push(GuardContinuation {
+                if_id: id,
+                path: ContinuationPath::WhenTrue,
                 scope_id,
                 visible_from: node.1.end,
                 diverging_statements: else_ids.clone(),
@@ -72826,6 +72853,7 @@ impl<'src> Analyzer<'src> {
             if !diverges {
                 continue;
             }
+            self.guard_continuation_ifs.insert(guard.if_id, guard.path);
             for (name, capture_id, visible_until) in guard.captures {
                 self.guard_continuation_captures
                     .insert(capture_id, guard.visible_from);
@@ -77713,6 +77741,13 @@ pub struct Program<'src> {
     // `for e in &mut list` loop bindings → whether the element view is `&mut`.
     pub for_each_views: HashMap<Id, bool>,
     pub binary_op_dispatch: HashMap<Id, Id>,
+    /// B709: every guard clause whose captures the analyzer published past
+    /// the `if` (B187's diverging then-block, R15's diverging `else`), by the
+    /// `if`'s id, with the path its continuation runs on. The JS backend needs
+    /// nothing (a capture is an accessor at every read); a backend whose
+    /// bindings are lexically scoped has to restructure the `if` so the
+    /// captures outlive it — Rust's `let … else`.
+    pub guard_continuations: HashMap<Id, ContinuationPath>,
     /// B176: `str + value` binaries whose right operand is a generic parameter
     /// whose bound provides the string form — `(the parameter's constraint, the
     /// trait that provides `to_string`)`. The emission routes the operand
@@ -93577,6 +93612,7 @@ fn analyze_over_world<'src>(
         for_each_iterable_types: analyzer.for_each_iterable_types,
         for_each_views: analyzer.for_each_views,
         binary_op_dispatch: analyzer.binary_op_dispatch,
+        guard_continuations: analyzer.guard_continuation_ifs,
         concat_render_dispatch: analyzer.concat_render_dispatch,
         own_generic_call_bindings: analyzer.own_generic_call_bindings,
         bound_dispatch_traits: analyzer.bound_dispatch_traits,
