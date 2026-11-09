@@ -345,10 +345,14 @@ export impl Overlay<type T: PartialEq, type K: PartialEq + Hashable> {
 	/// An overlay beside `lens`, whose rows are told apart by `key`. Made under an
 	/// owner, the index and row feed it keeps on the lens are released with it.
 	fun beside(lens: SequenceLens<List<T>, T>, key: |&T| K): Overlay<T, K> {
+		// Bound first, under the impl's `K`: a `Ledger::new()` written in the
+		// literal's field is checked against `Overlay`'s DECLARED bounds, which
+		// lack `PartialEq`, and refused (a checker defect, reported with S5).
+		let ledger: Ledger<K, T> = Ledger::new();
 		Overlay {
 			lens,
 			key,
-			ledger = Ledger::new(),
+			ledger,
 			index = lens.index_by(key),
 			feed = lens.rows(),
 			shape = lens.lens().slot_of(-1).index(),
@@ -1064,7 +1068,9 @@ export struct MapOverlay<K: Hashable, V> {
 
 export impl MapOverlay<type K: PartialEq + Hashable, type V: PartialEq> {
 	fun beside(lens: KeyedLens<HashMap<K, V>, K, V>): MapOverlay<K, V> {
-		MapOverlay { lens, ledger = Ledger::new() }
+		// Bound first, as in `Overlay::beside`.
+		let ledger: Ledger<K, V> = Ledger::new();
+		MapOverlay { lens, ledger }
 	}
 
 	/// The lens the overlay sits beside: the server's word.

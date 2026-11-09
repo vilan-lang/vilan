@@ -1857,7 +1857,8 @@ function index(self) {
 	return [ __clone(self) ];
 }
 function beside(lens2, key, $c) {
-	return [ __clone(lens2), key, new8(), index_by2(lens2, key, $c), rows2(lens2, $c), index(slot_of(lens(lens2), -(1))) ];
+	const ledger = new8();
+	return [ __clone(lens2), key, ledger, index_by2(lens2, key, $c), rows2(lens2, $c), index(slot_of(lens(lens2), -(1))) ];
 }
 function identity(self) {
 	return [ 1 ];
@@ -2084,7 +2085,7 @@ function compose(self, with_hidden) {
 			const above = $aJ[0];
 			const below = $aJ[1];
 			const at2 = landing_among(all3, above, below);
-			__insert_at(all3, at2, [ __clone(row_key), [ 1 ] ], "std/src/reactive/lens/loaded.vl:584:9");
+			__insert_at(all3, at2, [ __clone(row_key), [ 1 ] ], "std/src/reactive/lens/loaded.vl:588:9");
 		}
 	}
 	if (with_hidden) {
@@ -2314,7 +2315,7 @@ function rows3(self, $aa, $ab) {
 		track(feed, $ad);
 		track2(layout, $ad);
 		return compose(overlay2, false);
-	}, "std/src/reactive/lens/loaded.vl:540:3"), "std/src/reactive/lens/loaded.vl:544:6"), $aa, $ab, "std/src/reactive/lens/loaded.vl:544:17");
+	}, "std/src/reactive/lens/loaded.vl:544:3"), "std/src/reactive/lens/loaded.vl:548:6"), $aa, $ab, "std/src/reactive/lens/loaded.vl:548:17");
 }
 function observe(signal, observer) {
 	const cell3 = signal[0];
@@ -2542,7 +2543,7 @@ function view(self, slot3, $cI, $cJ) {
 			$cP = [ 1 ];
 		}
 		return $cP;
-	}, "std/src/reactive/lens/loaded.vl:503:3"), "std/src/reactive/lens/loaded.vl:512:6"), $cI, $cJ, "std/src/reactive/lens/loaded.vl:512:17");
+	}, "std/src/reactive/lens/loaded.vl:507:3"), "std/src/reactive/lens/loaded.vl:516:6"), $cI, $cJ, "std/src/reactive/lens/loaded.vl:516:17");
 }
 function attach_observer3(self, observer, immediately) {
 	const subscription = observe(self, observer);
@@ -3087,7 +3088,7 @@ function propose_insert(self, at2, value, $fg) {
 	const shown2 = shown_rows(self);
 	let $fi = null;
 	if (at2 > 0 && at2 <= shown2.length) {
-		$fi = [ 0, __clone(__at(shown2, at2 - 1, "std/src/reactive/lens/loaded.vl:399:53")[0]) ];
+		$fi = [ 0, __clone(__at(shown2, at2 - 1, "std/src/reactive/lens/loaded.vl:403:53")[0]) ];
 	} else {
 		$fi = [ 1 ];
 	}
@@ -3173,7 +3174,7 @@ function view_key(self, key, $fw, $fx) {
 		}
 		const held2 = $fC;
 		return over3(ledger, key, held2);
-	}, "std/src/reactive/lens/loaded.vl:521:3"), "std/src/reactive/lens/loaded.vl:529:6"), $fw, $fx, "std/src/reactive/lens/loaded.vl:529:17");
+	}, "std/src/reactive/lens/loaded.vl:525:3"), "std/src/reactive/lens/loaded.vl:533:6"), $fw, $fx, "std/src/reactive/lens/loaded.vl:533:17");
 }
 function is_pending_key(self, key) {
 	return [ __clone(row(self[2], key)[1]) ];

@@ -1911,7 +1911,8 @@ function index(self) {
 	return [ __clone(self) ];
 }
 function beside(lens2, key, $g) {
-	return [ __clone(lens2), key, new9(), index_by2(lens2, key, $g), rows2(lens2, $g), index(slot_of(lens(lens2), -(1))) ];
+	const ledger = new9();
+	return [ __clone(lens2), key, ledger, index_by2(lens2, key, $g), rows2(lens2, $g), index(slot_of(lens(lens2), -(1))) ];
 }
 function get2(self) {
 	return __clone(self[0].v);
@@ -1976,11 +1977,11 @@ function drop_pages(self, $af) {
 	self[6].v[3] = 0;
 	const $ag = get2(self[4]);
 	if ($ag[0] === 1) {
-		set(self[4], [ 0 ], $af, "std/src/reactive/lens/loaded.vl:869:20");
+		set(self[4], [ 0 ], $af, "std/src/reactive/lens/loaded.vl:873:20");
 	}
 	const $ar = get2(self[5]);
 	if ($ar[0] === 1) {
-		set(self[5], [ 0 ], $af, "std/src/reactive/lens/loaded.vl:872:20");
+		set(self[5], [ 0 ], $af, "std/src/reactive/lens/loaded.vl:876:20");
 	}
 }
 function retire(self, $ae) {
@@ -1995,7 +1996,7 @@ function retire(self, $ae) {
 function new12(key, $c, $d) {
 	const empty = [  ];
 	const lens2 = over2(empty, $c);
-	const feed8 = [ __clone(lens2), beside(lens2, key, $d), key, new8([ 0 ], "std/src/reactive/lens/loaded.vl:763:24"), new8([ 0 ], "std/src/reactive/lens/loaded.vl:764:29"), new8([ 0 ], "std/src/reactive/lens/loaded.vl:765:29"), __shared_new([ 0, 0, 0, 0 ]), __shared_new([ [ 1 ], [ 1 ], [ 1 ] ]) ];
+	const feed8 = [ __clone(lens2), beside(lens2, key, $d), key, new8([ 0 ], "std/src/reactive/lens/loaded.vl:767:24"), new8([ 0 ], "std/src/reactive/lens/loaded.vl:768:29"), new8([ 0 ], "std/src/reactive/lens/loaded.vl:769:29"), __shared_new([ 0, 0, 0, 0 ]), __shared_new([ [ 1 ], [ 1 ], [ 1 ] ]) ];
 	defer_to_owner(() => {
 		return retire(feed8, $c);
 	}, $d);
@@ -2123,7 +2124,7 @@ function set2(self, value, $ah, caller) {
 }
 function set_phase(cell4, next, $aD) {
 	if (!(same_phase(get2(cell4), next))) {
-		set2(cell4, next, $aD, "std/src/reactive/lens/loaded.vl:712:8");
+		set2(cell4, next, $aD, "std/src/reactive/lens/loaded.vl:716:8");
 	}
 }
 function load(self, $ay) {
@@ -2955,7 +2956,7 @@ function view(self, slot5, $cJ, $cK) {
 			$da = [ 1 ];
 		}
 		return $da;
-	}, "std/src/reactive/lens/loaded.vl:503:3"), "std/src/reactive/lens/loaded.vl:512:6"), $cJ, $cK, "std/src/reactive/lens/loaded.vl:512:17");
+	}, "std/src/reactive/lens/loaded.vl:507:3"), "std/src/reactive/lens/loaded.vl:516:6"), $cJ, $cK, "std/src/reactive/lens/loaded.vl:516:17");
 }
 function observe(signal, observer) {
 	const cell4 = signal[0];
@@ -3070,7 +3071,7 @@ function is_pending(self, slot5) {
 		const key = $eX[1];
 		$eY = is_pending_key(self, key);
 	} else {
-		$eY = [ new8(false, "std/src/reactive/lens/loaded.vl:605:42") ];
+		$eY = [ new8(false, "std/src/reactive/lens/loaded.vl:609:42") ];
 	}
 	return $eY;
 }
@@ -3165,7 +3166,7 @@ function set_edge(cell4, next, $fw) {
 	}
 	const same = $fy;
 	if (!(same)) {
-		set(cell4, next, $fw, "std/src/reactive/lens/loaded.vl:725:8");
+		set(cell4, next, $fw, "std/src/reactive/lens/loaded.vl:729:8");
 	}
 }
 function request(self, older3, $ft) {
@@ -3336,7 +3337,7 @@ function settle_page(self, older3, token, reply, $fC) {
 		}, $fC);
 	} else {
 		const error = $fF[1];
-		$fG = set(edge2, [ 3, __clone(error) ], $fC, "std/src/reactive/lens/loaded.vl:945:27");
+		$fG = set(edge2, [ 3, __clone(error) ], $fC, "std/src/reactive/lens/loaded.vl:949:27");
 	}
 	$fG;
 	return true;
@@ -3441,7 +3442,7 @@ function compose(self, with_hidden) {
 			const above = $gm[0];
 			const below = $gm[1];
 			const at3 = landing_among(all3, above, below);
-			__insert_at(all3, at3, [ __clone(row_key), [ 1 ] ], "std/src/reactive/lens/loaded.vl:584:9");
+			__insert_at(all3, at3, [ __clone(row_key), [ 1 ] ], "std/src/reactive/lens/loaded.vl:588:9");
 		}
 	}
 	if (with_hidden) {
@@ -3795,7 +3796,7 @@ function rows3(self, $gY, $gZ) {
 		track3(feed8, $hb);
 		track2(layout, $hb);
 		return compose(overlay3, false);
-	}, "std/src/reactive/lens/loaded.vl:540:3"), "std/src/reactive/lens/loaded.vl:544:6"), $gY, $gZ, "std/src/reactive/lens/loaded.vl:544:17");
+	}, "std/src/reactive/lens/loaded.vl:544:3"), "std/src/reactive/lens/loaded.vl:548:6"), $gY, $gZ, "std/src/reactive/lens/loaded.vl:548:17");
 }
 function attach_observer7(self, observer, immediately) {
 	return attach_observer5(self[0], observer, immediately);
@@ -3900,7 +3901,8 @@ function over5(value) {
 	return [ keyed(value) ];
 }
 function beside2(lens2) {
-	return [ __clone(lens2), new9() ];
+	const ledger = new9();
+	return [ __clone(lens2), ledger ];
 }
 function retire2(self) {
 	self[3].v = new10();
@@ -4192,7 +4194,7 @@ function view2(self, key, $hQ, $hR) {
 	return memo3(distinct(derive(($ib, $ic, $id) => {
 		track2(row2(ledger, key)[0], $ic);
 		return over6(ledger, key, track4(slot5, $ic));
-	}, "std/src/reactive/lens/loaded.vl:1144:3"), "std/src/reactive/lens/loaded.vl:1147:6"), $hQ, $hR, "std/src/reactive/lens/loaded.vl:1147:17");
+	}, "std/src/reactive/lens/loaded.vl:1150:3"), "std/src/reactive/lens/loaded.vl:1153:6"), $hQ, $hR, "std/src/reactive/lens/loaded.vl:1153:17");
 }
 function on_change6(self, observer, caller) {
 	return place_subscription(attach_observer7(self, (value) => {
@@ -4206,7 +4208,7 @@ function phase_cell(self, key) {
 	if ($iL[0] === 0) {
 		return $iL[1];
 	}
-	const made = new8([ 0 ], "std/src/reactive/lens/loaded.vl:1208:62");
+	const made = new8([ 0 ], "std/src/reactive/lens/loaded.vl:1214:62");
 	insert2(self[2].v, key, made);
 	return made;
 }
