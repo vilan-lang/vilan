@@ -40,7 +40,7 @@
 //! Every function here takes `&Program` (and at most an admission file), so
 //! neither emitter's state can leak into an answer.
 
-use crate::analyzer::{Expr, Program, SourceId};
+use crate::analyzer::{Expr, Implementation, Program, SourceId};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::impl_select;
@@ -382,8 +382,14 @@ pub fn trait_parameter_substitution(
     if trait_.generic_parameter_constraint_ids.is_empty() {
         return substitution;
     }
+    // A supertrait's default reached through a ONE-BLOCK subtrait impl (B715:
+    // `impl Cell with Write<str>`, `trait Write<T> with Read<T>`, a `Read`
+    // default) has no block that NAMES the declaring trait, so selection by the
+    // written clause finds none; the block that PROVIDES it through the chain
+    // (B419's closed set) is the one whose arguments the body runs under.
     let Some(implementation) =
         impl_select::select_implementation(program, file, type_id, *trait_id)
+            .or_else(|| providing_implementation(program, type_id, *trait_id))
     else {
         return substitution;
     };
@@ -393,8 +399,12 @@ pub fn trait_parameter_substitution(
         type_id,
         &mut substitution,
     );
+    // What the block PROVIDES, not what it names (B419): the providing block
+    // above carries the declaring trait's arguments only in the closed set.
+    // Unbound, the default's `T` lowered `&item` as a VALUE where the reader,
+    // typed at `str`, took a PLACE — a miscompile with no diagnostic (B715).
     let Some((_, arguments)) = implementation
-        .trait_args
+        .provided_trait_args
         .iter()
         .find(|(provided, _)| provided == trait_id)
     else {
@@ -408,4 +418,31 @@ pub fn trait_parameter_substitution(
         substitution.insert(*parameter_id, *argument_id);
     }
     substitution
+}
+
+/// The most specific block that PROVIDES `trait_id` to `type_id` through its
+/// supertrait chain without naming it (B419's `provided_trait_args`): a
+/// one-block subtrait impl, for a supertrait's default. Declaration order breaks
+/// a tie, as [`impl_select::select_implementation`]'s maxima do.
+fn providing_implementation<'a, 'src>(
+    program: &'a Program<'src>,
+    type_id: TypeId,
+    trait_id: Id,
+) -> Option<&'a Implementation<'src>> {
+    let providers: Vec<&Implementation<'src>> = program
+        .implementations
+        .iter()
+        .filter(|implementation| {
+            implementation
+                .provided_trait_args
+                .iter()
+                .any(|(provided, _)| *provided == trait_id)
+                && impl_select::subject_applies(program, implementation.subject, type_id)
+        })
+        .collect();
+    providers.iter().copied().find(|candidate| {
+        !providers
+            .iter()
+            .any(|other| impl_select::subject_outranks(program, other.subject, candidate.subject))
+    })
 }

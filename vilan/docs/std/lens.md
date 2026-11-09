@@ -9,7 +9,7 @@ follows its item wherever it goes), or one part of one item. Concepts: the
 [std::reactive](reactive.md).
 
 ```vilan,fragment
-import std::reactive::lens::{ SequenceLens, KeyedLens, Resizable, Lookup, Change, sequence, keyed };
+import std::reactive::lens::{ SequenceLens, KeyedLens, SetLens, Indexed, Resizable, Lookup, Membership, Change, sequence, indexed, keyed, set };
 ```
 
 The module is reached **by name**. `std::reactive` does not re-export it, so a
@@ -23,7 +23,9 @@ has no cell for, and for rows whose slots follow their items.
 | Item | Kind | One line |
 |---|---|---|
 | `sequence(value)` / `SequenceLens::over(value)` | constructor | a lens over anything `Resizable<T>`, addressed by position |
+| `indexed(value)` / `SequenceLens::indexed(value)` | constructor | a READ-ONLY sequence lens over anything `Indexed<T>`: written through `update` and `plan` only |
 | `keyed(value)` / `KeyedLens::over(value)` | constructor | a lens over anything `Lookup<K, V>`, addressed by key |
+| `set(value)` / `SetLens::over(value)` | constructor | a lens over anything `Membership<T>`, addressed by member |
 | `Lens<S, A, T, H>` | struct | the lens itself: structure, address, item, handler |
 | `SequenceLens<S, T>`, `KeyedLens<S, K, V>` | struct | the same lens, naming only the types that matter; `lens()` hands out the full one |
 | `.slot(at)` | method | an `ItemSlot`: a `Source<Option<T>>` that follows the item now at `at` |
@@ -33,10 +35,11 @@ has no cell for, and for rows whose slots follow their items.
 | `.rows()` | method | the op feed of slots, for `each` |
 | `.index_by(key)` | method | a list that is also looked up by id: `find(key)` is a slot |
 | `.entries()` | method on a keyed lens | std's map op feed, for the map operators |
+| `.members()` | method on a set lens | std's set op feed (`SetOp`), a `SetSource` |
 | `.update(..)`, `.plan(..)` | methods | a write the shape has no method for, naming its changes |
 | `sequence_checked(value)` | constructor | a sequence lens that checks every `update` and `plan` |
 | `Change<A>` | enum | what one write did: `Splice`, `Insert`, `Replace`, `Delete`, `Edit`, `Move`, `Reset` |
-| `Resizable<T>`, `Lookup<K, V>` | traits | the shapes: what a structure implements to go under a lens |
+| `Indexed<T>`, `Resizable<T>`, `Lookup<K, V>`, `Membership<T>` | traits | the shapes: what a structure implements to go under a lens |
 
 ## A sequence lens
 
@@ -121,11 +124,13 @@ because an integer literal is not yet inferred through `Change<A>`.
 
 ## A structure of your own
 
-A structure goes under a lens by implementing its shape. `Resizable<T>` has
-three required members (`count`, `item`, `splice`) and defaults for the rest
-(`put`, `lend`, `change`, `shift`), which a structure overrides when it can do
-better.
-The structure holds no reactive code:
+A structure goes under a lens by implementing its shape. A sequence's shape
+comes in two halves: `Indexed<T>` is the reading half (`count`, `item`, and a
+default `lend`), and `Resizable<T>`, which requires `Indexed<T>`, is the
+writing half (`splice`, and defaults for `put`, `change` and `shift`). A
+structure overrides a default when it can do better, and one `impl ..
+with Resizable<T>` may write the members of both halves. The structure holds
+no reactive code:
 
 ```vilan
 import std::reactive::SequenceCell;
@@ -210,7 +215,95 @@ impl Rope with Resizable<str> { .. }   // in a module that exports `Rope`
 The fix is `export impl Rope with Resizable<str>`, not the import the message
 suggests (tracker B712). A module with `export *;` exports its impls already.
 
-`List<T>` is `Resizable<T>` and `HashMap<K, V>` is `Lookup<K, V>` out of the box.
+`List<T>` is `Indexed<T>` and `Resizable<T>`, `HashMap<K, V>` is
+`Lookup<K, V>` and `HashSet<T>` is `Membership<T>` out of the box.
+
+## A read-only sequence
+
+Some structures decide where an item goes: a sorted index puts `25` after
+`20`, whatever the caller wanted. Such a structure implements `Indexed<T>`
+and not `Resizable<T>`, and goes under `indexed(value)`. Its lens has
+everything that READS a sequence — slots, parts, `rows()`, `items()`,
+`length()`, `index_by` — and no `splice`, `push`, `insert_at` or `move_item`
+that could put an item where the order says it does not belong. Calling one
+is a build error (`'SortedIndex' does not implement trait 'Resizable<i32>'`).
+
+It is written through `update`, beside the structure's own mutator, which
+returns the change it made because only it knows where the item landed. When
+the caller can say where first, `plan` is exact: the op feed sees what is
+about to leave.
+
+```vilan
+import std::reactive::lens::{ Change, Indexed, indexed };
+
+struct SortedIndex {
+	items: List<i32>,
+}
+
+impl SortedIndex {
+	fun place(self, value: i32): usize {
+		mut at: usize = 0;
+		for at < self.items.len() && self.items[at] <= value {
+			at += 1;
+		}
+		at
+	}
+
+	/// The structure decides, and says what it did.
+	fun insert(&mut self, value: i32): Change<usize> {
+		let at = self.place(value);
+		self.items.insert(at, value);
+		Change::Insert(at, 1)
+	}
+}
+
+impl SortedIndex with Indexed<i32> {
+	fun count(self): usize {
+		self.items.len()
+	}
+
+	fun item(self, at: usize): Option<i32> {
+		self.items.get(at)
+	}
+}
+
+fun main() {
+	let prices = indexed(SortedIndex { items = [10, 20, 30] });
+	let thirty = prices.slot(2);
+	prices.update(|held| (void, [held.insert(25)]));
+	print(prices.all());   // [10, 20, 25, 30]
+	print(thirty.at());    // Some(3): the slot followed 30, and did not wake
+	let gone = prices.peek(|held| held.place(10)) - 1;
+	prices.plan(Change::Delete(gone, 1usize), |held| {
+		held.items.remove(gone);
+	});
+	print(prices.all());   // [20, 25, 30]
+}
+```
+
+A write AT a position through the lens itself — `replace`, `edit`, or a slot's
+`set` and `edit` — is a runtime panic on a read-only lens, not a build error:
+those methods are shared by every lens. Write the item through `update`.
+
+## A real rope
+
+The structure above is a toy: its `splice` re-cuts every chunk. The corpus
+program `vilan/test/lens-rope.vl` is the real thing, and it is still nothing
+but a shape impl. Lines live in chunks of at most `cap` lines (and at least
+half that, unless there is one chunk), with each chunk's starting line kept so
+`item(at)` is a binary search. Its `splice` cuts again only the chunks the span
+touches, plus one neighbour when what is left would be under half a chunk (the
+merge), and replaces them in place; `put` and `change` write one line where it
+sits and cut nothing.
+
+What that buys under the lens:
+
+- A slot follows its line through every split and merge. Chunks are the
+  rope's business; the lens's slot table never hears of them.
+- A 5,000-line paste is `splice(at, 0, lines)`: ONE `Splice` change, one row
+  op carrying 5,000 rows, a `map` over `items()` that runs for the 5,000
+  arrivals and nothing else, and one wake for the whole value and the length.
+- `index_by` keeps working across both, by the same one change.
 
 ## Parts
 
@@ -327,6 +420,96 @@ fun main() {
 `entries()` is std's map op feed (`MapOp`), so `filter`, `map_values` and
 `memo` follow a keyed lens; `reconcile_keyed(next)` becomes `next` by the
 changes that get there and leaves equal values alone.
+
+## A sequence of ids and a keyed lens of records
+
+A keyed lens has no order, and does not need one. What a list of records
+looked up by id wants is two lenses: a SEQUENCE of ids, which owns the order,
+and a KEYED lens of records, which owns the data (R14). Rows come from the
+ids; each row reads its record through the keyed lens's slot for that id. A
+reorder touches only the ids, so no record's reader wakes; an edit of a record
+touches only the records, so no row moves. `index_by` on the ids answers where
+an id sits now.
+
+```vilan
+import std::hash_map::HashMap;
+import std::reactive::lens::{ KeyedLens, sequence };
+import std::reactive::{ SequenceCell, Source };
+
+[derive(PartialEq)]
+struct Task {
+	title: str,
+	done: bool,
+}
+
+fun main() {
+	mut start: HashMap<str, Task> = HashMap::new();
+	start.insert("t1", Task { title = "write", done = false });
+	start.insert("t2", Task { title = "review", done = false });
+	start.insert("t3", Task { title = "ship", done = false });
+	let records = KeyedLens::over(start);
+	let order = sequence(["t1", "t2", "t3"]);
+	let place = order.index_by(|id| *id);
+
+	// A row per id; each reads its record by key.
+	let rows = order.rows();
+	let first = rows.get()[0];
+	let ship = records.slot("t3");
+	let _w = ship.on_change(|task| print(i"t3 woke: {task.map(|task| task.title).debug()}"));
+
+	order.move_item(2, 0);                       // the order changed; no record woke
+	print(place.find("t3").map(|slot| slot.at()));   // Some(Some(0))
+	records.edit("t3", "done", |task| task.done = true);   // t3 woke; no row moved
+	print(first.get());                          // Some("t1"): the row still holds its id
+	order.push("t4");
+	records.put("t4", Task { title = "celebrate", done = false });
+	print(order.all());
+}
+```
+
+The pairing costs one lookup per row and keeps each lens doing one thing: the
+sequence's slots follow positions, the keyed lens's slots follow keys, and
+neither needs a handler the other has.
+
+## A set lens
+
+A set is addressed by its members, so its lens is keyed by member. A structure
+goes under one by implementing `Membership<T>` (`contains`, `members`, `add`,
+`remove`, and a default `count`); `HashSet<T>` does out of the box. A member's
+slot is its PRESENCE: `slot(x)` is a `Source<bool>`, as `HashSetCell`'s
+`contains(x)` is, which exists before `x` joins, wakes when `x` joins or
+leaves, and wakes for no other member. (Its `Option<T>` would only echo back
+the `x` the caller already holds.)
+
+```vilan
+import std::hash_set::HashSet;
+import std::reactive::Source;
+import std::reactive::lens::SetLens;
+
+fun main() {
+	let empty: HashSet<str> = HashSet::new();
+	let tags = SetLens::over(empty);
+	let urgent = tags.slot("urgent");
+	let _watch = urgent.on_change(|on| print(i"urgent: {on}"));
+	tags.add("urgent");      // urgent: true
+	tags.add("later");       // nothing: another member
+	tags.add("urgent");      // nothing: already held, nothing is written
+	tags.remove("urgent");   // urgent: false
+	print(tags.length().get());
+	mut next: HashSet<str> = HashSet::new();
+	next.insert("later");
+	next.insert("soon");
+	tags.reconcile_set(next);   // one turn: "soon" joins, nothing else is written
+	print(tags.all().len());
+}
+```
+
+`add` and `remove` answer whether they wrote, and write nothing for a member
+already held or already absent. `members()` is std's set op feed (`SetOp`): a
+`SetSource`, so a set flow opens over it. Every op is known from the change
+alone, since a member is its own address, so a write that names several
+changes through `update` replays them in order. `reconcile_set(next)` is the
+diff door: one change per member that left or joined, in one turn.
 
 ## Nesting
 

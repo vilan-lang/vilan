@@ -714,25 +714,25 @@ function follow(self, at3) {
 	if (self[0].length === 0) {
 		self[0].push(new6());
 	}
-	return follow2(__at(self[0], 0, "std/src/reactive/lens.vl:142:3"), at3);
+	return follow2(__at(self[0], 0, "std/src/reactive/lens.vl:145:3"), at3);
 }
 function apply(self, change2, wakes) {
 	if (self[0].length > 0) {
-		apply2(__at(self[0], 0, "std/src/reactive/lens.vl:147:4"), change2, wakes);
+		apply2(__at(self[0], 0, "std/src/reactive/lens.vl:150:4"), change2, wakes);
 	}
 }
 function locate(self, slot2) {
 	if (self[0].length === 0) {
 		return [ 1 ];
 	}
-	return locate2(__at(self[0], 0, "std/src/reactive/lens.vl:155:3"), slot2);
+	return locate2(__at(self[0], 0, "std/src/reactive/lens.vl:158:3"), slot2);
 }
 function follows_items(self) {
 	return true;
 }
 function release(self, slot2) {
 	if (self[0].length > 0) {
-		release2(__at(self[0], 0, "std/src/reactive/lens.vl:164:4"), slot2);
+		release2(__at(self[0], 0, "std/src/reactive/lens.vl:167:4"), slot2);
 	}
 }
 function new6() {
@@ -743,13 +743,13 @@ function seat(self, at3) {
 	let high = self[3].length;
 	while (high - low > 1) {
 		const middle = Math.trunc((low + high) / 2);
-		if (__at(self[3], middle, "std/src/reactive/lens.vl:210:7") <= at3) {
+		if (__at(self[3], middle, "std/src/reactive/lens.vl:213:7") <= at3) {
 			low = middle;
 		} else {
 			high = middle;
 		}
 	}
-	return [ low, at3 - __at(self[3], low, "std/src/reactive/lens.vl:216:14") ];
+	return [ low, at3 - __at(self[3], low, "std/src/reactive/lens.vl:219:14") ];
 }
 function restart(self) {
 	let starts = [  ];
@@ -757,20 +757,20 @@ function restart(self) {
 	let place = 0;
 	for (const block of self[1]) {
 		starts.push(running);
-		__at_put(self[2], as_usize(block), place, "std/src/reactive/lens.vl:226:4");
-		running = running + __at(self[0], as_usize(block), "std/src/reactive/lens.vl:227:15").length;
+		__at_put(self[2], as_usize(block), place, "std/src/reactive/lens.vl:229:4");
+		running = running + __at(self[0], as_usize(block), "std/src/reactive/lens.vl:230:15").length;
 		place = place + 1;
 	}
 	self[3] = starts;
 }
 function renumber(self, block, from) {
 	let index = from;
-	const held = __at(self[0], as_usize(block), "std/src/reactive/lens.vl:236:14").length;
+	const held = __at(self[0], as_usize(block), "std/src/reactive/lens.vl:239:14").length;
 	while (index < held) {
-		const slot2 = __at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:238:15"), index, "std/src/reactive/lens.vl:238:15");
+		const slot2 = __at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:241:15"), index, "std/src/reactive/lens.vl:241:15");
 		if (slot2 !== -(1)) {
-			__at_put(self[4], as_usize(slot2), block, "std/src/reactive/lens.vl:240:5");
-			__at_put(self[5], as_usize(slot2), index, "std/src/reactive/lens.vl:241:5");
+			__at_put(self[4], as_usize(slot2), block, "std/src/reactive/lens.vl:243:5");
+			__at_put(self[5], as_usize(slot2), index, "std/src/reactive/lens.vl:244:5");
 		}
 		index = index + 1;
 	}
@@ -779,7 +779,7 @@ function open(self, place) {
 	const block = as_i32(self[0].length);
 	self[0].push([  ]);
 	self[2].push(0);
-	__insert_at(self[1], place, block, "std/src/reactive/lens.vl:252:14");
+	__insert_at(self[1], place, block, "std/src/reactive/lens.vl:255:14");
 	return block;
 }
 function widen(self, at3, count2) {
@@ -789,21 +789,21 @@ function widen(self, at3, count2) {
 	const $dG = seat(self, at3);
 	const place = $dG[0];
 	const index = $dG[1];
-	const block = __at(self[1], place, "std/src/reactive/lens.vl:262:15");
+	const block = __at(self[1], place, "std/src/reactive/lens.vl:265:15");
 	let $dH = null;
 	if (count2 <= 8) {
 		let made = 0;
 		while (made < count2) {
-			__insert_at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:266:5"), index, -(1), "std/src/reactive/lens.vl:266:35");
+			__insert_at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:269:5"), index, -(1), "std/src/reactive/lens.vl:269:35");
 			made = made + 1;
 		}
 		$dH = undefined;
 	} else {
-		const before = __clone(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:270:17"));
+		const before = __clone(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:273:17"));
 		let grown = [  ];
 		let copied = 0;
 		while (copied < index) {
-			grown.push(__at(before, copied, "std/src/reactive/lens.vl:274:16"));
+			grown.push(__at(before, copied, "std/src/reactive/lens.vl:277:16"));
 			copied = copied + 1;
 		}
 		let made2 = 0;
@@ -813,15 +813,15 @@ function widen(self, at3, count2) {
 		}
 		const held = before.length;
 		while (copied < held) {
-			grown.push(__at(before, copied, "std/src/reactive/lens.vl:284:16"));
+			grown.push(__at(before, copied, "std/src/reactive/lens.vl:287:16"));
 			copied = copied + 1;
 		}
-		__at_put(self[0], as_usize(block), grown, "std/src/reactive/lens.vl:287:4");
+		__at_put(self[0], as_usize(block), grown, "std/src/reactive/lens.vl:290:4");
 	}
 	$dH;
 	self[6] = self[6] + count2;
 	renumber(self, block, index + count2);
-	if (__at(self[0], as_usize(block), "std/src/reactive/lens.vl:291:6").length > 2 * block_size) {
+	if (__at(self[0], as_usize(block), "std/src/reactive/lens.vl:294:6").length > 2 * block_size) {
 		rebalance(self, place);
 	}
 	restart(self);
@@ -832,8 +832,8 @@ function close(self, at3, count2, wakes) {
 		const $dE = seat(self, at3);
 		const place = $dE[0];
 		const index = $dE[1];
-		const block = __at(self[1], place, "std/src/reactive/lens.vl:303:16");
-		const held = __at(self[0], as_usize(block), "std/src/reactive/lens.vl:304:15").length;
+		const block = __at(self[1], place, "std/src/reactive/lens.vl:306:16");
+		const held = __at(self[0], as_usize(block), "std/src/reactive/lens.vl:307:15").length;
 		let $dF = null;
 		if (left < held - index) {
 			$dF = left;
@@ -843,17 +843,17 @@ function close(self, at3, count2, wakes) {
 		const take2 = $dF;
 		let taken = 0;
 		while (taken < take2) {
-			const slot2 = __remove_at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:308:16"), index, "std/src/reactive/lens.vl:308:46");
+			const slot2 = __remove_at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:311:16"), index, "std/src/reactive/lens.vl:311:46");
 			if (slot2 !== -(1)) {
-				__at_put(self[4], as_usize(slot2), -(1), "std/src/reactive/lens.vl:310:6");
+				__at_put(self[4], as_usize(slot2), -(1), "std/src/reactive/lens.vl:313:6");
 				wakes.push([ 2, slot2 ]);
 			}
 			taken = taken + 1;
 		}
 		self[6] = self[6] - take2;
 		left = left - take2;
-		if (__at(self[0], as_usize(block), "std/src/reactive/lens.vl:317:7").length === 0) {
-			__remove_at(self[1], place, "std/src/reactive/lens.vl:318:16");
+		if (__at(self[0], as_usize(block), "std/src/reactive/lens.vl:320:7").length === 0) {
+			__remove_at(self[1], place, "std/src/reactive/lens.vl:321:16");
 		} else {
 			renumber(self, block, index);
 		}
@@ -861,22 +861,22 @@ function close(self, at3, count2, wakes) {
 	}
 }
 function rebalance(self, place) {
-	const block = __at(self[1], place, "std/src/reactive/lens.vl:328:15");
-	const all2 = __clone(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:329:13"));
+	const block = __at(self[1], place, "std/src/reactive/lens.vl:331:15");
+	const all2 = __clone(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:332:13"));
 	let first = [  ];
 	let index = 0;
 	while (index < block_size) {
-		first.push(__at(all2, index, "std/src/reactive/lens.vl:333:15"));
+		first.push(__at(all2, index, "std/src/reactive/lens.vl:336:15"));
 		index = index + 1;
 	}
-	__at_put(self[0], as_usize(block), first, "std/src/reactive/lens.vl:336:3");
+	__at_put(self[0], as_usize(block), first, "std/src/reactive/lens.vl:339:3");
 	let next2 = place + 1;
 	const held = all2.length;
 	while (index < held) {
 		const fresh = open(self, next2);
 		let filled = 0;
 		while (filled < block_size && index < held) {
-			__at(self[0], as_usize(fresh), "std/src/reactive/lens.vl:343:5").push(__at(all2, index, "std/src/reactive/lens.vl:343:40"));
+			__at(self[0], as_usize(fresh), "std/src/reactive/lens.vl:346:5").push(__at(all2, index, "std/src/reactive/lens.vl:346:40"));
 			index = index + 1;
 			filled = filled + 1;
 		}
@@ -887,27 +887,27 @@ function rebalance(self, place) {
 function follow2(self, at3) {
 	while (self[6] <= at3) {
 		const places = self[1].length;
-		if (places === 0 || __at(self[0], as_usize(__at(self[1], places - 1, "std/src/reactive/lens.vl:358:34")), "std/src/reactive/lens.vl:358:22").length >= block_size) {
+		if (places === 0 || __at(self[0], as_usize(__at(self[1], places - 1, "std/src/reactive/lens.vl:361:34")), "std/src/reactive/lens.vl:361:22").length >= block_size) {
 			const fresh = open(self, places);
-			__at_put(self[2], as_usize(fresh), places, "std/src/reactive/lens.vl:360:5");
+			__at_put(self[2], as_usize(fresh), places, "std/src/reactive/lens.vl:363:5");
 			self[3].push(self[6]);
 		}
-		const last3 = __at(self[1], self[1].length - 1, "std/src/reactive/lens.vl:363:15");
-		__at(self[0], as_usize(last3), "std/src/reactive/lens.vl:364:4").push(-(1));
+		const last3 = __at(self[1], self[1].length - 1, "std/src/reactive/lens.vl:366:15");
+		__at(self[0], as_usize(last3), "std/src/reactive/lens.vl:367:4").push(-(1));
 		self[6] = self[6] + 1;
 	}
 	const $cO = seat(self, at3);
 	const place = $cO[0];
 	const index = $cO[1];
-	const block = __at(self[1], place, "std/src/reactive/lens.vl:368:15");
-	const held = __at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:369:14"), index, "std/src/reactive/lens.vl:369:14");
+	const block = __at(self[1], place, "std/src/reactive/lens.vl:371:15");
+	const held = __at(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:372:14"), index, "std/src/reactive/lens.vl:372:14");
 	if (held !== -(1)) {
 		return held;
 	}
 	const slot2 = as_i32(self[4].length);
 	self[4].push(block);
 	self[5].push(index);
-	__at_put(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:376:3"), index, slot2, "std/src/reactive/lens.vl:376:3");
+	__at_put(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:379:3"), index, slot2, "std/src/reactive/lens.vl:379:3");
 	return slot2;
 }
 function apply2(self, change2, wakes) {
@@ -935,7 +935,7 @@ function apply2(self, change2, wakes) {
 			const $dI = seat(self, at6);
 			const place = $dI[0];
 			const index = $dI[1];
-			const slot2 = __at(__at(self[0], as_usize(__at(self[1], place, "std/src/reactive/lens.vl:393:29")), "std/src/reactive/lens.vl:393:17"), index, "std/src/reactive/lens.vl:393:17");
+			const slot2 = __at(__at(self[0], as_usize(__at(self[1], place, "std/src/reactive/lens.vl:396:29")), "std/src/reactive/lens.vl:396:17"), index, "std/src/reactive/lens.vl:396:17");
 			if (slot2 !== -(1)) {
 				wakes.push([ 0, slot2 ]);
 			}
@@ -950,7 +950,7 @@ function apply2(self, change2, wakes) {
 			const $dK = seat(self, at7);
 			const place2 = $dK[0];
 			const index2 = $dK[1];
-			const slot3 = __at(__at(self[0], as_usize(__at(self[1], place2, "std/src/reactive/lens.vl:402:29")), "std/src/reactive/lens.vl:402:17"), index2, "std/src/reactive/lens.vl:402:17");
+			const slot3 = __at(__at(self[0], as_usize(__at(self[1], place2, "std/src/reactive/lens.vl:405:29")), "std/src/reactive/lens.vl:405:17"), index2, "std/src/reactive/lens.vl:405:17");
 			if (slot3 !== -(1)) {
 				wakes.push([ 1, slot3, part ]);
 			}
@@ -972,23 +972,23 @@ function apply2(self, change2, wakes) {
 		const far = $dM;
 		while (self[6] <= far) {
 			const places = self[1].length;
-			if (places === 0 || __at(self[0], as_usize(__at(self[1], places - 1, "std/src/reactive/lens.vl:416:36")), "std/src/reactive/lens.vl:416:24").length >= block_size) {
+			if (places === 0 || __at(self[0], as_usize(__at(self[1], places - 1, "std/src/reactive/lens.vl:419:36")), "std/src/reactive/lens.vl:419:24").length >= block_size) {
 				const fresh = open(self, places);
-				__at_put(self[2], as_usize(fresh), places, "std/src/reactive/lens.vl:418:7");
+				__at_put(self[2], as_usize(fresh), places, "std/src/reactive/lens.vl:421:7");
 				self[3].push(self[6]);
 			}
-			const last3 = __at(self[1], self[1].length - 1, "std/src/reactive/lens.vl:421:17");
-			__at(self[0], as_usize(last3), "std/src/reactive/lens.vl:422:6").push(-(1));
+			const last3 = __at(self[1], self[1].length - 1, "std/src/reactive/lens.vl:424:17");
+			__at(self[0], as_usize(last3), "std/src/reactive/lens.vl:425:6").push(-(1));
 			self[6] = self[6] + 1;
 		}
 		const $dN = seat(self, from);
 		const left = $dN[0];
 		const index3 = $dN[1];
-		const source = __at(self[1], left, "std/src/reactive/lens.vl:426:18");
-		const slot4 = __remove_at(__at(self[0], as_usize(source), "std/src/reactive/lens.vl:427:16"), index3, "std/src/reactive/lens.vl:427:47");
+		const source = __at(self[1], left, "std/src/reactive/lens.vl:429:18");
+		const slot4 = __remove_at(__at(self[0], as_usize(source), "std/src/reactive/lens.vl:430:16"), index3, "std/src/reactive/lens.vl:430:47");
 		self[6] = self[6] - 1;
-		if (__at(self[0], as_usize(source), "std/src/reactive/lens.vl:429:8").length === 0 && self[1].length > 1) {
-			__remove_at(self[1], left, "std/src/reactive/lens.vl:430:17");
+		if (__at(self[0], as_usize(source), "std/src/reactive/lens.vl:432:8").length === 0 && self[1].length > 1) {
+			__remove_at(self[1], left, "std/src/reactive/lens.vl:433:17");
 		} else {
 			renumber(self, source, index3);
 		}
@@ -996,15 +996,15 @@ function apply2(self, change2, wakes) {
 		let $dO = null;
 		if (to >= self[6]) {
 			const last4 = self[1].length - 1;
-			$dO = [ last4, __at(self[0], as_usize(__at(self[1], last4, "std/src/reactive/lens.vl:438:25")), "std/src/reactive/lens.vl:438:13").length ];
+			$dO = [ last4, __at(self[0], as_usize(__at(self[1], last4, "std/src/reactive/lens.vl:441:25")), "std/src/reactive/lens.vl:441:13").length ];
 		} else {
 			$dO = seat(self, to);
 		}
 		const $dP = $dO;
 		const place3 = $dP[0];
 		const landing = $dP[1];
-		const target = __at(self[1], place3, "std/src/reactive/lens.vl:442:18");
-		__insert_at(__at(self[0], as_usize(target), "std/src/reactive/lens.vl:443:5"), landing, slot4, "std/src/reactive/lens.vl:443:36");
+		const target = __at(self[1], place3, "std/src/reactive/lens.vl:445:18");
+		__insert_at(__at(self[0], as_usize(target), "std/src/reactive/lens.vl:446:5"), landing, slot4, "std/src/reactive/lens.vl:446:36");
 		self[6] = self[6] + 1;
 		renumber(self, target, landing);
 		restart(self);
@@ -1013,8 +1013,8 @@ function apply2(self, change2, wakes) {
 		let slot5 = 0;
 		const slots = as_i32(self[4].length);
 		while (slot5 < slots) {
-			if (__at(self[4], as_usize(slot5), "std/src/reactive/lens.vl:452:9") !== -(1)) {
-				__at_put(self[4], as_usize(slot5), -(1), "std/src/reactive/lens.vl:453:7");
+			if (__at(self[4], as_usize(slot5), "std/src/reactive/lens.vl:455:9") !== -(1)) {
+				__at_put(self[4], as_usize(slot5), -(1), "std/src/reactive/lens.vl:456:7");
 				wakes.push([ 2, slot5 ]);
 			}
 			slot5 = slot5 + 1;
@@ -1029,32 +1029,32 @@ function apply2(self, change2, wakes) {
 	return $dD;
 }
 function release2(self, slot2) {
-	const block = __at(self[4], as_usize(slot2), "std/src/reactive/lens.vl:468:15");
+	const block = __at(self[4], as_usize(slot2), "std/src/reactive/lens.vl:471:15");
 	if (block === -(1)) {
 		return;
 	}
-	__at_put(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:472:3"), __at(self[5], as_usize(slot2), "std/src/reactive/lens.vl:472:33"), -(1), "std/src/reactive/lens.vl:472:3");
-	__at_put(self[4], as_usize(slot2), -(1), "std/src/reactive/lens.vl:473:3");
+	__at_put(__at(self[0], as_usize(block), "std/src/reactive/lens.vl:475:3"), __at(self[5], as_usize(slot2), "std/src/reactive/lens.vl:475:33"), -(1), "std/src/reactive/lens.vl:475:3");
+	__at_put(self[4], as_usize(slot2), -(1), "std/src/reactive/lens.vl:476:3");
 }
 function locate2(self, slot2) {
-	const block = __at(self[4], as_usize(slot2), "std/src/reactive/lens.vl:477:15");
+	const block = __at(self[4], as_usize(slot2), "std/src/reactive/lens.vl:480:15");
 	if (block === -(1)) {
 		return [ 1 ];
 	}
-	return [ 0, __at(self[3], __at(self[2], as_usize(block), "std/src/reactive/lens.vl:481:20"), "std/src/reactive/lens.vl:481:8") + __at(self[5], as_usize(slot2), "std/src/reactive/lens.vl:481:51") ];
+	return [ 0, __at(self[3], __at(self[2], as_usize(block), "std/src/reactive/lens.vl:484:20"), "std/src/reactive/lens.vl:484:8") + __at(self[5], as_usize(slot2), "std/src/reactive/lens.vl:484:51") ];
 }
 function extend_run(runs, from, to) {
 	const held = runs.v.length;
 	let $t = null;
 	if (held > 0) {
-		const $s = __at(runs.v, held - 1, "std/src/reactive/lens.vl:1946:31");
+		const $s = __at(runs.v, held - 1, "std/src/reactive/lens.vl:1992:31");
 		const start = $s[0];
 		const count2 = $s[1];
 		const first = $s[2];
 		const leftward = first < start && from === start + count2 && to === first + count2;
 		const rightward = first > start && from === start && to === first;
 		if (leftward || rightward) {
-			__at_put(runs.v, held - 1, [ start, count2 + 1, first ], "std/src/reactive/lens.vl:1950:4");
+			__at_put(runs.v, held - 1, [ start, count2 + 1, first ], "std/src/reactive/lens.vl:1996:4");
 			return;
 		}
 		$t = undefined;
@@ -1364,15 +1364,15 @@ function item(self, at3) {
 }
 function lend(self, at3, read) {
 	if (at3 < self.length) {
-		read(__at_view(self, at3, "std/src/reactive/lens.vl:2193:10"));
+		read(__at_view(self, at3, "std/src/reactive/lens.vl:2222:10"));
 	}
 }
 function put(self, at3, value) {
-	__at_put(self, at3, __clone(value), "std/src/reactive/lens.vl:2188:3");
+	__at_put(self, at3, __clone(value), "std/src/reactive/lens.vl:2242:3");
 }
 function change(self, at3, with2) {
 	if (at3 < self.length) {
-		with2(__at_view(self, at3, "std/src/reactive/lens.vl:2199:14"));
+		with2(__at_view(self, at3, "std/src/reactive/lens.vl:2247:14"));
 	}
 }
 function new7(value, caller) {
@@ -1384,7 +1384,7 @@ function new7(value, caller) {
 	return cell;
 }
 function lens_over(storage, handler, access) {
-	return [ __shared_new([ __clone(storage), __clone(access), new7(0, "std/src/reactive/lens.vl:726:28"), __shared_new([ handler, [  ], [ 1 ], [ 1 ] ]), [  ], 0, [ 1 ] ]) ];
+	return [ __shared_new([ __clone(storage), __clone(access), new7(0, "std/src/reactive/lens.vl:729:28"), __shared_new([ handler, [  ], [ 1 ], [ 1 ] ]), [  ], 0, [ 1 ] ]) ];
 }
 function over(value, handler, access) {
 	return lens_over([ 0, __shared_new(value) ], handler, access);
@@ -1430,7 +1430,7 @@ function peek_storage(storage, read) {
 			$l = value;
 		} else {
 			$l = (() => {
-				throw __panic("lens: a nested lens\'s port lent nothing", "std/src/reactive/lens.vl:710:13");
+				throw __panic("lens: a nested lens\'s port lent nothing", "std/src/reactive/lens.vl:713:13");
 			})();
 		}
 		$j = $l;
@@ -1473,7 +1473,7 @@ function peek_storage2(storage, read) {
 			$p = value;
 		} else {
 			$p = (() => {
-				throw __panic("lens: a nested lens\'s port lent nothing", "std/src/reactive/lens.vl:710:13");
+				throw __panic("lens: a nested lens\'s port lent nothing", "std/src/reactive/lens.vl:713:13");
 			})();
 		}
 		$n = $p;
@@ -1684,7 +1684,7 @@ function items_into(self, log, $e) {
 				record(log, [ 3, from, 1, to ]);
 				return;
 			}
-			const $G = __remove_at(runs.v, 0, "std/src/reactive/lens.vl:1633:47");
+			const $G = __remove_at(runs.v, 0, "std/src/reactive/lens.vl:1679:47");
 			const start = $G[0];
 			const count3 = $G[1];
 			const first = $G[2];
@@ -2829,7 +2829,7 @@ function peek_storage3(storage, read) {
 			$cJ = value;
 		} else {
 			$cJ = (() => {
-				throw __panic("lens: a nested lens\'s port lent nothing", "std/src/reactive/lens.vl:710:13");
+				throw __panic("lens: a nested lens\'s port lent nothing", "std/src/reactive/lens.vl:713:13");
 			})();
 		}
 		$cH = $cJ;
@@ -2849,7 +2849,7 @@ function follow_id(storage, watch, holds, at3) {
 	while (watch.v[1].length <= entry) {
 		watch.v[1].push([ [ 1 ], [  ], 0 ]);
 	}
-	__at(watch.v[1], entry, "std/src/reactive/lens.vl:1058:2")[2] = __at(watch.v[1], entry, "std/src/reactive/lens.vl:1058:2")[2] + 1;
+	__at(watch.v[1], entry, "std/src/reactive/lens.vl:1061:2")[2] = __at(watch.v[1], entry, "std/src/reactive/lens.vl:1061:2")[2] + 1;
 	return id;
 }
 function release_id(watch, id) {
@@ -2857,8 +2857,8 @@ function release_id(watch, id) {
 		return;
 	}
 	const entry = as_usize(id);
-	const left = __at(watch.v[1], entry, "std/src/reactive/lens.vl:1068:13")[2] - 1;
-	__at(watch.v[1], entry, "std/src/reactive/lens.vl:1069:2")[2] = left;
+	const left = __at(watch.v[1], entry, "std/src/reactive/lens.vl:1071:13")[2] - 1;
+	__at(watch.v[1], entry, "std/src/reactive/lens.vl:1072:2")[2] = left;
 	if (left <= 0) {
 		release(watch.v[0], id);
 	}
@@ -2892,7 +2892,7 @@ function rows(self, $cF) {
 		let gone = [  ];
 		let taken = 0;
 		while (taken < count2) {
-			const id = __remove_at(held.v, at3, "std/src/reactive/lens.vl:1793:27");
+			const id = __remove_at(held.v, at3, "std/src/reactive/lens.vl:1839:27");
 			release_id(watch, id);
 			gone.push(id);
 			taken = taken + 1;
@@ -2904,7 +2904,7 @@ function rows(self, $cF) {
 		let index = at3;
 		while (index < at3 + count2) {
 			const id = follow_id(storage, watch, holds, index);
-			__insert_at(held.v, index, id, "std/src/reactive/lens.vl:1805:18");
+			__insert_at(held.v, index, id, "std/src/reactive/lens.vl:1851:18");
 			arrived.push(id);
 			index = index + 1;
 		}
@@ -2934,8 +2934,8 @@ function rows(self, $cF) {
 		} else if ($cP[0] === 5) {
 			const from = $cP[1];
 			const to = $cP[2];
-			const id = __remove_at(held.v, from, "std/src/reactive/lens.vl:1821:28");
-			__insert_at(held.v, to, id, "std/src/reactive/lens.vl:1822:19");
+			const id = __remove_at(held.v, from, "std/src/reactive/lens.vl:1867:28");
+			__insert_at(held.v, to, id, "std/src/reactive/lens.vl:1868:19");
 			record(log, [ 3, from, 1, to ]);
 			$cQ = undefined;
 		} else if ($cP[0] === 6) {
@@ -3241,12 +3241,12 @@ function coming_one(self, change2) {
 function splice2(self, at3, removed, inserted) {
 	let taken = 0;
 	while (taken < removed) {
-		__remove_at(self, at3, "std/src/reactive/lens.vl:2177:9");
+		__remove_at(self, at3, "std/src/reactive/lens.vl:2231:9");
 		taken = taken + 1;
 	}
 	let offset = 0;
 	for (const value of inserted) {
-		__insert_at(self, at3 + offset, __clone(value), "std/src/reactive/lens.vl:2182:9");
+		__insert_at(self, at3 + offset, __clone(value), "std/src/reactive/lens.vl:2236:9");
 		offset = offset + 1;
 	}
 }
@@ -3264,7 +3264,7 @@ function mutate(self, change2) {
 }
 function wake_all(watch, slot2, $dZ) {
 	const held = viewing2(watch, (table) => {
-		return __clone(__at(table[1], as_usize(slot2), "std/src/reactive/lens.vl:1117:36"));
+		return __clone(__at(table[1], as_usize(slot2), "std/src/reactive/lens.vl:1120:36"));
 	});
 	const $ea = held[0];
 	if ($ea[0] === 0) {
@@ -3276,7 +3276,7 @@ function wake_all(watch, slot2, $dZ) {
 }
 function wake_part(watch, slot2, name, $eb) {
 	const held = viewing2(watch, (table) => {
-		return __clone(__at(table[1], as_usize(slot2), "std/src/reactive/lens.vl:1127:36"));
+		return __clone(__at(table[1], as_usize(slot2), "std/src/reactive/lens.vl:1130:36"));
 	});
 	const $ec = held[0];
 	if ($ec[0] === 0) {
@@ -3455,8 +3455,8 @@ function remove_at(self, at3, $en) {
 	return splice3(self, at3, 1, [  ], $en);
 }
 function shift(self, from, to) {
-	const item2 = __remove_at(self, from, "std/src/reactive/lens.vl:2204:19");
-	__insert_at(self, to, item2, "std/src/reactive/lens.vl:2205:8");
+	const item2 = __remove_at(self, from, "std/src/reactive/lens.vl:2252:19");
+	__insert_at(self, to, item2, "std/src/reactive/lens.vl:2253:8");
 }
 function move_item(self, from, to, $ep) {
 	const held = size2(self);

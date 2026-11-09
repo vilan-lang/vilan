@@ -109,6 +109,12 @@ const EXCLUDED: &[(&str, &str)] = &[
         "async + host filesystem (`node:fs/promises` handles)",
     ),
     (
+        "lens-rope.vl",
+        "host clock (`Date.now`): the exhibit prints its own timings; \
+         `vilan-cli/tests/reactive_lens.rs` runs it under node and reads every \
+         other line exactly (A185 S2)",
+    ),
+    (
         "time.vl",
         "host clock + timers (`Date.now`, `Date#toISOString`, `setTimeout`)",
     ),

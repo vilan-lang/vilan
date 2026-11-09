@@ -31,6 +31,7 @@
 import pkg::compare::PartialEq;
 import pkg::hash::Hashable;
 import pkg::hash_map::HashMap;
+import pkg::hash_set::HashSet;
 import pkg::io::panic;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::delta::{
@@ -41,8 +42,10 @@ import pkg::reactive::delta::{
 	MapOp,
 	SeqOp,
 	SequenceCell,
+	SetOp,
 };
 import pkg::reactive::hash_map_cell::MapSource;
+import pkg::reactive::hash_set_cell::SetSource;
 import pkg::reactive::{
 	SignalCell,
 	Source,
@@ -1325,26 +1328,36 @@ export impl ItemPart<type S, type A, type T, type H: Handler<A>, type U> with So
 
 // === The sequence shape ======================================================
 
-/// What a structure offers to be a sequence under the lens. Nothing reactive: three
-/// required members, like an iterator.
-export trait Resizable<T> {
+/// What a structure offers to be READ as a sequence under the lens: the reading
+/// half of `Resizable`. Nothing reactive: two required members.
+///
+/// A structure that decides its own positions (a sorted index) implements this and
+/// not `Resizable`: its lens (`indexed(..)`) has slots, rows, the op feed, the
+/// length and the index, and is written only through `update` and `plan`, so no
+/// caller can `splice` into the middle of its order.
+export trait Indexed<T> {
 	/// How many items it holds.
 	fun count(self): usize;
 	/// The item at a position, copied out.
 	fun item(self, at: usize): Option<T>;
-	/// `removed` items leave at `at` and `inserted` arrive there.
-	fun splice(&mut self, at: usize, removed: usize, inserted: List<T>);
-
-	/// Replace the item at a position.
-	fun put(&mut self, at: usize, value: T) {
-		self.splice(at, 1, [value]);
-	}
 
 	/// Lend the item at a position.
 	fun lend(self, at: usize, read: |&T| void) {
 		if self.item(at) is Some(let item) {
 			read(&item);
 		}
+	}
+}
+
+/// What a structure offers to be a WRITABLE sequence under the lens: the reading
+/// half (`Indexed`) and one required write, like an iterator.
+export trait Resizable<T> with Indexed<T> {
+	/// `removed` items leave at `at` and `inserted` arrive there.
+	fun splice(&mut self, at: usize, removed: usize, inserted: List<T>);
+
+	/// Replace the item at a position.
+	fun put(&mut self, at: usize, value: T) {
+		self.splice(at, 1, [value]);
 	}
 
 	/// Change the item at a position in place.
@@ -1369,7 +1382,7 @@ export trait Resizable<T> {
 /// agree, and everything outside the window the changes name must be untouched.
 /// A conservative check (a change naming a wrong part inside the window passes),
 /// but a wrong position, a wrong count or a change left unnamed fails it.
-export fun explain_sequence<S: Resizable<T>, T: PartialEq>(
+export fun explain_sequence<S: Indexed<T>, T: PartialEq>(
 	before: &S,
 	after: &S,
 	changes: List<Change<usize>>,
@@ -1500,6 +1513,35 @@ export fun sequence<S: Resizable<T>, T>(own value: S): Lens<S, usize, T, Positio
 	})
 }
 
+/// A READ-ONLY lens over a sequence that decides its own positions (a sorted
+/// index): slots, parts, `rows()`, `items()`, `length()` and `index_by` as any
+/// sequence lens has them, and no write but `update` and `plan`, where the
+/// structure's own mutators say what they did. There is no `splice`, `push` or
+/// `move_item` to put an item where the structure would not.
+///
+/// Writing an item through the lens itself (`replace`, `edit`, a slot's `set` or
+/// `edit`) panics: the item's position is the structure's to decide, so the write
+/// belongs in `update`, beside the mutator that knows where it lands.
+export fun indexed<S: Indexed<T>, T>(own value: S): Lens<S, usize, T, Positional> {
+	indexed_lens(value)
+}
+
+/// `indexed`'s body, under a second name: `SequenceLens::indexed` reaches it, where
+/// a bare `indexed(..)` would name the method itself.
+fun indexed_lens<S: Indexed<T>, T>(own value: S): Lens<S, usize, T, Positional> {
+	Lens::over(value, Positional::new(), Access {
+		holds = |held: &S, at: usize| at < held.count(),
+		read = |held: &S, at: usize| held.item(at),
+		view = |held: &S, at: usize, read: |&T| void| held.lend(at, read),
+		write = |_held: &mut S, _at: usize, _value: T| read_only(),
+		modify = |_held: &mut S, _at: usize, _with: |&mut T| void| read_only(),
+	})
+}
+
+fun read_only() {
+	panic("lens: this sequence is read-only (`Indexed`): write it through `update` or `plan`");
+}
+
 /// std's everyday sequence surface (`push`, `insert_at`, `remove_at`, `clear`, a
 /// dozen more), inherited whole: the lens writes the changes, so no call site names
 /// one.
@@ -1526,11 +1568,6 @@ export impl Lens<type S: Resizable<type T>, usize, T, Positional> with SequenceC
 }
 
 export impl Lens<type S: Resizable<type T>, usize, T, Positional> {
-	/// Every item, copied out in order.
-	fun all(self): List<T> {
-		all_of(self.core.read().storage)
-	}
-
 	/// Take the item at `from` out and put it back at `to`. One `Move`: the item's
 	/// slot goes with it, and a row over it is not rebuilt.
 	fun move_item(self, from: usize, to: usize) {
@@ -1543,6 +1580,15 @@ export impl Lens<type S: Resizable<type T>, usize, T, Positional> {
 		self.coming_one(change);
 		self.mutate(|held| held.shift(from, landing));
 		self.landed_one(change);
+	}
+}
+
+/// The READING surface of a sequence lens: everything here needs only `Indexed`,
+/// so a lens over a structure that decides its own positions has it too.
+export impl Lens<type S: Indexed<type T>, usize, T, Positional> {
+	/// Every item, copied out in order.
+	fun all(self): List<T> {
+		all_of(self.core.read().storage)
 	}
 
 	/// How many items, as a source: it wakes when items arrive or leave.
@@ -1906,7 +1952,7 @@ export impl Lens<type S: Resizable<type T: PartialEq>, usize, T, Positional> {
 
 /// The `count` items from `at`, copied out in one read: what arrived after an
 /// insert, or what is about to leave before a delete.
-fun arrived_at<S: Resizable<T>, T>(storage: Storage<S>, at: usize, count: usize): List<T> {
+fun arrived_at<S: Indexed<T>, T>(storage: Storage<S>, at: usize, count: usize): List<T> {
 	peek_storage(storage, |held| {
 		mut arrived: List<T> = [];
 		mut index = at;
@@ -1921,7 +1967,7 @@ fun arrived_at<S: Resizable<T>, T>(storage: Storage<S>, at: usize, count: usize)
 }
 
 /// Every item, copied out in order, from the storage alone (`Lens::all`).
-fun all_of<S: Resizable<T>, T>(storage: Storage<S>): List<T> {
+fun all_of<S: Indexed<T>, T>(storage: Storage<S>): List<T> {
 	peek_storage(storage, |held| {
 		mut out: List<T> = [];
 		mut at: usize = 0;
@@ -1961,7 +2007,7 @@ fun one<T>(item: Option<T>): List<T> {
 	}
 }
 
-fun record_set<S: Resizable<T>, T>(
+fun record_set<S: Indexed<T>, T>(
 	log: DeltaLog<SeqOp<T>>,
 	storage: Storage<S>,
 	leaving: Shared<List<T>>,
@@ -1986,7 +2032,7 @@ export struct KeyIndex<S, T, K: Hashable> {
 	tap: i32,
 }
 
-export impl KeyIndex<type S: Resizable<type T>, T, type K: Hashable> {
+export impl KeyIndex<type S: Indexed<type T>, T, type K: Hashable> {
 	/// Stop following the lens, and give back the slots the index holds.
 	fun release(self) {
 		self.lens.untap(self.tap);
@@ -2008,9 +2054,9 @@ export struct LensLength<S, T> {
 	lens: Lens<S, usize, T, Positional>,
 }
 
-export impl LensLength<type S: Resizable<type T>, T> with Source<usize> {
+export impl LensLength<type S: Indexed<type T>, T> with Source<usize> {
 	fun get(self): usize {
-		self.lens.size()
+		self.lens.peek(|held| held.count())
 	}
 
 	fun identity(self): Option<i32> {
@@ -2030,14 +2076,14 @@ export struct LensItems<S, T> {
 	tap: i32,
 }
 
-export impl LensItems<type S: Resizable<type T>, T> {
+export impl LensItems<type S: Indexed<type T>, T> {
 	/// Stop following the lens. The feed holds a tap until this is called.
 	fun release(self) {
 		self.lens.untap(self.tap);
 	}
 }
 
-export impl LensItems<type S: Resizable<type T>, T> with Source<List<T>> {
+export impl LensItems<type S: Indexed<type T>, T> with Source<List<T>> {
 	fun get(self): List<T> {
 		self.lens.all()
 	}
@@ -2050,9 +2096,9 @@ export impl LensItems<type S: Resizable<type T>, T> with Source<List<T>> {
 
 /// So std's collection operators (`map`, `filter`, `count`, `memo`, ..) start from
 /// it.
-export impl LensItems<type S: Resizable<type T>, T> with CollSource<T> {}
+export impl LensItems<type S: Indexed<type T>, T> with CollSource<T> {}
 
-export impl LensItems<type S: Resizable<type T>, T> with DeltaSource<List<T>, SeqOp<T>> {
+export impl LensItems<type S: Indexed<type T>, T> with DeltaSource<List<T>, SeqOp<T>> {
 	fun cursor(self): DeltaCursor {
 		self.log.cursor()
 	}
@@ -2078,7 +2124,7 @@ export struct LensRows<S, T> {
 	tap: i32,
 }
 
-export impl LensRows<type S: Resizable<type T>, T> {
+export impl LensRows<type S: Indexed<type T>, T> {
 	/// Stop following the lens, and let go of the slots the feed holds.
 	fun release(self) {
 		self.lens.untap(self.tap);
@@ -2115,7 +2161,7 @@ export impl LensRows<type S: Resizable<type T>, T> {
 	}
 }
 
-export impl LensRows<type S: Resizable<type T>, T> with Source<
+export impl LensRows<type S: Indexed<type T>, T> with Source<
 	List<ItemSlot<S, usize, T, Positional>>,
 > {
 	fun get(self): List<ItemSlot<S, usize, T, Positional>> {
@@ -2128,7 +2174,7 @@ export impl LensRows<type S: Resizable<type T>, T> with Source<
 	}
 }
 
-export impl LensRows<type S: Resizable<type T>, T> with DeltaSource<
+export impl LensRows<type S: Indexed<type T>, T> with DeltaSource<
 	List<ItemSlot<S, usize, T, Positional>>,
 	SeqOp<ItemSlot<S, usize, T, Positional>>,
 > {
@@ -2161,8 +2207,8 @@ export impl ItemSlot<type S, type A, type T, type H> with PartialEq {
 	}
 }
 
-/// A plain list is a sequence.
-export impl List<type T> with Resizable<T> {
+/// A plain list is a sequence, to read and to write.
+export impl List<type T> with Indexed<T> {
 	fun count(self): usize {
 		self.len()
 	}
@@ -2171,6 +2217,14 @@ export impl List<type T> with Resizable<T> {
 		self.get(at)
 	}
 
+	fun lend(self, at: usize, read: |&T| void) {
+		if at < self.len() {
+			read(&self[at]);
+		}
+	}
+}
+
+export impl List<type T> with Resizable<T> {
 	fun splice(&mut self, at: usize, removed: usize, inserted: List<T>) {
 		mut taken: usize = 0;
 		for taken < removed {
@@ -2186,12 +2240,6 @@ export impl List<type T> with Resizable<T> {
 
 	fun put(&mut self, at: usize, value: T) {
 		self[at] = value;
-	}
-
-	fun lend(self, at: usize, read: |&T| void) {
-		if at < self.len() {
-			read(&self[at]);
-		}
 	}
 
 	fun change(&mut self, at: usize, with: |&mut T| void) {
@@ -2455,6 +2503,326 @@ export impl LensEntries<type S: Lookup<type K: Hashable, type V>, K, V> with Del
 	}
 }
 
+// === The set shape ===========================================================
+
+/// What a structure offers to be a SET under the lens: membership, and nothing held
+/// beside it. Nothing reactive: four required members.
+///
+/// A set is addressed by its members, so its lens is keyed: a member's slot follows
+/// the MEMBER, exists before it joins, and reads it again if it returns. What a
+/// slot reads is presence (`MemberSlot` is a `Source<bool>`), not a value that
+/// pretends to be `true` (the lab made a set a `Lookup<T, bool>`).
+export trait Membership<T: Hashable> {
+	/// Whether `member` is held.
+	fun contains(self, member: T): bool;
+	/// Every member, in the structure's own order.
+	fun members(self): List<T>;
+	/// `member` joins. Joining twice holds it once.
+	fun add(&mut self, member: T);
+	/// `member` leaves, if it was held.
+	fun remove(&mut self, member: T);
+
+	/// How many members. The default counts `members()`; a structure that knows
+	/// says so.
+	fun count(self): usize {
+		self.members().len()
+	}
+}
+
+/// A plain set is a set.
+export impl HashSet<type T: Hashable> with Membership<T> {
+	fun contains(self, member: T): bool {
+		self.contains(member)
+	}
+
+	fun members(self): List<T> {
+		self.values()
+	}
+
+	fun add(&mut self, member: T) {
+		self.insert(member);
+	}
+
+	fun remove(&mut self, member: T) {
+		self.remove(member);
+	}
+
+	fun count(self): usize {
+		self.len()
+	}
+}
+
+/// A lens over a set: `SetLens<HashSet<str>, str>`. The wrapper is the only
+/// spelling (R10): the full lens, `Lens<S, T, T, Keyed<T>>`, reads a member's slot
+/// as `Option<T>`, which only echoes the member back, so `slot(x)` here is the
+/// member's PRESENCE.
+export struct SetLens<S, T: Hashable> {
+	inner: Lens<S, T, T, Keyed<T>>,
+}
+
+/// A lens over any set, its types inferred from it: `set(tags)`.
+export fun set<S: Membership<T>, T: Hashable>(own value: S): SetLens<S, T> {
+	SetLens {
+		inner = Lens::over(value, Keyed::new(), Access {
+			holds = |held: &S, member: T| held.contains(member),
+			// The address IS the member: what is held there is the member itself.
+			read = |held: &S, member: T| (held.contains(member) then Some(member) else None),
+			view = |held: &S, member: T, read: |&T| void| {
+				if held.contains(member) {
+					read(&member);
+				}
+			},
+			write = |held: &mut S, member: T, _value: T| held.add(member),
+			modify = |_held: &mut S, _member: T, _with: |&mut T| void| {
+				panic("lens: a set's member is its own address and cannot be edited in place");
+			},
+		}),
+	}
+}
+
+export impl SetLens<type S: Membership<type T: Hashable>, T> {
+	/// A set lens over `value`.
+	fun over(own value: S): SetLens<S, T> {
+		set(value)
+	}
+
+	/// The full lens, for whatever the wrapper does not forward.
+	fun lens(self): Lens<S, T, T, Keyed<T>> {
+		self.inner
+	}
+
+	/// Read the structure in place. Not tracked.
+	fun peek<R>(self, read: |&S| R): R {
+		self.inner.peek(read)
+	}
+
+	/// The structure's own write, with the changes it made: `Insert(x, 1)` for a
+	/// member that joined, `Delete(x, 1)` for one that left.
+	fun update<R>(self, change: |&mut S| (R, List<Change<T>>)): R {
+		self.inner.update(change)
+	}
+
+	/// Whether `member` is held now. Not tracked: a reader that wants to hear the
+	/// answer change asks for `slot(member)`.
+	fun contains(self, member: T): bool {
+		self.inner.has(member)
+	}
+
+	/// `member` joins: one `Insert`, and `true`, when it was not held; a held
+	/// member writes nothing and answers `false`.
+	fun add(self, member: T): bool {
+		if self.inner.has(member) {
+			ret false;
+		}
+		let change = Change::Insert(member, 1);
+		self.inner.coming_one(change);
+		self.inner.mutate(|held| held.add(member));
+		self.inner.landed_one(change);
+		true
+	}
+
+	/// `member` leaves: one `Delete`, and `true`, when it was held; otherwise
+	/// nothing, and `false`.
+	fun remove(self, member: T): bool {
+		if !self.inner.has(member) {
+			ret false;
+		}
+		let change = Change::Delete(member, 1);
+		self.inner.coming_one(change);
+		self.inner.mutate(|held| held.remove(member));
+		self.inner.landed_one(change);
+		true
+	}
+
+	/// `member`'s presence, as a source: it wakes when `member` joins or leaves,
+	/// and for no other member. Made inside an owner scope, it is released with
+	/// that owner; outside one, by `release()`.
+	fun slot(self, member: T): MemberSlot<S, T> {
+		MemberSlot { slot = self.inner.slot(member) }
+	}
+
+	/// Every member, copied out.
+	fun all(self): HashSet<T> {
+		self.inner.peek(|held| held.members()).to_set()
+	}
+
+	/// How many members, as a source: it wakes when members join or leave.
+	fun length(self): SetLength<S, T> {
+		SetLength { lens = self.inner }
+	}
+
+	/// The members as std's SET op feed (`SetOp`): what `entries()` is to a keyed
+	/// lens. Made inside an owner scope, it is released with that owner; outside
+	/// one, by `release()`.
+	fun members(self): LensMembers<S, T> {
+		let log: DeltaLog<SetOp<T>> = DeltaLog::new();
+		// The tap captures the storage, never the lens handle (the module's rule).
+		let storage = self.inner.core.read().storage;
+		// A member is its own address, so every op is known from the change alone:
+		// nothing is read before a write, and a write that named several changes is
+		// replayed change by change (L8).
+		let tap = self.inner.tap(|_change| {}, |change, _stage| {
+			match change {
+				Change::Insert(let member, let _count) => log.record(SetOp::Add(member)),
+				Change::Delete(let member, let _count) => log.record(SetOp::Remove(member)),
+				Change::Splice(let member, let removed, let inserted) => {
+					if inserted > removed {
+						log.record(SetOp::Add(member));
+					} else if removed > inserted {
+						log.record(SetOp::Remove(member));
+					}
+				},
+				// A member replaced by itself, or edited: membership did not
+				// change.
+				Change::Replace(let _member) => {},
+				Change::Edit(let _member, let _part) => {},
+				Change::Move(let _from, let _to) => {},
+				Change::Reset => log.record(SetOp::Reset(members_of(storage))),
+			}
+		});
+		let feed = LensMembers { lens = self.inner, log, tap };
+		defer_to_owner(|| feed.release());
+		feed
+	}
+
+	/// Become `next`, by the changes that get there: what left is removed and what
+	/// is new is added, one change per member; a member both hold writes nothing.
+	/// One turn.
+	fun reconcile_set(self, next: HashSet<T>) {
+		let lens = self;
+		batch(|| {
+			for member in lens.peek(|held| held.members()) {
+				if !next.contains(member) {
+					lens.remove(member);
+				}
+			}
+			for member in next.values() {
+				lens.add(member);
+			}
+		});
+	}
+}
+
+export impl SetLens<type S: Membership<type T: Hashable>, T> with Source<S> {
+	fun get(self): S {
+		self.inner.get()
+	}
+
+	fun identity(self): Option<i32> {
+		self.inner.identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.inner.on_settle(subscriber)
+	}
+}
+
+/// Every member, as a set, from the storage alone.
+fun members_of<S: Membership<T>, T: Hashable>(storage: Storage<S>): HashSet<T> {
+	peek_storage(storage, |held| held.members()).to_set()
+}
+
+/// One member's presence, followed by key.
+export struct MemberSlot<S, T: Hashable> {
+	slot: ItemSlot<S, T, T, Keyed<T>>,
+}
+
+export impl MemberSlot<type S: Membership<type T: Hashable>, T> {
+	/// Let this handle go (`ItemSlot::release`).
+	fun release(self) {
+		self.slot.release();
+	}
+
+	/// The slot's identity, as `ItemSlot::key`.
+	fun key(self): i32 {
+		self.slot.key()
+	}
+}
+
+export impl MemberSlot<type S: Membership<type T: Hashable>, T> with Source<bool> {
+	fun get(self): bool {
+		self.slot.get() is Some(let _member)
+	}
+
+	fun identity(self): Option<i32> {
+		self.slot.identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.slot.on_settle(subscriber)
+	}
+}
+
+/// A set lens's member count.
+export struct SetLength<S, T: Hashable> {
+	lens: Lens<S, T, T, Keyed<T>>,
+}
+
+export impl SetLength<type S: Membership<type T: Hashable>, T> with Source<usize> {
+	fun get(self): usize {
+		self.lens.peek(|held| held.count())
+	}
+
+	fun identity(self): Option<i32> {
+		self.lens.sized_cell().identity()
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.lens.sized_cell().on_settle(subscriber)
+	}
+}
+
+/// A set lens's members, as a source of the set and of std's set ops.
+export struct LensMembers<S, T: Hashable> {
+	lens: Lens<S, T, T, Keyed<T>>,
+	log: DeltaLog<SetOp<T>>,
+	tap: i32,
+}
+
+export impl LensMembers<type S: Membership<type T: Hashable>, T> {
+	/// Stop following the lens. The feed holds a tap until this is called.
+	fun release(self) {
+		self.lens.untap(self.tap);
+	}
+}
+
+export impl LensMembers<type S: Membership<type T: Hashable>, T> with Source<HashSet<T>> {
+	fun get(self): HashSet<T> {
+		members_of(self.lens.core.read().storage)
+	}
+
+	[must_use]
+	fun on_settle(self, subscriber: Subscriber): Subscription {
+		self.lens.core.read().published.on_settle(subscriber)
+	}
+}
+
+export impl LensMembers<type S: Membership<type T: Hashable>, T> with DeltaSource<
+	HashSet<T>,
+	SetOp<T>,
+> {
+	fun cursor(self): DeltaCursor {
+		self.log.cursor()
+	}
+
+	fun drop_cursor(self, cursor: DeltaCursor) {
+		self.log.drop_cursor(cursor);
+	}
+
+	fun since(self, cursor: DeltaCursor): List<SetOp<T>> {
+		match self.log.since(cursor) {
+			Some(let recorded) => recorded,
+			None => [SetOp::Reset(members_of(self.lens.core.read().storage))],
+		}
+	}
+}
+
+/// So std's set flows (`SetFlow`: `open`, and the pipes over it) start from it.
+export impl LensMembers<type S: Membership<type T: Hashable>, T> with SetSource<T> {}
+
 // === The wrapper types (R10) =================================================
 //
 // `Lens<S, A, T, H>` names four types where two carry the meaning: the address
@@ -2474,6 +2842,29 @@ export impl SequenceLens<type S: Resizable<type T>, T> {
 	/// `SequenceLens::over(["a", "b"])`.
 	fun over(own value: S): SequenceLens<S, T> {
 		SequenceLens { inner = sequence(value) }
+	}
+
+	/// Replace the item at `at`. `false` when nothing is there.
+	fun replace(self, at: usize, value: T): bool {
+		self.inner.replace(at, value)
+	}
+
+	/// Change one part of the item at `at` in place.
+	fun edit(self, at: usize, part: str, change: |&mut T| void): bool {
+		self.inner.edit(at, part, change)
+	}
+
+	/// Take the item at `from` out and put it back at `to`, its slot with it.
+	fun move_item(self, from: usize, to: usize) {
+		self.inner.move_item(from, to)
+	}
+}
+
+export impl SequenceLens<type S: Indexed<type T>, T> {
+	/// A READ-ONLY sequence lens over a structure that decides its own positions
+	/// (`indexed(value)`): written through `update` and `plan` only.
+	fun indexed(own value: S): SequenceLens<S, T> {
+		SequenceLens { inner = indexed_lens(value) }
 	}
 
 	/// The full lens, for whatever the wrapper does not forward.
@@ -2501,24 +2892,9 @@ export impl SequenceLens<type S: Resizable<type T>, T> {
 		self.inner.plan(change, write)
 	}
 
-	/// Replace the item at `at`. `false` when nothing is there.
-	fun replace(self, at: usize, value: T): bool {
-		self.inner.replace(at, value)
-	}
-
-	/// Change one part of the item at `at` in place.
-	fun edit(self, at: usize, part: str, change: |&mut T| void): bool {
-		self.inner.edit(at, part, change)
-	}
-
 	/// Every item, copied out in order.
 	fun all(self): List<T> {
 		self.inner.all()
-	}
-
-	/// Take the item at `from` out and put it back at `to`, its slot with it.
-	fun move_item(self, from: usize, to: usize) {
-		self.inner.move_item(from, to)
 	}
 
 	/// How many items, as a source.
@@ -2552,7 +2928,7 @@ export impl SequenceLens<type S: Resizable<type T>, T> with SequenceCell<T> {
 	}
 }
 
-export impl SequenceLens<type S: Resizable<type T>, T> with Source<S> {
+export impl SequenceLens<type S: Indexed<type T>, T> with Source<S> {
 	fun get(self): S {
 		self.inner.get()
 	}
