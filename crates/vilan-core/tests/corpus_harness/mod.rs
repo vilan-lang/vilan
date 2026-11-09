@@ -131,6 +131,9 @@ macro_rules! corpus_manifest {
             lens_keyed => "lens-keyed.vl",
             lens_laws => "lens-laws.vl",
             lens_nested => "lens-nested.vl",
+            lens_rope => "lens-rope.vl",
+            lens_set => "lens-set.vl",
+            lens_sorted => "lens-sorted.vl",
             lens_tracked => "lens-tracked.vl",
             lift_chain => "lift-chain.vl",
             list_build_infer => "list-build-infer.vl",
@@ -246,6 +249,12 @@ pub const NOT_RUN: &[(&str, &str)] = &[
     ("crypto.vl", "host WebCrypto: a fresh random draw per run"),
     ("db.vl", "host database: touches the filesystem"),
     ("process-env.vl", "reads the host environment and argv"),
+    (
+        "lens-rope.vl",
+        "host clock: the exhibit prints its own timings (`now_millis`); \
+         `vilan-cli/tests/reactive_lens.rs` runs it under node and reads every \
+         other line exactly",
+    ),
     // Sequential runs agree; the divergence appeared only under the 8-way
     // parallelism the release gate used to run its own loop with, which is the
     // proof that it is scheduling and not codegen. E32's rule applies — a

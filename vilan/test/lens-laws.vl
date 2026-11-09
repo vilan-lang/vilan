@@ -503,5 +503,17 @@ fun main() {
 	bag.move_item(3, 0);
 	assert(bag.all() == ["s", "q", "r", "p"], "S3: leftward too");
 
+	// S2: `lend` is `Indexed`'s default now, reached through `Bag`'s ONE
+	// `Resizable` block; a part reads through it. (B715: that default ran with
+	// its `T` unbound and lent a `str` as a value where the reader took a place,
+	// so the part read `undefined`.) `change`'s default writes through it too.
+	let p_width = bag.slot(3).part("width", |line| line.len());
+	assert(p_width.get() == Some(1), "S2: a part reads through a supertrait's default lend");
+	bag.slot(3).edit("width", |line| line = "pp");
+	assert(
+		p_width.get() == Some(2) && bag.all() == ["s", "q", "r", "pp"],
+		"S2: and an edit writes through change's default",
+	);
+
 	print("laws: all passed");
 }

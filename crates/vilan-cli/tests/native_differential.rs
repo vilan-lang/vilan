@@ -1185,7 +1185,14 @@ const PLATFORM_BOUND_REQUIRED: &[&str] = &[
 
 /// Platform-bound corpus programs whose stdout the two `vilan run`s cannot
 /// agree on for a reason that is not the program's, named with the reason.
-const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[];
+const PLATFORM_BOUND_OUTSIDE: &[(&str, &str)] = &[(
+    "lens-rope.vl",
+    "prints its own wall-clock timings (`std::time::now_millis`), which no two \
+     runs agree on; and `std::reactive::lens` is JS-only until B709 (the native \
+     backend drops a guard binding the module uses). It reaches the platform \
+     list through `std::time` alone; `vilan-cli/tests/reactive_lens.rs` runs it \
+     under node (A185 S2)",
+)];
 
 /// Modules whose presence in an `import` means the program reaches a platform
 /// surface S1a has none of. Written as a support list so Order 38 widens the
