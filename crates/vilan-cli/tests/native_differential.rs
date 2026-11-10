@@ -14349,6 +14349,42 @@ fn b718_a_bang_on_a_host_bound_result_is_identical_on_both_backends() {
     );
 }
 
+/// B719: a let-else whose scrutinee ends in `}` natively (an awaited call, an
+/// `if` value) is parenthesized, and `for f() is Some(let found) { .. }` — and a
+/// `&&` chain after a capture — is a `while let` that keeps its binder.
+#[test]
+fn b719_a_let_else_over_a_block_and_a_capturing_loop_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b719_let_else_and_while_let.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b719_let_else_and_while_let.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\n40\ntrue\n2\ncb\n0\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b719_let_else_and_while_let")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("while let Some(found_"),
+        "the emission names `while let Some(found_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(" = ({ let awaited = "),
+        "the let-else's awaited scrutinee is parenthesized:\n{emitted}"
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

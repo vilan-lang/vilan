@@ -5729,19 +5729,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::If(branch) => self.if_branch(&branch, depth)?,
             Expr::Match(subject, legs) => self.match_expr(subject, &legs, depth, span)?,
             Expr::For(condition, (statements, tail)) => {
+                // B719: the head is rendered BEFORE the body, because a
+                // condition that captures (`for next() is Some(let found)`)
+                // is a `while let` whose bindings the body reads - the
+                // `matches!` it had been bound nothing, and every read of
+                // `found` below named a binding rustc had never seen (E0425).
+                let (head, captured) = match condition {
+                    Some(condition) => match self.capturing_condition(condition, depth)? {
+                        Some((parts, captured)) => (format!("while {parts}"), captured),
+                        None => (
+                            format!("while {}", self.expression(condition, depth)?),
+                            Vec::new(),
+                        ),
+                    },
+                    None => ("loop".to_string(), Vec::new()),
+                };
                 let mut body = String::new();
                 self.loop_jumps.push(None);
                 let emitted = self.emit_block(&statements, tail, &mut body, depth + 1);
                 self.loop_jumps.pop();
+                self.release_captures(&captured);
                 emitted?;
                 let pad = Self::indent(depth);
-                match condition {
-                    Some(condition) => {
-                        let condition = self.expression(condition, depth)?;
-                        format!("while {condition} {{\n{body}{pad}}}")
-                    }
-                    None => format!("loop {{\n{body}{pad}}}"),
-                }
+                format!("{head} {{\n{body}{pad}}}")
             }
             Expr::ForEach(iterable, item, (statements, tail)) => {
                 // F118: a tuple is walked unrolled, and its jumps are labelled.
@@ -8954,6 +8964,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some((format!("if {}", parts.join(" && ")), captured)))
     }
 
+    /// B719: a loop condition that CAPTURES — one capturing `is`-test, or a
+    /// `&&` chain with one among its conjuncts — as the let-chain a `while`
+    /// heads with (`let Some(found) = (next()).clone() && (found > 0)`), and
+    /// the captures it registered for the body; the caller releases them.
+    /// `None` for a condition that binds nothing.
+    fn capturing_condition(
+        &mut self,
+        condition: Id,
+        depth: usize,
+    ) -> Result<Option<(String, Vec<Id>)>, Error> {
+        if let Some((head, captured)) = self.capturing_let_chain(condition, depth)? {
+            let parts = head
+                .strip_prefix("if ")
+                .expect("a let-chain head starts with `if `")
+                .to_string();
+            return Ok(Some((parts, captured)));
+        }
+        if self.is_condition_captures(condition).is_none() {
+            return Ok(None);
+        }
+        let (parts, captured) = self.let_chain_parts(&[PathConjunct::Test(condition)], depth)?;
+        Ok(Some((parts.join(" && "), captured)))
+    }
+
     /// The parts of a let-chain head, one per conjunct: a capturing `is`-test
     /// is a `let`, its subject copied as `if let` copies one (F20), and every
     /// other conjunct is the boolean it is (negated where it must FAIL). The
@@ -8999,6 +9033,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// One capturing `is`-test as a let-chain's `let PATTERN = SUBJECT`, with
     /// the captures it binds.
     fn capturing_let(&mut self, test: Id, depth: usize) -> Result<(String, Vec<Id>), Error> {
+        let (pattern_text, subject_text, bindings) = self.capturing_let_parts(test, depth)?;
+        Ok((format!("let {pattern_text} = {subject_text}"), bindings))
+    }
+
+    /// [`Self::capturing_let`]'s pattern and subject, apart.
+    fn capturing_let_parts(
+        &mut self,
+        test: Id,
+        depth: usize,
+    ) -> Result<(String, String, Vec<Id>), Error> {
         let (subject, pattern, bindings) = self
             .is_condition_captures(test)
             .expect("a `PathConjunct::Test` is a capturing `is`-test");
@@ -9006,7 +9050,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let subject_text = self.copy_a_pattern_subject(subject, subject_text);
         let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(&pattern, subject_type, self.span_of(test))?;
-        Ok((format!("let {pattern_text} = {subject_text}"), bindings))
+        Ok((pattern_text, subject_text, bindings))
     }
 
     /// The conjuncts that hold, all of them, exactly when `condition`
@@ -9097,8 +9141,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let [PathConjunct::Test(test)] = conjuncts[..]
             && runs_nothing
         {
-            let (binding, _) = self.capturing_let(test, depth)?;
-            return Ok(format!("{binding} else {diverging_text};"));
+            let (pattern_text, subject_text, _) = self.capturing_let_parts(test, depth)?;
+            // B719: a `let … else` initializer may not END in `}` (rustc
+            // refuses it as ambiguous with the `else`), and an awaited call,
+            // a `!`'s `match`, a block or an `if` all do — so such a subject
+            // is parenthesized, which is what rustc's own help suggests.
+            let subject_text = if subject_text.ends_with('}') {
+                format!("({subject_text})")
+            } else {
+                subject_text
+            };
+            return Ok(format!(
+                "let {pattern_text} = {subject_text} else {diverging_text};"
+            ));
         }
         let (parts, captured) = self.let_chain_parts(&conjuncts, depth)?;
         let mut body = String::new();

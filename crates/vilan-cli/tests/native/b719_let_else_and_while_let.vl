@@ -1,0 +1,45 @@
+// B719: two B709 follow-ups. (1) A let-else whose scrutinee is an awaited
+// call: the await is a block natively, and rustc refuses a `}` right before
+// a let-else's `else`. A `!`'s `match` and an `if` value end in `}` too.
+// (2) `for f() is Some(let found) { .. found .. }` is a `while let`: it had
+// been `while matches!(..)`, which binds nothing (E0425 on `found`). A
+// chained `&&` loop condition and a nested pattern ride along.
+import std::{ fs::stat, io::print };
+
+fun size_of(path: str): i32 {
+	stat(path) is Some(let found) else ret 0 - 1;
+	found.size
+}
+
+fun first_even(values: List<i32>): Option<i32> {
+	let picked = values.get(0usize)!;
+	(picked % 2 == 0 then Some(picked) else None) is Some(let even) else ret None;
+	Some(even * 10)
+}
+
+fun find(text: str, needle: str): Option<usize> {
+	let parts = text.split(needle);
+	parts.len() > 1 then Some(parts[0].len()) else None
+}
+
+fun main() {
+	print(size_of("/nonexistent/b719") < 0);
+	print(first_even([4, 5]).unwrap_or(0));
+	print(first_even([3]).is_none());
+	let text = "abab";
+	mut start = 0usize;
+	mut hits = 0;
+	for find(text.substring(start, text.len()), "b") is Some(let found) {
+		let at = start + found;
+		hits += 1;
+		start = at + 1;
+	}
+	print(hits);
+	mut stack = [(1, "a"), (2, "b"), (3, "c")];
+	mut seen = "";
+	for stack.pop() is Some((let number, let name)) && number > 1 {
+		seen = seen + name;
+	}
+	print(seen);
+	print(stack.len());
+}

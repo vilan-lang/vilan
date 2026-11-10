@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B719: two B709 follow-ups on the native backend - a let-else whose scrutinee is an awaited call builds, and `for f() is Some(let found) { .. found .. }` keeps its binder.** (1) An awaited call is a block natively, and rustc refuses a `}` right before a let-else's `else`; a `!`'s `match` and an `if` value end the same way. A let-else subject that ends in `}` is now parenthesized. (2) A capturing loop condition was emitted `while matches!(..)`, which binds nothing, so every read of the capture in the body was E0425; the head is now rendered before the body as a `while let` (a `&&` chain after the capture is a `while let` let-chain), the captures registered for the body as an `if let`'s are. Pins: `native_differential::b719_a_let_else_over_a_block_and_a_capturing_loop_are_identical_on_both_backends` (an awaited `stat`, an `if` scrutinee after a `!`, the `while let`, a `pop()` let-chain with a nested pattern; the emitted `while let` and the parenthesized subject). Tracker B719.
+
+---
+
+<!-- family: fix -->
 **B718: natively, `!` on the result of a host-bound method builds - `parts[1].parse_f64()!`, `items.get(0usize)!` and `text.parse_f64().ok_or(..)!` were refused as "a `!` assertion on an unresolved receiver" while a user method's `!` built.** The analyzer records no type on a call, and the Rust emitter read a callee's return only off a function WITH a body, so every call to an `external` callee (a host-bound `str`, `List` or `Option` member) had no type at all: `!` had no `Option`/`Result` to dispatch on, and (B723) a `+` of two of them was not seen as a concatenation. An extern callee's written return now types its call, the same channel a bodied callee's return already took. Pins: `native_differential::b718_a_bang_on_a_host_bound_result_is_identical_on_both_backends` (`Option` and `Result`, a call chained after the `!`, a generic `List::get` inside a generic function, a user method as the control). Tracker B718.
 
 ---
