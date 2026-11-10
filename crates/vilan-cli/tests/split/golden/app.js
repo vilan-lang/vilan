@@ -832,7 +832,7 @@ function ensure_wired($b) {
 }
 function current_path($a) {
 	ensure_wired($a);
-	return path_signal;
+	return __clone(path_signal);
 }
 function navigate(path, $bt) {
 	navigate_with(path, "", $bt);
@@ -964,10 +964,10 @@ function on_event(self, event, handler) {
 	return __clone(self);
 }
 function chunk_pending() {
-	return chunk_pending_signal;
+	return __clone(chunk_pending_signal);
 }
 function chunk_failure() {
-	return chunk_error_signal;
+	return __clone(chunk_error_signal);
 }
 function set_chunk_pending(busy, $cr) {
 	if (get(chunk_pending_signal) !== busy) {
