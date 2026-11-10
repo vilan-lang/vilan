@@ -14404,6 +14404,24 @@ fn b722_a_deref_of_a_destructured_binding_is_identical_on_both_backends() {
     );
 }
 
+/// B723: `a + b` over `str`s two host-bound methods answer is a concatenation
+/// natively; untyped, it was emitted `Rc<str> + Rc<str>` (E0369).
+#[test]
+fn b723_a_concatenation_of_host_str_results_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b723_str_add_of_host_results.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b723_str_add_of_host_results.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "Hello\n\nmixed caseMIXED CASEMixed Case\n10Mixed\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

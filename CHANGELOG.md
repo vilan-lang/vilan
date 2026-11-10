@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B723: natively, `a + b` over two `str`s that host-bound methods answer builds - `word.substring(0, 1).to_uppercase() + word.substring(1, word.len()).to_lowercase()` was emitted `Rc<str> + Rc<str>` (E0369).** The same root as B718: neither call had a type, so the `+` was not read as a concatenation. Fixed by B718's change (an extern callee's return types its call); this entry adds the pin. Pins: `native_differential::b723_a_concatenation_of_host_str_results_is_identical_on_both_backends` (two host results, a chain of three, an interpolation operand). Tracker B723.
+
+---
+
+<!-- family: fix -->
 **B722: natively, `*` on a binding a tuple pattern declares builds - `meta.filter(|(name, _)| *name == key)` was rustc's E0277 (`str` compared with `Rc<str>`) and, over an `i32`, E0614.** A destructure's `let` copies its subject, so its bindings hold values natively, but a binding with no initializer of its own kept its `(*name)`. A binding declared by a destructuring pattern - a closure's tuple parameter or a destructuring `let` - now reads its value under `*`, as a by-value parameter does (F128). Pins: `native_differential::b722_a_deref_of_a_destructured_binding_is_identical_on_both_backends`. Tracker B722.
 
 ---
