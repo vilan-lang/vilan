@@ -90,8 +90,8 @@ use std::task::{Context, Poll};
 
 use crate::bytes::Bytes;
 use crate::executor::{
-    Boxed, Failure, IoSource, Parked, caught, raise_cancelled, raise_failure, register_io, spawn,
-    termination_requested,
+    Boxed, Failure, Interest, IoSource, Parked, caught, raise_cancelled, raise_failure,
+    register_io, reported_quiet, spawn, termination_requested,
 };
 use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
@@ -131,6 +131,11 @@ const DEFAULT_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// closes at 1.6 s). The announced timeout is the client's, the grace is the
 /// server's: a client that sends just inside it does not race the close.
 const KEEP_ALIVE_GRACE: Duration = Duration::from_secs(1);
+
+/// How soon a server whose accept failed tries again (F160) — the pace the
+/// loop's old tick polled at, so a listener stuck readable (no descriptors
+/// left) is retried as often as it was, and never spun on.
+const ACCEPT_RETRY: Duration = Duration::from_millis(1);
 
 /// The answer to a request that missed its deadline — node's own bytes
 /// (`requestTimeoutResponse` in `_http_server.js`), written before the close.
@@ -1081,6 +1086,47 @@ impl Connection {
         left == 0 || hung_up
     }
 
+    /// F160: what the connection's next service waits for — bytes to read
+    /// while it [`wants_bytes`](Connection::wants_bytes), room to write while
+    /// its outbox holds something, and every deadline [`Server::service`]
+    /// checks. Generous by design ([`IoSource::interest`]): a deadline that
+    /// turns out to mean nothing in the connection's stage costs one turn.
+    fn interest(&self, interest: &mut Interest) {
+        if self.stage.get() == Stage::Closed {
+            return;
+        }
+        let policy = &self.policy;
+        interest.watch(
+            &*self.stream.borrow(),
+            self.wants_bytes(),
+            !self.outbox.borrow().is_empty(),
+        );
+        if let Some(started) = self.request_started.get() {
+            for limit in [policy.head_deadline(), policy.request_timeout.get()]
+                .into_iter()
+                .flatten()
+            {
+                interest.wake_at(started + limit);
+            }
+        }
+        if let (Some(idle), Some(timeout)) =
+            (self.idle_since.get(), policy.keep_alive_timeout.get())
+        {
+            interest.wake_at(idle + timeout + KEEP_ALIVE_GRACE);
+        }
+        for moment in [self.close_by.get(), self.linger_until.get()]
+            .into_iter()
+            .flatten()
+        {
+            interest.wake_at(moment);
+        }
+        if let Some(limit) = self.idle_limit.get()
+            && !self.timed_out.get()
+        {
+            interest.wake_at(self.last_activity.get() + limit);
+        }
+    }
+
     fn touch(&self) {
         self.last_activity.set(Instant::now());
         self.timed_out.set(false);
@@ -2023,6 +2069,11 @@ struct ServerBody {
     /// Whether this server has already answered a termination request (F45) —
     /// it answers each one once, at the first poll that sees it.
     terminated: Cell<bool>,
+    /// F160: this turn's accept failed with something other than "nothing
+    /// waiting" (out of file descriptors, say). The listener stays readable
+    /// while that lasts, so the readiness wait leaves it out and comes back
+    /// after [`ACCEPT_RETRY`] — the tick's pace — rather than spinning on it.
+    accept_failed: Cell<bool>,
 }
 
 /// `http.createServer(handler)`.
@@ -2037,6 +2088,7 @@ pub fn create_server(handler: Handler) -> Server {
         closing: Cell::new(false),
         on_closed: RefCell::new(None),
         terminated: Cell::new(false),
+        accept_failed: Cell::new(false),
     }))
 }
 
@@ -2225,6 +2277,17 @@ impl Server {
     /// Accepts everything waiting. `true` if anything was accepted.
     fn accept_pending(&self) -> bool {
         let mut accepted = false;
+        if self
+            .0
+            .listener
+            .borrow()
+            .as_ref()
+            .is_some_and(|listener| reported_quiet(listener, true))
+        {
+            // F160: nobody is waiting to be accepted.
+            return false;
+        }
+        self.0.accept_failed.set(false);
         loop {
             let incoming = {
                 let listener = self.0.listener.borrow();
@@ -2256,7 +2319,10 @@ impl Server {
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 // A failed accept is not a failed server: the listener is still
                 // bound and the next poll tries again.
-                Err(_) => return accepted,
+                Err(_) => {
+                    self.0.accept_failed.set(true);
+                    return accepted;
+                }
             }
         }
     }
@@ -2267,25 +2333,28 @@ impl Server {
         let mut progressed = false;
         // A body nobody asked for is not read (M164): it waits in the kernel,
         // and a client sending more than the socket buffers holds stalls.
-        let (read, hung_up) = if connection.wants_bytes() {
-            let budget = match connection.stage.get() {
-                Stage::Dispatched | Stage::Settling | Stage::Closing => BODY_SLICE,
-                // A head is at most `MAX_HEAD`, and what a fast client has
-                // already sent after it is a body nobody has asked for yet:
-                // read past the head by at most one slice, and leave the rest
-                // in the kernel for the reads a handler makes (N192: with no
-                // bound, a 4 MiB chunked upload already on the wire was fed
-                // whole to the decoder at the handler's first `next`, and the
-                // cap refused it with `413` before the handler took its ten
-                // bytes - on Linux, whose loopback buffers hold megabytes;
-                // Windows never handed that much in one turn).
-                Stage::Reading => MAX_HEAD + BODY_SLICE,
-                _ => usize::MAX,
+        // F160: a read the readiness wait already said would find nothing is
+        // not made — on a busy server, most connections at most turns.
+        let (read, hung_up) =
+            if connection.wants_bytes() && !reported_quiet(&*connection.stream.borrow(), true) {
+                let budget = match connection.stage.get() {
+                    Stage::Dispatched | Stage::Settling | Stage::Closing => BODY_SLICE,
+                    // A head is at most `MAX_HEAD`, and what a fast client has
+                    // already sent after it is a body nobody has asked for yet:
+                    // read past the head by at most one slice, and leave the rest
+                    // in the kernel for the reads a handler makes (N192: with no
+                    // bound, a 4 MiB chunked upload already on the wire was fed
+                    // whole to the decoder at the handler's first `next`, and the
+                    // cap refused it with `413` before the handler took its ten
+                    // bytes - on Linux, whose loopback buffers hold megabytes;
+                    // Windows never handed that much in one turn).
+                    Stage::Reading => MAX_HEAD + BODY_SLICE,
+                    _ => usize::MAX,
+                };
+                connection.read_available(budget)
+            } else {
+                (false, false)
             };
-            connection.read_available(budget)
-        } else {
-            (false, false)
-        };
         progressed |= read;
         if read && connection.request_started.get().is_none() {
             // The first byte of the next request on a kept-alive connection:
@@ -2339,7 +2408,11 @@ impl Server {
         if self.enforce_deadlines(connection) {
             progressed = true;
         }
-        let (written, dead) = connection.write_available();
+        let (written, dead) = if reported_quiet(&*connection.stream.borrow(), false) {
+            (false, false)
+        } else {
+            connection.write_available()
+        };
         progressed |= written;
         if dead {
             connection.close();
@@ -2610,6 +2683,22 @@ impl IoSource for Server {
             }
         }
         progressed
+    }
+
+    /// F160: the listener while it accepts, and what each connection waits
+    /// for ([`Connection::interest`]).
+    fn interest(&self, interest: &mut Interest) -> bool {
+        if let Some(listener) = self.0.listener.borrow().as_ref() {
+            if self.0.accept_failed.get() {
+                interest.wake_at(Instant::now() + ACCEPT_RETRY);
+            } else {
+                interest.watch(listener, true, false);
+            }
+        }
+        for connection in self.0.connections.borrow().iter() {
+            connection.interest(interest);
+        }
+        true
     }
 
     fn is_live(&self) -> bool {
@@ -4245,5 +4334,99 @@ mod tests {
                 "{host}: a closed connection's peer is undefined: {after:?}"
             );
         }
+    }
+
+    // -- F160: what a connection's readiness wait watches --
+
+    /// A server-side connection over a real loopback socket, and the client
+    /// end that keeps it open.
+    fn accepted_connection() -> (Connection, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        let (stream, _) = listener.accept().expect("accept");
+        stream.set_nonblocking(true).expect("nonblocking");
+        let connection = Connection::new(
+            stream,
+            "127.0.0.1".to_string(),
+            Rc::new(ServerPolicy::node_defaults()),
+        );
+        (connection, client)
+    }
+
+    fn interest_of(connection: &Connection, turn: Instant) -> Interest {
+        let mut interest = Interest::starting(turn);
+        connection.interest(&mut interest);
+        interest
+    }
+
+    #[test]
+    fn f160_a_connection_reading_its_head_watches_for_bytes_until_its_head_deadline() {
+        let turn = Instant::now();
+        let (connection, _client) = accepted_connection();
+        let interest = interest_of(&connection, turn);
+        let [watch] = interest.watches() else {
+            panic!("one socket: {:?}", interest.watches());
+        };
+        assert!(watch.readable && !watch.writable, "{watch:?}");
+        let started = connection
+            .request_started
+            .get()
+            .expect("a fresh connection's request");
+        assert_eq!(
+            interest.deadline(),
+            Some(started + DEFAULT_HEADERS_TIMEOUT),
+            "the nearer of the head's and the request's deadlines"
+        );
+    }
+
+    #[test]
+    fn f160_a_queued_answer_watches_for_room_and_not_for_the_next_request() {
+        let (connection, _client) = accepted_connection();
+        connection.enqueue(b"HTTP/1.1 200 OK\r\n\r\n");
+        let interest = interest_of(&connection, Instant::now());
+        let [watch] = interest.watches() else {
+            panic!("one socket: {:?}", interest.watches());
+        };
+        // A pipelined request is not read while an answer is queued
+        // (`wants_bytes`), so its bytes must not wake the wait either.
+        assert!(!watch.readable && watch.writable, "{watch:?}");
+    }
+
+    #[test]
+    fn f160_an_idle_kept_alive_connection_wakes_for_its_keep_alive_close() {
+        let (connection, _client) = accepted_connection();
+        connection.stage.set(Stage::Settling);
+        connection.next_exchange();
+        let idle = connection.idle_since.get().expect("idle between requests");
+        let interest = interest_of(&connection, Instant::now());
+        assert_eq!(
+            interest.deadline(),
+            Some(idle + DEFAULT_KEEP_ALIVE_TIMEOUT + KEEP_ALIVE_GRACE)
+        );
+        assert!(interest.watches()[0].readable, "the next request's bytes");
+    }
+
+    #[test]
+    fn f160_a_deadline_the_turn_already_passed_is_not_a_wake() {
+        let (connection, _client) = accepted_connection();
+        connection.close_by.set(Some(Instant::now()));
+        // The turn began after the moment: its poll already saw it.
+        let interest = interest_of(&connection, Instant::now() + Duration::from_millis(1));
+        assert!(
+            interest
+                .deadline()
+                .is_none_or(|deadline| deadline > Instant::now()),
+            "a past moment would make the wait a spin: {:?}",
+            interest.deadline()
+        );
+    }
+
+    #[test]
+    fn f160_a_closed_connection_watches_nothing() {
+        let (connection, _client) = accepted_connection();
+        connection.close();
+        let interest = interest_of(&connection, Instant::now());
+        assert!(interest.watches().is_empty(), "{:?}", interest.watches());
+        assert_eq!(interest.deadline(), None);
     }
 }

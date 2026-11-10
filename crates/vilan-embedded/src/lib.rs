@@ -101,6 +101,11 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
         staging.join("vilan-rt-term").join("Cargo.toml"),
         RT_TERM_MANIFEST,
     ));
+    // F160: the loop's readiness wait.
+    written.push((
+        staging.join("vilan-rt-poll").join("Cargo.toml"),
+        RT_POLL_MANIFEST,
+    ));
     // M185: the image glue and, beside it, the codec core its manifest
     // reaches as `../vilan-image`.
     written.push((

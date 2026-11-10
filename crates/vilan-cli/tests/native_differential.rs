@@ -6325,6 +6325,11 @@ impl SignalledServer {
             manifest.contains("vilan-rt-signal"),
             "a program that starts a server links the signal crate:\n{manifest}"
         );
+        // F160: and the readiness wait its loop blocks in.
+        assert!(
+            manifest.contains("vilan-rt-poll"),
+            "a program that starts a server links the readiness wait:\n{manifest}"
+        );
         let binary = String::from_utf8_lossy(&built.stdout)
             .lines()
             .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
@@ -6893,8 +6898,10 @@ fn the_crypto_surface_answers_nodes_bytes_on_both_backends() {
     assert!(
         !manifest.contains("vilan-rt-crypto")
             && !manifest.contains("vilan-rt-sqlite")
-            && !manifest.contains("vilan-rt-image"),
-        "a program that reaches none names none (M185: the image crate included):\n{manifest}"
+            && !manifest.contains("vilan-rt-image")
+            && !manifest.contains("vilan-rt-poll"),
+        "a program that reaches none names none (M185: the image crate included; F160: \
+         the readiness wait too):\n{manifest}"
     );
 }
 

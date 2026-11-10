@@ -158,6 +158,10 @@ pub struct OptionalCrates {
     /// the glue and sits beside it in the cache too, so it is not named here:
     /// the manifest names the crate the PROGRAM depends on.
     pub image: bool,
+    /// The event loop's readiness wait — `vilan-rt-poll` (`libc` /
+    /// `windows-sys`; F160). Reached by the I/O the loop waits on: starting
+    /// an HTTP server, dialing a WebSocket, reading stdin.
+    pub poll: bool,
 }
 
 impl OptionalCrates {
@@ -178,6 +182,9 @@ impl OptionalCrates {
         }
         if self.image {
             names.push("vilan-rt-image");
+        }
+        if self.poll {
+            names.push("vilan-rt-poll");
         }
         names
     }
@@ -598,6 +605,12 @@ struct Emitter<'a, 'src> {
     /// helpers is lowered and where `std::image::Image` is rendered — every
     /// reach passes through one or the other.
     reaches_image: bool,
+    /// Whether this program does I/O the event loop waits on, and so links
+    /// `vilan-rt-poll` (F160): the emitted `main` installs the readiness wait
+    /// before its body runs. Set where `createServer`, `new WebSocket`,
+    /// `__stdin_line` and `__stdin_bytes` are lowered — the doors every
+    /// `IoSource` the runtime registers is reached through.
+    reaches_poll: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -863,6 +876,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_signal: false,
             reaches_term: false,
             reaches_image: false,
+            reaches_poll: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -934,6 +948,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 1,
             );
         }
+        // F160: a program whose loop waits on I/O waits for READINESS, not on
+        // the runtime's 1 ms tick — installed before anything can register a
+        // source.
+        if self.reaches_poll {
+            main_body = main_body.replacen(
+                "fn main() {\n",
+                "fn main() {\n    vilan_rt_poll::install();\n",
+                1,
+            );
+        }
 
         let mut source = String::from(PRELUDE);
         for declaration in self.types.values() {
@@ -963,6 +987,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 signal: self.reaches_signal,
                 term: self.reaches_term,
                 image: self.reaches_image,
+                poll: self.reaches_poll,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -11376,20 +11401,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ExternBinding::Function {
                 module: None,
                 symbol: "__stdin_line",
-            } => format!(
-                "vilan_rt::process::stdin_line({})",
-                self.value_argument(argument_ids, 0, depth)?
-            ),
+            } => {
+                // F160: stdin's reader wakes the loop's readiness wait.
+                self.reaches_poll = true;
+                format!(
+                    "vilan_rt::process::stdin_line({})",
+                    self.value_argument(argument_ids, 0, depth)?
+                )
+            }
             // A173 S2: the byte read behind `process::Keys`, on the same
             // shared pump and carrying the signal the same way.
             ExternBinding::Function {
                 module: None,
                 symbol: "__stdin_bytes",
-            } => format!(
-                "vilan_rt::process::stdin_bytes({}, {})",
-                self.value_argument(argument_ids, 0, depth)?,
-                self.value_argument(argument_ids, 1, depth)?
-            ),
+            } => {
+                self.reaches_poll = true;
+                format!(
+                    "vilan_rt::process::stdin_bytes({}, {})",
+                    self.value_argument(argument_ids, 0, depth)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                )
+            }
             ExternBinding::Function {
                 module: None,
                 symbol: "__nursery_new",
@@ -11597,6 +11629,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // F45: a program that serves stops gracefully on a termination
                 // signal, which is `vilan-rt-signal`'s wire to the runtime.
                 self.reaches_signal = true;
+                self.reaches_poll = true;
                 return Ok(Some(format!("vilan_rt::http::create_server({})", handler?)));
             }
             // M164: `std::http`'s lazy body. The read CONSUMES the two handles,
@@ -13406,11 +13439,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     symbol: "WebSocket",
                 },
                 _,
-            ) => format!(
-                "vilan_rt::ws::WebSocket::connect(&{}, &{})",
-                self.place_argument(argument_ids, 0, depth)?,
-                self.place_argument(argument_ids, 1, depth)?
-            ),
+            ) => {
+                // F160: a dialed socket is a source the loop waits on.
+                self.reaches_poll = true;
+                format!(
+                    "vilan_rt::ws::WebSocket::connect(&{}, &{})",
+                    self.place_argument(argument_ids, 0, depth)?,
+                    self.place_argument(argument_ids, 1, depth)?
+                )
+            }
             // `dial_promise` and `reply_promise`: a task its executor's
             // resolver settles, first call wins.
             (

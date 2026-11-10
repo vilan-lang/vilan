@@ -53,7 +53,7 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use crate::bytes::Bytes;
-use crate::executor::{IoSource, register_io};
+use crate::executor::{Interest, IoSource, loop_waker, register_io};
 use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
 
@@ -497,9 +497,13 @@ impl WebSocket {
         let port = target.port;
         // The lookup and the connect block, so they run off the loop. If the
         // socket is closed first the receiver is gone, the send fails, and the
-        // connected stream is dropped (closed) on this thread.
+        // connected stream is dropped (closed) on this thread. The answer
+        // wakes the loop (F160): nothing about it is a socket the loop could
+        // be watching yet.
+        let waker = loop_waker();
         std::thread::spawn(move || {
             let _ = sender.send(TcpStream::connect((host.as_str(), port)));
+            waker.wake();
         });
         let client = Rc::new(Client {
             stage: Cell::new(Stage::Connecting),
@@ -905,6 +909,25 @@ impl IoSource for Client {
         }
         progressed |= self.deliver_one();
         progressed
+    }
+
+    /// F160: the socket — read while the peer may still send, written while
+    /// the outbox holds something — and a `close()`'s deadline. A connect in
+    /// flight is the helper thread's, and it wakes the loop itself.
+    fn interest(&self, interest: &mut Interest) -> bool {
+        if let Some(stream) = self.stream.borrow().as_ref() {
+            interest.watch(
+                stream,
+                !self.peer_gone.get(),
+                !self.outbox.borrow().is_empty(),
+            );
+        }
+        if self.stage.get() == Stage::Closing
+            && let Some(deadline) = self.close_deadline.get()
+        {
+            interest.wake_at(deadline);
+        }
+        true
     }
 
     /// Live while it can still produce an event, or still has bytes to put on

@@ -67,7 +67,8 @@ use std::time::Duration;
 
 use crate::bytes::Bytes;
 use crate::executor::{
-    CancelSignal, IoSource, Parked, TimerHandle, TimerWait, raise_cancelled, register_io, timer,
+    CancelSignal, Interest, IoSource, Parked, TimerHandle, TimerWait, raise_cancelled, register_io,
+    timer,
 };
 use crate::{Str, panic_with, str_new};
 
@@ -458,6 +459,8 @@ fn pump() {
 fn start_reader() -> Reader {
     let (requests, requested) = mpsc::channel::<()>();
     let (sent, chunks) = mpsc::channel::<Option<Vec<u8>>>();
+    // F160: each chunk wakes the loop, which waits on no socket for it.
+    let waker = crate::executor::loop_waker();
     let spawned = std::thread::Builder::new()
         .name("vilan-stdin".to_string())
         .spawn(move || {
@@ -475,7 +478,9 @@ fn start_reader() -> Reader {
                     }
                 };
                 let ended = chunk.is_none();
-                if sent.send(chunk).is_err() || ended {
+                let delivered = sent.send(chunk).is_ok();
+                waker.wake();
+                if !delivered || ended {
                     break;
                 }
             }
@@ -520,6 +525,13 @@ impl IoSource for StdinSource {
             pump();
         }
         received
+    }
+
+    /// F160: nothing to watch — the reader thread wakes the loop when a
+    /// chunk is in the channel ([`start_reader`]).
+    fn interest(&self, interest: &mut Interest) -> bool {
+        let _ = interest;
+        true
     }
 
     /// F146: the loop's wait when stdin is its only live source — block on

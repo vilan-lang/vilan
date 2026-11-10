@@ -164,6 +164,11 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         manifest_static: "RT_TERM_MANIFEST",
         item: "A173 S2",
     },
+    OptionalCrate {
+        directory: "vilan-rt-poll",
+        manifest_static: "RT_POLL_MANIFEST",
+        item: "F160",
+    },
     // M185: `std::image`'s glue, and the codec core it reaches by a path
     // dependency (`../vilan-image`) — the one optional crate with a sibling
     // dependency of its own, which is why the core materializes here too

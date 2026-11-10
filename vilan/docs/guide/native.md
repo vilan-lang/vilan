@@ -120,6 +120,15 @@ whose open response never ends. The handler
 lives in a third runtime crate, linked only by a program that serves, so a
 native server build fetches the `ctrlc` crate the first time.
 
+**The event loop sleeps until there is work.** A native program that serves,
+dials a WebSocket or reads stdin waits in the operating system (`poll` on Linux
+and macOS, `WSAPoll` on Windows) until a socket it uses is ready, the next timer
+or request deadline is due, or another thread hands it something: an idle
+server costs no CPU, and a request is answered as soon as its bytes arrive. The
+wait lives in its own small runtime crate, linked only by such a program; the
+order in which tasks, timers and socket events run is the same as before, and
+the same as node's.
+
 **A native client's socket is the host's, with two differences you can see
 only from outside the program.** The address lookup and the TCP connect run on
 a helper thread (Rust's standard library has no non-blocking connect), so a
