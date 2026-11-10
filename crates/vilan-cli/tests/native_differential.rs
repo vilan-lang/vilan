@@ -5519,8 +5519,9 @@ fn both_servers(staged: &Path, program: &str) -> (Command, Command) {
     (native, node)
 }
 
-/// Builds a client program for node (clients are always the JS leg: the
-/// generated rpc client is a browser-shaped program).
+/// Builds a client program for node (the node client is these pins' fixed
+/// leg; `f1_s1b_a_native_rpc_client_sees_the_same_wire_from_both_servers`
+/// builds the same client natively too).
 fn build_client(staged: &Path, program: &str) {
     let bundled = vilan(staged)
         .args(["build", program])
@@ -5649,6 +5650,190 @@ fn the_keyed_rpc_service_answers_a_node_client_the_same_from_a_native_server() {
             .any(|line| line == format!("hash:{native_contract}")),
         "the client's contract hash is the server's own ({native_contract}):\n{native}"
     );
+}
+
+/// Runs a client COMMAND to completion under a liveness bound (the clients
+/// exit by themselves) and answers its stdout — [`run_client`] for a client
+/// of either backend.
+fn run_client_command(command: &mut Command, environment: &[(&str, String)]) -> String {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("spawn the client");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if child.try_wait().expect("poll the client").is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the client never finished");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("the client's stdout")
+        .read_to_string(&mut out)
+        .expect("read the client's stdout");
+    out
+}
+
+/// **F1 S1b — the rpc CLIENT natively.** The keyed pin's client half
+/// (`native/keyed_chat_client.vl`, unchanged) built by BOTH backends, and each
+/// build run against BOTH servers: the generated `ChatClient::connect` dials
+/// over `vilan_rt::ws` (the upgrade, the `vilan-rpc` offer, the accept check,
+/// masked frames), verifies the contract, attaches both mirrors, holds a
+/// per-key subscription, calls both rpcs and closes. All four pairings print
+/// the same lines, and the node client against the node server — the pairing
+/// that predates this slice — is the reference.
+#[test]
+fn f1_s1b_a_native_rpc_client_sees_the_same_wire_from_both_servers() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_keyed_server.vl"),
+        include_str!("native/keyed_chat_server.vl"),
+    )
+    .expect("write the server");
+    std::fs::write(
+        staged.join("native_keyed_client.vl"),
+        include_str!("native/keyed_chat_client.vl"),
+    )
+    .expect("write the client");
+    let (mut native_server, mut node_server) = both_servers(&staged, "native_keyed_server.vl");
+    let (mut native_client, mut node_client) = both_servers(&staged, "native_keyed_client.vl");
+    let mut answers = Vec::new();
+    for (server_name, server_command) in
+        [("native", &mut native_server), ("node", &mut node_server)]
+    {
+        for (client_name, client_command) in
+            [("native", &mut native_client), ("node", &mut node_client)]
+        {
+            let server = ServerUnderTest::spawn(server_command);
+            let answered =
+                run_client_command(client_command, &[("CHAT_PORT", server.port().to_string())]);
+            answers.push((
+                format!("{client_name} client, {server_name} server"),
+                answered,
+            ));
+        }
+    }
+    let reference = answers
+        .iter()
+        .find(|(pairing, _)| pairing == "node client, node server")
+        .map(|(_, answered)| answered.clone())
+        .expect("the reference pairing ran");
+    for line in [
+        "post:2",
+        "edit:true",
+        "m2:world again",
+        "held:m2=world again ",
+        "topic-held:general",
+        "fault:false",
+    ] {
+        assert!(
+            reference.lines().any(|answered| answered == line),
+            "the reference client's `{line}`:\n{reference}"
+        );
+    }
+    for (pairing, answered) in &answers {
+        assert_eq!(
+            answered, &reference,
+            "{pairing} must print what a node client prints against a node server"
+        );
+    }
+}
+
+/// F1 S1b: `wss://` is refused by the native client BY NAME — the native
+/// backend has no TLS (`native-objective.md` S1) — where the node build dials
+/// it. The refusal is the constructor's, at run time (the URL is a value), and
+/// it says what to do instead.
+#[test]
+fn f1_s1b_a_native_wss_dial_is_refused_by_name() {
+    let staged = stage();
+    let file = "native_probe_wss_refused.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n",
+            "import std::result::Result::{ self, Err, Ok };\n",
+            "import std::rpc::connect_socket;\n",
+            "\n",
+            "async fun main() {\n",
+            "\tprint(\"dialling\");\n",
+            "\tmatch connect_socket(\"wss://127.0.0.1:9/\") {\n",
+            "\t\tOk(let _duplex) => print(\"open\"),\n",
+            "\t\tErr(let reason) => print(i\"err {reason}\"),\n",
+            "\t}\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    let run = run_on(&staged, Some("rust"), file);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.stdout, "dialling\n");
+    assert!(
+        run.stderr
+            .contains("the native backend has no TLS, so `wss://` is refused")
+            && run.stderr.contains("wss://127.0.0.1:9/"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// F1 S1b: `guarded_async` answers a CANCELLED body as an `Err`, on both
+/// backends — the JS helper's `catch` takes the `AbortError` an aborted
+/// `__sleep` rejects with, and the native one re-raised the cancellation
+/// instead, which carried a cancelled dial's backoff out through its nursery
+/// (`dial_cancel.rs`'s backoff ordering, natively, failed the program).
+#[test]
+fn f1_s1b_guarded_async_catches_a_cancelled_body_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_guarded_abort.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n",
+            "import std::result::Result::{ self, Err, Ok };\n",
+            "import std::task::nursery;\n",
+            "import std::time::sleep;\n",
+            "\n",
+            "[extern(\"__guarded_async\")]\n",
+            "async external fun guarded<T>(body: async || T): Result<T, str>;\n",
+            "\n",
+            "fun wait(): bool {\n",
+            "\tsleep(1000);\n",
+            "\ttrue\n",
+            "}\n",
+            "\n",
+            "async fun main() {\n",
+            "\tlet answer = nursery(|n| {\n",
+            "\t\tlet running = async guarded(|| wait());\n",
+            "\t\tn.cancel();\n",
+            "\t\tawait running\n",
+            "\t});\n",
+            "\tmatch answer {\n",
+            "\t\tOk(let value) => print(i\"ok {value}\"),\n",
+            "\t\tErr(let reason) => print(i\"err {reason}\"),\n",
+            "\t}\n",
+            "\tprint(\"after\");\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "err This operation was aborted\nafter\n",
+            "{backend:?}"
+        );
+    }
 }
 
 /// **F18 slice 3's EXIT** — a program with the SHAPE of kolt's server leg,
@@ -8450,7 +8635,7 @@ fn the_native_copy_census_matches_its_table() {
 ///
 /// `host_name` is reached nowhere but inside the argument of the refused
 /// `set_priority` call; `range_i32` nowhere but inside the body of the closure
-/// the refused `hmr_register_teardown` takes. Neither was in the census before
+/// the refused `on_exit` takes. Neither was in the census before
 /// the walk continued past a refusal, which is how `createServer`'s handler hid
 /// nine bindings from the census that sized F18.
 ///
@@ -8458,10 +8643,12 @@ fn the_native_copy_census_matches_its_table() {
 /// table will ever answer: the pair had been `random_bytes(random_uuid()..)`,
 /// and F40 lowered both, which turned the pin's shape into a program with
 /// nothing hidden in it. A pair the runtime cannot grow into keeps it measuring
-/// the walk rather than the runtime's coverage.
+/// the walk rather than the runtime's coverage. The closure-taking refusal is
+/// the program's own for the same reason: it had been std's
+/// `hmr_register_teardown`, which F1 S1b lowered (inert: a native build has no
+/// HMR shim).
 const CENSUS_PROBE: &str = concat!(
     "import std::random::range_i32;\n",
-    "import std::rpc::hmr_register_teardown;\n",
     "import std::io::print;\n",
     "\n",
     "[extern(\"node:os\", \"hostname\")]\n",
@@ -8470,9 +8657,12 @@ const CENSUS_PROBE: &str = concat!(
     "[extern(\"node:os\", \"setPriority\")]\n",
     "external fun set_priority(name: str): i32;\n",
     "\n",
+    "[extern(\"node:process\", \"on\", retains)]\n",
+    "external fun on_exit(handler: || void);\n",
+    "\n",
     "fun main() {\n",
     "\tprint(set_priority(host_name()));\n",
-    "\thmr_register_teardown(|| { print(range_i32(1, 4)); });\n",
+    "\ton_exit(|| { print(range_i32(1, 4)); });\n",
     "}\n",
 );
 
@@ -8520,7 +8710,7 @@ fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() 
     // a continuation OF.
     for refused in [
         "the host binding `set_priority`",
-        "the host binding `hmr_register_teardown`",
+        "the host binding `on_exit`",
     ] {
         assert!(
             census.contains(refused),
@@ -15983,8 +16173,8 @@ fn f158_base64_and_json_keys_are_identical_on_both_backends() {
 /// dial (the nursery cancels it, and joins it, so a dial left running would
 /// hold the line back by that minute), a deadline already past — and the two
 /// new `RpcError` arms `Debug`-render, compare and encode as the others. The
-/// WebSocket dial itself is JS-only (the native backend refuses `WebSocket`),
-/// which `dial_cancel.rs` pins on node.
+/// WebSocket dial's own cancel orderings are `dial_cancel.rs`'s, on node and
+/// natively (F1 S1b).
 #[test]
 fn a179_dial_within_answers_the_same_on_both_backends() {
     let staged = stage();

@@ -66,6 +66,13 @@ pub enum JsonValue {
     /// Insertion-ordered, because JavaScript objects are: `Object.keys` answers
     /// string keys in insertion order, and `__json_tag` reads `Object.keys(v)[0]`.
     Object(Rc<Vec<(Str, JsonValue)>>),
+    /// An `ArrayBuffer` — a host value no JSON text produces, and the one a
+    /// binary WebSocket message's `data` is (F1 S1b: `std::rpc`'s dial reads
+    /// `data` untyped and asks `Object.prototype.toString` which lane it is,
+    /// [`host_kind`]). It answers every seam as JavaScript answers for an
+    /// `ArrayBuffer`: `typeof` is `"object"`, it has no fields, and it
+    /// stringifies as an empty object.
+    Buffer(crate::bytes::Bytes),
 }
 
 impl JsonValue {
@@ -163,7 +170,7 @@ impl JsonValue {
             JsonValue::Number(_) => "number",
             JsonValue::Text(_) => "string",
             JsonValue::Array(_) => "array",
-            JsonValue::Object(_) => "object",
+            JsonValue::Object(_) | JsonValue::Buffer(_) => "object",
         })
     }
 
@@ -206,6 +213,7 @@ impl JsonValue {
                 str_new(&parts.join(","))
             }
             JsonValue::Object(_) => str_new("[object Object]"),
+            JsonValue::Buffer(_) => str_new("[object ArrayBuffer]"),
         }
     }
 
@@ -218,7 +226,7 @@ impl JsonValue {
             JsonValue::Bool(value) => *value,
             JsonValue::Number(value) => *value != 0.0 && !value.is_nan(),
             JsonValue::Text(text) => !text.is_empty(),
-            JsonValue::Array(_) | JsonValue::Object(_) => true,
+            JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Buffer(_) => true,
         }
     }
 
@@ -248,7 +256,7 @@ impl JsonValue {
             }
             JsonValue::Array(items) if items.is_empty() => 0.0,
             JsonValue::Array(items) if items.len() == 1 => items[0].coerce_number(),
-            JsonValue::Array(_) | JsonValue::Object(_) => f64::NAN,
+            JsonValue::Array(_) | JsonValue::Object(_) | JsonValue::Buffer(_) => f64::NAN,
         }
     }
 
@@ -527,6 +535,23 @@ impl Parser<'_> {
 
 /// `JSON.stringify(value)` of an already-parsed value.
 ///
+/// `Object.prototype.toString.call(value)` — the host's class oracle, which
+/// `std::rpc` binds as `host_kind` to tell a binary WebSocket message
+/// (`"[object ArrayBuffer]"`) from a text one (`"[object String]"`). Every arm
+/// answers what the oracle answers for the JavaScript value it stands for.
+pub fn host_kind(value: &JsonValue) -> Str {
+    str_new(match value {
+        JsonValue::Undefined => "[object Undefined]",
+        JsonValue::Null => "[object Null]",
+        JsonValue::Bool(_) => "[object Boolean]",
+        JsonValue::Number(_) => "[object Number]",
+        JsonValue::Text(_) => "[object String]",
+        JsonValue::Array(_) => "[object Array]",
+        JsonValue::Object(_) => "[object Object]",
+        JsonValue::Buffer(_) => "[object ArrayBuffer]",
+    })
+}
+
 /// `undefined` is the one arm with no JSON rendering: `JSON.stringify(undefined)`
 /// answers the value `undefined`, not a string, and the only place a vilan
 /// program can reach that is stringifying a field it never checked for. `null`
@@ -551,6 +576,8 @@ impl Json for JsonValue {
                     .collect();
                 format!("{{{}}}", parts.join(","))
             }
+            // `JSON.stringify(new ArrayBuffer(2))` is `{}`: no enumerable keys.
+            JsonValue::Buffer(_) => "{}".to_string(),
         }
     }
 }
@@ -579,6 +606,17 @@ impl Js for JsonValue {
                     .map(|(key, (_, value))| (key.as_str(), value as &dyn Js))
                     .collect();
                 crate::inspect::object(&fields)
+            }
+            // node's inspection: `ArrayBuffer { [Uint8Contents]: <68 69>,
+            // byteLength: 2 }`.
+            JsonValue::Buffer(bytes) => {
+                let contents = bytes.as_slice();
+                let hex: Vec<String> = contents.iter().map(|byte| format!("{byte:02x}")).collect();
+                format!(
+                    "ArrayBuffer {{ [Uint8Contents]: <{}>, byteLength: {} }}",
+                    hex.join(" "),
+                    contents.len()
+                )
             }
         }
     }
@@ -625,6 +663,9 @@ impl PartialEq for JsonValue {
             (JsonValue::Text(left), JsonValue::Text(right)) => left == right,
             (JsonValue::Array(left), JsonValue::Array(right)) => left == right,
             (JsonValue::Object(left), JsonValue::Object(right)) => left == right,
+            // An `ArrayBuffer` is an object, and an object compares by
+            // reference — which `Bytes`'s own equality is.
+            (JsonValue::Buffer(left), JsonValue::Buffer(right)) => left == right,
             _ => false,
         }
     }

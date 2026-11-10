@@ -17,10 +17,12 @@
 //! of the dial's nursery), which the harness writes only after it has OBSERVED
 //! the state the cancel must find.
 //!
-//! Node only: the native backend has no WebSocket client (it refuses the host
-//! type `WebSocket`, F1 S1b), so there is no native dial to cancel.
-//! `dial_within` itself runs natively over any dial — the native differential
-//! `a179_dial_within_answers_the_same_on_both_backends` pins that.
+//! Every ordering runs twice: the client built for node, and the same source
+//! built with `--backend rust` (F1 S1b's WebSocket client, `vilan_rt::ws`)
+//! against the same listeners and the same node server — each `…_natively`
+//! test is its node twin with the native binary in the client's seat.
+//! `dial_within` over hand-written dials is also pinned by the native
+//! differential (`a179_dial_within_answers_the_same_on_both_backends`).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -182,11 +184,16 @@ async fun main() {
 						print("redial:reconnecting");
 					} else if current == ConnectionState::Connected && dropped.read() {
 						print("redial:connected");
-						match client.echo(11) {
-							Ok(let value) => print(i"redial:call:{value}"),
-							Err(let error) => print(i"redial:call-err:{error.debug()}"),
-						}
-						exit(0);
+						// A task of its own: the subscriber is synchronous, and
+						// the native backend takes no `async` closure where a
+						// synchronous one is declared.
+						let _call = async {
+							match client.echo(11) {
+								Ok(let value) => print(i"redial:call:{value}"),
+								Err(let error) => print(i"redial:call-err:{error.debug()}"),
+							}
+							exit(0);
+						};
 					} else if current == ConnectionState::Closed {
 						print("redial:closed");
 						exit(0);
@@ -208,6 +215,38 @@ async fun main() {
 /// shares one build among the threads).
 struct Built {
     directory: PathBuf,
+}
+
+/// Which build of the client a test runs.
+#[derive(Clone, Copy)]
+enum Backend {
+    Node,
+    Native,
+}
+
+/// The client built with `--backend rust` — once per test process, and only
+/// by a test that runs it (a native build is a `cargo build`).
+fn native_client() -> &'static PathBuf {
+    static NATIVE: OnceLock<PathBuf> = OnceLock::new();
+    NATIVE.get_or_init(|| {
+        let directory = &built().directory;
+        let build = Command::new(env!("CARGO_BIN_EXE_vilan"))
+            .current_dir(directory)
+            .args(["build", "--backend", "rust", "client/src/main.vl"])
+            .output()
+            .expect("run vilan build --backend rust");
+        assert!(
+            build.status.success(),
+            "the native client did not build:\n{}{}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let binary = String::from_utf8_lossy(&build.stdout)
+            .lines()
+            .find_map(|line| line.split(" -> ").nth(1).map(str::to_string))
+            .expect("`vilan build` says where the binary is");
+        directory.join(binary)
+    })
 }
 
 fn built() -> &'static Built {
@@ -257,9 +296,16 @@ struct Client {
 }
 
 impl Client {
-    fn spawn(mode: &str, port: u16) -> Client {
-        let mut child = Command::new("node")
-            .arg(built().directory.join("dist/client.mjs"))
+    fn spawn(backend: Backend, mode: &str, port: u16) -> Client {
+        let mut command = match backend {
+            Backend::Node => {
+                let mut command = Command::new("node");
+                command.arg(built().directory.join("dist/client.mjs"));
+                command
+            }
+            Backend::Native => Command::new(native_client()),
+        };
+        let mut child = command
             .args([mode, &port.to_string()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -428,8 +474,17 @@ fn no_further_upgrade(listener: &TcpListener) {
 /// sentence.
 #[test]
 fn a_cancel_during_the_backoff_ends_the_dial_with_cancelled() {
+    a_cancel_during_the_backoff_ends_the_dial_with_cancelled_on(Backend::Node);
+}
+
+#[test]
+fn a_cancel_during_the_backoff_ends_the_dial_with_cancelled_natively() {
+    a_cancel_during_the_backoff_ends_the_dial_with_cancelled_on(Backend::Native);
+}
+
+fn a_cancel_during_the_backoff_ends_the_dial_with_cancelled_on(backend: Backend) {
     let (listener, port) = listener();
-    let mut client = Client::spawn("socket", port);
+    let mut client = Client::spawn(backend, "socket", port);
     let mut first = accept(&listener);
     first
         .shutdown(std::net::Shutdown::Write)
@@ -454,8 +509,17 @@ fn a_cancel_during_the_backoff_ends_the_dial_with_cancelled() {
 /// `connect` answers `RpcError::Cancelled`.
 #[test]
 fn a_cancelled_hung_dial_closes_its_half_open_socket() {
+    a_cancelled_hung_dial_closes_its_half_open_socket_on(Backend::Node);
+}
+
+#[test]
+fn a_cancelled_hung_dial_closes_its_half_open_socket_natively() {
+    a_cancelled_hung_dial_closes_its_half_open_socket_on(Backend::Native);
+}
+
+fn a_cancelled_hung_dial_closes_its_half_open_socket_on(backend: Backend) {
     let (listener, port) = listener();
-    let mut client = Client::spawn("service", port);
+    let mut client = Client::spawn(backend, "service", port);
     let mut held = accept(&listener);
     client.cancel();
     assert_eq!(client.next_line(), "service:err:RpcError::Cancelled");
@@ -476,8 +540,17 @@ fn a_cancelled_hung_dial_closes_its_half_open_socket() {
 /// cancelled dial left nothing running.
 #[test]
 fn dial_within_times_out_a_hung_dial_and_closes_its_socket() {
+    dial_within_times_out_a_hung_dial_and_closes_its_socket_on(Backend::Node);
+}
+
+#[test]
+fn dial_within_times_out_a_hung_dial_and_closes_its_socket_natively() {
+    dial_within_times_out_a_hung_dial_and_closes_its_socket_on(Backend::Native);
+}
+
+fn dial_within_times_out_a_hung_dial_and_closes_its_socket_on(backend: Backend) {
     let (listener, port) = listener();
-    let mut client = Client::spawn("within", port);
+    let mut client = Client::spawn(backend, "within", port);
     let mut held = accept(&listener);
     assert_eq!(client.next_line(), "within:err:RpcError::Timeout");
     // The client is alive and waiting: the close is the cancelled dial's.
@@ -512,8 +585,17 @@ fn echo_server_on(port: u16) -> support::port::Server {
 /// `Connected` and a call through it succeeds.
 #[test]
 fn dial_within_answers_a_dial_that_wins_and_leaves_its_connection_alone() {
+    dial_within_answers_a_dial_that_wins_and_leaves_its_connection_alone_on(Backend::Node);
+}
+
+#[test]
+fn dial_within_answers_a_dial_that_wins_and_leaves_its_connection_alone_natively() {
+    dial_within_answers_a_dial_that_wins_and_leaves_its_connection_alone_on(Backend::Native);
+}
+
+fn dial_within_answers_a_dial_that_wins_and_leaves_its_connection_alone_on(backend: Backend) {
     let server = echo_server();
-    let output = Client::spawn("within-open", server.port()).output();
+    let output = Client::spawn(backend, "within-open", server.port()).output();
     assert_eq!(
         output,
         [
@@ -528,8 +610,17 @@ fn dial_within_answers_a_dial_that_wins_and_leaves_its_connection_alone() {
 /// `Connected`: the dial's abort listener is gone the moment it settled.
 #[test]
 fn an_abort_after_the_socket_opened_leaves_the_duplex_connected() {
+    an_abort_after_the_socket_opened_leaves_the_duplex_connected_on(Backend::Node);
+}
+
+#[test]
+fn an_abort_after_the_socket_opened_leaves_the_duplex_connected_natively() {
+    an_abort_after_the_socket_opened_leaves_the_duplex_connected_on(Backend::Native);
+}
+
+fn an_abort_after_the_socket_opened_leaves_the_duplex_connected_on(backend: Backend) {
     let server = echo_server();
-    let output = Client::spawn("opened", server.port()).output();
+    let output = Client::spawn(backend, "opened", server.port()).output();
     assert_eq!(
         output,
         ["opened:state:ConnectionState::Connected", "opened:call:9"]
@@ -543,9 +634,18 @@ fn an_abort_after_the_socket_opened_leaves_the_duplex_connected() {
 /// first attempt and close the duplex for good; it waits on no signal at all.
 #[test]
 fn a_connection_from_a_cancelled_nursery_still_redials() {
+    a_connection_from_a_cancelled_nursery_still_redials_on(Backend::Node);
+}
+
+#[test]
+fn a_connection_from_a_cancelled_nursery_still_redials_natively() {
+    a_connection_from_a_cancelled_nursery_still_redials_on(Backend::Native);
+}
+
+fn a_connection_from_a_cancelled_nursery_still_redials_on(backend: Backend) {
     let mut server = echo_server();
     let port = server.port();
-    let client = Client::spawn("redial", port);
+    let client = Client::spawn(backend, "redial", port);
     assert_eq!(client.next_line(), "redial:ready");
     server.stop();
     let _revived = echo_server_on(port);

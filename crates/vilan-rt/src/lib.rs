@@ -46,6 +46,7 @@ pub mod process;
 pub mod show;
 pub mod time;
 pub mod url;
+pub mod ws;
 
 // ---------------------------------------------------------------- strings ---
 
