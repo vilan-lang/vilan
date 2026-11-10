@@ -5,7 +5,7 @@
 
 import std::http::{ Request, Response, ResponseStream, Server };
 import std::io::print;
-import std::time::Duration;
+import std::time::{ Duration, sleep };
 
 fun main() {
 	Server::builder()
@@ -40,9 +40,18 @@ fun answer(request: Request): Response {
 	Response::builder().code(code).body(i"{request.method()} {path}").build()
 }
 
+// Each piece goes out on a turn of its own. Node frames one chunk per
+// `write()` only up to a version: a newer node 24 corks the response for the
+// rest of the tick and sends every write of that tick as ONE chunk (the CI
+// windows runner's node answered `d\r\none two three`), where the native
+// server frames each write. A turn between the writes is the one schedule both
+// backends, and every node, answer with three chunks; the last piece and the
+// close share a turn, which node flushes as the last data chunk before the end.
 fun send_three(stream: ResponseStream) {
 	stream.send("one ");
+	sleep(0);
 	stream.send("two ");
+	sleep(0);
 	stream.send("three");
 	stream.close();
 }
