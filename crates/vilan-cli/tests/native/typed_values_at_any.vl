@@ -33,10 +33,12 @@ fun main() {
 		Migration { name = "002", sql = "CREATE INDEX t_a ON t (a)" },
 	]);
 	print(applied.len());
-	print(db.migrate([
-		Migration { name = "001", sql = "CREATE TABLE t (a TEXT, b TEXT, n INTEGER)" },
-		Migration { name = "002", sql = "CREATE INDEX t_a ON t (a)" },
-	]).len());
+	print(db
+		.migrate([
+			Migration { name = "001", sql = "CREATE TABLE t (a TEXT, b TEXT, n INTEGER)" },
+			Migration { name = "002", sql = "CREATE INDEX t_a ON t (a)" },
+		])
+		.len());
 	db.prepare("INSERT INTO t VALUES (?, ?, ?)").run(["x", "y", 1]);
 	mut parameters: List<str> = ["x"];
 	parameters.push("y");

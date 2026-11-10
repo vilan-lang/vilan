@@ -4,7 +4,9 @@
 // a local and called between direct writes, a `&mut self` method whose closure
 // writes `self`, an early return, the parameter handed on to another `&mut`
 // callee, and the caller reading its place after each call.
-struct Table { names: List<str> }
+struct Table {
+	names: List<str>,
+}
 
 impl Table {
 	fun intern(&mut self, name: str): usize {
