@@ -14385,6 +14385,25 @@ fn b719_a_let_else_over_a_block_and_a_capturing_loop_are_identical_on_both_backe
     );
 }
 
+/// B722: `*` on a binding a tuple pattern declares (a closure's `|(name, _)|`,
+/// a destructuring `let`) reads the value natively: the destructure copies its
+/// subject, and `(*name)` was rustc's E0614 / E0277.
+#[test]
+fn b722_a_deref_of_a_destructured_binding_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b722_tuple_binder_deref.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b722_tuple_binder_deref.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "2\n1\n4\ntrue\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

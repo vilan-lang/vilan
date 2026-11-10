@@ -254,6 +254,20 @@ fn for_each_resource_subjects(program: &Program<'_>) -> HashSet<Id> {
     subjects
 }
 
+/// B722: every binding a destructuring pattern declares — a `let (a, b) =
+/// ..` and a closure's tuple parameter `|(name, _)| ..` alike. The emitted
+/// `let` takes its subject as a copy (`Expr::Destructure`'s arm), so each such
+/// binding holds a VALUE natively ([`Emitter::local_holds_a_value`]).
+fn destructured_bindings(program: &Program<'_>) -> HashSet<Id> {
+    let mut bindings = Vec::new();
+    for expr in program.entity_map.values() {
+        if let Expr::Destructure(_, pattern) = expr {
+            collect_pattern_bindings(pattern, &mut bindings);
+        }
+    }
+    bindings.into_iter().collect()
+}
+
 fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, DropImpl> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
@@ -645,6 +659,9 @@ struct Emitter<'a, 'src> {
     /// drops it after the loop), so it is borrowed `&mut` and its `let` is
     /// emitted `mut`. See [`Emitter::for_each_borrows_its_subject`].
     for_each_resource_subjects: HashSet<Id>,
+    /// B722: the bindings a destructuring pattern declares — see
+    /// [`destructured_bindings`].
+    destructured_bindings: HashSet<Id>,
     /// F37: the FIELD reads (`record.live`) that are their field path's last
     /// use — [`Emitter::compute_liveness`]'s path-aware half.
     last_field_uses: HashSet<Id>,
@@ -822,6 +839,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_instance: None,
             last_uses: HashSet::new(),
             for_each_resource_subjects: for_each_resource_subjects(program),
+            destructured_bindings: destructured_bindings(program),
             last_field_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
@@ -6398,7 +6416,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .get(&binding)
             .and_then(|variable| variable.initial)
         else {
-            return false;
+            // B722: a binding a destructure declares has no initializer of
+            // its own, and its `let` copies the subject — `|(name, _)| *name
+            // == key` read `(*name)`, rustc's E0614 on an `i32` and a `str`
+            // compared with an `Rc<str>`.
+            return self.destructured_bindings.contains(&binding);
         };
         // Only initializers that are values by their shape: a call may be a
         // `borrows` one reached through a method, a branch may choose a view

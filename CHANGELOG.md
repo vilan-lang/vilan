@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B722: natively, `*` on a binding a tuple pattern declares builds - `meta.filter(|(name, _)| *name == key)` was rustc's E0277 (`str` compared with `Rc<str>`) and, over an `i32`, E0614.** A destructure's `let` copies its subject, so its bindings hold values natively, but a binding with no initializer of its own kept its `(*name)`. A binding declared by a destructuring pattern - a closure's tuple parameter or a destructuring `let` - now reads its value under `*`, as a by-value parameter does (F128). Pins: `native_differential::b722_a_deref_of_a_destructured_binding_is_identical_on_both_backends`. Tracker B722.
+
+---
+
+<!-- family: fix -->
 **B719: two B709 follow-ups on the native backend - a let-else whose scrutinee is an awaited call builds, and `for f() is Some(let found) { .. found .. }` keeps its binder.** (1) An awaited call is a block natively, and rustc refuses a `}` right before a let-else's `else`; a `!`'s `match` and an `if` value end the same way. A let-else subject that ends in `}` is now parenthesized. (2) A capturing loop condition was emitted `while matches!(..)`, which binds nothing, so every read of the capture in the body was E0425; the head is now rendered before the body as a `while let` (a `&&` chain after the capture is a `while let` let-chain), the captures registered for the body as an `if let`'s are. Pins: `native_differential::b719_a_let_else_over_a_block_and_a_capturing_loop_are_identical_on_both_backends` (an awaited `stat`, an `if` scrutinee after a `!`, the `while let`, a `pop()` let-chain with a nested pattern; the emitted `while let` and the parenthesized subject). Tracker B719.
 
 ---
