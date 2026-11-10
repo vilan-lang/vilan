@@ -22,6 +22,13 @@ publish = false
 
 [dependencies]
 
+# F164: the http server's unit tests bind `::` dual-stack as a built program
+# does, through the binder `vilan-rt-signal` registers in one. A test-only
+# edge (and `vilan-rt-net` depends on nothing of vilan's, so it is no cycle):
+# the runtime itself still takes no dependency.
+[dev-dependencies]
+vilan-rt-net = { path = "../vilan-rt-net" }
+
 # The workspace clippy exception list (root Cargo.toml, backlog N21).
 [lints]
 workspace = true

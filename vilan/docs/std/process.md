@@ -479,9 +479,9 @@ client of a dual-stack listener (bound to `::`, node's default with no
 `host`) mapped as `Some("::ffff:127.0.0.1")`. It is `None` once the socket is
 gone — a client that hung up. Behind a proxy it is the **proxy's** address; an
 app that trusts a forwarding header (`X-Forwarded-For`) reads that with
-`header` instead. The native server binds `0.0.0.0` when no `host` is given
-where node binds `::`, so there the same client reads `127.0.0.1` natively —
-see [the native guide](../guide/native.md).
+`header` instead. Both backends bind a server with no `host` to `::`
+dual-stack, so an IPv4 client of one reads `Some("::ffff:127.0.0.1")` on
+either — see [the native guide](../guide/native.md).
 
 `ServerBuilder::port(0)` asks the OS for a free port instead of guessing
 one, and the `Server` handed to `on_start` carries the port it actually

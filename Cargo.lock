@@ -1445,6 +1445,9 @@ dependencies = [
 [[package]]
 name = "vilan-rt"
 version = "0.55.1"
+dependencies = [
+ "vilan-rt-net",
+]
 
 [[package]]
 name = "vilan-rt-crypto"
@@ -1463,11 +1466,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vilan-rt-net"
+version = "0.55.1"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "vilan-rt-signal"
 version = "0.55.1"
 dependencies = [
  "ctrlc",
  "vilan-rt",
+ "vilan-rt-net",
 ]
 
 [[package]]

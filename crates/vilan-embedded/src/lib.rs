@@ -97,6 +97,12 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
         staging.join("vilan-rt-signal").join("Cargo.toml"),
         RT_SIGNAL_MANIFEST,
     ));
+    // F164: the dual-stack listener, reached by `vilan-rt-signal`'s manifest
+    // as `../vilan-rt-net`.
+    written.push((
+        staging.join("vilan-rt-net").join("Cargo.toml"),
+        RT_NET_MANIFEST,
+    ));
     written.push((
         staging.join("vilan-rt-term").join("Cargo.toml"),
         RT_TERM_MANIFEST,

@@ -35,6 +35,12 @@
 /// second install, which `ctrlc` refuses) leaves the default disposition in
 /// place, which is node's own behaviour — the process dies of the signal.
 /// Called once, from the emitted `main`, before the program's body runs.
+///
+/// F164: it also registers `vilan-rt-net`'s dual-stack IPv6 binder with the
+/// runtime, because this call is the one every program that starts a server
+/// makes first — so its listeners bind `::` with `IPV6_V6ONLY` cleared, as
+/// node's do, on every OS.
 pub fn install() {
+    vilan_rt::http::set_ipv6_binder(vilan_rt_net::bind_dual_stack);
     let _ = ctrlc::set_handler(vilan_rt::executor::request_termination);
 }

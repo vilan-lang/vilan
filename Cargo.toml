@@ -34,6 +34,12 @@ members = [
     # `windows-sys` (both already the CLI's) live in a fourth optional crate,
     # linked only by a program that reaches `keys()`.
     "crates/vilan-rt-term",
+    # F164: node binds `::` with `IPV6_V6ONLY` cleared, so its listener is
+    # dual-stack on every OS; the option is set between `socket()` and `bind()`,
+    # which std cannot reach, so the `setsockopt` is FFI (`libc`/`windows-sys`,
+    # already the CLI's) in a crate of its own. `vilan-rt-signal` links it, so
+    # it rides every program that starts an HTTP server and no other.
+    "crates/vilan-rt-net",
     # M185 (proposal/image.md): `std::image`'s codec core over the `image`
     # crate, kept free of vilan types so ONE implementation serves both
     # backends — `vilan-rt-image` links it natively (a fifth optional crate,

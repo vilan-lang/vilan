@@ -7,7 +7,7 @@ conflict, `CLAUDE.md` wins.
 
 ## The lay of the land
 
-Rust workspace, fifteen crates, plus the language's own tree:
+Rust workspace, sixteen crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -74,6 +74,12 @@ Rust workspace, fifteen crates, plus the language's own tree:
   CLI's) lives here and routes the signals to `vilan_rt::http::request_termination`; the
   crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
   when the program starts an HTTP server.
+- `crates/vilan-rt-net` — a native server's IPv6 listening socket, bound DUAL-STACK as node's
+  (F164): `IPV6_V6ONLY` is cleared between `socket()` and `bind()`, which std cannot reach, so
+  the `setsockopt` is FFI (`libc`/`windows-sys`) here. It depends on nothing of vilan's and
+  answers a std `TcpListener`; `vilan-rt-signal::install` registers it through
+  `vilan_rt::http::set_ipv6_binder`, so it rides every program that starts a server, and
+  `vilan-rt`'s unit tests take it as a dev-dependency.
 - `crates/vilan-rt-term` — the terminal MODE behind `std::process::keys()` for emitted Rust
   (A173 S2, terminal.md Q3): raw mode is FFI (`tcsetattr` on unix, `SetConsoleMode` on
   Windows), so `libc`/`windows-sys` live here, with a signal handler that restores the
