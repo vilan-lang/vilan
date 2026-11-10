@@ -278,3 +278,10 @@ green_seals = 4
 blocking = true
 mandate = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - re-anchored from `channel_name.adopt(channel.current_name());` (gone from channel.vl with organizations, kolt@38a7ac9) to `let name = Channel { id }.current_name(g.talk());` in the same channel.vl (the hover card's channel arm) - a statement over the `talk.channels().at(id)` boundary, the `(` opened before it as before; the repair row (`parse repair`) is the undo of the same edit; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (db-58 M175/F149/M195, http-58 F151/F152, peer-58 F163): std grew for every program - the SqlValue trait and the optional row readers in std::sqlite, ServerTimeouts and the keep-alive surface in std::http, Request::peer_address; every ci row rose x1.0006-x1.0031 and the walkthrough, the widest reader of std, crossed its limit (CI read x1.0052 of the ceiling at next 09032e8f where the limit stood at x1.0050; x1.0037 at 46ff5439, x1.0005 at 9e09acf0 before db-58)"
+item = "M175"
