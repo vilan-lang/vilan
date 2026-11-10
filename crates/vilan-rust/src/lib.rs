@@ -3216,6 +3216,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "NodeHash" => Ok("vilan_rt::crypto::NodeHash".to_string()),
             // `std::fs`'s `fs.Stats`, which `stat` copies three fields out of.
             "RawStat" => Ok("vilan_rt::fs::RawStat".to_string()),
+            // F1 S1b: `std::rpc`'s WebSocket CLIENT — the host class, its
+            // message event and the dial's abort listener — and the
+            // `ArrayBuffer` a binary message's `data` is, which natively is
+            // the same shared buffer `Bytes` is. Gated on std's declaration,
+            // because all four are common enough names for an app's own
+            // `external struct` to carry one.
+            _ if let Some(native) = self.std_declared(id).then(|| ws_host_type(name)).flatten() => {
+                Ok(native.to_string())
+            }
             // F40: node's `Buffer`, under whatever name the program gave it —
             // recognized by the binding that answers it, not by the name.
             _ if self.node_buffer_struct(id) => {
@@ -10590,14 +10599,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 // `'static` it needs. The receiver is a VALUE in vilan (a bare
                 // `self` is a copy), so the capture takes a copy of it, which is
                 // what capturing a by-value parameter already does.
-                if self
-                    .program
-                    .parameters
-                    .get(binding)
-                    .is_some_and(|parameter| self.is_a_value_received_by_reference(parameter))
-                {
-                    return format!("let {name} = (*{name}).clone(); ");
-                }
+                //
+                // `name.clone()` IS that copy for a `&T` (method lookup finds
+                // `T::clone` at the by-value step, before it would autoref to
+                // clone the reference) — and it stays right where an enclosing
+                // `async move` block has ALREADY rebound the parameter to an
+                // owned `T` ([`Emitter::async_capture_prelude`]), which the
+                // `(*name).clone()` spelling this replaces could not be: a
+                // closure handed to `reply_promise` inside
+                // `SocketTransport::call`'s `async` body dereferenced an owned
+                // `SocketTransport` and rustc refused it (F1 S1b).
                 format!("let {name} = {name}.clone(); ")
             })
             .collect()
@@ -12014,6 +12025,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         {
             return Ok(Some(rendered));
         }
+        // F1 S1b: `std::rpc`'s WebSocket client in `vilan_rt::ws`.
+        if let Some(rendered) = self.ws_host_binding(target, binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
         // F18 slice 2: `std::json`'s host seams in `vilan_rt::json`, and
         // `std::number`/`std::string`'s in the runtime's scalar half.
         if let Some(rendered) = self.json_host_binding(name, binding, argument_ids, depth)? {
@@ -12685,6 +12700,167 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.place_argument(argument_ids, 0, depth)?
             ),
             _ => return Ok(None),
+        };
+        Ok(Some(rendered))
+    }
+
+    /// Whether `id` — a declaration — is std's own, which is what lets a host
+    /// table key on a common NAME without claiming an app's declaration of it.
+    fn std_declared(&self, id: Id) -> bool {
+        self.program
+            .source_of(id)
+            .is_some_and(|source| self.program.std_sources.contains(&source))
+    }
+
+    /// The host bindings `vilan_rt::ws` answers (F1 S1b): `std::rpc`'s
+    /// WebSocket client — the constructor, the seven methods and setters on
+    /// the socket, the message event's three reads of `data`, the
+    /// `ArrayBuffer` view and the class oracle that tell a binary message from
+    /// a text one, the two `new Promise` one-shots a socket event settles, the
+    /// dial's abort listener, and the HMR hooks a native build has no shim
+    /// for.
+    ///
+    /// Every arm is gated on std's declaration ([`Emitter::std_declared`]):
+    /// `new WebSocket`, `close`, `data` and `new Promise` are all host names
+    /// an app's own binding could carry with a different meaning. The methods
+    /// are keyed on the receiver's host type and the vilan name, as the HTTP
+    /// table's are, because two pairs share a host symbol (`send`, `data`).
+    fn ws_host_binding(
+        &mut self,
+        target: Id,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        if !self.std_declared(target) {
+            return Ok(None);
+        }
+        let Some(external) = self.program.external_functions.get(&target) else {
+            return Ok(None);
+        };
+        let name = external.name;
+        let rendered = match (binding, name) {
+            (
+                ExternBinding::New {
+                    module: None,
+                    symbol: "WebSocket",
+                },
+                _,
+            ) => format!(
+                "vilan_rt::ws::WebSocket::connect(&{}, &{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.place_argument(argument_ids, 1, depth)?
+            ),
+            // `dial_promise` and `reply_promise`: a task its executor's
+            // resolver settles, first call wins.
+            (
+                ExternBinding::New {
+                    module: None,
+                    symbol: "Promise",
+                },
+                "dial_promise" | "reply_promise",
+            ) => format!(
+                "vilan_rt::executor::promise({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            // `new Uint8Array(buffer)` over a whole `ArrayBuffer`: natively
+            // the buffer already IS the shared byte buffer, so the view is the
+            // same handle.
+            (
+                ExternBinding::New {
+                    module: None,
+                    symbol: "Uint8Array",
+                },
+                "bytes_of_buffer",
+            ) => format!("({}).clone()", self.place_argument(argument_ids, 0, depth)?),
+            (
+                ExternBinding::Function {
+                    module: None,
+                    symbol: "Object.prototype.toString.call",
+                },
+                _,
+            ) => format!(
+                "vilan_rt::json::host_kind(&{})",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            (
+                ExternBinding::Function {
+                    module: None,
+                    symbol: "__dial_on_abort",
+                },
+                _,
+            ) => format!(
+                "vilan_rt::executor::on_abort(&{}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            // HMR is the JS backend's dev loop (`--watch`); a native build has
+            // no shim, so the guard answers `false` — exactly what it answers
+            // in a JS build run without one — and the registration it guards
+            // is never reached.
+            (
+                ExternBinding::Function {
+                    module: None,
+                    symbol: "__hmr_active",
+                },
+                _,
+            ) => "false".to_string(),
+            (
+                ExternBinding::Function {
+                    module: None,
+                    symbol: "__hmr_register_teardown",
+                },
+                _,
+            ) => format!(
+                "{{ let _ = {}; }}",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            _ => {
+                let Some(receiver) = self.host_receiver_type(target) else {
+                    return Ok(None);
+                };
+                match (receiver, name) {
+                    ("WebSocket", "transmit") => format!(
+                        "({}).transmit(&{})",
+                        self.place_argument(argument_ids, 0, depth)?,
+                        self.place_argument(argument_ids, 1, depth)?
+                    ),
+                    ("WebSocket", "transmit_bytes") => format!(
+                        "({}).transmit_bytes(&{})",
+                        self.place_argument(argument_ids, 0, depth)?,
+                        self.place_argument(argument_ids, 1, depth)?
+                    ),
+                    ("WebSocket", "set_binary_type") => format!(
+                        "({}).set_binary_type(&{})",
+                        self.place_argument(argument_ids, 0, depth)?,
+                        self.place_argument(argument_ids, 1, depth)?
+                    ),
+                    ("WebSocket", "set_on_message" | "set_on_close" | "set_on_error") => {
+                        format!(
+                            "({}).{name}({})",
+                            self.place_argument(argument_ids, 0, depth)?,
+                            self.value_argument(argument_ids, 1, depth)?
+                        )
+                    }
+                    ("WebSocket", "close") => {
+                        format!("({}).close()", self.place_argument(argument_ids, 0, depth)?)
+                    }
+                    ("SocketMessage", "data" | "data_value" | "data_buffer") => format!(
+                        "({}).{name}()",
+                        self.place_argument(argument_ids, 0, depth)?
+                    ),
+                    ("AbortHook", "detach") => {
+                        format!(
+                            "({}).detach()",
+                            self.place_argument(argument_ids, 0, depth)?
+                        )
+                    }
+                    _ => return Ok(None),
+                }
+            }
         };
         Ok(Some(rendered))
     }
@@ -16997,6 +17173,20 @@ fn http_host_type(name: &str) -> Option<&'static str> {
     })
 }
 
+/// F1 S1b: the `external struct`s `std::rpc`'s WebSocket client declares (and
+/// `std::bytes`'s `ByteBuffer`, the `ArrayBuffer` a binary message carries),
+/// and the runtime type that IS each one. Answered only for std's own
+/// declarations ([`Emitter::std_declared`]).
+fn ws_host_type(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "WebSocket" => "vilan_rt::ws::WebSocket",
+        "SocketMessage" => "vilan_rt::ws::SocketMessage",
+        "AbortHook" => "vilan_rt::executor::AbortHook",
+        "ByteBuffer" => "vilan_rt::bytes::Bytes",
+        _ => return None,
+    })
+}
+
 /// F18 slice 2: the vilan type one `[extern("Number")]` JSON coercion labels
 /// its result with, as a Rust scalar.
 ///
@@ -17099,6 +17289,9 @@ fn host_handle_name(rendered: &str) -> Option<&'static str> {
         ("vilan_rt::bytes::Bytes", "Bytes"),
         ("vilan_rt::crypto::NodeHash", "NodeHash"),
         ("vilan_rt::fs::RawStat", "RawStat"),
+        ("vilan_rt::ws::WebSocket", "WebSocket"),
+        ("vilan_rt::ws::SocketMessage", "SocketMessage"),
+        ("vilan_rt::executor::AbortHook", "AbortHook"),
         ("vilan_rt_crypto::NodeBuffer", "Buffer"),
     ];
     HANDLES

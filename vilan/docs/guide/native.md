@@ -41,15 +41,24 @@ What the backend reaches today:
   `Service::factory`, the WebSocket upgrade with its handshake gate
   (`authorize`), and `[expose]`/`[expose(keyed)]` mirrors a vilan client
   subscribes to, byte-for-byte on the wire with the node build
+- **rpc clients**: `std::rpc`'s WebSocket client over `ws://` — a generated
+  client's `connect` (and `connect_with` a credential), `connect_socket`,
+  calls, mirrors, the reconnect loop with its backoff, and a dial that honours
+  its nursery's cancel (`dial_within`'s deadline included). A native client
+  talks to a native server or a node one, and a node client to either
 
 What it does **not** reach yet — each refused by name, with the construct in the
 message, rather than silently mis-compiled: the browser platform (`std::web::dom`,
 `std::web::ui`, `std::web::prelude`, `std::web::router`), a `resource` type with a `Drop` impl
 (deterministic teardown natively is its own slice; a resource with no `Drop`,
 such as a pipe node, builds as an ordinary move-only type), a handful of host bindings (the `fs`
-calls that take an options object), and
+calls that take an options object),
 `--watch` (a native round is a full `cargo build`; the dev loop's hot-swap
-belongs to the JS backend).
+belongs to the JS backend), and **TLS**: a native client dialling `wss://` stops
+at the dial with a message saying the native backend has no TLS — the URL is a
+value, so this one is refused when the program runs rather than when it builds.
+Dial `ws://`, behind a TLS-terminating proxy (caddy, nginx) when the server
+needs one, as a native server is deployed.
 
 If your program uses one of these, `--backend rust` tells you which and stops.
 Build it with `--backend js`, which is still the default.
@@ -73,6 +82,13 @@ the upgraded sockets, lets a request already being answered finish — and then
 the process at once, for a server whose open response never ends. The handler
 lives in a third runtime crate, linked only by a program that serves, so a
 native server build fetches the `ctrlc` crate the first time.
+
+**A native client's socket is the host's, with two differences you can see
+only from outside the program.** The address lookup and the TCP connect run on
+a helper thread (Rust's standard library has no non-blocking connect), so a
+slow DNS answer does not stall the event loop; and no compression extension is
+offered on the handshake. Events arrive one per turn of the event loop, as the
+host's do, so the program sees the same order of messages, errors and closes.
 
 ## Debug by default
 

@@ -688,10 +688,14 @@ export struct SocketDuplex {
 	pending: Shared<List<PendingCall>>,
 	next_request: Shared<i32>,
 	// Run (and awaited, in order) after each successful re-dial — the generated
-	// client re-attaches its mirrors here. Stored plain (an `async` closure TYPE
-	// lives only at parameter/`let` seams, J2 v1); the runner re-marks each entry
-	// at a `let` so the calls await.
-	on_reconnect: Shared<List<|| void>>,
+	// client re-attaches its mirrors here. Each hook STARTS its work and answers
+	// the task (an `async` closure TYPE lives only at parameter/`let` seams, J2
+	// v1, so the list cannot hold `async || void`), and the runner awaits that
+	// task. The task is what makes "awaited, in order" survive the store on the
+	// native backend too: a plain `|| void` there is a closure answering
+	// nothing, and an async body stored into one had no future left to await
+	// (F1 S1b).
+	on_reconnect: Shared<List<|| Task<void>>>,
 	// The handler dispatcher this client answers the SERVER's `s:` requests with
 	// (§9.3), installed by the generated `with_handlers` after `connect` has
 	// verified the contract. `None` until then — and on a client that declares no
@@ -887,7 +891,7 @@ export impl SocketTransport {
 	/// re-arm a subscription), not ride a long round-trip that holds the
 	/// reconnect open behind it.
 	fun on_reconnect(self, hook: async || void) {
-		self.duplex.on_reconnect.write().push(hook);
+		self.duplex.on_reconnect.write().push(|| async hook());
 	}
 }
 
@@ -1235,10 +1239,8 @@ fun handle_drop(duplex: SocketDuplex) {
 				watch_socket(duplex);
 				duplex.state.set(ConnectionState::Connected);
 				for entry in duplex.on_reconnect.read() {
-					// Re-marked at the `let` so the call awaits (J2's typed
-					// channel): re-attach completes before the next hook.
-					let hook: async || void = entry;
-					hook();
+					// Awaited: re-attach completes before the next hook.
+					await entry();
 				}
 			},
 			Err(let _reason) => close_for_good(duplex),
@@ -6621,7 +6623,7 @@ fun dispose_on_close(socket: SocketDuplex, client: ReactiveClient) {
 /// for the hand-wired shape (`ReactiveClient::new(bridge(socket), codec)`),
 /// where it is one line beside the client's construction.
 export fun invalidate_on_reconnect(socket: SocketDuplex, client: ReactiveClient) {
-	socket.on_reconnect.write().push(|| client.invalidate_dynamic());
+	socket.on_reconnect.write().push(|| async client.invalidate_dynamic());
 }
 
 /// Re-attach a generated client's mirrors after a reconnect (§2.5): re-verify the
@@ -7762,7 +7764,7 @@ export macro fun service(item: Item): Source {
 	body.push(i"let rebinds: List<|i32, Frame| void> = {rebind_list};");
 	// The client's wire demand is forgotten first (A143): the rebinds and replays
 	// re-register what each mirror still holds on the fresh session's ids.
-	body.push("socket.on_reconnect.write().push(|| {\n"
+	body.push("socket.on_reconnect.write().push(|| async {\n"
 		+ indent("reactive.reset_wire();", 1)
 		+ "\n"
 		+ indent("rpc::reattach_mirrors(socket, transport, codec, " + hash + ", rebinds, || reactive.replay_dynamic());", 1)

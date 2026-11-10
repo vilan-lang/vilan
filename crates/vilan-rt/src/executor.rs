@@ -371,12 +371,21 @@ pub(crate) fn raise_failure(failure: Failure) -> ! {
 /// names (M165: an `[rpc]` body that throws answers its call with the error).
 /// The JS helper is a `try`/`await`/`catch` returning `[0, value]` or
 /// `[1, message]`; natively [`Catch`] catches at every poll, as a task's own
-/// failure latch does. A cancellation is not the body's failure and keeps
-/// travelling.
+/// failure latch does.
+///
+/// **A cancellation is caught too**, because the JS `catch` catches it: an
+/// aborted `__sleep` rejects with the signal's reason — the `AbortError` whose
+/// message is `This operation was aborted` — and the helper answers it as
+/// `[1, message]` like any rejection. `std::rpc`'s dial reads exactly that:
+/// its backoff wait is `guarded_async(|| backoff_wait(..))`, and an `Err` there
+/// is how a cancel during the wait ends the dial with `Cancelled` (A179).
+/// Re-raising it here instead (as this did until F1 S1b gave the dial a
+/// native client) carried the abort out through the dial's task and failed
+/// the nursery that was only asking the dial to stop.
 pub async fn guarded_async<T>(body: Boxed<T>) -> Result<T, Str> {
     match Catch::new(body).await {
         Ok(value) => Ok(value),
-        Err(Failure::Cancelled) => raise(Failure::Cancelled),
+        Err(Failure::Cancelled) => Err(crate::str_new("This operation was aborted")),
         Err(Failure::Panic(message, _location)) => Err(message),
     }
 }
@@ -406,6 +415,12 @@ struct NurseryBody {
     /// DOWNWARD at cancel time so a descendant's parked `sleep` is woken —
     /// which is exactly what the JS listener does.
     descendants: RefCell<Vec<Weak<NurseryBody>>>,
+    /// Callbacks to RUN when this nursery cancels (F1 S1b) — the native
+    /// `signal.addEventListener("abort", listener)` that `std::rpc`'s dial
+    /// registers through `__dial_on_abort`, beside the park-only
+    /// `cancel_waiters` a leaf future uses. Keyed by a registration number so
+    /// an [`AbortHook`] can take its own back out.
+    abort_hooks: RefCell<Vec<(u64, Rc<dyn Fn()>)>>,
     parent: Option<Weak<NurseryBody>>,
     /// A DETACHED nursery is never joined, so it must not silently absorb a
     /// child's failure: this flag is `__nursery_new_detached`'s `__fail`
@@ -452,6 +467,7 @@ impl Nursery {
             fail_waiters: RefCell::new(Vec::new()),
             cancel_waiters: RefCell::new(Vec::new()),
             descendants: RefCell::new(Vec::new()),
+            abort_hooks: RefCell::new(Vec::new()),
             parent,
             detached,
         }))
@@ -466,6 +482,19 @@ impl Nursery {
         }
         for waiter in self.0.cancel_waiters.borrow_mut().drain(..) {
             enqueue(waiter);
+        }
+        // The abort listeners run HERE, synchronously and in registration
+        // order, as `AbortController::abort` dispatches its `abort` event.
+        // Taken out of the cell first: a hook may register or detach another.
+        let hooks: Vec<Rc<dyn Fn()>> = self
+            .0
+            .abort_hooks
+            .borrow_mut()
+            .drain(..)
+            .map(|(_, hook)| hook)
+            .collect();
+        for hook in hooks {
+            hook();
         }
         let descendants: Vec<Weak<NurseryBody>> = self.0.descendants.borrow().clone();
         for descendant in descendants {
@@ -609,6 +638,112 @@ pub async fn nursery_run<T>(nursery: Nursery, body: Boxed<T>) -> T {
         // answer if it ever did.
         Some(Failure::Cancelled) | None => std::panic::panic_any(Cancellation),
     }
+}
+
+// --------------------------------------------------------- host one-shots ---
+
+/// The registration counter behind [`AbortHook`]'s identity.
+static NEXT_ABORT_HOOK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `__dial_on_abort(signal, handler)` (F1 S1b) — run `handler` once when
+/// `signal` aborts, or at once when it already has; the hook it answers
+/// removes it again.
+///
+/// The JS helper is `addEventListener("abort", listener, { once: true })`
+/// behind an `aborted` check, and this is the same two arms: an aborted signal
+/// runs the handler inside this call and answers a hook that detaches nothing,
+/// and a live one registers it with the nursery, whose [`Nursery::cancel`]
+/// runs it. A signal whose nursery is GONE never aborts (see
+/// [`CancelSignal::aborted`]), so its handler never runs.
+pub fn on_abort(signal: &CancelSignal, handler: Rc<dyn Fn()>) -> AbortHook {
+    if signal.aborted() {
+        handler();
+        return AbortHook {
+            signal: Weak::new(),
+            id: 0,
+        };
+    }
+    let id = NEXT_ABORT_HOOK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(body) = signal.0.upgrade() {
+        body.abort_hooks.borrow_mut().push((id, handler));
+    }
+    AbortHook {
+        signal: Weak::clone(&signal.0),
+        id,
+    }
+}
+
+/// `AbortHook` — one abort listener, as a value its registrant can take back
+/// (`std::rpc`'s `external struct AbortHook`).
+#[derive(Clone)]
+pub struct AbortHook {
+    signal: Weak<NurseryBody>,
+    id: u64,
+}
+
+impl AbortHook {
+    /// `hook.detach()` — `removeEventListener`: an abort after this reaches
+    /// nothing of the registrant's. Idempotent, and inert after the hook ran.
+    pub fn detach(&self) {
+        if let Some(body) = self.signal.upgrade() {
+            body.abort_hooks
+                .borrow_mut()
+                .retain(|(registered, _)| *registered != self.id);
+        }
+    }
+}
+
+impl PartialEq for AbortHook {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.signal.as_ptr(), other.signal.as_ptr()) && self.id == other.id
+    }
+}
+
+impl crate::Js for AbortHook {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing an `AbortHook` is a host object's own inspection, which the native backend \
+             does not reproduce",
+        )
+    }
+}
+
+/// `new Promise(executor)` (F1 S1b) — a task settled by the RESOLVER its
+/// executor is handed rather than by a body of its own.
+///
+/// `std::rpc` binds the host `Promise` constructor twice — `dial_promise` and
+/// `reply_promise` — as a first-call-wins one-shot that a socket event
+/// completes. The executor runs inside this call, as the constructor runs it;
+/// the first call of the resolver settles the task with its value and wakes
+/// whatever awaits it, and every later call is inert, as resolving a settled
+/// promise is. The node has no driver and is never in the slab: nothing polls
+/// it, the resolver settles it, and a join parks on it like any task's.
+pub fn promise<T: 'static>(executor: Rc<dyn Fn(Rc<dyn Fn(T)>)>) -> Task<T> {
+    let node = Rc::new(TaskNode {
+        origin: crate::str_new("Promise"),
+        driver: RefCell::new(None),
+        settled: Cell::new(false),
+        failure: RefCell::new(None),
+        observed: Cell::new(false),
+        owned: false,
+        nursery: None,
+        waiters: RefCell::new(Vec::new()),
+        reported: Cell::new(false),
+    });
+    let value: Rc<RefCell<Option<T>>> = Rc::new(RefCell::new(None));
+    let resolve: Rc<dyn Fn(T)> = {
+        let node = Rc::clone(&node);
+        let value = Rc::clone(&value);
+        Rc::new(move |resolved: T| {
+            if node.settled.get() {
+                return;
+            }
+            *value.borrow_mut() = Some(resolved);
+            node.settle(None);
+        })
+    };
+    executor(resolve);
+    Task { node, value }
 }
 
 // ----------------------------------------------------------------- time ---
