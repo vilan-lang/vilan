@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B726: natively, `List<T>::new()` read before its first push builds - `mut merged = List<(usize, usize)>::new(); merged.pop()` was a bare `Vec::new()` and rustc's E0282.** A `let` initialized with `List::new()` is now annotated with the binding's type where that type is closed, exactly as one initialized with `[]` always was (`let mut merged: Vec<(usize, usize)> = Vec::new();`); a `Shared::new(List::new())` and an ascription ride the same rule. Pins: `native_differential::b726_a_list_read_before_its_first_push_is_identical_on_both_backends` (a pop before any push, an annotated empty list; both annotated in the emission). Tracker B726.
+
+---
+
+<!-- family: fix -->
 **B725: natively, a function made async that calls itself - or two that call each other - builds; rustc refused it (E0733, an async fn's future may not contain itself).** An awaited call to a function that reaches the function being emitted through the call graph (a self-call, any edge of a mutual recursion) is now `Box::pin(..)`-ed before its `.await`; every other awaited call is emitted as before. Pins: `native_differential::b725_a_recursive_async_function_is_identical_on_both_backends` (self-recursion, a `ping`/`pong` pair; the boxed calls in the emission). Tracker B725.
 
 ---

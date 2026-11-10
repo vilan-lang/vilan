@@ -14462,6 +14462,42 @@ fn b725_a_recursive_async_function_is_identical_on_both_backends() {
     );
 }
 
+/// B726: a `let` initialized with `List<T>::new()` is annotated natively, as one
+/// initialized with `[]` is, so a read before the first push types (rustc E0282
+/// on a bare `Vec::new()`).
+#[test]
+fn b726_a_list_read_before_its_first_push_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b726_list_new_before_push.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b726_list_new_before_push.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "2\n0\ntrue\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b726_list_new_before_push")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains(": Vec<(usize, usize)> = Vec::new()"),
+        "the `let` names its element:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(": Vec<vilan_rt::Str> = Vec::new()"),
+        "an annotated `let` names its element too:\n{emitted}"
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

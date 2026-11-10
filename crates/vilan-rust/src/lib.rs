@@ -7485,7 +7485,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ""
         };
         // An annotation is WRITTEN ONLY where the initializer cannot type the
-        // binding — an empty collection literal, and a `Shared` cell built
+        // binding — an empty collection literal or `List::new()` (B726), and a `Shared` cell built
         // around one (F74: `let leases: Shared<List<KeyLease>> =
         // Shared::new([])` read `lease.key` off a `Vec<_>` rustc had not
         // settled yet, E0282) — and nothing else.
@@ -7612,6 +7612,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 else {
                     return false;
                 };
+                // B726: `List::new()` is `Vec::new()`, as open as `[]` — a
+                // binding read before its first push (`merged.pop()`) left
+                // rustc nothing to infer the element from (E0282).
+                if Some(*subject) == self.program.list_new_fn_id {
+                    return true;
+                }
                 matches!(
                     self.program.intrinsics.get(subject),
                     Some(Intrinsic::SharedNew)
