@@ -15299,6 +15299,33 @@ fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
     }
 }
 
+/// B721: a typed value at an `any`-typed slot converts at the boundary,
+/// element-wise for a list and payload-wise for an option — a `List<str>`
+/// variable at std::db's `List<any>` (read again after the call), a
+/// `List<Option<i32>>`, a nested `List<List<str>>`, an `Option<str>` at
+/// `Option<any>`, a mixed literal, and std's own `Database::migrate`, whose
+/// bind list literal goes straight to a host binding. Natively every one was
+/// rustc's E0308 (`expected Vec<Any>, found Vec<Rc<str>>`), so no program that
+/// migrated built.
+#[test]
+fn b721_a_typed_value_converts_at_an_any_slot_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_typed_values_at_any.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/typed_values_at_any.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "2\n0\n1\n2\n2\n3\n2\n3\ntrue\nfalse\n4\n2\n",
+            "{backend:?}"
+        );
+    }
+}
+
 /// M185: `std::image` prints the same pixels on both backends — the point of
 /// running ONE codec core (`vilan-image`) natively through `vilan-rt-image` and
 /// on node as its wasm32 build. Decode and sniff, the pixel limit's sentence,

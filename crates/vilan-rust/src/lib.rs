@@ -619,6 +619,12 @@ struct Emitter<'a, 'src> {
     /// once, so its payload is read out (a copy, rule 1's) and the option
     /// arrives at the pointee type every generic over it is monomorphised at.
     copying_a_payload_view: bool,
+    /// B721: the declared parameter types of the host binding whose arguments
+    /// are being rendered, so [`Self::value_argument`] can hand an `any`
+    /// position down to its argument (`run_guarded(recorder, [step.name,
+    /// now().millis])` in std's own `migrate`, whose list literal had no
+    /// position to wrap its elements at).
+    host_parameter_types: Vec<TypeId>,
     /// F22 (async-polymorphism.md A.1): the ADAPTED INSTANCE being emitted —
     /// which of the callee's closure parameters arrive async at this instance,
     /// and the emission decisions the analyzer already made for that pairing.
@@ -818,6 +824,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             expects_payload_view: None,
             matching_the_subject: false,
             copying_a_payload_view: false,
+            host_parameter_types: Vec::new(),
             current_adapted_bits: Vec::new(),
             current_instance: None,
             last_uses: HashSet::new(),
@@ -6105,7 +6112,119 @@ impl<'a, 'src> Emitter<'a, 'src> {
             let rendered = self.copy_a_consumed_place_read(id, rendered);
             return Ok(format!("vilan_rt::Any::from({rendered})"));
         }
+        // B721: the same wrap STRUCTURALLY — a typed `List<str>` value at a
+        // `List<any>` position converts element-wise (and an `Option<str>` at
+        // `Option<any>` payload-wise). A literal never gets here with work to
+        // do: its elements met the element position above and were wrapped one
+        // by one, so its own type already reads `any` where the position does.
+        if let (Some(position), Some(value)) = (expecting, self.type_of(id))
+            && self.mentions_any(position)
+        {
+            let binder = format!("__any_{}", id.0);
+            if let Some(conversion) = self.conversion_into_any(value, position, &binder, 0) {
+                // The conversion consumes the value, so rule 1's copy is owed
+                // here as at the scalar wrap; what it answers is a FRESH value,
+                // written as a block [`Self::copy_a_consumed_place_read`] knows
+                // not to copy a second time.
+                let rendered = self.copy_a_consumed_place_read(id, rendered);
+                return Ok(format!(
+                    "{{ let {binder} = {rendered}; {} }}",
+                    conversion.replace("{value}", &binder)
+                ));
+            }
+        }
         Ok(rendered)
+    }
+
+    /// B721: the Rust that turns a value of type `value` into one of type
+    /// `position`, where `position` holds `any` at some depth the value holds
+    /// a typed value — `None` when the two already agree (or the shapes are
+    /// ones this conversion does not reach, which rustc then names as it did
+    /// before). The template's `{value}` is the value being converted.
+    ///
+    /// `List` and `Option` are the two containers a bind list is built of
+    /// (`Any` itself has no list variant, so a list INSIDE an `any` is not a
+    /// value either backend binds); each element is converted by the same
+    /// `Any::from` the scalar wrap uses, which also flattens an `Option` to
+    /// its payload or NULL (M165).
+    fn conversion_into_any(
+        &self,
+        value: TypeId,
+        position: TypeId,
+        binder: &str,
+        nesting: usize,
+    ) -> Option<String> {
+        let _guard = vilan_core::util::RecursionGuard::enter()?;
+        let value_type = self.resolve(value)?.clone();
+        let position_type = self.resolve(position)?.clone();
+        match (&value_type, &position_type) {
+            (Type::Any, _) => None,
+            (_, Type::Any) => Some("vilan_rt::Any::from({value})".to_string()),
+            (
+                Type::Struct(value_id, value_arguments),
+                Type::Struct(position_id, position_arguments),
+            ) if value_id == position_id
+                && self.container_name(Some(*value_id), None) == Some("List") =>
+            {
+                let (Some(value_element), Some(position_element)) =
+                    (value_arguments.first(), position_arguments.first())
+                else {
+                    return None;
+                };
+                let element = format!("{binder}_{nesting}");
+                let inner = self.conversion_into_any(
+                    *value_element,
+                    *position_element,
+                    binder,
+                    nesting + 1,
+                )?;
+                Some(format!(
+                    "{{value}}.into_iter().map(|{element}| {}).collect::<Vec<_>>()",
+                    inner.replace("{value}", &element)
+                ))
+            }
+            (
+                Type::Enum(value_id, value_arguments),
+                Type::Enum(position_id, position_arguments),
+            ) if value_id == position_id
+                && self.container_name(None, Some(*value_id)) == Some("Option") =>
+            {
+                let (Some(value_payload), Some(position_payload)) =
+                    (value_arguments.first(), position_arguments.first())
+                else {
+                    return None;
+                };
+                let element = format!("{binder}_{nesting}");
+                let inner = self.conversion_into_any(
+                    *value_payload,
+                    *position_payload,
+                    binder,
+                    nesting + 1,
+                )?;
+                Some(format!(
+                    "{{value}}.map(|{element}| {})",
+                    inner.replace("{value}", &element)
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// The name of an external struct or of an enum — `List`, `Option` —
+    /// which the containers [`Self::conversion_into_any`] walks are known by.
+    fn container_name(&self, struct_id: Option<Id>, enum_id: Option<Id>) -> Option<&'src str> {
+        if let Some(struct_id) = struct_id {
+            return self
+                .program
+                .structs
+                .get(&struct_id)
+                .filter(|declaration| declaration.external)
+                .map(|declaration| declaration.name);
+        }
+        self.program
+            .enums
+            .get(&enum_id?)
+            .map(|declaration| declaration.name)
     }
 
     /// An expression in a VALUE position — rule 1's copy applied where the
@@ -12001,6 +12120,34 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<Option<String>, Error> {
+        let parameter_types: Vec<TypeId> = self
+            .program
+            .external_functions
+            .get(&target)
+            .map(|external| external.parameters.clone())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|parameter_id| self.program.parameters.get(parameter_id))
+            .map(|parameter| parameter.type_id)
+            .collect();
+        let saved = std::mem::replace(&mut self.host_parameter_types, parameter_types);
+        let rendered =
+            self.lowered_host_binding_in(target, name, binding, argument_ids, depth, span);
+        self.host_parameter_types = saved;
+        rendered
+    }
+
+    /// [`Self::lowered_host_binding`] with the binding's parameter types in
+    /// [`Self::host_parameter_types`].
+    fn lowered_host_binding_in(
+        &mut self,
+        target: Id,
+        name: &str,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+        span: Span,
+    ) -> Result<Option<String>, Error> {
         // J6: the concurrency helpers have native bodies in
         // `vilan_rt::executor`.
         if let Some(rendered) =
@@ -14913,7 +15060,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// Two shapes are skipped: a read already copied, and a binding that holds a
     /// VIEW — `(&mut T).clone()` derefs rather than copies.
     fn copy_a_consumed_place_read(&mut self, id: Id, rendered: String) -> String {
-        if rendered.ends_with(".clone()") {
+        // B721: a value converted into an `any` position is built fresh by
+        // the conversion, which already took the copy its place read owed.
+        if rendered.ends_with(".clone()") || rendered.starts_with("{ let __any_") {
             return rendered;
         }
         // A read out of a cell — a spine through a `Shared` view or over a
@@ -15125,10 +15274,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // the second (E0382). A host member that takes a reference (`&{}` in
         // its rendering) reads its argument with [`Self::place_argument`]
         // instead, and owes nothing.
+        //
+        // B721: the one declared position that IS handed down is one that
+        // mentions `any` — the conversion seam — so a bind list built in place
+        // (`run_guarded(recorder, [step.name, now().millis])`) wraps its
+        // elements as it does at a vilan function's `List<any>` parameter.
+        // Every other position keeps the literal's own record, as above.
+        let expecting = self
+            .host_parameter_types
+            .get(index)
+            .copied()
+            .filter(|type_id| self.mentions_any(*type_id));
         match argument_ids.get(index) {
             Some(argument) => {
                 let argument = *argument;
-                self.consumed_value_of_expecting(argument, None, depth)
+                self.consumed_value_of_expecting(argument, expecting, depth)
             }
             None => Ok("()".to_string()),
         }

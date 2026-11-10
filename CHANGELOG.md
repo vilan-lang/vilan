@@ -23,6 +23,11 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**B721: a typed value at an `any`-typed slot converts at the boundary on the native backend — a `List<str>` at `std::db`'s `List<any>` built natively, and so does std's own `Database::migrate`, which no native program could call.** The native backend wrapped a scalar landing in an `any` position (`Any::from`) but nothing structural, so a `List<str>` variable handed to `Statement::first(parameters: List<any>)` was rustc's E0308 (`expected Vec<Any>, found Vec<Rc<str>>`); and a host binding's argument met no position at all, so `migrate`'s `run_guarded(recorder, [step.name, now().millis])` built `vec![name, millis]` where the host takes `Vec<Any>`. The wrap is now structural — a `List<T>` at `List<any>` converts element-wise, an `Option<T>` at `Option<any>` payload-wise, at any nesting (`List<List<str>>` at `List<List<any>>`), each element by the same `Any::from` that flattens an `Option` to its payload or NULL (M165), and a value already `any` passes through untouched — and a host binding's argument is handed its declared parameter type when that type mentions `any`, so a literal built in place wraps its elements as it does at a vilan function's parameter. The JS backend needs no conversion and is unchanged. Pins: `native_differential::b721_a_typed_value_converts_at_an_any_slot_on_both_backends` (a migration applied and re-applied, a `List<str>` variable read again after the call, `List<i32>`, `List<Option<i32>>`, a nested list, `Option<str>` at `Option<any>`, a mixed literal; red natively before the fix). No golden moved. Tracker B721.
+
 ## v0.55.0 — 2026-11-09
 
 > Performance: this release was cut over a performance verdict that was not green (the performance verdict at 302d355a is RED - perf-302d355aa86c28f911346d4376d64f59f6c36ecd.json names the rows). tip equals v0.54.0 in instructions on every LSP row (x1.000) and on kolt (x0.997); the two red E121 rows are absolute CPU-ms targets (model.vl 600, css 1300, interim since 2026-11-03) that the base compiler itself misses (620 / 1380 ms) - measurement spread, not a regression; owner's word 2026-11-09
