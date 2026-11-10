@@ -23,6 +23,14 @@ written down.
 -->
 
 
+## v0.55.1 — 2026-11-09
+
+> Performance: this release was cut over a performance verdict that was not green (no performance verdict at d194fd7a (perf-d194fd7a259e7c17fcb8dfdffda258fdbce232e7.json) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine). extension-only patch: no compiler, std or runtime path moved; v0.55.0's verdict and its override note stand
+
+<!-- commit: 792563e4 -->
+<!-- family: fix -->
+**E361: a `vilan` launch configuration dropped `preLaunchTask`, `postDebugTask` and VS Code's other generic launch attributes.** `resolveAdapterLaunch` and `resolveLaunch` (`editors/vscode/src/debug.ts`) built the resolved configuration from a fixed list of fields, and VS Code reads its own generic attributes (`preLaunchTask`, `postDebugTask`, `preRestartTask`, `postRestartTask`, `presentation`, `internalConsoleOptions`, `serverReadyAction`, `suppressMultipleSessionWarning`, ...) from the RESOLVED configuration, so a task on a `vilan` launch never ran while the same task on a `node` one did, with no warning. The resolved configuration now carries every attribute the extension does not own: the user's configuration is spread first and the extension's own fields are written over it; on the `"adapter": "js-debug"` path the vilan-only fields (`program`, `args`, `entry`, `watch`, `vilanPath`, `adapter`) are left out of the spread, as node would read them as a second program and arguments. Pins: `src/test/debug.test.ts` (two: the generic attributes survive both resolutions, and the extension's own fields win over a user-supplied value), red with the spread planted out. Ships as the v0.55.1 patch. Tracker E361.
+
 ## v0.55.0 — 2026-11-09
 
 > Performance: this release was cut over a performance verdict that was not green (the performance verdict at 302d355a is RED - perf-302d355aa86c28f911346d4376d64f59f6c36ecd.json names the rows). tip equals v0.54.0 in instructions on every LSP row (x1.000) and on kolt (x0.997); the two red E121 rows are absolute CPU-ms targets (model.vl 600, css 1300, interim since 2026-11-03) that the base compiler itself misses (620 / 1380 ms) - measurement spread, not a regression; owner's word 2026-11-09
