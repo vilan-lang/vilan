@@ -691,7 +691,9 @@ fn run_guarded_main(body: impl FnOnce()) -> bool {
     }));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     std::panic::set_hook(previous);
-    outcome.is_err()
+    // F157: a termination that ended the loop under a suspended `main` is the
+    // program's end, not its failure.
+    outcome.is_err_and(|payload| !payload.is::<executor::TerminationStop>())
 }
 
 // How many CATCHING regions the current thread is inside (F25). A counter

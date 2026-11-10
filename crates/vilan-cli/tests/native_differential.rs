@@ -6310,6 +6310,79 @@ fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
     drop(stream);
 }
 
+/// F157: a termination ends the program once its servers have drained,
+/// WHATEVER ELSE is pending — node, with no handler, dies of the signal and
+/// abandons it all. Two shapes, each of which kept the native process alive
+/// after the listener closed (the second signal then blamed "open
+/// connections" that did not exist): a detached forever-loop task sleeping an
+/// hour (kolt's `keep_storage_tidy`), and an `async fun main` that is itself
+/// still suspended on an hour-long sleep, which ends without its value and
+/// without a failure line. Each exits 0 on the FIRST signal with nothing on
+/// stderr; the 60-second bound in `finish` is liveness only.
+#[cfg(unix)]
+#[test]
+fn f157_a_termination_ends_the_program_whatever_else_is_pending() {
+    let staged = stage();
+    for (file, source) in [
+        ("native_probe_detached_forever.vl", DETACHED_FOREVER_PROBE),
+        ("native_probe_suspended_main.vl", SUSPENDED_MAIN_PROBE),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let server = SignalledServer::spawn(&staged, file, &[]);
+        let answered = ServedRequest::exchange(server.port, "GET", "/", "");
+        assert_eq!(answered.body, "ok", "{file}");
+        server.signal("-TERM");
+        let (status, stderr) = server.finish();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{file}: one SIGTERM ends it (stderr: {stderr})"
+        );
+        assert_eq!(stderr, "", "{file}: a graceful end says nothing");
+    }
+}
+
+#[cfg(unix)]
+const DETACHED_FOREVER_PROBE: &str = concat!(
+    "import std::http::{ Response, Server };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "fun tidy() {\n",
+    "\tasync {\n",
+    "\t\tfor {\n",
+    "\t\t\tsleep(3600000);\n",
+    "\t\t}\n",
+    "\t};\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\ttidy();\n",
+    "\tServer::builder()\n",
+    "\t\t.port(0)\n",
+    "\t\t.on_request(|request| Response::builder().code(200).body(\"ok\").build())\n",
+    "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()}\"))\n",
+    "\t\t.build()\n",
+    "\t\t.start();\n",
+    "}\n",
+);
+
+#[cfg(unix)]
+const SUSPENDED_MAIN_PROBE: &str = concat!(
+    "import std::http::{ Response, Server };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tServer::builder()\n",
+    "\t\t.port(0)\n",
+    "\t\t.on_request(|request| Response::builder().code(200).body(\"ok\").build())\n",
+    "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()}\"))\n",
+    "\t\t.build()\n",
+    "\t\t.start();\n",
+    "\tsleep(3600000);\n",
+    "\tprint(\"main ended\");\n",
+    "}\n",
+);
+
 #[cfg(unix)]
 const OPEN_STREAM_PROBE: &str = concat!(
     "import std::io::print;\n",

@@ -5,12 +5,13 @@
 //!
 //! [`install`] asks the operating system to deliver SIGTERM, SIGINT and SIGHUP
 //! (on Windows: Ctrl-C and the console's close, logoff and shutdown events) to
-//! [`vilan_rt::http::request_termination`] instead of killing the process
+//! [`vilan_rt::executor::request_termination`] instead of killing the process
 //! where it stands. The first request is the GRACEFUL stop: every server stops
 //! accepting, closes what is waiting on a request or holds an upgraded socket,
-//! lets a request already being answered finish, and the event loop runs out
-//! of work — so `main` returns, and whatever runs at process end (the leak
-//! census among it) runs. A SECOND request ends the process at once, for the
+//! lets a request already being answered finish, and once the servers have
+//! drained the event loop ENDS — pending timers and detached tasks are
+//! abandoned, as node's death abandons them (F157) — so whatever runs at
+//! process end (the leak census among it) runs. A SECOND request ends the process at once, for the
 //! server whose open response never ends.
 //!
 //! # Why a crate of its own
@@ -28,12 +29,12 @@
 
 #![forbid(unsafe_code)]
 
-/// Routes the termination signals to [`vilan_rt::http::request_termination`].
+/// Routes the termination signals to [`vilan_rt::executor::request_termination`].
 ///
 /// Best effort, and idempotent in effect: a handler the OS refuses (or a
 /// second install, which `ctrlc` refuses) leaves the default disposition in
 /// place, which is node's own behaviour — the process dies of the signal.
 /// Called once, from the emitted `main`, before the program's body runs.
 pub fn install() {
-    let _ = ctrlc::set_handler(vilan_rt::http::request_termination);
+    let _ = ctrlc::set_handler(vilan_rt::executor::request_termination);
 }

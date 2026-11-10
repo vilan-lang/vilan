@@ -73,8 +73,12 @@ does on node. Beyond it, a program that starts a server answers SIGTERM, SIGINT
 and SIGHUP (Ctrl-C, and the console's close on Windows) by stopping its
 servers: it stops accepting, closes the connections that are only waiting and
 the upgraded sockets, lets a request already being answered finish — and then
-`main` returns, where node would have died of the signal. A second signal ends
-the process at once, for a server whose open response never ends. The handler
+the program ends, where node would have died of the signal. It ends whatever
+else is still pending: a timer, a detached `async { for { ..; sleep(..) } }`
+task, a `main` still suspended (which ends without a failure) — node abandons
+all of them when it dies, so a native program that waited for them would be one
+SIGTERM no longer stops. A second signal ends the process at once, for a server
+whose open response never ends. The handler
 lives in a third runtime crate, linked only by a program that serves, so a
 native server build fetches the `ctrlc` crate the first time.
 
