@@ -504,7 +504,7 @@ jobs:
       # The licence notices are regenerated and compared, so the generator is
       # pinned to the version that wrote the committed file.
       - name: cargo-about, at the version the notices were written with
-        run: cargo install cargo-about --version 0.9.1 --locked
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
       - name: The webview crate holds its gates, and a desktop window opens
         run: scripts/ci-local.sh webview
 
