@@ -285,3 +285,38 @@ class = "ci"
 ratio = 1.01
 reason = "Order 58 (db-58 M175/F149/M195, http-58 F151/F152, peer-58 F163): std grew for every program - the SqlValue trait and the optional row readers in std::sqlite, ServerTimeouts and the keep-alive surface in std::http, Request::peer_address; every ci row rose x1.0006-x1.0031 and the walkthrough, the widest reader of std, crossed its limit (CI read x1.0052 of the ceiling at next 09032e8f where the limit stood at x1.0050; x1.0037 at 46ff5439, x1.0005 at 9e09acf0 before db-58)"
 item = "M175"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0057 of the ceiling at next 7ca039b0 where the limit stood at x1.0050"
+item = "M199"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0056 of the ceiling at next 7ca039b0 where the limit stood at x1.0050"
+item = "M199"
+
+[[bump]]
+subject = "example:canvas"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0049 of the ceiling at next 7ca039b0 where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+item = "M199"
+
+[[bump]]
+subject = "example:fullstack"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0047 of the ceiling at next 7ca039b0 where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+item = "M199"
+
+[[bump]]
+subject = "example:watch"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0042 of the ceiling at next 7ca039b0 where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+item = "M199"
