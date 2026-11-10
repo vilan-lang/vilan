@@ -17104,8 +17104,10 @@ fn f1_m2_only_a_window_program_names_the_webview_crate() {
             ..Default::default()
         },
     );
+    // The sibling path is joined with the host's separator (`\\` on Windows),
+    // so the pin names the dependency line, not the spelled path.
     assert!(
-        windowed.contains("vilan-rt-webview = { path = \"/cache/vilan-rt-webview\" }"),
+        windowed.contains("vilan-rt-webview = { path = \"/cache"),
         "{windowed}"
     );
     assert!(windowed.contains("vilan-rt-poll"), "{windowed}");
