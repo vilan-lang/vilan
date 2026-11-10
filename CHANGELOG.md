@@ -23,7 +23,9 @@ written down.
 -->
 
 
-## Unreleased
+## v0.55.1 — 2026-11-09
+
+> Performance: this release was cut over a performance verdict that was not green (no performance verdict at d194fd7a (perf-d194fd7a259e7c17fcb8dfdffda258fdbce232e7.json) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine). extension-only patch: no compiler, std or runtime path moved; v0.55.0's verdict and its override note stand
 
 <!-- commit: 792563e4 -->
 <!-- family: fix -->
