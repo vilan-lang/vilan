@@ -9932,17 +9932,18 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// replaced it at `vilan check` — "cannot infer the type of this value" at the
 /// user's call — so the library-body probe now proves that the refusal comes
 /// from the CHECK, at the call, before any body is instantiated.) N167: the
-/// in-body note's std probe is `std::fs::copy_dir`, which checks clean and
-/// whose body reaches a host binding the native backend does not emit
-/// (`new_fs_options`): the refusal is drawn at the user's call and names the
-/// body and its file.
+/// in-body note's std probe is `std::fs::with_file`, which checks clean and
+/// whose body reaches a host type the native backend does not emit (`File`,
+/// the handle tier): the refusal is drawn at the user's call and names the
+/// body and its file. (It was `copy_dir` over `new_fs_options` until F156
+/// gave that body a native twin.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
     let file = "native_probe_n167_std_body_refusal.vl";
     std::fs::write(
         staged.join(file),
-        "import std::fs::copy_dir;\n\nfun main() {\n\tcopy_dir(\"a\", \"b\");\n}\n",
+        "import std::fs::with_file;\n\nfun main() {\n\twith_file(\"a\", |file| 0);\n}\n",
     )
     .expect("write the probe");
     let checked = vilan(&staged)
@@ -9966,7 +9967,7 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
     assert!(
         stderr.contains(&format!("{file}:4:2"))
             && stderr.contains(
-                "The construct is in `copy_dir`'s body (`fs.vl`), which this call instantiates.",
+                "The construct is in `with_file`'s body (`fs.vl`), which this call instantiates.",
             ),
         "the refusal inside std's body is drawn at the user's call and names the body:\n{stderr}"
     );
