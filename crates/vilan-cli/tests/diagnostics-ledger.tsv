@@ -797,3 +797,4 @@ NEW	-	`::*` names every export of a module, and is written only as a RE-EXPORT �
 NEW	-	`{spelled}::*` re-exports a MODULE's names, and `{spelled}` is not a module: re-export the names it holds one by one
 NEW	-	`{name}` is a function, not a module: `{name}::{member}` looks `{member}` up in `{name}`, and a function has no members
 NEW	-	`[track_caller]` on `{trait}`'s `{member}`, which the compiler calls implicitly — {how} — with no argument list to pass a location through; drop the attribute
+NEW	-	this program reaches `{module}` (its `{symbol}`), which only the native backend builds: a desktop window is the operating system's webview, linked into a native binary, and a JavaScript build has none. Build it with `vilan build --backend rust`

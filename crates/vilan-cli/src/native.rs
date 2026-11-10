@@ -90,7 +90,7 @@ pub fn record_host_gaps(gaps: Vec<String>) {
 /// The optional runtime crates the last emit reached, and so which of them the
 /// cargo project written for it depends on (F18 slice 2's `vilan-rt-sqlite`,
 /// F40's `vilan-rt-crypto`, F45's `vilan-rt-signal`, A173 S2's `vilan-rt-term`,
-/// M185's `vilan-rt-image`, F160's `vilan-rt-poll`). Recorded on the same terms as the three above, for
+/// M185's `vilan-rt-image`, F160's `vilan-rt-poll`, F1 M2's `vilan-rt-webview`). Recorded on the same terms as the three above, for
 /// the same reason: the fact belongs to the COMPILE and the manifest is written
 /// after it.
 static OPTIONAL_CRATES: std::sync::Mutex<vilan_rust::OptionalCrates> =
@@ -101,6 +101,7 @@ static OPTIONAL_CRATES: std::sync::Mutex<vilan_rust::OptionalCrates> =
         term: false,
         image: false,
         poll: false,
+        window: false,
     });
 
 pub fn record_optional_crates(reached: vilan_rust::OptionalCrates) {
@@ -267,16 +268,22 @@ fn write_project(
         );
         return Err(ExitCode::FAILURE);
     }
-    let manifest = vilan_rust::cargo_manifest(
-        &name,
-        &runtime.to_string_lossy(),
-        *OPTIONAL_CRATES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
+    let optional = *OPTIONAL_CRATES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let manifest = vilan_rust::cargo_manifest(&name, &runtime.to_string_lossy(), optional);
     if let Err(error) = std::fs::write(directory.join("Cargo.toml"), manifest) {
         eprintln!(
             "{} cannot write the cargo manifest: {error}",
+            paint::error_prefix()
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    if optional.window
+        && let Err(error) = seed_webview_lock(&directory)
+    {
+        eprintln!(
+            "{} cannot write the cargo lockfile: {error}",
             paint::error_prefix()
         );
         return Err(ExitCode::FAILURE);
@@ -289,6 +296,29 @@ fn write_project(
         return Err(ExitCode::FAILURE);
     }
     Ok((directory, name))
+}
+
+/// F1 M2 (native-objective.md D2a): a program with a window links `wry` +
+/// `tao` and their whole platform stack, and that stack was audited and
+/// licence-checked at the versions `vilan-rt-webview`'s OWN lockfile holds —
+/// so the generated project starts from that lockfile rather than resolving
+/// the newest versions crates.io has today. Cargo keeps every version it finds
+/// locked and adds what the program needs beyond the webview (its own package,
+/// the other runtime crates), so this seeds rather than freezes.
+///
+/// Written when the project has no lockfile yet, or has one that holds no
+/// `wry` — a project that built before it reached `std::window`, whose lock
+/// knows nothing of the stack. A lockfile that already holds `wry` is left as
+/// it is: it is this seed after cargo's additions, or one the developer moved
+/// on purpose (`cargo update`).
+fn seed_webview_lock(directory: &Path) -> std::io::Result<()> {
+    let path = directory.join("Cargo.lock");
+    let holds_the_stack =
+        std::fs::read_to_string(&path).is_ok_and(|lock| lock.contains("\nname = \"wry\"\n"));
+    if holds_the_stack {
+        return Ok(());
+    }
+    std::fs::write(path, vilan_embedded::RT_WEBVIEW_LOCK)
 }
 
 /// Runs `cargo build` over the written project, answering the binary's path.
@@ -669,5 +699,41 @@ error: could not compile `over` (bin "over") due to 1 previous error
             refusal.overflows[0].named(),
             "the expression at src/main.rs:10:5 in the emitted Rust"
         );
+    }
+
+    /// F1 M2 (D2a): a desktop program's project starts from the webview
+    /// crate's audited lockfile — when it has no lockfile, and when the one it
+    /// has knows nothing of the stack (it built before the program reached a
+    /// window) — and a lockfile that already holds `wry` is the developer's.
+    #[test]
+    fn the_webview_lockfile_seeds_a_project_that_does_not_hold_the_stack() {
+        let directory = std::env::temp_dir().join(format!(
+            "vilan-seed-webview-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("scratch");
+        let lock = directory.join("Cargo.lock");
+
+        seed_webview_lock(&directory).expect("seed a missing lockfile");
+        assert_eq!(
+            std::fs::read_to_string(&lock).expect("seeded"),
+            vilan_embedded::RT_WEBVIEW_LOCK
+        );
+
+        let without_the_stack = "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.0.0\"\n";
+        std::fs::write(&lock, without_the_stack).expect("write");
+        seed_webview_lock(&directory).expect("seed over a lockfile without wry");
+        assert_eq!(
+            std::fs::read_to_string(&lock).expect("seeded"),
+            vilan_embedded::RT_WEBVIEW_LOCK
+        );
+
+        let moved_on = format!("{}\n# the developer's\n", vilan_embedded::RT_WEBVIEW_LOCK);
+        std::fs::write(&lock, &moved_on).expect("write");
+        seed_webview_lock(&directory).expect("keep a lockfile that holds wry");
+        assert_eq!(std::fs::read_to_string(&lock).expect("kept"), moved_on);
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

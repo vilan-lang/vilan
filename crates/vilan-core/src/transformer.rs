@@ -1312,6 +1312,37 @@ fn image_codec_refusal(helpers: &BTreeSet<&'static str>) -> Option<Error> {
     })
 }
 
+/// F1 M2: the `__`-named free externs only the NATIVE backend implements, each
+/// with the std module that declares it — `std::window`'s desktop window,
+/// which is the operating system's webview and has no JavaScript twin. The
+/// interpreter refuses them as host capabilities too. Answers the canonical
+/// `'static` symbol and the module.
+pub(crate) fn native_only_extern(symbol: &str) -> Option<(&'static str, &'static str)> {
+    const NATIVE_ONLY: &[(&str, &str)] = &[
+        ("__window_open", "std::window"),
+        ("__window_close", "std::window"),
+    ];
+    NATIVE_ONLY
+        .iter()
+        .find(|(name, _)| *name == symbol)
+        .copied()
+}
+
+/// The JavaScript backend's refusal of a program that reaches a native-only
+/// module (F1 M2) — never a bundle that calls a helper it does not define.
+fn native_only_refusal(symbol: &str, module: &str) -> Error {
+    Error {
+        trace: Vec::new(),
+        note: None,
+        span: Span::default(),
+        msg: format!(
+            "this program reaches `{module}` (its `{symbol}`), which only the native backend \
+             builds: a desktop window is the operating system's webview, linked into a native \
+             binary, and a JavaScript build has none. Build it with `vilan build --backend rust`"
+        ),
+    }
+}
+
 /// The `__`-named free externs whose implementations live in the helper table:
 /// a std module binds `[extern("__name")]`, and transforming a call through
 /// one marks its helper for emission. Returns the canonical `'static` name.
@@ -4012,6 +4043,12 @@ struct Transformer<'src> {
     // (backlog M34). `false` for every emitting transform, which is what keeps
     // the emitted text byte-identical.
     diagnose_only: bool,
+    // F1 M2: the first NATIVE-ONLY host helper a call reached (a `std::window`
+    // `__window_*` extern), with the module that declares it. The JavaScript
+    // backend has no implementation to emit, so an emitting build refuses the
+    // program by the module's name ([`native_only_refusal`]); a check does
+    // not, because `vilan check` is the same for both backends.
+    native_only_reached: Option<(&'static str, &'static str)>,
     // E257 S5: leave source-map marks in the tree — a `Mark` before each
     // statement and tail, an `At` around each call. Set only by
     // [`transform_with_source_map`]; every other walk (a plain build, a
@@ -4458,6 +4495,7 @@ impl<'src> Transformer<'src> {
             gate_call_names: BTreeMap::new(),
             recorder: None,
             diagnose_only: false,
+            native_only_reached: None,
             source_marks: false,
             debug_recorder: None,
         }
@@ -5127,6 +5165,12 @@ impl<'src> Transformer<'src> {
         // where the helper set is final: every emission is done.
         if let Some(error) = image_codec_refusal(&self.used_helpers) {
             return Err(error);
+        }
+        // F1 M2: a native-only module, refused by name — except by a check.
+        if !self.diagnose_only
+            && let Some((symbol, module)) = self.native_only_reached
+        {
+            return Err(native_only_refusal(symbol, module));
         }
         let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
         close_helper_dependencies(&mut helpers);
@@ -11475,6 +11519,9 @@ impl<'src> Transformer<'src> {
                 // lives in the helper table (glue for shapes the extern binding
                 // forms can't express — option-object arguments, `??`
                 // flattening, global property reads).
+                if let Some(module) = native_only_extern(symbol) {
+                    self.native_only_reached.get_or_insert((module.0, module.1));
+                }
                 if let Some(helper) = extern_helper(symbol) {
                     self.used_helpers.insert(helper);
                     // `__nursery_new_detached` builds on the base `__Nursery`

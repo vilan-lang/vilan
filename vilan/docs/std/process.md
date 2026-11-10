@@ -2,7 +2,8 @@
 
 The process modules (Node/Deno/Bun builds): `std::db`, `std::http`,
 `std::fs`, `std::process`, `std::rpc::server`, `std::watch` — and
-`std::image`, which has [a page of its own](image.md). Task-oriented
+`std::image`, which has [a page of its own](image.md), and the native-only
+`std::window` ([its page](window.md)). Task-oriented
 usage: [Persistence and the server](../guide/persistence.md).
 
 ## std::db: SQLite

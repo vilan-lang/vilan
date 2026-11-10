@@ -95,6 +95,25 @@ fn main() {
         ));
     }
 
+    // F1 M2 (D2a): the webview crate keeps a lockfile of its own, outside the
+    // compiler's, and a desktop program's generated project is SEEDED with it
+    // so every transitive crate starts at the version that lockfile was audited
+    // with (`vilan-cli`'s `native.rs` writes it).
+    let webview_lock = manifest_dir.join("../vilan-rt-webview/Cargo.lock");
+    println!("cargo:rerun-if-changed={}", webview_lock.display());
+    assert!(
+        webview_lock.is_file(),
+        "embedded-std build: {} is missing — is this a complete checkout?",
+        webview_lock.display()
+    );
+    generated.push_str(&format!(
+        "/// `vilan-rt-webview`'s own `Cargo.lock` (F1 M2, D2a): the versions its\n\
+         /// audit and licence gates read, which a desktop program's generated\n\
+         /// project starts from.\n\
+         pub static RT_WEBVIEW_LOCK: &str = include_str!({:?});\n",
+        webview_lock.canonicalize().unwrap()
+    ));
+
     let mut out = fs::File::create(&out_path).unwrap();
     out.write_all(generated.as_bytes()).unwrap();
 }
@@ -190,6 +209,13 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         directory: "vilan-image",
         manifest_static: "IMAGE_CORE_MANIFEST",
         item: "M185",
+    },
+    // F1 M2: `std::window`'s webview (`wry` + `tao`). Outside the compiler's
+    // workspace (D2a), embedded like every other optional crate all the same.
+    OptionalCrate {
+        directory: "vilan-rt-webview",
+        manifest_static: "RT_WEBVIEW_MANIFEST",
+        item: "F1 M2",
     },
 ];
 
@@ -307,11 +333,24 @@ fn collect_rust(directory: &Path, prefix: &Path, files: &mut Vec<(String, PathBu
         let path = entry.path();
         let relative = prefix.join(entry.file_name());
         if path.is_dir() {
+            // F1 M2: a crate root's own `target/` is build output, never
+            // source — and the webview crate, its own workspace outside the
+            // compiler's, HAS one (its build scripts write `.rs` files there).
+            if is_crate_target(prefix, &entry.file_name()) {
+                continue;
+            }
             collect_rust(&path, &relative, files);
         } else if path.extension().is_some_and(|extension| extension == "rs") {
             files.push((key_of(&relative), path));
         }
     }
+}
+
+/// Whether `name`, under `prefix`, is a crate root's `target/` directory: the
+/// prefix is the crate's own directory name alone (`vilan-rt-webview`), one
+/// component deep.
+fn is_crate_target(prefix: &Path, name: &std::ffi::OsStr) -> bool {
+    name == "target" && prefix.components().count() == 1
 }
 
 /// A collected file's table key: its path relative to the materialization root,

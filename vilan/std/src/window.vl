@@ -1,0 +1,94 @@
+// `std::window` — a desktop window showing a web page, for a native program (F1 M2;
+// native-objective.md D2, D2a, D4, D8).
+//
+// The short road to a desktop app: ONE native binary that serves its own page from
+// an in-process `std::http` server and shows it in the operating system's webview
+// (WebKitGTK on Linux, WKWebView on macOS, WebView2 on Windows). The page talks to
+// the server over the real loopback socket, exactly as a browser would (D8); there
+// is no new UI layer.
+//
+// NATIVE ONLY. A window is the `--backend rust` build's: its runtime is the
+// `vilan-rt-webview` crate (`wry` + `tao`), which the generated cargo project
+// links only when the program reaches this module. The JavaScript backend
+// refuses a program that reaches it, by name, when it builds; `vilan check`
+// does not, because a check is the same for both backends. A process module,
+// like `std::http`: a browser entry that reaches it is refused by the platform
+// check.
+//
+// Closing the LAST window stops the program the way SIGTERM does: servers stop
+// accepting and drain, the event loop ends, `main` returns, the process exits with
+// code 0. A program with no server stays up while its window is open.
+//
+// Window chrome beyond a title and a size — menus, a tray icon, deep links,
+// notifications, more than one window's worth of management — is not here yet
+// (each is its own slice), and shared code never names this module (D4).
+
+[platform("@process")] mod self;
+
+import pkg::result::Result::{ self, Err, Ok };
+
+// The seam: two `vilan-rt-webview` calls, a window crossing as its id.
+
+[extern("__window_open")]
+external fun window_open(url: str, title: str, width: u32, height: u32): Result<u32, str>;
+
+[extern("__window_close")]
+external fun window_close(id: u32): void;
+
+/// An open window. A handle: it holds the window's id, and the window itself
+/// lives on the platform's side until it is closed — by the person using it,
+/// or by `close`.
+export struct Window {
+	id: u32,
+}
+
+/// What `open` makes: the page to show, the title bar's text and the size, in
+/// logical pixels (the operating system scales them for the display).
+export struct WindowBuilder {
+	url: str,
+	title: str,
+	width: u32,
+	height: u32,
+}
+
+export impl Window {
+	/// A window showing `url` — usually the program's own server,
+	/// `http://127.0.0.1:<port>/`. Untitled and 800 x 600 until `title` and
+	/// `size` say otherwise.
+	fun builder(url: str): WindowBuilder {
+		WindowBuilder { url, title = "", width = 800, height = 600 }
+	}
+
+	/// Closes the window. Closing the last window stops the program as closing it
+	/// by hand does; closing one already closed does nothing.
+	fun close(self) {
+		window_close(self.id);
+	}
+}
+
+export impl WindowBuilder {
+	/// The text in the window's title bar.
+	fun title(own self, title: str): WindowBuilder {
+		self.title = title;
+		self
+	}
+
+	/// The window's inner size, in logical pixels. Both sides must be at least 1,
+	/// or `open` answers an `Err`.
+	fun size(own self, width: u32, height: u32): WindowBuilder {
+		self.width = width;
+		self.height = height;
+		self
+	}
+
+	/// Opens the window, which starts loading the page. An `Err` says why it could
+	/// not: no window system (a machine with no display), a webview that would not
+	/// start, a size of zero. The page loads after this answers, and a page that
+	/// fails to load is the webview's to show, as a browser's is.
+	fun open(self): Result<Window, str> {
+		match window_open(self.url, self.title, self.width, self.height) {
+			Ok(let id) => Ok(Window { id }),
+			Err(let reason) => Err(reason),
+		}
+	}
+}

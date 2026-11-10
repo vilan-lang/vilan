@@ -468,6 +468,46 @@ jobs:
           path: target/perf-gate/measured.json
           if-no-files-found: ignore
 
+  # F1 M2 (native-objective.md D2a): `std::window`'s runtime crate,
+  # `crates/vilan-rt-webview` (`wry` + `tao`), lives OUTSIDE the compiler's
+  # workspace with its own lockfile, so `fmt`, `clippy`, `test` and `audit`
+  # above never reach it; this leg does — its own fmt, clippy, unit tests,
+  # audit (one advisory ignored by name) and licence notices, then the desktop
+  # example built natively and run in a real window under xvfb. The leg's
+  # script says why each exception is there.
+  #
+  # GitHub-hosted, never the self-hosted runner: it installs system packages
+  # (the WebKitGTK and GTK development headers, xvfb), which is exactly what the
+  # workspace build was kept free of. Its own cache entry: a `target/` of the
+  # webview stack plus a debug compiler.
+  webview:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # NO `RUSTUP_TOOLCHAIN`, as `fmt` and `clippy` carry none: the crate's
+    # fmt and clippy are pinned gates too, so this resolves through
+    # rust-toolchain.toml (rustfmt and clippy included).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest,cargo-audit
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: webview
+          workspaces: |
+            . -> target
+            crates/vilan-rt-webview -> target
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
+      - name: WebKitGTK, GTK and a virtual display
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev xvfb dbus
+      # The licence notices are regenerated and compared, so the generator is
+      # pinned to the version that wrote the committed file.
+      - name: cargo-about, at the version the notices were written with
+        run: cargo install cargo-about --version 0.9.1 --locked
+      - name: The webview crate holds its gates, and a desktop window opens
+        run: scripts/ci-local.sh webview
+
   # **This is the job to make a required status check** (process.md §2.5, where
   # it is called `ci`; the context reads `ci / check`). Everything above it can
   # legitimately not run; this cannot, which is the entire point — a required
@@ -482,13 +522,13 @@ jobs:
   #   cancelled-> FAIL    the result is unknown, and unknown is not green
   #
   # So a docs-only or root-prose-only push takes the cheap path — `changes`
-  # runs, `test`, `wasm`, `fmt`, `vilan-fmt`, `clippy`, `audit` and `perf` skip, `check`
+  # runs, `test`, `wasm`, `fmt`, `vilan-fmt`, `clippy`, `audit`, `perf` and `webview` skip, `check`
   # is green —
   # and any red leg turns `check` red. `changes` is in `needs` on purpose: if
   # the filter itself fails, the expensive legs skip, and without this the
   # aggregate would call that a pass.
   check:
-    needs: [changes, test, wasm, fmt, vilan-fmt, clippy, audit, perf]
+    needs: [changes, test, wasm, fmt, vilan-fmt, clippy, audit, perf, webview]
     if: always()
     runs-on: ubuntu-latest
     steps:

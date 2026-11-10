@@ -9304,3 +9304,95 @@ fun main() {
         "3\n2\n0\n😀\n-a-😀-b-\n",
     );
 }
+
+// --- F1 M2: `std::window` (native-objective.md D2, D4) -------------------------
+//
+// A desktop window is the operating system's webview, linked only into a
+// native binary (`vilan-rt-webview`). The JavaScript backend has no twin, so
+// an EMITTING build refuses a program that reaches it, by the module's name;
+// `vilan check` (the emitter's diagnose walk) does not, because a check is the
+// same for both backends; and a browser build refuses it at the platform
+// fence, as every process module. The native lowering is pinned by
+// `native_differential`'s `f1_m2_*`, the real window by `desktop_shell.rs`.
+
+fn f1_m2_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::result::Result::{{ Err, Ok }};
+        import std::window::{{ Window, WindowBuilder }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+/// What `vilan check` answers: analysis, then the emitter's diagnose walk.
+fn f1_m2_check(source: &str) -> Result<(), Vec<String>> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = vilan_core::analyze_source(
+                leaked,
+                &std_spec(),
+                std::path::Path::new("."),
+                std::path::Path::new("test.vl"),
+                Some(vilan_core::Platform::default()),
+                &vilan_core::Workspace::default(),
+            );
+            match program {
+                Some(program) if errors.is_empty() => {
+                    vilan_core::diagnose(&program, &vilan_core::BuildOptions::default())
+                        .map_err(|error| vec![error.msg])
+                }
+                _ => Err(errors.into_iter().map(|error| error.msg).collect()),
+            }
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the check finished")
+}
+
+const F1_M2_OPEN: &str = r#"
+    match Window::builder("http://127.0.0.1:8080/").title("app").size(640, 480).open() {
+        Ok(let window) => window.close(),
+        Err(let reason) => print(reason),
+    }
+"#;
+
+#[test]
+fn f1_m2_the_javascript_build_refuses_a_window_by_the_modules_name() {
+    assert_fails_with(
+        &f1_m2_program(F1_M2_OPEN),
+        "this program reaches `std::window` (its `__window_open`), which only the native \
+         backend builds",
+    );
+}
+
+#[test]
+fn f1_m2_a_window_program_checks_clean() {
+    if let Err(errors) = f1_m2_check(&f1_m2_program(F1_M2_OPEN)) {
+        panic!("`vilan check` must accept a window program: {errors:#?}");
+    }
+}
+
+/// The refusal is by REACH, as every capability is: naming the module and
+/// building a `WindowBuilder` that is never opened reaches no host call.
+#[test]
+fn f1_m2_a_builder_never_opened_reaches_no_window() {
+    assert_compiles(&f1_m2_program(
+        r#"
+        let builder: WindowBuilder = Window::builder("about:blank").size(1, 1);
+        print("built, never opened");
+        "#,
+    ));
+}
+
+/// A browser entry is refused at the platform fence, before any backend.
+#[test]
+fn f1_m2_a_browser_build_cannot_reach_a_window() {
+    assert_fails_browser_with(&f1_m2_program(F1_M2_OPEN), "@process");
+}

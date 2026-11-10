@@ -45,6 +45,9 @@ What the backend reaches today:
   `Service::factory`, the WebSocket upgrade with its handshake gate
   (`authorize`), and `[expose]`/`[expose(keyed)]` mirrors a vilan client
   subscribes to, byte-for-byte on the wire with the node build
+- **desktop windows**: `std::window` — a window showing a web page in the
+  operating system's webview, which is how a native server becomes a desktop
+  app ([below](#a-desktop-window))
 - **rpc clients**: `std::rpc`'s WebSocket client over `ws://` — a generated
   client's `connect` (and `connect_with` a credential), `connect_socket`,
   calls, mirrors, the reconnect loop with its backoff, and a dial that honours
@@ -139,6 +142,102 @@ slow DNS answer does not stall the event loop; and no compression extension is
 offered on the handshake. Events arrive one per turn of the event loop, as the
 host's do, so the program sees the same order of messages, errors and closes.
 
+## A desktop window
+
+A native program can show its own page in a window: serve it from an
+in-process `std::http` server bound to loopback, and open
+[`std::window`](../std/window.md) on the server's URL. That is one binary, with
+no browser and no runtime host, and the page talks to the server over the real
+socket exactly as it would in a browser. `vilan/examples/desktop` is the whole
+app; its core is this:
+
+```vilan,native
+import std::http::{ Request, Response, Server };
+import std::io::print;
+import std::window::Window;
+
+fun main() {
+	Server::builder()
+		.port(0)                 // a port the OS knows is free
+		.host("127.0.0.1")       // reachable from this machine only
+		.on_request(|request| Response::builder()
+			.set_header("Content-Type", "text/html; charset=utf-8")
+			.body("<h1>Hello from the program's own server</h1>")
+			.build())
+		.on_start(|server| show(server.url()))
+		.build()
+		.start();
+}
+
+fun show(url: str) {
+	match Window::builder(url).title("Hello").size(640, 400).open() {
+		Ok(_) => print(i"window open on {url}"),
+		Err(let reason) => print(i"no window ({reason}); the app is at {url}"),
+	}
+}
+main();
+```
+
+```sh
+vilan run --backend rust .
+```
+
+**Closing the window ends the program cleanly.** Closing the last window — by
+hand or with `Window::close` — is the program's graceful stop, the one SIGTERM
+makes: the server stops accepting and drains, `main` returns, and the process
+exits with code 0. SIGTERM does the same with the window open.
+
+**Native only, by name.** `vilan build` (the JavaScript backend) refuses a
+program that reaches `std::window`, saying so; `vilan check` accepts it, since
+a check is the same for both backends.
+
+**What happens underneath.** A window system wants the process's main thread
+— macOS refuses any other, and GTK and Windows bind a window to the thread
+that made it — and its event loop runs until the program ends. So a program
+that reaches `std::window` gives the main thread to that loop, and its own
+`main`, with the event loop that runs its server and tasks, runs on a second
+thread (with an 8 MiB stack, a Linux main thread's size). `open` asks the main
+thread for the window and waits for the answer; an open window keeps the
+program's loop alive while doing nothing, and closing it wakes the loop. Both
+loops sleep in the operating system until there is work. When there is no
+window system at all — no display — the program runs as it would without one
+and `open` answers why.
+
+**What it links.** The window is the operating system's webview reached
+through two crates of the Tauri project, `wry` (the webview) and `tao` (the
+window and its event loop), in a runtime crate of its own that a program links
+only when it reaches `std::window`. Building one needs, on Linux, the
+WebKitGTK and GTK development packages (`libwebkit2gtk-4.1-dev` and
+`libgtk-3-dev` on Debian and Ubuntu), and running it needs WebKitGTK 4.1;
+macOS and Windows use the webview the system ships (on Windows, WebView2,
+which Windows 10 and 11 carry). The first desktop build fetches and compiles
+that stack, a minute or two.
+
+**Which versions.** `wry` and `tao` are pinned exactly, and the generated
+project starts from the lockfile the runtime crate was audited and licence-checked
+with, so every crate under them builds at that version too. Cargo adds what
+your program needs beyond them, and a lockfile you have moved yourself (a
+`cargo update` in `dist/native/<entry>/`) is kept. What is not pinned is the
+system's own webview: WebKitGTK on Linux is whatever the distribution ships.
+
+**Licences you ship.** A Linux desktop binary links `option-ext` (through
+`dirs`), which is MPL-2.0: distributing a binary that links it unmodified asks
+that its recipients can find its source and licence. Everything the webview
+stack can link, with its licence text, is in
+`crates/vilan-rt-webview/THIRD-PARTY-NOTICES.txt` in the vilan repository, the
+file to ship beside a desktop binary. The system webview libraries themselves
+(WebKitGTK, GTK) are LGPL and dynamically linked from the system.
+
+**On a machine with no screen.** A test that opens a window needs a display;
+`xvfb-run` gives it a virtual one. GTK also registers the application on the
+D-Bus session bus, so run it inside `dbus-run-session` (a CI machine has no
+session bus, and a desktop's own bus can stall a headless start), and
+`NO_AT_BRIDGE=1` keeps the accessibility bridge off it:
+
+```sh
+NO_AT_BRIDGE=1 dbus-run-session -- xvfb-run -a dist/native/main/target/debug/main
+```
+
 ## Debug by default
 
 `vilan run --backend rust` builds in **debug**, and so does `vilan build
@@ -207,6 +306,9 @@ the point of emitting a language rather than machine code. `vilan build
 
 ## Not here yet
 
-Native **windows and UI** are not in this backend and are not close: how UI code
-should be written once and run on both native and the web is a design question
-being settled first.
+A desktop window shows a web page and nothing more yet: no menus, tray icon,
+notifications, deep links, secure token storage, or second window to manage,
+and no installer or package — each is its own slice. A **native UI**, drawn by
+the program rather than by a webview, is further off: how UI code should be
+written once and run on both native and the web is a design question being
+settled first.

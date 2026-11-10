@@ -17039,3 +17039,95 @@ fn m186_a_shared_store_path_subscribes_writes_and_prunes_on_both_backends() {
         "a shared store path must subscribe, write and prune alike on both backends"
     );
 }
+
+/// F1 M2: a program that reaches `std::window` gives the MAIN thread to the
+/// desktop shell — `main` is one call, `vilan_rt_webview::run`, handing it the
+/// program's own body — and that body installs the readiness wait first, so
+/// the window's source never ticks. A program that reaches no window keeps
+/// its `main` as it was. Emitted with `--stdout`: no cargo build, so this runs
+/// wherever the suite does (the build and the window are `desktop_shell.rs`'s).
+#[test]
+fn f1_m2_a_window_program_hands_main_to_the_desktop_shell() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_window.vl"), WINDOW_PROBE)
+        .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_window.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    assert!(
+        emitted.status.success(),
+        "the window probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    assert!(
+        source.contains(
+            "fn main() {\n    vilan_rt_webview::run(vilan_program_main);\n}\n\nfn vilan_program_main() {\n    vilan_rt_poll::install();\n"
+        ),
+        "`main` is not the shell's, with the readiness wait installed first:\n{source}"
+    );
+    assert!(source.contains("vilan_rt_webview::open("), "{source}");
+    assert!(source.contains("vilan_rt_webview::close("), "{source}");
+
+    let plain = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", "bool.vl"])
+        .output()
+        .expect("emit a program with no window");
+    assert!(plain.status.success());
+    let plain = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        !plain.contains("vilan_rt_webview") && !plain.contains("vilan_program_main"),
+        "a program with no window kept the shell's `main`:\n{plain}"
+    );
+}
+
+/// F1 M2: the generated manifest names `vilan-rt-webview` beside the runtime
+/// only for a program that reaches a window — the crate is not in the
+/// compiler's workspace, and a program without a window must not pay for
+/// WebKitGTK's development packages to build.
+#[test]
+fn f1_m2_only_a_window_program_names_the_webview_crate() {
+    let runtime = "/cache/vilan-rt";
+    let windowed = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            window: true,
+            poll: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        windowed.contains("vilan-rt-webview = { path = \"/cache/vilan-rt-webview\" }"),
+        "{windowed}"
+    );
+    assert!(windowed.contains("vilan-rt-poll"), "{windowed}");
+    let plain = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            poll: true,
+            ..Default::default()
+        },
+    );
+    assert!(!plain.contains("vilan-rt-webview"), "{plain}");
+}
+
+const WINDOW_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::window::Window;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmatch Window::builder(\"about:blank\").title(\"t\").size(200, 100).open() {\n",
+    "\t\tOk(let window) => window.close(),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);

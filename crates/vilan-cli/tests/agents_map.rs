@@ -15,6 +15,12 @@
 //! root `Cargo.toml`'s `members` list — the only list that decides what the
 //! workspace actually builds.
 //!
+//! F1 M2 added the one crate the repository holds OUTSIDE the workspace
+//! (`exclude`, native-objective.md D2a): it gets a bullet like every member —
+//! an agent must learn it exists, and why it is apart — and the count word
+//! stays the number of MEMBERS, because it is a sentence about what the
+//! workspace builds.
+//!
 //! Deliberately only the *membership* and the *count word*: what each bullet
 //! SAYS about its crate is prose no test can judge, and pinning the prose would
 //! turn every honest map improvement into a red suite. Membership is the half
@@ -57,6 +63,26 @@ fn workspace_members() -> Vec<String> {
     members
 }
 
+/// The root manifest's `exclude` paths — crates in the repository that the
+/// workspace deliberately does not build (F1 M2's webview crate). Empty when
+/// there is no `exclude` list.
+fn workspace_excludes() -> Vec<String> {
+    let path = repo_root().join("Cargo.toml");
+    let manifest = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let Some(start) = manifest.find("\nexclude = [") else {
+        return Vec::new();
+    };
+    let rest = &manifest[start..];
+    let end = rest.find(']').expect("the `exclude` list is closed");
+    rest[..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
 /// The `crates/…` paths the map gives their own top-level bullet.
 fn mapped_crates(map: &str) -> Vec<String> {
     map.lines()
@@ -83,17 +109,35 @@ fn the_repo_map_gives_every_workspace_member_its_own_bullet() {
 }
 
 #[test]
+fn the_repo_map_gives_every_excluded_crate_its_own_bullet() {
+    let map = agents_map();
+    let mapped = mapped_crates(&map);
+    let missing: Vec<String> = workspace_excludes()
+        .into_iter()
+        .filter(|excluded| !mapped.contains(excluded))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "AGENTS.md's repo map has no bullet for {missing:?} — a crate the repository \
+         holds outside the workspace, which no workspace gate reaches and an agent \
+         would never learn exists."
+    );
+}
+
+#[test]
 fn the_repo_map_names_no_crate_the_workspace_does_not_build() {
     let map = agents_map();
     let members = workspace_members();
+    let excludes = workspace_excludes();
     let stale: Vec<String> = mapped_crates(&map)
         .into_iter()
-        .filter(|mapped| !members.contains(mapped))
+        .filter(|mapped| !members.contains(mapped) && !excludes.contains(mapped))
         .collect();
     assert!(
         stale.is_empty(),
-        "AGENTS.md's repo map bullets {stale:?}, which the root manifest does not \
-         list as a workspace member — a renamed or deleted crate left behind in the map."
+        "AGENTS.md's repo map bullets {stale:?}, which the root manifest lists neither \
+         as a workspace member nor under `exclude` — a renamed or deleted crate left \
+         behind in the map."
     );
 }
 
