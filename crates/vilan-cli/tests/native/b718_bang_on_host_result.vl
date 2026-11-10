@@ -1,0 +1,50 @@
+// B718: `!` on the result of a host-bound (`external`) method. The analyzer
+// records no type on a call, and the emitter read a callee's return only
+// off a function WITH a body, so `parts[1].parse_f64()!` and `items.get(0)!`
+// were refused as "an unresolved receiver" while a user method's `!` built.
+// The `Option` and `Result` halves, a chained call after the `!`, a generic
+// host member (`List::get`) inside a generic function, and a user method as
+// the control.
+import std::io::print;
+
+struct Halver { value: i32 }
+
+impl Halver {
+	fun half(self): Option<i32> {
+		self.value % 2 == 0 then Some(self.value / 2) else None
+	}
+}
+
+fun parts_of(subject: str): Option<(str, u53)> {
+	let parts = subject.split(":");
+	parts.len() == 2 else ret None;
+	let id = parts[1].parse_f64()!.as_u53();
+	Some((parts[0], id))
+}
+
+fun first_of<type T>(items: List<T>): Option<T> {
+	let first = items.get(0usize)!;
+	Some(first)
+}
+
+fun halved_twice(halver: Halver): Option<i32> {
+	let once = halver.half()!;
+	Halver { value = once }.half()
+}
+
+fun parsed(text: str): Result<i32, str> {
+	let number = text.parse_f64().ok_or("not a number")!;
+	Ok(number.as_i32() + 1)
+}
+
+fun main() {
+	print(parts_of("doc:12").is_some());
+	print(parts_of("doc:x").is_some());
+	print(parts_of("doc").is_some());
+	print(first_of([7, 8]).unwrap_or(0));
+	print(first_of(List<str>::new()).is_none());
+	print(halved_twice(Halver { value = 8 }).unwrap_or(0));
+	print(halved_twice(Halver { value = 6 }).is_none());
+	print(parsed("41").unwrap_or(0));
+	print(parsed("x").is_err());
+}

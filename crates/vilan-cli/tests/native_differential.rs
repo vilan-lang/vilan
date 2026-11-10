@@ -14329,6 +14329,26 @@ fn f153_a_for_over_the_key_stream_builds_on_both_backends() {
     }
 }
 
+/// B718: `!` on the result of a host-bound (`external`) method — `parse_f64()!`,
+/// a generic `List::get(..)!`, a `Result`'s `ok_or(..)!` — builds natively; it was
+/// refused as "an unresolved receiver" because a call to an extern callee had
+/// no type in the emitter. A user method's `!` is the control.
+#[test]
+fn b718_a_bang_on_a_host_bound_result_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b718_bang_on_host_result.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b718_bang_on_host_result.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\nfalse\nfalse\n7\ntrue\n2\ntrue\n42\ntrue\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

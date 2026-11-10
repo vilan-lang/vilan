@@ -23,6 +23,13 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**B718: natively, `!` on the result of a host-bound method builds - `parts[1].parse_f64()!`, `items.get(0usize)!` and `text.parse_f64().ok_or(..)!` were refused as "a `!` assertion on an unresolved receiver" while a user method's `!` built.** The analyzer records no type on a call, and the Rust emitter read a callee's return only off a function WITH a body, so every call to an `external` callee (a host-bound `str`, `List` or `Option` member) had no type at all: `!` had no `Option`/`Result` to dispatch on, and (B723) a `+` of two of them was not seen as a concatenation. An extern callee's written return now types its call, the same channel a bodied callee's return already took. Pins: `native_differential::b718_a_bang_on_a_host_bound_result_is_identical_on_both_backends` (`Option` and `Result`, a call chained after the `!`, a generic `List::get` inside a generic function, a user method as the control). Tracker B718.
+
+---
+
 ## v0.55.0 — 2026-11-09
 
 > Performance: this release was cut over a performance verdict that was not green (the performance verdict at 302d355a is RED - perf-302d355aa86c28f911346d4376d64f59f6c36ecd.json names the rows). tip equals v0.54.0 in instructions on every LSP row (x1.000) and on kolt (x0.997); the two red E121 rows are absolute CPU-ms targets (model.vl 600, css 1300, interim since 2026-11-03) that the base compiler itself misses (620 / 1380 ms) - measurement spread, not a regression; owner's word 2026-11-09

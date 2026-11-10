@@ -4594,6 +4594,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(function) = self.program.functions.get(&target) {
             return self.return_type_of(function);
         }
+        // B718: an EXTERN callee (a host-bound method such as `str::parse_f64`
+        // or `List::get`) has no body but always a written return - and the
+        // analyzer records no type on the call itself, so a `!` on its result,
+        // and a `+` of two of them, found nothing to dispatch on.
+        if let Some(function) = self.program.external_functions.get(&target) {
+            return Some(function.return_type_id);
+        }
         // F53: a call through a CLOSURE-typed binding answers the closure
         // type's return — `erase(r).get()` with `erase: |Root| dyn Src` is a
         // slot call whose receiver is that call, and it had no type to
