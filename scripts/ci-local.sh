@@ -39,7 +39,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # misformatted tree is a 20-second red rather than a 10-minute one, then the
 # suite, then the two builds, then the cross-check. THIS LIST IS THE JOB LIST —
 # ci_local_script.rs holds it against ci.yml's jobs in both directions.
-LEGS="fmt vilan-fmt clippy test doctest audit wasm perf windows"
+LEGS="fmt vilan-fmt clippy test doctest audit wasm perf webview windows"
 
 # Legs with no ci.yml job, and why (see THE WINDOWS LEG above). A leg named here
 # must not appear in any workflow `run:` step; the pin checks that too, so a leg
@@ -202,10 +202,55 @@ leg_perf() {
         --class "${VILAN_PERF_CLASS:-local}" --json target/perf-gate/measured.json
 }
 
+# F1 M2 (native-objective.md D2a, RULED 2026-11-10): `std::window`'s runtime
+# crate, `crates/vilan-rt-webview` (`wry` + `tao`), is OUTSIDE the compiler's
+# workspace with a lockfile of its own, so no leg above reaches it; this one
+# holds it to the same bars, with its own two written exceptions. It needs the
+# WebKitGTK and GTK development packages and a virtual display (ci.yml's
+# `webview` job installs `libwebkit2gtk-4.1-dev libgtk-3-dev xvfb`), plus
+# `cargo-audit` and `cargo-about`.
+#
+# - RUSTSEC-2024-0429 is ignored BY NAME: an `unsound` advisory against glib
+#   0.18's `VariantStrIter` (`Variant::array_iter_str`). glib 0.18 is the last
+#   line of the gtk3 bindings, which WebKitGTK 4.1 (and so `wry` on Linux)
+#   needs; the fixed glib is gtk4-only, so no gtk3 release will carry the fix.
+#   Nothing in this crate's tree calls it: a grep of every crate in its
+#   lockfile (2026-11-10, 252 packages) finds `VariantStrIter` and
+#   `array_iter_str` only in glib's own definition and glib's own tests.
+# - The notices are regenerated with the crate's own `about.toml` (MPL-2.0 and
+#   Apache-2.0 WITH LLVM-exception accepted there, each with its reason) and
+#   must match the committed `THIRD-PARTY-NOTICES.txt` byte for byte, so a
+#   licence outside the list, or a lockfile change without its notices, is red.
+# - The end-to-end proof (`desktop_shell.rs`) runs REQUIRED here: it skips
+#   elsewhere when there is no WebKitGTK or xvfb, and must not skip here.
+leg_webview() {
+    status=0
+    (
+        cd crates/vilan-rt-webview
+        cargo fmt --check || exit 1
+        cargo clippy --all-targets -- -D warnings || exit 1
+        cargo test || exit 1
+        cargo audit --deny unsound --ignore RUSTSEC-2024-0429 || exit 1
+        notices=$(mktemp)
+        cargo about generate -c about.toml ../../about.hbs -o "$notices" || exit 1
+        tr -d '\r' <"$notices" | cmp - THIRD-PARTY-NOTICES.txt || exit 1
+        rm -f "$notices"
+    ) || status=$?
+    VILAN_REQUIRE_WEBVIEW_E2E=1 cargo nextest run -p vilan-cli --test desktop_shell || status=$?
+    return "$status"
+}
+
 # LOCAL ONLY. Not the windows suite — the windows COMPILE. See the header.
+# The second command is the webview crate's (outside the workspace, so the
+# first does not reach it): `wry`'s WebView2 half and `tao`'s Win32 half
+# cross-check from Linux, which nothing in CI does.
 leg_windows() {
+    status=0
     cargo clippy --workspace --exclude vilan-rt-sqlite --all-targets \
-        --target x86_64-pc-windows-msvc -- -D warnings
+        --target x86_64-pc-windows-msvc -- -D warnings || status=$?
+    (cd crates/vilan-rt-webview && cargo clippy --all-targets \
+        --target x86_64-pc-windows-msvc -- -D warnings) || status=$?
+    return "$status"
 }
 
 # ── The runner ──────────────────────────────────────────────────────────────

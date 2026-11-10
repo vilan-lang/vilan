@@ -58,6 +58,7 @@
 - [Dev / HMR](std/dev.md)
 - [Process modules](std/process.md)
 - [Images](std/image.md)
+- [Windows](std/window.md)
 - [Misc](std/misc.md)
 
 # The specification

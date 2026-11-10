@@ -1,0 +1,36 @@
+# cargo-about config for THIS crate's notices (F1 M2, native-objective.md D2a):
+# the licences `wry` + `tao` and their platform stacks may carry. The compiler's
+# own list (the root `about.toml`) is the base, unchanged; the two additions
+# below are this crate's alone, each accepted BY NAME with its reason, and the
+# webview CI leg (`scripts/ci-local.sh webview`) regenerates the notices with
+# this file and refuses a licence outside it.
+#
+#   cd crates/vilan-rt-webview
+#   cargo about generate -c about.toml ../../about.hbs -o THIRD-PARTY-NOTICES.txt
+#
+# The notices are what a desktop program's binary links (on Linux, `option-ext`
+# below) and are named in the vilan guide's native chapter for anyone who ships
+# one.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "CC0-1.0",
+    # `option-ext` (through `dirs`, which `wry` reads on Linux) is LINKED into a
+    # Linux desktop binary; `cssparser`, `cssparser-macros`, `selectors` and
+    # `dtoa-short` (through `dom_query`) are Android-only and never built here.
+    # MPL-2.0 is file-level copyleft: shipping a binary that links an
+    # UNMODIFIED crate asks only that recipients can find its source (the
+    # crate's crates.io page) and its licence (these notices).
+    "MPL-2.0",
+    # `target-lexicon` (through `system-deps`, the build script that finds the
+    # gtk system libraries with pkg-config): BUILD-time only, never linked; the
+    # LLVM exception widens Apache-2.0 for exactly this kind of use.
+    "Apache-2.0 WITH LLVM-exception",
+]
+# No `targets` filter, as the compiler's: the notices cover the WHOLE lockfile,
+# every platform's crates included.

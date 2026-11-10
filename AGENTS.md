@@ -97,6 +97,21 @@ Rust workspace, seventeen crates, plus the language's own tree:
   (`IoSource::interest`, `LoopWaker`); a generated cargo project names this crate only when
   the program starts a server, dials a WebSocket or reads stdin — without it the loop keeps
   its 1 ms tick. Its `unsafe` is the one FFI call per platform, with its reason.
+- `crates/vilan-rt-webview` — `std::window` for emitted Rust (F1 M2, native-objective.md
+  D2/D2a): a desktop window showing a web page in the OS webview, through `wry` + `tao`. NOT a
+  workspace member — the root manifest EXCLUDES it, and it keeps its own `Cargo.lock`,
+  because the Linux half is the gtk3 stack, which carries an unsound advisory with no gtk3
+  fix (RUSTSEC-2024-0429), licences outside the compiler's `about.toml` (MPL-2.0, Apache-2.0
+  WITH LLVM-exception) and a pin that would drag the compiler's own `toml` back. So no
+  workspace gate reaches it: `scripts/ci-local.sh webview` (ci.yml's `webview` job) runs
+  its fmt, clippy, tests, audit (that advisory ignored by name), its own notices
+  (`crates/vilan-rt-webview/about.toml`, `THIRD-PARTY-NOTICES.txt`) and the xvfb end-to-end
+  proof (`crates/vilan-cli/tests/desktop_shell.rs`), and the `windows` leg cross-lints it. It
+  is still embedded like its siblings, with its lockfile (`RT_WEBVIEW_LOCK`), which seeds a
+  desktop program's generated project. Threading: the platform loop owns the main thread
+  (`vilan_rt_webview::run`), the program and its executor run on a second one, and an open
+  window is an `IoSource` the shell wakes through a `LoopWaker`. Building or running it
+  locally needs `libwebkit2gtk-4.1-dev` and `libgtk-3-dev` (and `xvfb` for the proof).
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

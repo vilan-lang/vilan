@@ -122,6 +122,11 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
         staging.join("vilan-image").join("Cargo.toml"),
         IMAGE_CORE_MANIFEST,
     ));
+    // F1 M2: `std::window`'s webview.
+    written.push((
+        staging.join("vilan-rt-webview").join("Cargo.toml"),
+        RT_WEBVIEW_MANIFEST,
+    ));
     for (path, contents) in written {
         let parent = path.parent().expect("every embedded file has a parent");
         fs::create_dir_all(parent)

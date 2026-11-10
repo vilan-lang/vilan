@@ -55,6 +55,13 @@ members = [
     "crates/vilan-rt-image",
     "crates/vilan-image-wasm",
 ]
+# F1 M2 (native-objective.md D2a, RULED 2026-11-10): `std::window`'s runtime
+# crate is NOT a member. `wry` + `tao` bring the gtk3 stack on Linux, with an
+# unsound advisory that has no gtk3 fix, licences outside `about.toml`'s list,
+# and a `toml_datetime` pin that would force the compiler's own `toml` from
+# 0.8.23 down to 0.8.2 — so the crate keeps its own `Cargo.lock` and its own CI job
+# (`scripts/ci-local.sh webview`), and is still embedded for user builds.
+exclude = ["crates/vilan-rt-webview"]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace
 # --all-targets -- -D warnings` is a CI leg, so every finding is an error and an

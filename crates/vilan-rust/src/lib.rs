@@ -162,6 +162,12 @@ pub struct OptionalCrates {
     /// `windows-sys`; F160). Reached by the I/O the loop waits on: starting
     /// an HTTP server, dialing a WebSocket, reading stdin.
     pub poll: bool,
+    /// A desktop window showing a web page — `vilan-rt-webview` (`wry` +
+    /// `tao`; F1 M2, native-objective.md D2/D2a). Reached by `std::window`:
+    /// the emitted `main` then runs the program beside the platform's event
+    /// loop. Outside the compiler's workspace, with its own lockfile, which
+    /// the CLI seeds the generated project with.
+    pub window: bool,
 }
 
 impl OptionalCrates {
@@ -186,6 +192,9 @@ impl OptionalCrates {
         if self.poll {
             names.push("vilan-rt-poll");
         }
+        if self.window {
+            names.push("vilan-rt-webview");
+        }
         names
     }
 }
@@ -205,6 +214,10 @@ pub fn emit(program: &Program<'_>, options: &BuildOptions) -> Result<Emitted, Er
 /// The name `async fun main`'s body takes, since `fn main` cannot be `async`
 /// and the executor has to be entered from a synchronous frame.
 const ASYNC_MAIN_BODY: &str = "vilan_async_main";
+
+/// The name `main`'s body takes in a program that reaches `std::window` (F1
+/// M2): `main` itself is the one call that hands it to the desktop shell.
+const WINDOW_PROGRAM_MAIN: &str = "vilan_program_main";
 
 /// F122 (array-lengths.md Q12): a fixed array whose estimated size passes
 /// this many BYTES keeps its `[T; N]` type and lives on the heap natively
@@ -611,6 +624,12 @@ struct Emitter<'a, 'src> {
     /// `__stdin_line` and `__stdin_bytes` are lowered — the doors every
     /// `IoSource` the runtime registers is reached through.
     reaches_poll: bool,
+    /// Whether this program reaches `std::window` (F1 M2), and so links
+    /// `vilan-rt-webview`: the emitted `main` becomes `vilan_program_main`,
+    /// and `main` hands it to `vilan_rt_webview::run`, which keeps the main
+    /// thread for the platform's event loop. Set where `__window_open` and
+    /// `__window_close` are lowered.
+    reaches_window: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -877,6 +896,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_term: false,
             reaches_image: false,
             reaches_poll: false,
+            reaches_window: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -959,6 +979,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
             );
         }
 
+        // F1 M2: a program with a window gives the main thread to the
+        // platform's event loop (macOS requires it; GTK and Windows bind a
+        // window to the thread that made it) and runs on a second thread —
+        // the installs above included, so its loop's bell and its signal
+        // handler are the program's. Last, so the installs are inside.
+        if self.reaches_window {
+            main_body = main_body.replacen(
+                "fn main() {\n",
+                &format!("fn main() {{\n    vilan_rt_webview::run({WINDOW_PROGRAM_MAIN});\n}}\n\nfn {WINDOW_PROGRAM_MAIN}() {{\n"),
+                1,
+            );
+        }
+
         let mut source = String::from(PRELUDE);
         for declaration in self.types.values() {
             source.push('\n');
@@ -988,6 +1021,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 term: self.reaches_term,
                 image: self.reaches_image,
                 poll: self.reaches_poll,
+                window: self.reaches_window,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -12703,6 +12737,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(rendered) = self.image_host_binding(binding, argument_ids, depth)? {
             return Ok(Some(rendered));
         }
+        if let Some(rendered) = self.window_host_binding(binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
         self.crypto_host_binding(target, name, binding, argument_ids, depth)
     }
 
@@ -12780,6 +12817,46 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ => return Ok(None),
         };
         self.reaches_image = true;
+        Ok(Some(rendered))
+    }
+
+    /// F1 M2: `std::window`'s two host helpers, each one call into
+    /// `vilan-rt-webview`, and each RECORDS the reach — the manifest names the
+    /// crate, and `main` hands the program to the desktop shell. Keyed on the
+    /// host symbol alone, as [`Emitter::image_host_binding`] is: only
+    /// `std::window` declares a `__window_`-prefixed name. A window is a plain
+    /// `u32` id on the vilan side, so nothing crosses but strings and numbers.
+    /// A window's I/O is a source of the program's loop, so it links the
+    /// readiness wait too.
+    fn window_host_binding(
+        &mut self,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(ExternBinding::Function {
+            module: None,
+            symbol,
+        }) = binding
+        else {
+            return Ok(None);
+        };
+        let rendered = match *symbol {
+            "__window_open" => format!(
+                "vilan_rt_webview::open(&{}, &{}, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.place_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
+            ),
+            "__window_close" => format!(
+                "vilan_rt_webview::close({})",
+                self.value_argument(argument_ids, 0, depth)?
+            ),
+            _ => return Ok(None),
+        };
+        self.reaches_window = true;
+        self.reaches_poll = true;
         Ok(Some(rendered))
     }
 

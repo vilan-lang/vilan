@@ -118,6 +118,7 @@ modules — sits at `std::<name>`.
 | [dev / HMR](std/dev.md) | `std::web::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
 | [process](std/process.md) | db, http, fs, build, `web::document`, process, `rpc::server`, watch |
 | [images](std/image.md) | `std::image`: decode, resize, crop, encode (process) |
+| [windows](std/window.md) | `std::window`: a desktop window on a web page (process, native only) |
 | [misc](std/misc.md) | io, task, `js::promise`, context, crypto, jwt, `web::asset` |
 
 ### Specification

@@ -1,0 +1,63 @@
+# The desktop window of a native program: `std::window` on the native backend
+# (F1 M2, native-objective.md D2 and D2a).
+#
+# SEPARATE from `vilan-rt`, for the reason `vilan-rt-sqlite` is: `vilan-rt`
+# takes no crates.io dependencies (Order 37's R8), and a window showing a web
+# page is the operating system's webview — WebKitGTK on Linux, WKWebView on
+# macOS, WebView2 on Windows — reached through `wry` (the webview) and `tao`
+# (the window and the platform event loop), the Tauri crates D2 ruled in. The
+# cargo project `vilan build --backend rust` writes names this crate ONLY when
+# the program reaches `std::window`; a program that does not pays nothing.
+#
+# OUTSIDE the compiler's workspace (D2a, RULED 2026-11-10): the root
+# `Cargo.toml` lists this directory under `exclude`, and the crate carries its
+# OWN `Cargo.lock`. Three reasons, each measured when the crate was first a
+# member: on Linux the stack is the gtk3 bindings, which (1) bring an `unsound`
+# advisory with no fixed gtk3 release (RUSTSEC-2024-0429, glib 0.18) and (2)
+# licences outside the compiler's accepted list (MPL-2.0, Apache-2.0 WITH
+# LLVM-exception), and (3) pin `toml_datetime =0.6.3`, which forced the
+# compiler's own `toml` from 0.8.23 down to 0.8.2. Apart, the compiler's
+# lockfile, audit leg and notices are untouched, nobody building the compiler
+# needs the WebKitGTK development packages, and this crate's own CI job
+# (`scripts/ci-local.sh webview`) holds the stack to its own audit and licence
+# gates, each exception written down there by name.
+#
+# The versions a user's build resolves: `wry` and `tao` are pinned EXACTLY
+# here, and the compiler seeds a desktop program's generated project with this
+# crate's `Cargo.lock` (embedded beside the sources), so every transitive crate
+# starts at the version that lockfile was audited with. The vilan guide's
+# native chapter says what that does and does not hold.
+[package]
+name = "vilan-rt-webview"
+version = "0.55.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The desktop window of programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+vilan-rt = { path = "../vilan-rt" }
+# Default features off, each kept one named: `os-webview` is the platform
+# webview itself (WebKitGTK through webkit2gtk on Linux); `x11` (raw X11
+# handles) and `devtools` are left out — the webview is built into tao's GTK
+# container on Linux, which serves X11 and Wayland alike.
+wry = { version = "=0.57.2", default-features = false, features = ["os-webview"] }
+# `rwh_06` is how `wry` finds a tao window's native handle on macOS and
+# Windows. `x11` and `dbus` (tao's defaults) are left out: neither is reached
+# by a window that shows a page.
+tao = { version = "=0.37.2", default-features = false, features = ["rwh_06"] }
+
+# The unit tests prove an open window waits in the readiness wait, not on the
+# loop's tick, which takes the wait a program installs.
+[dev-dependencies]
+vilan-rt-poll = { path = "../vilan-rt-poll" }
+
+# A workspace of its own: the compiler's root manifest EXCLUDES this
+# directory, and without this table cargo would keep walking up past it (to an
+# enclosing checkout, when this tree is a worktree inside one).
+[workspace]
+
+# Not the compiler's `[workspace.lints]` (this crate is not in that workspace):
+# the same bar, stated here.
+[lints.rust]
+unsafe_code = "forbid"

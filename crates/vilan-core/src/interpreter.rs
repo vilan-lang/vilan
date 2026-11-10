@@ -1470,6 +1470,11 @@ impl<'a> Interpreter<'a> {
             "__stdin_line" | "__stdin_bytes" | "__term_enter" | "__term_leave"
             | "__stdout_write" | "__env" | "__args" | "__random_int" | "__random_float"
             | "__timer" => Failure::unsupported(format!("`{name}`")),
+            // F1 M2: a desktop window is a host capability the evaluator has
+            // none of, BY DESIGN — a clean capability miss.
+            _ if crate::transformer::native_only_extern(name).is_some() => {
+                Failure::unsupported(format!("`{name}`"))
+            }
             _ => Failure::internal(format!("`{name}` is not defined")),
         })
     }

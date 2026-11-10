@@ -1806,6 +1806,16 @@ fn advance_macrotasks() -> bool {
     if progressed {
         return true;
     }
+    // F1 M2: a termination's graceful stop can COMPLETE inside this poll — a
+    // server whose connections were only waiting closes them and its listener
+    // and leaves the registry — while a live source that does not hold the
+    // stop (a desktop window, stdin's reader) stays. The check at the top of
+    // the turn ran before that poll and saw the server still holding, so
+    // without asking again the wait below blocks with nothing left that will
+    // ever wake it, and the stop never ends the program.
+    if stopped() {
+        return false;
+    }
     if let Some(slot) = earliest_timer()
         && slot.deadline <= Instant::now()
     {

@@ -125,6 +125,13 @@ enum PostBuild {
     /// non-empty at their documented paths.
     Artifacts(&'static [&'static str]),
     BuildOnly,
+    /// F1 M2: a NATIVE-ONLY example (it reaches `module`, which only the Rust
+    /// backend builds). Here it must CHECK clean and its JavaScript build must
+    /// refuse it by the module's name; the native build and run are
+    /// `desktop_shell.rs`'s, which needs a window system this gate does not.
+    NativeOnly {
+        module: &'static str,
+    },
 }
 
 fn post_build(directory: &str) -> PostBuild {
@@ -173,6 +180,9 @@ fn post_build(directory: &str) -> PostBuild {
         "reactive-ui" => PostBuild::Artifacts(&["app.js", "app.css"]),
         "router" => PostBuild::Artifacts(&["app.js"]),
         "todo" => PostBuild::Artifacts(&["dist/server.mjs", "dist/client.js", "dist/client.css"]),
+        "desktop" => PostBuild::NativeOnly {
+            module: "std::window",
+        },
         _ => PostBuild::BuildOnly,
     }
 }
@@ -180,7 +190,7 @@ fn post_build(directory: &str) -> PostBuild {
 /// Runs the post-build check; a failure message, or `None` when it holds.
 fn check_post_build(directory: &str, staged: &std::path::Path) -> Option<String> {
     match post_build(directory) {
-        PostBuild::BuildOnly => None,
+        PostBuild::BuildOnly | PostBuild::NativeOnly { .. } => None,
         PostBuild::Artifacts(artifacts) => {
             let missing: Vec<&str> = artifacts
                 .iter()
@@ -339,6 +349,9 @@ fn unlinked_stylesheets(directory: &str, staged: &std::path::Path) -> Option<Str
 /// One example staged, built and checked: its failure, or `None` when it holds.
 fn build_example(directory: &str) -> Option<String> {
     let staged = stage(directory);
+    if let PostBuild::NativeOnly { module } = post_build(directory) {
+        return check_native_only(directory, &staged, module);
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["build", staged.to_str().expect("utf-8 temp path")])
         .output()
@@ -372,6 +385,40 @@ fn build_example(directory: &str) -> Option<String> {
         ));
     }
     let _ = std::fs::remove_dir_all(&staged);
+    None
+}
+
+/// [`PostBuild::NativeOnly`]: checks clean, and the JavaScript build refuses
+/// it naming `module`. Its failure, or `None` when both hold.
+fn check_native_only(directory: &str, staged: &std::path::Path, module: &str) -> Option<String> {
+    let path = staged.to_str().expect("utf-8 temp path");
+    let checked = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", path])
+        .output()
+        .expect("run vilan");
+    if !checked.status.success() {
+        return Some(format!(
+            "--- {directory}: `vilan check` failed (staged at {})\n{}{}",
+            staged.display(),
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr),
+        ));
+    }
+    let built = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", path])
+        .output()
+        .expect("run vilan");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if built.status.success() || !said.contains(&format!("reaches `{module}`")) {
+        return Some(format!(
+            "--- {directory}: the JavaScript build must refuse it naming `{module}`; it said:\n{said}"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(staged);
     None
 }
 
