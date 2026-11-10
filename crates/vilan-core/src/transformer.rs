@@ -1327,6 +1327,7 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_run",
         "__db_all",
         "__db_get",
+        "__db_bytes",
         "__db_column",
         "__db_is_null",
         "__db_close",
@@ -2164,6 +2165,15 @@ fn helper_source(name: &str) -> &'static str {
              \t\tvalue = value[1];\n\
              \t}\n\
              \treturn value;\n\
+             }"
+        }
+        // M195: a BLOB column is the `Uint8Array` node answers; any other
+        // column reads as the UTF-8 of its text, SQLite's `CAST(value AS BLOB)`
+        // (`vilan-rt-sqlite`'s `Row::bytes` answers the same).
+        "__db_bytes" => {
+            "function __db_bytes(row, name) {\n\
+             \tconst value = row[name];\n\
+             \treturn value instanceof Uint8Array ? value : new TextEncoder().encode(String(value));\n\
              }"
         }
         "__db_column" => "function __db_column(row, name) {\n\treturn row[name];\n}",

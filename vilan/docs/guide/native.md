@@ -59,6 +59,13 @@ the `Uint8Array` it is on the JS backend: `let b = a` is an alias, and a
 `set`, `fill` or `copy_into` through either is seen through both. `slice` and
 `Bytes::concat` are the two that make a new buffer.
 
+**`std::db` binds and reads a BLOB.** A `Bytes` binds as a BLOB and
+`Row::bytes` reads it back as the bytes that were bound, as on node. One
+difference is node's, not the program's: node binds every JS number as a
+REAL, so a column with no declared type (no affinity) stores `7` as `7.0`
+there and as INTEGER natively. Declare the column `INTEGER` (or `NUMERIC`)
+and both read back the same.
+
 **A server is compared on the wire, not by its bytes alone.** The native HTTP
 server answers `Connection: close` on every response and sends no `Date`; node
 keeps connections alive and dates every answer. Everything a program sets — the

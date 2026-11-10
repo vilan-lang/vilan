@@ -2023,11 +2023,13 @@ impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
 /// `any` — a value whose vilan type is open at the position it fills.
 ///
 /// It exists for ONE shape today and the scope is deliberate: `std::db`'s
-/// `Statement::run(parameters: List<any>)`, where a query's bind list is
-/// heterogeneous by nature (`["ada", 1.5]`) and the schema, not the type
-/// system, says what each slot means. On the JS backend such a list is just a
-/// JS array; natively it needs a value type, and this is the smallest one that
-/// covers what a bind list can hold.
+/// `List<any>` bind list, where a query's parameters are heterogeneous by nature
+/// (`["ada", 1.5]`) and the schema, not the type system, says what each slot
+/// means. On the JS
+/// backend such a value is just a JS value; natively it needs a value type,
+/// and this is the smallest one that covers what SQLite stores: its five
+/// storage classes (NULL, INTEGER, REAL, TEXT, BLOB), plus `bool`, which the
+/// binder writes as 0 or 1.
 ///
 /// Not a dynamic type system. There is no downcast, no reflection and no
 /// `is`-test over it — a program reads an `any` back through the accessor of
@@ -2043,6 +2045,9 @@ pub enum Any {
     Integer(i64),
     Float(f64),
     Text(Str),
+    /// A BLOB: a `Bytes` bound or read back (M195). The buffer is SHARED, as
+    /// every `Bytes` is — it is the same `Uint8Array` on the other backend.
+    Blob(bytes::Bytes),
 }
 
 macro_rules! any_from_integer {
@@ -2087,6 +2092,12 @@ impl From<&str> for Any {
     }
 }
 
+impl From<bytes::Bytes> for Any {
+    fn from(value: bytes::Bytes) -> Any {
+        Any::Blob(value)
+    }
+}
+
 impl<T: Into<Any>> From<Option<T>> for Any {
     fn from(value: Option<T>) -> Any {
         match value {
@@ -2104,6 +2115,7 @@ impl Js for Any {
             Any::Integer(value) => value.js(),
             Any::Float(value) => value.js(),
             Any::Text(value) => value.js(),
+            Any::Blob(value) => value.js(),
         }
     }
 
@@ -2127,6 +2139,7 @@ impl Json for Any {
             Any::Integer(value) => value.json(),
             Any::Float(value) => value.json(),
             Any::Text(value) => value.json(),
+            Any::Blob(value) => value.json(),
         }
     }
 }

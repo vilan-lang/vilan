@@ -43,6 +43,7 @@ use std::rc::Rc;
 
 use rusqlite::Connection;
 use rusqlite::types::ValueRef;
+use vilan_rt::bytes::Bytes;
 use vilan_rt::{Any, Js, Json, Str, str_new};
 
 /// `DatabaseSync` — an open connection. A vilan `resource`: it moves rather
@@ -236,9 +237,9 @@ impl Json for Statement {
 pub struct Row(Rc<Vec<(Str, Any)>>);
 
 impl Row {
-    /// `__db_column` at `str`. The three column readers share one host helper
-    /// and the vilan signature supplies the type, so each reader here coerces
-    /// the same way `String(row[name])` would.
+    /// `__db_column` at `str`. The four typed column readers share one host
+    /// helper and the vilan signature supplies the type, so each reader here
+    /// coerces the same way `String(row[name])` would.
     pub fn text(&self, name: Str) -> Str {
         match self.at(&name) {
             Any::Text(text) => text,
@@ -246,6 +247,20 @@ impl Row {
             Any::Integer(value) => str_new(&value.to_string()),
             Any::Float(value) => str_new(&vilan_rt::js_number(value)),
             Any::Bool(value) => str_new(if value { "true" } else { "false" }),
+            // A BLOB read as text is the bytes decoded, as `String(buffer)`
+            // decodes them there.
+            Any::Blob(bytes) => str_new(&String::from_utf8_lossy(&bytes.as_slice())),
+        }
+    }
+
+    /// `__db_bytes` — a BLOB column as the `Bytes` it holds (M195), and any
+    /// other column as the UTF-8 of its text, SQLite's own
+    /// `CAST(value AS BLOB)`, which is what the JS helper answers too.
+    pub fn bytes(&self, name: Str) -> Bytes {
+        match self.at(&name) {
+            Any::Blob(bytes) => bytes,
+            Any::Null => refuse_null(&name),
+            _ => Bytes::from_vec(self.text(name).as_bytes().to_vec()),
         }
     }
 
@@ -296,6 +311,7 @@ impl Row {
             // the JS reader performs on the same column.
             Any::Null => 0.0,
             Any::Text(text) => text.trim().parse::<f64>().unwrap_or(f64::NAN),
+            Any::Blob(_) => f64::NAN,
         }
     }
 }
@@ -329,8 +345,8 @@ impl Json for Row {
 
 /// A bind list, as `rusqlite` wants to see it.
 ///
-/// `vilan_rt::Any`'s five arms are exactly SQLite's five storage classes minus
-/// BLOB, which no `std::db` signature can produce today. Building owned
+/// `vilan_rt::Any`'s arms are SQLite's five storage classes plus `bool`, which
+/// binds as 0 or 1. Building owned
 /// `Value`s rather than implementing `ToSql` on a borrowed view is the shorter
 /// road and costs one small allocation per TEXT parameter per call — against a
 /// statement prepare and a query, which is not where a bind list's cost is.
@@ -344,6 +360,7 @@ fn bind(parameters: Vec<Any>) -> Vec<rusqlite::types::Value> {
             Any::Integer(value) => Value::Integer(value),
             Any::Float(value) => Value::Real(value),
             Any::Text(value) => Value::Text(value.to_string()),
+            Any::Blob(value) => Value::Blob(value.to_vec()),
         })
         .collect()
 }
@@ -355,10 +372,15 @@ fn read(value: ValueRef<'_>) -> Any {
         ValueRef::Integer(value) => Any::Integer(value),
         ValueRef::Real(value) => Any::Float(value),
         ValueRef::Text(bytes) => Any::Text(str_new(&String::from_utf8_lossy(bytes))),
-        // A BLOB has no `std::db` accessor; reading one through `text` is what
-        // `String(buffer)` would do there.
-        ValueRef::Blob(bytes) => Any::Text(str_new(&String::from_utf8_lossy(bytes))),
+        // M195: a BLOB stays one, as node answers a `Uint8Array`; `Row::bytes`
+        // reads it back.
+        ValueRef::Blob(bytes) => Any::Blob(Bytes::from_vec(bytes.to_vec())),
     }
+}
+
+/// A BLOB read met a NULL: no buffer to answer.
+fn refuse_null(name: &str) -> ! {
+    vilan_rt::panic_with(&format!("std::db: column '{name}' is NULL"))
 }
 
 /// A failure, in the shape a `node:sqlite` throw takes: the driver's own
@@ -433,6 +455,34 @@ mod tests {
             .run_guarded(vec![Any::Null])
             .expect("a NOT NULL violation is an error");
         assert!(refused.contains("NOT NULL"), "{refused}");
+    }
+
+    /// M195: a `Bytes` binds as a BLOB and reads back as the same bytes — a
+    /// NUL and a high byte included — where it was read as lossy TEXT; a TEXT
+    /// column read through `bytes` is its UTF-8, SQLite's own cast.
+    #[test]
+    fn a_blob_round_trips_through_bind_and_read() {
+        let database = Database::open(str_new(":memory:"));
+        database.exec(str_new("CREATE TABLE blobs (data BLOB, label TEXT)"));
+        let stored = Bytes::from_vec(vec![0, 1, 255, 0x80, 0]);
+        database
+            .prepare(str_new("INSERT INTO blobs (data, label) VALUES (?, ?)"))
+            .run(vec![Any::from(stored), Any::from("hé")]);
+        let row = database
+            .prepare(str_new(
+                "SELECT data, typeof(data) AS kind, label FROM blobs",
+            ))
+            .first(Vec::new())
+            .expect("the row just inserted");
+        assert_eq!(
+            row.bytes(str_new("data")).to_vec(),
+            vec![0, 1, 255, 0x80, 0]
+        );
+        assert_eq!(&*row.text(str_new("kind")), "blob");
+        assert_eq!(
+            row.bytes(str_new("label")).to_vec(),
+            "hé".as_bytes().to_vec()
+        );
     }
 
     /// A closed database answers the sentence rather than a use-after-free, and

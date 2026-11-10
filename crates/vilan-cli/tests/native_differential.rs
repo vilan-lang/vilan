@@ -15515,6 +15515,28 @@ fn b721_a_typed_value_converts_at_an_any_slot_on_both_backends() {
     }
 }
 
+/// M195: a `Bytes` binds as a BLOB and reads back through `Row::bytes` as
+/// the bytes bound on both backends — a NUL and a high byte inside, an empty
+/// buffer, `typeof` blob, a BLOB as a `WHERE` parameter — and a TEXT column
+/// read through `bytes` is its UTF-8 (SQLite's `CAST(value AS BLOB)`).
+/// Natively the bind was rustc's E0277 (`vilan_rt::Any` had no BLOB arm) and
+/// a BLOB column read back as lossy TEXT.
+#[test]
+fn m195_a_blob_round_trips_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_blob.vl";
+    std::fs::write(staged.join(file), include_str!("native/db_blob.vl"))
+        .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "blob blob 5 00ff800007\nempty blob 0 \ntext text 6 68c3a96c6c6f\nblob\n",
+            "{backend:?}"
+        );
+    }
+}
+
 /// B724: a closure that captures a VIEW parameter builds natively and leaves
 /// the caller's place as the JS backend does — a `&mut` parameter written
 /// through a closure handed to `map`, through a closure kept in a local and

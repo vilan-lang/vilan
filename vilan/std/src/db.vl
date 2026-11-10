@@ -9,6 +9,7 @@
 
 [platform("@process")] mod self;
 
+import pkg::bytes::Bytes;
 import pkg::drop::Drop;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
@@ -66,8 +67,8 @@ export impl Database with Drop {
 ///
 /// A bind list holds what SQLite stores (M165): an `Option` is its value or NULL
 /// (converted where it lands in the `List<any>`, as `vilan_rt::Any` holds one
-/// natively), a `bool` binds as 0 or 1, and anything else is refused at the bind,
-/// naming its index in the list.
+/// natively), a `bool` binds as 0 or 1, a `Bytes` as a BLOB (M195), and anything
+/// else is refused at the bind, naming its index in the list.
 [extern("__db_run")]
 external fun statement_run(statement: Statement, parameters: List<any>): i32;
 
@@ -88,6 +89,12 @@ external fun column_big_integer(row: Row, name: str): i53;
 
 [extern("__db_column")]
 external fun column_real(row: Row, name: str): f64;
+
+/// A BLOB column's bytes. Its own helper, because the host value of a column SQLite
+/// stores as TEXT or a number is not a `Uint8Array`: such a column reads as the
+/// UTF-8 of its text, SQLite's own `CAST(value AS BLOB)`.
+[extern("__db_bytes")]
+external fun column_bytes(row: Row, name: str): Bytes;
 
 [extern("__db_is_null")]
 external fun column_is_null(row: Row, name: str): bool;
@@ -128,6 +135,11 @@ export impl Row {
 
 	fun real(self, name: str): f64 {
 		column_real(self, name)
+	}
+
+	/// A BLOB column, as the bytes `Bytes` bound (M195).
+	fun bytes(self, name: str): Bytes {
+		column_bytes(self, name)
 	}
 
 	fun is_null(self, name: str): bool {

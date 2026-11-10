@@ -53,13 +53,13 @@ The whole surface fits in a few lines:
   `Option<Row>`, and `.all(params)` fetches a `List<Row>`.
 - Rows read by column name: `text`, `integer` (i32), `big_integer`
   (i53; use it for epoch-millis timestamps, which outgrow i32),
-  `real` (f64), and `is_null`.
+  `real` (f64), `bytes` (a BLOB), and `is_null`.
 
 Two habits to keep:
 
 - Values always go through `?` placeholders. Never interpolate them into
-  the SQL string. A nullable column takes an `Option` (`None` binds NULL)
-  and a flag column takes a `bool` (0 or 1).
+  the SQL string. A nullable column takes an `Option` (`None` binds NULL),
+  a flag column takes a `bool` (0 or 1), and a BLOB column takes `Bytes`.
 - Don't name a column with an SQL keyword. `desc` is the one that bites
   in practice: spell it `description`.
 

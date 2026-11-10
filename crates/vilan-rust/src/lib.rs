@@ -12204,11 +12204,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// `std::db`'s ten host seams (F18 slice 2; Order 39's R1).
+    /// `std::db`'s host seams (F18 slice 2; Order 39's R1; M195's BLOB reader).
     ///
     /// Keyed on the pair (host symbol, vilan name) for
     /// [`Emitter::json_host_binding`]'s reason, and here the second half does
-    /// real work twice over: the three column readers SHARE the host helper
+    /// real work twice over: the five column readers SHARE the host helper
     /// `__db_column` and differ only in the vilan type they read the column
     /// AT, and `exec`/`prepare` are bare `[extern(method)]`s whose host name
     /// defaults to their own.
@@ -12300,6 +12300,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 ),
                 ("__db_column", "column_real") => format!(
                     "({}).real({})",
+                    receiver(self)?,
+                    self.value_argument(argument_ids, 1, depth)?
+                ),
+                ("__db_bytes", _) => format!(
+                    "({}).bytes({})",
                     receiver(self)?,
                     self.value_argument(argument_ids, 1, depth)?
                 ),

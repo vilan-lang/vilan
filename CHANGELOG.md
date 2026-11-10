@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: feature -->
+**M195: `std::db` binds and reads a BLOB on both backends — `Bytes` binds as one (natively it was rustc's E0277: `vilan_rt::Any` had no BLOB arm) and `Row::bytes(name)` / `Row::optional_bytes(name)` read one back as the bytes bound, where the native backend read a BLOB column as lossy TEXT.** `vilan_rt::Any` gains `Blob(Bytes)` (a shared buffer, as every `Bytes` is), `vilan-rt-sqlite` binds it as `Value::Blob` and keeps a BLOB column a BLOB. A column SQLite stores as TEXT or a number reads through `bytes` as the UTF-8 of its text (SQLite's own `CAST(value AS BLOB)`), on both backends (a `__db_bytes` helper on JS). Docs: std/process.md, the native guide. Pins: `native_differential::m195_a_blob_round_trips_on_both_backends` (`native/db_blob.vl`: a NUL and a high byte, an empty buffer, `typeof` = blob, a BLOB as a `WHERE` parameter, a TEXT column read as bytes), `vilan-rt-sqlite`'s `a_blob_round_trips_through_bind_and_read`. Tracker M195.
+
+---
+
 <!-- family: fix -->
 **B720: a closure whose body builds `Ok(..)`/`Err(..)` builds on the native backend — `map_or(|found| Ok(found), Err(..))` was typed `Rc<dyn Fn(..) -> Result<>>` (rustc E0107).** The analyzer types a variant whose payload fixes only some of its enum's parameters (`Ok(found)` says nothing of `E`) as the enum with its arguments ERASED, and a call handed that closure records its generic (`map_or`'s `U`) at the erased form; the emitter read an empty argument list as closed, so the channel that closes an open binding from the call's position (the declared return, a `let` annotation) never ran. An erased generic nominal is now open in the emitter's grounding test, so the position closes it — for any generic enum or struct, not only `Result` — and an erased `Result` nothing closes is refused by name instead of written as `Result<>`. The JS backend is unchanged. Not closed: a call with NO position (`let r = o.map_or(|x| Ok(x), Err("e"));`) is refused natively, and the erased form is still the analyzer's (tracker note). Pins: `native_differential::b720_a_closure_building_a_partial_variant_is_typed_at_its_position_on_both_backends` (`Result` through `map_or` with an `Err` fallback, a body with both arms, a user enum of two parameters, an annotated closure binding; red natively before the fix). No golden moved. Tracker B720.
 
