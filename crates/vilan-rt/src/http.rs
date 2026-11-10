@@ -79,8 +79,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{
+    Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, SocketAddrV6, TcpListener, TcpStream, ToSocketAddrs,
+};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -2025,6 +2028,80 @@ struct ServerBody {
     terminated: Cell<bool>,
 }
 
+/// How an IPv6 listening socket is bound: with `IPV6_V6ONLY` cleared, as
+/// libuv binds every one for node (F164). Std's `TcpListener::bind` cannot
+/// clear the option (it must be set between `socket()` and `bind()`), and this
+/// crate forbids the FFI that can, so the binder is `vilan-rt-net`'s, and
+/// `vilan-rt-signal::install` — run first by every program that starts a
+/// server — registers it here.
+pub type Ipv6Binder = fn(SocketAddrV6) -> std::io::Result<TcpListener>;
+
+static IPV6_BINDER: OnceLock<Ipv6Binder> = OnceLock::new();
+
+/// Registers the dual-stack IPv6 binder (`vilan_rt_net::bind_dual_stack`).
+/// The first registration wins; a second is ignored.
+pub fn set_ipv6_binder(binder: Ipv6Binder) {
+    let _ = IPV6_BINDER.set(binder);
+}
+
+/// The registered binder. A built program always has one; this crate's own
+/// unit tests take `vilan-rt-net` as a dev-dependency and bind through it as
+/// a program would, so the tests see on every OS what a program sees.
+fn registered_ipv6_binder() -> Option<Ipv6Binder> {
+    if let Some(binder) = IPV6_BINDER.get() {
+        return Some(*binder);
+    }
+    #[cfg(test)]
+    return Some(vilan_rt_net::bind_dual_stack);
+    #[cfg(not(test))]
+    None
+}
+
+/// node's no-host bind: `::` dual-stack, else `0.0.0.0` (F164).
+///
+/// node's `createServerHandle` tries `bind6("::")` and on ANY error falls back
+/// to `bind("0.0.0.0")` — but libuv DEFERS an address-in-use error from the
+/// bind to the listen, so a port already taken is never a reason to fall back:
+/// it is reported, as here. With no binder registered (only a host program
+/// that never started a server through `vilan-rt-signal` could be in that
+/// state) the IPv4 bind is taken outright, because std's `::` would be
+/// IPv6-ONLY on Windows — a listener that silently refuses every IPv4 client
+/// is worse than one that is not dual-stack.
+fn bind_unspecified(port: u16, binder: Option<Ipv6Binder>) -> std::io::Result<TcpListener> {
+    let ipv4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let Some(binder) = binder else {
+        return TcpListener::bind(ipv4);
+    };
+    match binder(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)) {
+        Ok(listener) => Ok(listener),
+        Err(error) if error.kind() == ErrorKind::AddrInUse => Err(error),
+        Err(_) => TcpListener::bind(ipv4),
+    }
+}
+
+/// A named host: resolved as std resolves one (an IP literal is parsed, a name
+/// looked up), each address tried in order until one binds, the IPv6 ones
+/// through `binder` so `::` is dual-stack as node's is.
+fn bind_host(host: &str, port: u16, binder: Option<Ipv6Binder>) -> std::io::Result<TcpListener> {
+    let mut last = None;
+    for address in (host, port).to_socket_addrs()? {
+        let bound = match (address, binder) {
+            (SocketAddr::V6(address), Some(binder)) => binder(address),
+            _ => TcpListener::bind(address),
+        };
+        match bound {
+            Ok(listener) => return Ok(listener),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "could not resolve to any addresses",
+        )
+    }))
+}
+
 /// `http.createServer(handler)`.
 pub fn create_server(handler: Handler) -> Server {
     Server(Rc::new(ServerBody {
@@ -2063,11 +2140,14 @@ impl Js for Address {
 }
 
 impl Server {
-    /// `server.listen(port, on_ready)`.
+    /// `server.listen(port, on_ready)` — node's `listen(port)` with no host.
     ///
-    /// Binds `127.0.0.1` and `::1`? No — one socket, on `0.0.0.0`, which is what
-    /// node's `listen(port)` with no host does. Port `0` asks the OS for a free
-    /// one, and [`Server::port`] reports what it gave, which is the whole
+    /// F164: node takes `::` there, DUAL-STACK (libuv clears `IPV6_V6ONLY` on
+    /// every IPv6 bind, on every OS), so one socket answers IPv4 clients —
+    /// read back mapped, `::ffff:127.0.0.1` — and IPv6 ones alike; where the
+    /// machine has no IPv6 the bind fails and node takes `0.0.0.0` instead.
+    /// So does this, through [`bind_unspecified`]. Port `0` asks the OS for a
+    /// free one, and [`Server::port`] reports what it gave, which is the whole
     /// mechanism `std::http`'s port-0 bind and every test harness here depends
     /// on.
     ///
@@ -2080,19 +2160,31 @@ impl Server {
     /// request: the socket is bound here, but a connection is only ACCEPTED in
     /// the loop's I/O poll, and the microtask queue drains before every one.
     pub fn listen(&self, port: i32, on_ready: Rc<dyn Fn()>) {
-        self.listen_at("0.0.0.0", port, on_ready);
+        let requested = port.clamp(0, 65535) as u16;
+        let listener = bind_unspecified(requested, registered_ipv6_binder());
+        self.listen_with(listener, "::", requested, on_ready);
     }
 
     /// `server.listen(port, host, on_ready)` — bound to `host` alone
     /// (`ServerBuilder::host`, M168): `127.0.0.1` is reachable from this
-    /// machine only, where [`Self::listen`] takes every interface.
+    /// machine only, where [`Self::listen`] takes every interface. An IPv6
+    /// address is bound as node binds it, `IPV6_V6ONLY` cleared (F164), so
+    /// `host("::")` is dual-stack too; `::1` and the IPv4 addresses are what
+    /// they say.
     pub fn listen_on(&self, port: i32, host: &str, on_ready: Rc<dyn Fn()>) {
-        self.listen_at(host, port, on_ready);
+        let requested = port.clamp(0, 65535) as u16;
+        let listener = bind_host(host, requested, registered_ipv6_binder());
+        self.listen_with(listener, host, requested, on_ready);
     }
 
-    fn listen_at(&self, host: &str, port: i32, on_ready: Rc<dyn Fn()>) {
-        let requested = port.clamp(0, 65535) as u16;
-        let listener = match TcpListener::bind((host, requested)) {
+    fn listen_with(
+        &self,
+        listener: std::io::Result<TcpListener>,
+        host: &str,
+        requested: u16,
+        on_ready: Rc<dyn Fn()>,
+    ) {
+        let listener = match listener {
             Ok(listener) => listener,
             Err(error) => crate::panic_with(&format!(
                 "the server could not bind {host} port {requested}: {error}"
@@ -4189,19 +4281,20 @@ mod tests {
     /// a dual-stack `::` bind as the mapped `::ffff:127.0.0.1` (Rust's
     /// `Ipv6Addr` display and node's agree on that spelling). Once the
     /// connection is gone it reads back `undefined`, as node's does.
+    ///
+    /// F164: the `::` case runs on Windows too — the bind clears
+    /// `IPV6_V6ONLY`, which is on there by default — and a server with NO host
+    /// (`None`) is node's `::` as well, answering both families.
     #[test]
     fn a_requests_socket_reports_the_peer_as_node_formats_it() {
         for (host, dial, expected) in [
-            ("127.0.0.1", "127.0.0.1", "127.0.0.1"),
-            ("::1", "::1", "::1"),
-            ("::", "127.0.0.1", "::ffff:127.0.0.1"),
+            (Some("127.0.0.1"), "127.0.0.1", "127.0.0.1"),
+            (Some("::1"), "::1", "::1"),
+            (Some("::"), "127.0.0.1", "::ffff:127.0.0.1"),
+            (Some("::"), "::1", "::1"),
+            (None, "127.0.0.1", "::ffff:127.0.0.1"),
+            (None, "::1", "::1"),
         ] {
-            // F164: Windows sockets are IPv6-only by default, so a `::` bind is
-            // not dual-stack there until the runtime clears `IPV6_V6ONLY` as
-            // node does; an IPv4 client is refused, and this case waits on that.
-            if cfg!(windows) && host == "::" {
-                continue;
-            }
             let seen = Rc::new(RefCell::new(Vec::<Request>::new()));
             let kept = Rc::clone(&seen);
             let (answered, peer, after) = block_on(async move {
@@ -4217,7 +4310,10 @@ mod tests {
                     })
                 });
                 let server = create_server(handler);
-                server.listen_on(0, host, Rc::new(|| {}));
+                match host {
+                    Some(host) => server.listen_on(0, host, Rc::new(|| {})),
+                    None => server.listen(0, Rc::new(|| {})),
+                }
                 let port = server.port() as u16;
                 let client = std::thread::spawn(move || {
                     let mut stream = TcpStream::connect((dial, port)).expect("connect");
@@ -4238,12 +4334,60 @@ mod tests {
                 let (_, _, body) = split(&answered);
                 (answered, body, after)
             });
-            assert!(answered.starts_with("HTTP/1.1 200"), "{host}: {answered}");
-            assert_eq!(peer, expected, "{host}: the peer as node spells it");
+            assert!(answered.starts_with("HTTP/1.1 200"), "{host:?}: {answered}");
+            assert_eq!(
+                peer, expected,
+                "{host:?} from {dial}: the peer as node spells it"
+            );
             assert!(
                 matches!(after, JsonValue::Undefined),
-                "{host}: a closed connection's peer is undefined: {after:?}"
+                "{host:?}: a closed connection's peer is undefined: {after:?}"
             );
         }
+    }
+
+    /// F164: node's no-host bind falls back from `::` to `0.0.0.0` when the
+    /// IPv6 bind fails — a machine without IPv6 — but NOT when the port is
+    /// taken (libuv defers that error to the listen, where node reports it).
+    /// With no binder registered the IPv4 bind is taken outright, never std's
+    /// `::`, which Windows would make IPv6-only.
+    #[test]
+    fn the_no_host_bind_falls_back_to_ipv4_only_when_ipv6_is_missing() {
+        fn no_ipv6(_: SocketAddrV6) -> std::io::Result<TcpListener> {
+            Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "address family not supported",
+            ))
+        }
+        fn in_use(_: SocketAddrV6) -> std::io::Result<TcpListener> {
+            Err(std::io::Error::from(ErrorKind::AddrInUse))
+        }
+        let fallen_back = bind_unspecified(0, Some(no_ipv6)).expect("the IPv4 fallback");
+        assert_eq!(
+            fallen_back.local_addr().expect("bound").ip(),
+            std::net::IpAddr::from(Ipv4Addr::UNSPECIFIED)
+        );
+        let refused = bind_unspecified(0, Some(in_use)).expect_err("a taken port is reported");
+        assert_eq!(refused.kind(), ErrorKind::AddrInUse);
+        let unregistered = bind_unspecified(0, None).expect("the IPv4 bind");
+        assert!(unregistered.local_addr().expect("bound").is_ipv4());
+        let dual = bind_unspecified(0, registered_ipv6_binder()).expect("the dual-stack bind");
+        assert_eq!(
+            dual.local_addr().expect("bound").ip(),
+            std::net::IpAddr::from(Ipv6Addr::UNSPECIFIED)
+        );
+    }
+
+    /// F164: a named host binds its IPv6 addresses through the binder and its
+    /// IPv4 ones through std, so `::` is dual-stack and `0.0.0.0` stays IPv4.
+    #[test]
+    fn a_named_host_binds_ipv6_through_the_binder() {
+        fn refuse(_: SocketAddrV6) -> std::io::Result<TcpListener> {
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        }
+        let ipv4 = bind_host("0.0.0.0", 0, Some(refuse)).expect("std binds IPv4");
+        assert!(ipv4.local_addr().expect("bound").is_ipv4());
+        let routed = bind_host("::", 0, Some(refuse)).expect_err("the binder was asked");
+        assert_eq!(routed.kind(), ErrorKind::PermissionDenied);
     }
 }

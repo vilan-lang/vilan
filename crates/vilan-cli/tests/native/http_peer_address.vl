@@ -1,6 +1,7 @@
 // F163: `Request::peer_address` — the native differential binds this server to
-// each of three hosts (the test rewrites the `host` line) and compares the peer
-// address the handler answers with node's.
+// each of three hosts (the test rewrites the `host` line), and with no host at
+// all (F164: the test removes the line), and compares the peer address the
+// handler answers with node's.
 
 import std::http::{ Request, Response, Server };
 import std::io::print;

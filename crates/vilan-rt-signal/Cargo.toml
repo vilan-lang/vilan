@@ -30,6 +30,9 @@ publish = false
 [dependencies]
 vilan-rt = { path = "../vilan-rt" }
 ctrlc = { version = "3.5.2", features = ["termination"] }
+# F164: the dual-stack IPv6 listener `install` registers with `vilan-rt` — a
+# sibling path crate, materialized beside this one.
+vilan-rt-net = { path = "../vilan-rt-net" }
 
 # The workspace clippy exception list (root Cargo.toml, backlog N21).
 [lints]

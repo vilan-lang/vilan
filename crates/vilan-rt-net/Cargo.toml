@@ -1,0 +1,40 @@
+# A native server's IPv6 listening socket, bound DUAL-STACK as node binds one
+# (tracker F164).
+#
+# SEPARATE from `vilan-rt`, for the reason `vilan-rt-term` is: `vilan-rt` takes
+# no crates.io dependencies and forbids `unsafe` (Order 37's R8), and clearing
+# `IPV6_V6ONLY` has to happen between `socket()` and `bind()` — a window Rust's
+# std `TcpListener::bind` does not open. So the `setsockopt` is FFI, and it
+# lives here. Node (libuv) clears the option on every IPv6 bind, on every OS:
+# that is what makes its default `::` listener answer IPv4 clients too, and on
+# Windows, where the option is ON by default, it is the whole difference.
+#
+# `libc` (unix) and `windows-sys` (Windows), both already in the compiler's own
+# lockfile and so in the third-party notices — the same two `vilan-rt-term`
+# takes. This crate does NOT depend on `vilan-rt`: it answers a std
+# `TcpListener`, `vilan-rt` registers it through a seam
+# (`vilan_rt::http::set_ipv6_binder`), and keeping the edge one-way is what lets
+# `vilan-rt`'s own unit tests take this crate as a dev-dependency without a
+# cycle. A program reaches it through `vilan-rt-signal`, the crate every
+# program that starts an HTTP server already links, whose `install` registers
+# it — so it is not an `OptionalCrates` entry of its own, and a program that
+# serves nothing pays nothing.
+[package]
+name = "vilan-rt-net"
+version = "0.55.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The dual-stack listening socket for server programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock"] }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true

@@ -159,6 +159,14 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         manifest_static: "RT_SIGNAL_MANIFEST",
         item: "F45",
     },
+    // F164: the dual-stack listener `vilan-rt-signal` reaches by a path
+    // dependency (`../vilan-rt-net`) — like the image core, named by no
+    // generated manifest, materialized because a sibling's manifest names it.
+    OptionalCrate {
+        directory: "vilan-rt-net",
+        manifest_static: "RT_NET_MANIFEST",
+        item: "F164",
+    },
     OptionalCrate {
         directory: "vilan-rt-term",
         manifest_static: "RT_TERM_MANIFEST",

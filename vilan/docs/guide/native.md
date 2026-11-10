@@ -97,14 +97,17 @@ answered `408 Request Timeout` when missed), and 5 s idle between requests;
 set them on both backends. HTTP/2 and TLS are not here: a native server is
 deployed behind a proxy that terminates TLS.
 
-**A server with no `host` binds IPv4 natively.** Node's `listen(port)` with no
-host takes `::`, a dual-stack socket, where the native server takes `0.0.0.0`.
-Both answer an IPv4 client on every interface, but only node answers an IPv6
-one, and `Request::peer_address` spells the same IPv4 client differently: node
-reports it mapped, `::ffff:127.0.0.1`, the native server as `127.0.0.1`. Name the
-bind with `ServerBuilder::host` and the two agree: `host("127.0.0.1")` reads
-`127.0.0.1` on both, `host("::1")` reads `::1`, and `host("::")` is dual-stack
-on both and reads an IPv4 client as `::ffff:127.0.0.1`.
+**A server with no `host` binds dual-stack, as node's does.** Node's
+`listen(port)` with no host takes `::` with IPv6-only switched off, so one
+socket answers IPv4 and IPv6 clients on every interface, and the native server
+binds the same socket the same way — on Windows too, where an IPv6 socket is
+IPv6-only unless told otherwise. On a machine without IPv6 both take `0.0.0.0`
+instead. `Request::peer_address` therefore spells an IPv4 client of a server
+with no host mapped on both backends, `::ffff:127.0.0.1`, and an IPv6 one as
+itself. Name the bind with `ServerBuilder::host` to narrow it:
+`host("127.0.0.1")` and `host("0.0.0.0")` are IPv4 only and read `127.0.0.1`,
+`host("::1")` is IPv6 loopback only and reads `::1`, and `host("::")` is the
+same dual-stack socket as no host at all.
 
 **A native server stops gracefully on SIGTERM.** `Server::stop()` works as it
 does on node. Beyond it, a program that starts a server answers SIGTERM, SIGINT

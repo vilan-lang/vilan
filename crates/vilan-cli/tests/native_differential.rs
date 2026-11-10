@@ -16736,23 +16736,32 @@ fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
 /// `127.0.0.1`), `::1` (an IPv6 one sees `::1`), and `::`, the dual-stack
 /// listener, where an IPv4 client reads back mapped as `::ffff:127.0.0.1`.
 ///
-/// A server with NO `host` is not compared: node listens on `::` there (when
-/// the machine has IPv6) and the native server on `0.0.0.0`, so the same
-/// client reads `::ffff:127.0.0.1` on node and `127.0.0.1` natively — the
-/// difference `docs/guide/native.md` records.
+/// F164: and a server with NO `host`, which node binds `::` dual-stack (when
+/// the machine has IPv6) and the native server now binds the same way — so an
+/// IPv4 client reads `::ffff:127.0.0.1` on both and an IPv6 one `::1`, where
+/// before the fix the native server took `0.0.0.0`, read the IPv4 client as
+/// `127.0.0.1` and refused the IPv6 one.
 #[cfg(target_os = "linux")]
 #[test]
 fn f163_a_requests_peer_address_is_spelled_alike_on_both_backends() {
     let staged = stage();
     let source = include_str!("native/http_peer_address.vl");
     for (host, dial, expected) in [
-        ("127.0.0.1", "127.0.0.1", "peer=127.0.0.1"),
-        ("::1", "::1", "peer=::1"),
-        ("::", "127.0.0.1", "peer=::ffff:127.0.0.1"),
+        (Some("127.0.0.1"), "127.0.0.1", "peer=127.0.0.1"),
+        (Some("::1"), "::1", "peer=::1"),
+        (Some("::"), "127.0.0.1", "peer=::ffff:127.0.0.1"),
+        (Some("::"), "::1", "peer=::1"),
+        (None, "127.0.0.1", "peer=::ffff:127.0.0.1"),
+        (None, "::1", "peer=::1"),
     ] {
         let program = "native_probe_http_peer_address.vl";
-        let rewritten = source.replace(".host(\"127.0.0.1\")", &format!(".host(\"{host}\")"));
-        assert!(rewritten.contains(host), "the probe's host line moved");
+        let host_line = "\t\t.host(\"127.0.0.1\")\n";
+        assert!(source.contains(host_line), "the probe's host line moved");
+        let rewritten = match host {
+            Some(host) => source.replace(host_line, &format!("\t\t.host(\"{host}\")\n")),
+            None => source.replace(host_line, ""),
+        };
+        let host = host.unwrap_or("no host");
         std::fs::write(staged.join(program), rewritten).expect("write the probe program");
         let (mut native, mut node) = both_servers(&staged, program);
         for (leg, command) in [("native", &mut native), ("node", &mut node)] {
