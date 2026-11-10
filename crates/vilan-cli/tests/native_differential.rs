@@ -4473,7 +4473,7 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
 /// reaches the same server.
 const HTTP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ BodyLimits, Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response, ServerTimeouts };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -4488,6 +4488,7 @@ const HTTP_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -4506,10 +4507,13 @@ const HTTP_PROBE: &str = concat!(
 ///
 /// **What is compared, and what cannot be.** The status line, the header the
 /// PROGRAM set, and the body, byte for byte on both legs. Not the whole
-/// response: node adds a `Date`, which changes every second, and node and this
-/// server order `Connection` and `Content-Length` differently — two facts
-/// written down rather than normalised away, because a reader deserves to know
-/// the comparison is not the whole wire. stdout IS compared whole, and it is
+/// response: node adds a `Date`, which changes every second — a fact written
+/// down rather than normalised away, because a reader deserves to know the
+/// comparison is not the whole wire. (Until Order 58 the two servers also
+/// ordered `Connection` and `Content-Length` differently; F152 made the native
+/// head node's, field for field, and
+/// [`f152_a_kept_connection_answers_the_same_bytes_on_both_backends`] compares
+/// whole heads.) stdout IS compared whole, and it is
 /// the port announcement, which is the same line from both.
 ///
 /// **The ordering is the harness's own, not a sleep.** The SERVER binds port 0
@@ -4569,9 +4573,8 @@ fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
         "the two backends must answer the same body"
     );
     assert_eq!(native.body, "hello\n", "and it is the handler's own body");
-    // The header the PROGRAM set goes out on both. Node's `Date` and the order
-    // it writes `Connection`/`Content-Length` in are its own; see this test's
-    // header comment.
+    // The header the PROGRAM set goes out on both. Node's `Date` is its own;
+    // see this test's header comment.
     for leg in [&native, &javascript] {
         assert!(
             leg.headers
@@ -4611,7 +4614,7 @@ fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
 /// good login, a bad one, and the shell — status line, the header the program
 /// set, `Content-Length` and the body. NOT compared, for Order 39's reasons
 /// written at [`a_native_std_http_server_answers_a_get_over_a_real_socket`]:
-/// node's `Date`, and the order the two write `Connection`/`Content-Length`.
+/// node's `Date`. Every other field is compared, in order.
 ///
 /// **Non-vacuous by its content, not by its exit code.** The bodies are
 /// asserted verbatim, and the two logins differ only in the password — so a
@@ -4715,7 +4718,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "import std::bytes::encode_utf8;\n",
     "import std::crypto::sha256;\n",
     "import std::db::Database;\n",
-    "import std::http::{ BodyLimits, Request, Response, Server };\n",
+    "import std::http::{ BodyLimits, Request, Response, Server, ServerTimeouts };\n",
     "import std::io::print;\n",
     "import std::json::{ FromJson, Json };\n",
     "import std::option::Option::None;\n",
@@ -4768,6 +4771,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -5939,13 +5943,12 @@ impl ServedRequest {
         let status = lines.next().unwrap_or_default().to_string();
         ServedRequest {
             status,
-            // node adds a `Date` of its own and the two backends order
-            // `Connection`/`Content-Length` differently; both are dropped here
-            // so the two legs can be compared whole. See the exit's own
-            // comment for why that is written down rather than normalised
-            // away silently.
+            // node adds a `Date` of its own, which is dropped here so the two
+            // legs can be compared whole — every other field, in order (F152
+            // made the native head node's). See the exit's own comment for why
+            // that is written down rather than normalised away silently.
             headers: lines
-                .filter(|line| !line.starts_with("Date:") && !line.starts_with("Connection:"))
+                .filter(|line| !line.starts_with("Date:"))
                 .map(str::to_string)
                 .collect(),
             body: body.to_string(),
@@ -6080,7 +6083,7 @@ fn a_stopped_server_ends_the_program_the_same_on_both_backends() {
 
 const STOP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ BodyLimits, Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response, ServerTimeouts };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -6095,6 +6098,7 @@ const STOP_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| print(\"stopped\"),\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -6313,7 +6317,7 @@ fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
 #[cfg(unix)]
 const OPEN_STREAM_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ BodyLimits, Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response, ServerTimeouts };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -6327,6 +6331,7 @@ const OPEN_STREAM_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -15625,6 +15630,180 @@ fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
             "{leg}: a server bound to 127.0.0.2 must not accept on 127.0.0.1"
         );
     }
+}
+
+/// Reads ONE response off a connection that may stay open (F152): the head,
+/// then the body by the head's own framing — a `Content-Length`, chunks to the
+/// zero-size one, or (with neither, on an answer that closes) the rest of the
+/// stream; a head with neither on a kept connection has no body (`HEAD`,
+/// `204`). Node's `Date` line is dropped — the one field the two servers cannot
+/// agree on — and everything else is answered byte for byte. `pending` carries
+/// what one read took past this response.
+fn read_kept_response(stream: &mut std::net::TcpStream, pending: &mut Vec<u8>) -> String {
+    let mut chunk = [0u8; 4096];
+    let mut fill = |pending: &mut Vec<u8>, stream: &mut std::net::TcpStream| -> bool {
+        let count = stream.read(&mut chunk).expect("read the response");
+        pending.extend_from_slice(&chunk[..count]);
+        count > 0
+    };
+    let head_end = loop {
+        if let Some(at) = pending.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at + 4;
+        }
+        if !fill(pending, stream) {
+            return String::from_utf8_lossy(&std::mem::take(pending)).into_owned();
+        }
+    };
+    let head = String::from_utf8_lossy(&pending[..head_end]).into_owned();
+    let lower = head.to_ascii_lowercase();
+    let body_end = if let Some(line) = lower
+        .lines()
+        .find(|line| line.starts_with("content-length:"))
+    {
+        let length: usize = line["content-length:".len()..]
+            .trim()
+            .parse()
+            .expect("a numeric length");
+        while pending.len() < head_end + length {
+            assert!(fill(pending, stream), "the body ended short: {head}");
+        }
+        head_end + length
+    } else if lower.contains("\r\ntransfer-encoding: chunked\r\n") {
+        loop {
+            if let Some(at) = pending[head_end..]
+                .windows(5)
+                .position(|window| window == b"0\r\n\r\n")
+            {
+                break head_end + at + 5;
+            }
+            assert!(
+                fill(pending, stream),
+                "the chunked body ended short: {head}"
+            );
+        }
+    } else if lower.contains("\r\nconnection: close\r\n") {
+        while fill(pending, stream) {}
+        pending.len()
+    } else {
+        head_end
+    };
+    let response: Vec<u8> = pending.drain(..body_end).collect();
+    String::from_utf8_lossy(&response)
+        .split_inclusive("\r\n")
+        .filter(|line| !line.starts_with("Date: "))
+        .collect()
+}
+
+/// F151 + F152 (Order 58's S3/S4): the two servers answer the SAME BYTES, less
+/// node's `Date`, for what a persistent connection carries — node's reason
+/// phrases (`418 I'm a Teapot`, `413 Payload Too Large`, `422 Unprocessable
+/// Entity`, node's `unknown` for a code it does not list), `Connection:
+/// keep-alive` with `Keep-Alive: timeout=5`, a `204`, a `HEAD` with no body and
+/// no length, a stream sent `Transfer-Encoding: chunked`, and a program's own
+/// `Connection: close` — all NINE over one connection, which is itself the
+/// claim that the connection is kept — then HTTP/1.0 (ended by the close, no
+/// length) and a client's `Connection: close` on connections of their own, and
+/// node's `408` bytes for a head that misses the program's 400 ms
+/// `headers_timeout`.
+///
+/// The header comparison is whole and ordered: node writes the program's
+/// fields, then `Connection`/`Keep-Alive`, then the framing, and the native
+/// server writes them in that order. The 408's TIMING is not compared — node
+/// sweeps for expired requests on an interval (`std::http` sets it to half the
+/// deadline) where the native server checks every turn — only that it lands
+/// after the deadline and well before a liveness bound.
+#[test]
+fn f152_a_kept_connection_answers_the_same_bytes_on_both_backends() {
+    let staged = stage();
+    let program = "native_probe_http_keep_alive.vl";
+    std::fs::write(
+        staged.join(program),
+        include_str!("native/http_keep_alive.vl"),
+    )
+    .expect("write the probe program");
+    let (mut native, mut node) = both_servers(&staged, program);
+    let mut transcripts = Vec::new();
+    for (leg, command) in [("native", &mut native), ("node", &mut node)] {
+        let server = ServerUnderTest::spawn(command);
+        let port = server.port();
+        let mut transcript = Vec::new();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|error| panic!("{leg}: connect: {error}"));
+        let mut pending = Vec::new();
+        for request in [
+            "GET /ok HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /teapot HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /too-large HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /unprocessable HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /unlisted HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /empty HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /stream HTTP/1.1\r\nHost: a\r\n\r\n",
+            "HEAD /ok HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /close HTTP/1.1\r\nHost: a\r\n\r\n",
+        ] {
+            stream.write_all(request.as_bytes()).expect("send");
+            transcript.push(read_kept_response(&mut stream, &mut pending));
+        }
+        for request in [
+            "GET /ok HTTP/1.0\r\n\r\n",
+            "GET /ok HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        ] {
+            let mut own = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            own.write_all(request.as_bytes()).expect("send");
+            transcript.push(read_kept_response(&mut own, &mut Vec::new()));
+        }
+        let mut slow = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let started = std::time::Instant::now();
+        slow.write_all(b"GET / HTTP/1.1\r\nHost:")
+            .expect("send half a head");
+        slow.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .expect("bound the read");
+        let mut timed_out = String::new();
+        slow.read_to_string(&mut timed_out)
+            .unwrap_or_else(|error| panic!("{leg}: read the 408: {error}"));
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(350),
+            "{leg}: the 408 came before the deadline: {waited:?}"
+        );
+        transcript.push(timed_out);
+        transcripts.push(transcript);
+    }
+    assert_eq!(
+        transcripts[0], transcripts[1],
+        "node and native answer different bytes"
+    );
+    let keep = "Connection: keep-alive\r\nKeep-Alive: timeout=5\r\n";
+    let plain = "Content-Type: text/plain\r\n";
+    assert_eq!(
+        transcripts[0],
+        vec![
+            format!("HTTP/1.1 200 OK\r\n{plain}{keep}Content-Length: 7\r\n\r\nGET /ok"),
+            format!(
+                "HTTP/1.1 418 I'm a Teapot\r\n{plain}{keep}Content-Length: 11\r\n\r\nGET /teapot"
+            ),
+            format!(
+                "HTTP/1.1 413 Payload Too Large\r\n{plain}{keep}Content-Length: 14\r\n\r\nGET /too-large"
+            ),
+            format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\n{plain}{keep}Content-Length: 18\r\n\r\n\
+                 GET /unprocessable"
+            ),
+            format!("HTTP/1.1 299 unknown\r\n{plain}{keep}Content-Length: 13\r\n\r\nGET /unlisted"),
+            format!("HTTP/1.1 204 No Content\r\n{plain}{keep}\r\n"),
+            format!(
+                "HTTP/1.1 200 OK\r\n{plain}{keep}Transfer-Encoding: chunked\r\n\r\n\
+                 4\r\none \r\n4\r\ntwo \r\n5\r\nthree\r\n0\r\n\r\n"
+            ),
+            format!("HTTP/1.1 200 OK\r\n{plain}{keep}\r\n"),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 7\r\n\r\nclosing".to_string(),
+            format!("HTTP/1.1 200 OK\r\n{plain}Connection: close\r\n\r\nGET /ok"),
+            format!(
+                "HTTP/1.1 200 OK\r\n{plain}Connection: close\r\nContent-Length: 7\r\n\r\nGET /ok"
+            ),
+            "HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n".to_string(),
+        ]
+    );
 }
 
 /// A178 S1 + S2: `Length` is data — a number and a `Unit`, or a text — and its

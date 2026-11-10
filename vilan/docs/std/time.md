@@ -34,7 +34,8 @@ impl Duration {
 	fun minutes(count: i53): Duration
 	fun hours(count: i53): Duration
 	fun days(count: i53): Duration
-	// truncating accessors
+	// the whole span, then truncating accessors
+	fun as_millis(self): i53
 	fun as_seconds(self): i53
 	fun as_minutes(self): i53
 	fun as_hours(self): i53

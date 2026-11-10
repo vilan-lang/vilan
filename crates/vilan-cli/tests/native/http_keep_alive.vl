@@ -1,0 +1,48 @@
+// F151 + F152 (Order 58's S3/S4): a server whose answers the native
+// differential compares whole, less node's `Date` — node's reason phrases, its
+// `Connection`/`Keep-Alive` fields, a chunked stream, and its `408` for a head
+// that misses a short `headers_timeout`.
+
+import std::http::{ Request, Response, ResponseStream, Server };
+import std::io::print;
+import std::time::Duration;
+
+fun main() {
+	Server::builder()
+		.port(0)
+		.host("127.0.0.1")
+		.headers_timeout(Duration::millis(400))
+		.on_request(|request| answer(request))
+		.on_start(|server| print(i"vilan-test-port={server.port()}"))
+		.build()
+		.start();
+}
+
+fun answer(request: Request): Response {
+	let path = request.path();
+	if path == "/stream" {
+		ret Response::builder()
+			.set_header("Content-Type", "text/plain")
+			.streaming(|stream| send_three(stream))
+			.build();
+	}
+	if path == "/close" {
+		ret Response::builder().set_header("Connection", "close").body("closing").build();
+	}
+	let code = match path {
+		"/teapot" => 418,
+		"/too-large" => 413,
+		"/unprocessable" => 422,
+		"/unlisted" => 299,
+		"/empty" => 204,
+		_ => 200,
+	};
+	Response::builder().code(code).body(i"{request.method()} {path}").build()
+}
+
+fun send_three(stream: ResponseStream) {
+	stream.send("one ");
+	stream.send("two ");
+	stream.send("three");
+	stream.close();
+}

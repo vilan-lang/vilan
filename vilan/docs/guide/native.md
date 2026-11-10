@@ -59,10 +59,18 @@ the `Uint8Array` it is on the JS backend: `let b = a` is an alias, and a
 `set`, `fill` or `copy_into` through either is seen through both. `slice` and
 `Bytes::concat` are the two that make a new buffer.
 
-**A server is compared on the wire, not by its bytes alone.** The native HTTP
-server answers `Connection: close` on every response and sends no `Date`; node
-keeps connections alive and dates every answer. Everything a program sets — the
-status, its headers, its body — is the same on both.
+**A server answers node's bytes, less node's `Date`.** The native HTTP server
+keeps connections alive as node does — HTTP/1.1 persistent connections,
+`Connection: close` honoured from either side, HTTP/1.0 answered and closed,
+pipelined requests answered in order — and writes node's head field for field:
+node's reason phrases, `Connection: keep-alive` with `Keep-Alive: timeout=5`, a
+streamed response `Transfer-Encoding: chunked`. The one field it does not write
+is node's `Date`. Node's three deadlines hold natively too, with node's
+defaults: a request's head within 60 s, the whole request within 300 s (each
+answered `408 Request Timeout` when missed), and 5 s idle between requests;
+`ServerBuilder`'s `headers_timeout`, `request_timeout` and `keep_alive_timeout`
+set them on both backends. HTTP/2 and TLS are not here: a native server is
+deployed behind a proxy that terminates TLS.
 
 **A native server stops gracefully on SIGTERM.** `Server::stop()` works as it
 does on node. Beyond it, a program that starts a server answers SIGTERM, SIGINT

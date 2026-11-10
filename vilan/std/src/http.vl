@@ -15,6 +15,7 @@ import pkg::json::{ JsonKind, JsonValue, coerce_str };
 import pkg::option::Option::{ self, None, Some };
 import pkg::rpc::server::{ Service, fold_service_requests, fold_service_upgrades };
 import pkg::shared::Shared;
+import pkg::time::Duration;
 
 // --- Raw node:http bindings ---
 
@@ -48,6 +49,24 @@ export impl NodeServer {
 	/// what `Server::stop` fires `on_stop` from (§9.1).
 	[extern(method, "close", retains)]
 	external fun close(self, on_closed: || void);
+
+	/// node's `server.headersTimeout`, in milliseconds (`0` is off).
+	[extern(set, "headersTimeout")]
+	external fun set_headers_timeout(self, millis: i32);
+
+	/// node's `server.requestTimeout`, in milliseconds (`0` is off).
+	[extern(set, "requestTimeout")]
+	external fun set_request_timeout(self, millis: i32);
+
+	/// node's `server.keepAliveTimeout`, in milliseconds (`0` is off).
+	[extern(set, "keepAliveTimeout")]
+	external fun set_keep_alive_timeout(self, millis: i32);
+
+	/// node's `server.connectionsCheckingInterval`: how often node sweeps for a
+	/// request past its deadline. Read when the server starts listening, so it is
+	/// set before `listen`; the native server checks every turn and ignores it.
+	[extern(set, "connectionsCheckingInterval")]
+	external fun set_connections_checking_interval(self, millis: i32);
 }
 
 /// The `AddressInfo` a listening server reports (`{ address, family, port }`).
@@ -283,7 +302,7 @@ export impl Request {
 	/// At most the request's cap (`max_body_bytes`, 1 MiB unless the server or the
 	/// handler said otherwise) is read. A body over it — a declared
 	/// `Content-Length` before a byte of the body is read, a chunked one at the
-	/// chunk that crosses it — is answered `413 Content Too Large`, the connection
+	/// chunk that crosses it — is answered `413 Payload Too Large`, the connection
 	/// is closed without reading the rest, and the handler ENDS here, as a
 	/// cancelled task ends: the request is over, so the code after the read does
 	/// not run and its response is never asked for. A client that hangs up mid-body
@@ -306,7 +325,7 @@ export impl Request {
 	///
 	/// Nothing is read until the first `next`, and the connection reads only as far
 	/// as the calls ask. The cap is the request's, as for `bytes`, counted as the
-	/// body arrives: a body over it is answered `413 Content Too Large` and the
+	/// body arrives: a body over it is answered `413 Payload Too Large` and the
 	/// handler ends at the `next` that met it — at the first one for a declared
 	/// `Content-Length`, at the piece that crosses the cap for a chunked body,
 	/// however much of it the handler has already read.
@@ -1170,6 +1189,8 @@ export struct Server {
 	upgrade_handler: Option<|NodeRequest, NodeSocket, Bytes| void>,
 	/// The request-body caps (M164): the server's, and each mount's.
 	body_limits: BodyLimits,
+	/// The connection deadlines (F152): node's three timeouts.
+	timeouts: ServerTimeouts,
 	/// The live listener, once bound — what `stop()` closes. `start()` populates it
 	/// on the copy of `Server` it hands to `on_start`, so stopping a `Server` value
 	/// that was never started (or started elsewhere) is a no-op rather than an
@@ -1207,6 +1228,71 @@ export struct ServerBuilder {
 	asset_cache: Option<|str| CachePolicy>,
 	/// The request-body caps `max_body_bytes` and `max_body_bytes_under` set.
 	body_limits: BodyLimits,
+	/// The deadlines `headers_timeout`, `request_timeout` and `keep_alive_timeout`
+	/// set.
+	timeouts: ServerTimeouts,
+}
+
+/// How long a connection may take over each part of an exchange (F152), in
+/// milliseconds, `0` for no deadline — node's three `http.Server` properties, by
+/// meaning and by default, and set as those properties on the JS backend. Set
+/// through `ServerBuilder`'s `headers_timeout`, `request_timeout` and
+/// `keep_alive_timeout`; exported, as `BodyLimits` is, so a program that writes a
+/// `Server { .. }` literal can give it `ServerTimeouts::new()`.
+export struct ServerTimeouts {
+	headers: i32,
+	request: i32,
+	keep_alive: i32,
+}
+
+export impl ServerTimeouts {
+	/// node's defaults: a head within 60 s of the request's start, the whole
+	/// request within 300 s, and 5 s idle between requests.
+	fun new(): ServerTimeouts {
+		ServerTimeouts { headers = 60000, request = 300000, keep_alive = 5000 }
+	}
+}
+
+impl ServerTimeouts {
+	/// How often node should sweep for a request past its deadline: every half of
+	/// the nearest deadline, or node's own thirty seconds when that is sooner — a
+	/// deadline is otherwise missed by up to a whole sweep. With node's defaults
+	/// this is node's default, so a server that sets nothing is unchanged.
+	fun checking_interval(self): i32 {
+		mut interval = 30000;
+		for bound in [self.headers, self.request] {
+			if bound > 0 && bound / 2 < interval {
+				interval = bound / 2;
+			}
+		}
+		if interval < 1 {
+			1
+		} else {
+			interval
+		}
+	}
+
+	/// Hands the deadlines to a server before it listens.
+	fun apply(self, node_server: NodeServer) {
+		node_server.set_headers_timeout(self.headers);
+		node_server.set_request_timeout(self.request);
+		node_server.set_keep_alive_timeout(self.keep_alive);
+		node_server.set_connections_checking_interval(self.checking_interval());
+	}
+}
+
+/// A deadline's milliseconds as node's property takes them: a span at or below zero
+/// is no deadline (`0`), and one past an `i32` of milliseconds (~24 days) is held
+/// at that.
+fun deadline_millis(timeout: Duration): i32 {
+	let millis = timeout.as_millis();
+	if millis <= 0i53 {
+		0
+	} else if millis > 2147483647i53 {
+		2147483647
+	} else {
+		millis.as_i32()
+	}
 }
 
 /// How many body bytes a request may send (M164): one cap for the whole server and
@@ -1264,6 +1350,7 @@ export impl Server {
 			assets = [],
 			asset_cache = None,
 			body_limits = BodyLimits::new(),
+			timeouts = ServerTimeouts::new(),
 		}
 	}
 
@@ -1301,6 +1388,7 @@ export impl Server {
 		let host = self.host;
 		let upgrade_handler = self.upgrade_handler;
 		let body_limits = self.body_limits;
+		let timeouts = self.timeouts;
 		let node_server = node_create_server(|node_request, node_response| {
 			// The handler runs on the HEAD: the body stays on the wire until it
 			// asks (`Request::bytes`, M164), under the cap its path resolves to.
@@ -1319,6 +1407,7 @@ export impl Server {
 			Some(let handler) => node_server.on_upgrade("upgrade", handler),
 			None => {},
 		}
+		timeouts.apply(node_server);
 		let on_ready = || {
 			// The server handed to `on_start` carries the port it actually bound,
 			// which is the whole point of being allowed to request 0 — and the live
@@ -1427,6 +1516,38 @@ export impl ServerBuilder {
 		self
 	}
 
+	/// How long a request's HEAD may take to arrive (F152) — counted from the
+	/// request's first byte, or from the accept on a fresh connection, so a client
+	/// that connects and sends nothing is bounded too. 60 s when this is never
+	/// called, node's `headersTimeout`; zero is no deadline. A request that misses
+	/// it is answered `408 Request Timeout` and its connection closed.
+	fun headers_timeout(own self, timeout: Duration): ServerBuilder {
+		self.timeouts.headers = deadline_millis(timeout);
+		self
+	}
+
+	/// How long a whole REQUEST, its body included, may take to arrive (F152) — 300
+	/// s when this is never called, node's `requestTimeout`; zero is no deadline. A
+	/// request that misses it is answered `408 Request Timeout` (when its response
+	/// has not started), a body read in flight ends the handler as a cancellation,
+	/// and the connection closes. Only the request is timed: a response that takes
+	/// long — a stream, a long poll — is not.
+	fun request_timeout(own self, timeout: Duration): ServerBuilder {
+		self.timeouts.request = deadline_millis(timeout);
+		self
+	}
+
+	/// How long a connection may sit idle between requests before the server closes
+	/// it (F152) — 5 s when this is never called, node's `keepAliveTimeout`, which
+	/// each answer announces as `Keep-Alive: timeout=N` in whole seconds; the
+	/// server waits one second past it, as node does, so a client acting on the
+	/// announcement does not race the close. Zero is no deadline and no
+	/// announcement.
+	fun keep_alive_timeout(own self, timeout: Duration): ServerBuilder {
+		self.timeouts.keep_alive = deadline_millis(timeout);
+		self
+	}
+
 	fun on_request(own self, handler: async |Request| Response): ServerBuilder {
 		self.request_handler = handler;
 		self
@@ -1529,6 +1650,7 @@ export impl ServerBuilder {
 			on_stop = self.on_stop,
 			upgrade_handler = fold_service_upgrades(self.services, self.upgrade_handler),
 			body_limits = self.body_limits,
+			timeouts = self.timeouts,
 			node = None,
 		}
 	}

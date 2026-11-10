@@ -379,7 +379,7 @@ fn declared_over_the_default_is_refused_before_the_body(
     _backend: Backend,
 ) -> Result<(), String> {
     let response = exchange(port, &post_head_keep_alive("/echo", 2 * MIB), b"")?;
-    expect_status(&response, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&response, "HTTP/1.1 413 Payload Too Large")?;
     expect_header(&response, "Connection: close")?;
     expect_body(&response, DEFAULT_REFUSAL)
 }
@@ -421,7 +421,7 @@ fn the_writer_of_a_refused_body_stalls(port: u16, _backend: Backend) -> Result<(
         .map_err(|error| format!("read the answer: {error}"))?;
     expect_status(
         &String::from_utf8_lossy(&answer[..read]),
-        "HTTP/1.1 413 Content Too Large",
+        "HTTP/1.1 413 Payload Too Large",
     )?;
     let piece = vec![b'a'; 64 * 1024];
     let mut written = 0;
@@ -461,7 +461,7 @@ fn the_writer_of_a_refused_body_stalls(port: u16, _backend: Backend) -> Result<(
 /// that closing over unread bytes sends cannot overtake the answer.
 fn a_streaming_client_reads_the_refusal(port: u16, _backend: Backend) -> Result<(), String> {
     let outcome = streamed(port, &post_head("/echo", 2 * MIB), 2 * MIB, false)?;
-    expect_status(&outcome, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&outcome, "HTTP/1.1 413 Payload Too Large")?;
     expect_body(&outcome, DEFAULT_REFUSAL)
 }
 
@@ -472,7 +472,7 @@ fn chunked_over_the_default_is_refused_as_it_arrives(
     _backend: Backend,
 ) -> Result<(), String> {
     let outcome = streamed(port, &chunked_head("/echo"), 3 * MIB / 2, true)?;
-    expect_status(&outcome, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&outcome, "HTTP/1.1 413 Payload Too Large")?;
     expect_body(&outcome, DEFAULT_REFUSAL)
 }
 
@@ -534,7 +534,7 @@ fn the_rpc_post_leg_is_under_the_cap(port: u16, _backend: Backend) -> Result<(),
         ),
         b"",
     )?;
-    expect_status(&response, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&response, "HTTP/1.1 413 Payload Too Large")?;
     expect_body(&response, DEFAULT_REFUSAL)?;
     // And a frame within it still reaches the codec (`{}` has no method: the
     // decode failure's 400 envelope).
@@ -606,10 +606,10 @@ fn a_handler_answering_from_the_head_never_reads_the_body(
     expect_body(&response, "sign in")
 }
 
-/// A body within the cap that the handler never read is DRAINED: on node the
-/// connection stays alive, so a request pipelined behind it is answered too;
-/// the native server (no keep-alive) discards it and closes with a FIN.
-fn an_unread_body_within_the_cap_is_drained(port: u16, backend: Backend) -> Result<(), String> {
+/// A body within the cap that the handler never read is DRAINED: the
+/// connection stays alive, so a request pipelined behind it is answered too —
+/// on both backends since the native server keeps connections (F152).
+fn an_unread_body_within_the_cap_is_drained(port: u16, _backend: Backend) -> Result<(), String> {
     let response = exchange(
         port,
         "POST /auth HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 5\r\n\r\nhello\
@@ -617,10 +617,7 @@ fn an_unread_body_within_the_cap_is_drained(port: u16, backend: Backend) -> Resu
         b"",
     )?;
     let answered = response.matches("HTTP/1.1 401 Unauthorized").count();
-    let expected = match backend {
-        Backend::Node => 2,
-        Backend::Native => 1,
-    };
+    let expected = 2;
     if answered != expected {
         return Err(format!(
             "expected {expected} answer(s) on the connection, got {answered}:\n{response}"
@@ -739,7 +736,7 @@ fn the_server_cap_is_the_builders(port: u16, _backend: Backend) -> Result<(), St
     expect_status(&within, "HTTP/1.1 200 OK")?;
     expect_body(&within, "len=500")?;
     let over = exchange(port, &post_head("/echo", 600), b"")?;
-    expect_status(&over, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&over, "HTTP/1.1 413 Payload Too Large")?;
     expect_body(&over, "the request body is larger than 512 bytes")
 }
 
@@ -750,7 +747,7 @@ fn a_route_raises_its_own_cap(port: u16, _backend: Backend) -> Result<(), String
     expect_status(&within, "HTTP/1.1 200 OK")?;
     expect_body(&within, "len=3145728")?;
     let over = exchange(port, &post_head("/route", 5 * MIB), b"")?;
-    expect_status(&over, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&over, "HTTP/1.1 413 Payload Too Large")?;
     expect_body(&over, "the request body is larger than 4194304 bytes")
 }
 
@@ -804,10 +801,10 @@ fn the_upload_route_shape(port: u16, _backend: Backend) -> Result<(), String> {
              Content-Length: {length}\r\nConnection: close\r\n\r\n"
         )
     };
-    // The app's own 413: node names it `Payload Too Large`, the native server
-    // RFC 9110's `Content Too Large`, so only the code is compared here.
+    // The app's own 413 reads node's phrase on both backends (F151): the
+    // whole status line is compared, as everywhere else.
     let too_big = exchange(port, &signed_in(30_000_000), b"")?;
-    expect_code(&too_big, 413)?;
+    expect_status(&too_big, "HTTP/1.1 413 Payload Too Large")?;
     expect_body(&too_big, "Files can be up to 25 MB.")?;
     let stored = streamed(port, &signed_in(5 * MIB), 5 * MIB, false)?;
     expect_status(&stored, "HTTP/1.1 200 OK")?;
@@ -1245,7 +1242,7 @@ fn a_declared_body_over_the_cap_is_refused_at_the_first_read(
     _backend: Backend,
 ) -> Result<(), String> {
     let response = exchange(port, &post_head_keep_alive("/count", 2 * MIB), b"")?;
-    expect_status(&response, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&response, "HTTP/1.1 413 Payload Too Large")?;
     expect_header(&response, "Connection: close")?;
     expect_body(&response, DEFAULT_REFUSAL)
 }
@@ -1260,7 +1257,7 @@ fn the_cap_refuses_mid_stream_and_the_writer_stalls(
 ) -> Result<(), String> {
     let before = refused_body_read(port)?;
     let outcome = streamed(port, &chunked_head("/count"), 64 * MIB, true)?;
-    expect_status(&outcome, "HTTP/1.1 413 Content Too Large")?;
+    expect_status(&outcome, "HTTP/1.1 413 Payload Too Large")?;
     expect_body(&outcome, DEFAULT_REFUSAL)?;
     let after = refused_body_read(port)?;
     if after != before {
@@ -1296,13 +1293,13 @@ fn a_body_is_read_one_way(port: u16, _backend: Backend) -> Result<(), String> {
 }
 
 /// A stream the handler leaves unfinished is an unread body (M164's rule):
-/// within the cap it is drained — on node the connection stays alive and a
-/// request pipelined behind it is answered; natively it is discarded before
-/// the close — and past it, chunked, the connection closes with the census
-/// still at zero.
+/// within the cap it is drained — the connection stays alive and a request
+/// pipelined behind it is answered, on both backends since the native server
+/// keeps connections (F152) — and past it, chunked, the connection closes
+/// with the census still at zero.
 fn an_unfinished_stream_is_discarded_as_an_unread_body(
     port: u16,
-    backend: Backend,
+    _backend: Backend,
 ) -> Result<(), String> {
     let body = vec![b'a'; 200 * 1024];
     let mut wire = format!(
@@ -1318,10 +1315,7 @@ fn an_unfinished_stream_is_discarded_as_an_unread_body(
         .map_err(|error| format!("send: {error}"))?;
     let response = read_response(&mut stream)?;
     let answered = response.matches("took=10").count();
-    let expected = match backend {
-        Backend::Node => 2,
-        Backend::Native => 1,
-    };
+    let expected = 2;
     if answered != expected {
         return Err(format!(
             "expected {expected} answer(s) on the connection, got {answered}:\n{response}"
