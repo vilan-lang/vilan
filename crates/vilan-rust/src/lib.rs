@@ -6920,6 +6920,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         )))
     }
 
+    /// B705: the binding a place spine is rooted in (`xs`, `self.items[0]`'s
+    /// `self`, `&mut xs`'s `xs`), when its root is a binding at all.
+    fn root_binding_of_place(&self, place: Id) -> Option<Id> {
+        let place = match self.program.entity_map.get(&place) {
+            Some(&Expr::Reference(operand, _)) => operand,
+            _ => place,
+        };
+        match self.program.entity_map.get(&self.place_root(place)) {
+            Some(&Expr::Local(binding) | &Expr::Parameter(binding)) => Some(binding),
+            _ => None,
+        }
+    }
+
     /// The ROOT of a place spine — under every field, tuple slot, subscript
     /// and dereference — which for `map.slot(k).get_or_insert((w, 0)).1` is the
     /// view-returning call the spine reads through (M191).
@@ -13747,9 +13760,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // met a live mutable borrow and rustc refused it (E0502). Taking the
         // place has no effect of its own, so evaluating the values ahead of it
         // is the order the program already had.
+        //
+        // B705: and a `&mut place` the source WROTE as the argument
+        // (`grow(&mut xs, xs.len())`), whose borrow is the same live one.
         let borrows_a_read_place = argument_ids.iter().enumerate().any(|(index, argument)| {
-            matches!(conventions.get(index), Some(Receiving::RefMut))
-                && self.place_spine(*argument).is_some_and(|(root, _)| {
+            let place = match self.program.entity_map.get(argument) {
+                Some(&Expr::Reference(place, true)) => Some(place),
+                _ if matches!(conventions.get(index), Some(Receiving::RefMut)) => Some(*argument),
+                _ => None,
+            };
+            place
+                .and_then(|place| self.place_spine(place))
+                .is_some_and(|(root, _)| {
                     argument_ids
                         .iter()
                         .enumerate()
@@ -16602,6 +16624,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 arguments.push(name);
             }
             let receiver = self.mutable_place(argument_ids[0], depth)?;
+            arguments.insert(0, receiver);
+            let rendered = self.intrinsic(intrinsic, arguments, span)?;
+            return Ok(format!("{{ {prelude}{rendered} }}"));
+        }
+        // B705: a mutating receiver over a plain local whose OTHER arguments
+        // read the same binding — `next.insert(next.position(..).unwrap_or(
+        // next.len()), x)`, `map.insert(k, map.len())`. The lowering is a free
+        // function taking `&mut receiver` first, and Rust's two-phase borrow
+        // covers only a method's autoref, so the reads met the live `&mut`
+        // (E0502) where the JS backend reads the list before it inserts. The
+        // arguments are hoisted ahead of the borrow, in order, as F30 hoists
+        // them for a cell.
+        if mutating
+            && let Some(receiver_root) = argument_ids
+                .first()
+                .and_then(|receiver| self.root_binding_of_place(*receiver))
+            && argument_ids
+                .iter()
+                .skip(1)
+                .any(|argument| self.reads_binding(*argument, receiver_root))
+        {
+            let mut prelude = String::new();
+            let mut arguments = Vec::new();
+            for (index, argument) in argument_ids.iter().enumerate().skip(1) {
+                let value = self.consumed_value_of_expecting(*argument, None, depth)?;
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {value}; ");
+                arguments.push(name);
+            }
+            let receiver = self.mutable_receiver(argument_ids[0], depth)?;
             arguments.insert(0, receiver);
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{rendered} }}"));

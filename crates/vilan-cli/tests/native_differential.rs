@@ -14498,6 +14498,26 @@ fn b726_a_list_read_before_its_first_push_is_identical_on_both_backends() {
     );
 }
 
+/// B705: a mutating call whose other arguments read its receiver —
+/// `next.insert(next.position(..).unwrap_or(next.len()), x)`, a map keyed off
+/// its own length, a field's list, `grow(&mut xs, xs.len())` — evaluates the
+/// reads before the `&mut` is taken (rustc E0502 otherwise).
+#[test]
+fn b705_an_argument_reading_the_mutated_receiver_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b705_argument_reads_mutated_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b705_argument_reads_mutated_receiver.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "5\n2\n9\n1\n4\n4\n4\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

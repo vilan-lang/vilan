@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B705: natively, a mutating call whose other arguments read its receiver builds - `next.insert(next.position(..).unwrap_or(next.len()), x)` was rustc's E0502.** The lowering hands the receiver as `&mut` to a free function, and Rust's two-phase borrow covers only a method's autoref, so the reads met the live borrow. A mutating intrinsic (`insert`, `remove`, a map's `insert`, ..) whose arguments read the receiver's root binding now evaluates them first, in order, as F30 already did for a receiver in a cell; and F35's hoist for a user call now also covers a `&mut place` the source wrote (`grow(&mut xs, xs.len())`), not only a loaned receiver. The tracker's other shape - a `let v = &mut xs` view held across a later read of `xs` - is not this one and stays open. Pins: `native_differential::b705_an_argument_reading_the_mutated_receiver_is_identical_on_both_backends`. Tracker B705.
+
+---
+
+<!-- family: fix -->
 **B726: natively, `List<T>::new()` read before its first push builds - `mut merged = List<(usize, usize)>::new(); merged.pop()` was a bare `Vec::new()` and rustc's E0282.** A `let` initialized with `List::new()` is now annotated with the binding's type where that type is closed, exactly as one initialized with `[]` always was (`let mut merged: Vec<(usize, usize)> = Vec::new();`); a `Shared::new(List::new())` and an ascription ride the same rule. Pins: `native_differential::b726_a_list_read_before_its_first_push_is_identical_on_both_backends` (a pop before any push, an annotated empty list; both annotated in the emission). Tracker B726.
 
 ---
