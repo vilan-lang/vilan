@@ -1,0 +1,46 @@
+// F156: `str::index_of`/`last_index_of` and `Instant::to_iso` print the same
+// lines on both backends. The indexes count UTF-16 code units (`substring`'s
+// unit) through a two-byte `é`/`ö` and a surrogate-pair emoji, with absence,
+// an empty needle at either end, and the bound fed back into `substring`. The
+// instants cross the epoch, both leap days, and the four-digit year's edges
+// into the expanded `+YYYYYY`/`-YYYYYY` form, out to the ends of the `Date`
+// range.
+import std::time::Instant;
+
+fun shown(at: Option<usize>): str {
+	match at {
+		Some(let index) => i"{index}",
+		None => "none",
+	}
+}
+
+fun main() {
+	let text = "héllo wörld 😀 wörld";
+	for needle in ["wörld", "😀", "h", "d", "zz", ""] {
+		print(i"[{needle}] first={shown(text.index_of(needle))} last={shown(text.last_index_of(needle))}");
+	}
+	match text.index_of("😀") {
+		Some(let at) => print(text.substring(at, text.len())),
+		None => print("absent"),
+	}
+	let empty = "";
+	print(i"empty: {shown(empty.index_of(""))} {shown(empty.last_index_of(""))} {shown(empty.index_of("a"))}");
+	let moments = [
+		0i53,
+		1700000000000i53,
+		0i53 - 1i53,
+		0i53 - 1000000000000i53,
+		951782400000i53,
+		1709251199999i53,
+		0i53 - 62167219200000i53,
+		0i53 - 62167219200001i53,
+		253402300799999i53,
+		253402300800000i53,
+		8640000000000000i53,
+		0i53 - 8640000000000000i53,
+	];
+	for millis in moments {
+		let at = Instant { millis };
+		print(i"{millis} {at.to_iso()}");
+	}
+}

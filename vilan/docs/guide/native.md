@@ -26,8 +26,12 @@ What the backend reaches today:
 - `async`, `await`, `Task` and `Nursery`, on a single-threaded executor of the
   runtime's own
 - `std::json`, `std::db` (SQLite, through a separate runtime crate that a
-  program links only when it reaches `std::db`), `std::bytes`, `std::time`'s
-  clock, and the plain `std::fs` reads and writes
+  program links only when it reaches `std::db`), `std::bytes`, `std::binary`,
+  `std::time`'s clock and `Instant::to_iso`, `str::index_of` and
+  `last_index_of` (in UTF-16 code units, as on node), and `std::fs`'s reads,
+  writes and directories — `create_dir_all`, `remove_dir_all`, `copy_dir`,
+  `scan_dir` and `read_dir_all` with node's results and failures (a listing
+  comes back sorted by name, which node does not promise either)
 - `std::crypto`: SHA-256, SHA-384 and SHA-512, HMAC-SHA-512, PBKDF2,
   `random_bytes` and `random_uuid` from the operating system's random source —
   and node:crypto's `pbkdf2Sync` when a program binds it itself, with the
@@ -46,8 +50,8 @@ What it does **not** reach yet — each refused by name, with the construct in t
 message, rather than silently mis-compiled: the browser platform (`std::web::dom`,
 `std::web::ui`, `std::web::prelude`, `std::web::router`), a `resource` type with a `Drop` impl
 (deterministic teardown natively is its own slice; a resource with no `Drop`,
-such as a pipe node, builds as an ordinary move-only type), a handful of host bindings (the `fs`
-calls that take an options object), and
+such as a pipe node, builds as an ordinary move-only type), a handful of host bindings
+(`std::fs`'s file handles and its watcher among them), and
 `--watch` (a native round is a full `cargo build`; the dev loop's hot-swap
 belongs to the JS backend).
 
@@ -69,8 +73,12 @@ does on node. Beyond it, a program that starts a server answers SIGTERM, SIGINT
 and SIGHUP (Ctrl-C, and the console's close on Windows) by stopping its
 servers: it stops accepting, closes the connections that are only waiting and
 the upgraded sockets, lets a request already being answered finish — and then
-`main` returns, where node would have died of the signal. A second signal ends
-the process at once, for a server whose open response never ends. The handler
+the program ends, where node would have died of the signal. It ends whatever
+else is still pending: a timer, a detached `async { for { ..; sleep(..) } }`
+task, a `main` still suspended (which ends without a failure) — node abandons
+all of them when it dies, so a native program that waited for them would be one
+SIGTERM no longer stops. A second signal ends the process at once, for a server
+whose open response never ends. The handler
 lives in a third runtime crate, linked only by a program that serves, so a
 native server build fetches the `ctrlc` crate the first time.
 

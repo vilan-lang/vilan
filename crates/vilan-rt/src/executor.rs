@@ -38,6 +38,8 @@ use std::collections::VecDeque;
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -1217,15 +1219,33 @@ fn reap_settled() {
 /// Answers whether anything fired — `false` means the deadline list is empty and
 /// the loop is done.
 fn advance_timers() -> bool {
+    if stopped() {
+        return false;
+    }
     let Some(slot) = earliest_timer() else {
         return false;
     };
-    let now = Instant::now();
-    if slot.deadline > now {
-        std::thread::sleep(slot.deadline - now);
+    wait_until(slot.deadline);
+    if stopped() {
+        return false;
     }
     fire_timer(&slot);
     true
+}
+
+/// Sleeps the program's thread until `deadline`, or until a termination
+/// request wakes it (F157): an hour-long `sleep` in a detached task must not
+/// stand between a SIGTERM and the program's end. Parked rather than slept,
+/// so [`request_termination`]'s unpark reaches it.
+fn wait_until(deadline: Instant) {
+    PROGRAM_THREAD.get_or_init(std::thread::current);
+    loop {
+        let now = Instant::now();
+        if now >= deadline || termination_requested() {
+            return;
+        }
+        std::thread::park_timeout(deadline - now);
+    }
 }
 
 /// The earliest live entry of the deadline list, with the dead ones swept.
@@ -1291,6 +1311,15 @@ pub trait IoSource {
     /// live connections answers `false`, is dropped from the registry, and the
     /// loop goes back to exiting when the deadline list empties.
     fn is_live(&self) -> bool;
+
+    /// F157: whether this source holds a termination's graceful stop open —
+    /// a server still answering what it accepted. Once a termination request
+    /// is in and no registered source answers `true`, the loop ENDS, whatever
+    /// timers and tasks are still pending; a source that would only wait for
+    /// more input (stdin) holds nothing, which is the default.
+    fn holds_the_stop(&self) -> bool {
+        false
+    }
 }
 
 /// How long the loop waits when no source is ready and no timer is due.
@@ -1328,6 +1357,9 @@ fn poll_io() -> bool {
 /// kind of macrotask: a poll of the sources, then the single earliest DUE timer
 /// (due, so the wait cannot be spent blind to a socket), then a bounded wait.
 fn advance_macrotasks() -> bool {
+    if stopped() {
+        return false;
+    }
     if !io_registered() {
         return advance_timers();
     }
@@ -1372,6 +1404,91 @@ fn sole_io_source() -> Option<Rc<dyn IoSource>> {
         (io.len() == 1).then(|| Rc::clone(&io[0]))
     })
 }
+
+// ----------------------------------------------------------- termination ---
+
+/// How many termination requests the process has had (F45). A COUNT, not a
+/// flag, because the second one means something the first does not.
+///
+/// Process-wide and atomic because the request arrives from outside the
+/// program's thread: `vilan-rt-signal` routes SIGTERM/SIGINT/SIGHUP here from
+/// the thread its signal crate runs handlers on.
+static TERMINATION_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+/// How many sources held the graceful stop open at the loop's last look —
+/// what the SECOND request's sentence reads, on the signal thread.
+static HOLDING_THE_STOP: AtomicUsize = AtomicUsize::new(0);
+
+/// The thread the event loop runs on, recorded by its first timer wait, so a
+/// request can wake a loop parked on a far deadline ([`wait_until`]).
+static PROGRAM_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+
+/// A request to stop the program GRACEFULLY — what a termination signal means
+/// to a native program that serves (F45; Order 43's R-i).
+///
+/// The first request is the graceful stop: at its next poll every server
+/// stops accepting, closes the connections that are only waiting, and lets a
+/// request already being answered finish; once no server holds the stop open
+/// ([`IoSource::holds_the_stop`]) the event loop ends and what runs at process
+/// end runs — the leak census among it. It ends WHATEVER ELSE is pending
+/// (F157): a detached `async { for { ..; sleep(3600000) } }`, a timer, a task
+/// still awaiting — node, with no handler, dies of the signal and abandons
+/// them all, so a native program that kept running for them would be one that
+/// SIGTERM no longer stops. A `main` still suspended ends without its value
+/// ([`block_on`]). The SECOND request ends the process at once, with exit code
+/// 1 and a sentence on stderr — for a server whose open response never ends
+/// (a stream, a long poll), or a program busy in a synchronous stretch that
+/// never reaches the loop.
+///
+/// Safe to call from any thread, which is the point: a signal handler's
+/// thread is not the program's.
+pub fn request_termination() {
+    if TERMINATION_REQUESTS.fetch_add(1, Ordering::SeqCst) > 0 {
+        if HOLDING_THE_STOP.load(Ordering::SeqCst) > 0 {
+            eprintln!(
+                "the program was stopped by a second termination request before its open \
+                 connections ended"
+            );
+        } else {
+            eprintln!(
+                "the program was stopped by a second termination request before it reached its \
+                 event loop to stop"
+            );
+        }
+        std::process::exit(1);
+    }
+    if let Some(thread) = PROGRAM_THREAD.get() {
+        thread.unpark();
+    }
+}
+
+/// Whether a termination request has arrived.
+pub fn termination_requested() -> bool {
+    TERMINATION_REQUESTS.load(Ordering::SeqCst) > 0
+}
+
+/// Whether the loop must end now: a termination request is in and no
+/// registered source holds the stop open. Publishes how many still do.
+fn stopped() -> bool {
+    if !termination_requested() {
+        return false;
+    }
+    let holding = RUNTIME.with(|runtime| {
+        runtime
+            .io
+            .borrow()
+            .iter()
+            .filter(|source| source.holds_the_stop())
+            .count()
+    });
+    HOLDING_THE_STOP.store(holding, Ordering::SeqCst);
+    holding == 0
+}
+
+/// The unwind payload a `main` still suspended at a termination's end leaves
+/// [`block_on`] with: there is no value to answer, and the stop is not a
+/// failure. [`crate::main_guard`] reads it as an ordinary end.
+pub struct TerminationStop;
 
 /// `async <body>` — the spawn. Eager: the body runs to its first suspension
 /// inside this call, as `this.promise = run()` does.
@@ -1518,10 +1635,14 @@ pub fn block_on<T: Clone + 'static>(body: impl Future<Output = T> + 'static) -> 
             break;
         }
     }
-    root.value
-        .borrow()
-        .clone()
-        .expect("the root task settled without a value")
+    let value = root.value.borrow().clone();
+    match value {
+        Some(value) => value,
+        // F157: the loop ended on a termination with `main` still suspended.
+        // `resume_unwind` runs no panic hook, so nothing is printed.
+        None if termination_requested() => std::panic::resume_unwind(Box::new(TerminationStop)),
+        None => panic!("the root task settled without a value"),
+    }
 }
 
 #[cfg(test)]

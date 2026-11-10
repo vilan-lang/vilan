@@ -100,6 +100,16 @@ impl JsonValue {
         }
     }
 
+    /// `Object.keys(value)` — `std::json`'s `JsonValue::keys` (F158), which
+    /// asks only of an object. The entries' order IS the answer, so this
+    /// shares whatever order the parse kept; anything else answers no keys.
+    pub fn keys(&self) -> Vec<Str> {
+        match self {
+            JsonValue::Object(entries) => entries.iter().map(|(key, _)| Rc::clone(key)).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The externally-tagged discriminator — the `JsonTag` intrinsic, which is
     /// `transformer.rs`'s `__json_tag` helper.
     ///

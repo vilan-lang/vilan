@@ -6310,6 +6310,79 @@ fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
     drop(stream);
 }
 
+/// F157: a termination ends the program once its servers have drained,
+/// WHATEVER ELSE is pending — node, with no handler, dies of the signal and
+/// abandons it all. Two shapes, each of which kept the native process alive
+/// after the listener closed (the second signal then blamed "open
+/// connections" that did not exist): a detached forever-loop task sleeping an
+/// hour (kolt's `keep_storage_tidy`), and an `async fun main` that is itself
+/// still suspended on an hour-long sleep, which ends without its value and
+/// without a failure line. Each exits 0 on the FIRST signal with nothing on
+/// stderr; the 60-second bound in `finish` is liveness only.
+#[cfg(unix)]
+#[test]
+fn f157_a_termination_ends_the_program_whatever_else_is_pending() {
+    let staged = stage();
+    for (file, source) in [
+        ("native_probe_detached_forever.vl", DETACHED_FOREVER_PROBE),
+        ("native_probe_suspended_main.vl", SUSPENDED_MAIN_PROBE),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let server = SignalledServer::spawn(&staged, file, &[]);
+        let answered = ServedRequest::exchange(server.port, "GET", "/", "");
+        assert_eq!(answered.body, "ok", "{file}");
+        server.signal("-TERM");
+        let (status, stderr) = server.finish();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{file}: one SIGTERM ends it (stderr: {stderr})"
+        );
+        assert_eq!(stderr, "", "{file}: a graceful end says nothing");
+    }
+}
+
+#[cfg(unix)]
+const DETACHED_FOREVER_PROBE: &str = concat!(
+    "import std::http::{ Response, Server };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "fun tidy() {\n",
+    "\tasync {\n",
+    "\t\tfor {\n",
+    "\t\t\tsleep(3600000);\n",
+    "\t\t}\n",
+    "\t};\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\ttidy();\n",
+    "\tServer::builder()\n",
+    "\t\t.port(0)\n",
+    "\t\t.on_request(|request| Response::builder().code(200).body(\"ok\").build())\n",
+    "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()}\"))\n",
+    "\t\t.build()\n",
+    "\t\t.start();\n",
+    "}\n",
+);
+
+#[cfg(unix)]
+const SUSPENDED_MAIN_PROBE: &str = concat!(
+    "import std::http::{ Response, Server };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tServer::builder()\n",
+    "\t\t.port(0)\n",
+    "\t\t.on_request(|request| Response::builder().code(200).body(\"ok\").build())\n",
+    "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()}\"))\n",
+    "\t\t.build()\n",
+    "\t\t.start();\n",
+    "\tsleep(3600000);\n",
+    "\tprint(\"main ended\");\n",
+    "}\n",
+);
+
 #[cfg(unix)]
 const OPEN_STREAM_PROBE: &str = concat!(
     "import std::io::print;\n",
@@ -9859,17 +9932,18 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// replaced it at `vilan check` — "cannot infer the type of this value" at the
 /// user's call — so the library-body probe now proves that the refusal comes
 /// from the CHECK, at the call, before any body is instantiated.) N167: the
-/// in-body note's std probe is `std::fs::copy_dir`, which checks clean and
-/// whose body reaches a host binding the native backend does not emit
-/// (`new_fs_options`): the refusal is drawn at the user's call and names the
-/// body and its file.
+/// in-body note's std probe is `std::fs::with_file`, which checks clean and
+/// whose body reaches a host type the native backend does not emit (`File`,
+/// the handle tier): the refusal is drawn at the user's call and names the
+/// body and its file. (It was `copy_dir` over `new_fs_options` until F156
+/// gave that body a native twin.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
     let file = "native_probe_n167_std_body_refusal.vl";
     std::fs::write(
         staged.join(file),
-        "import std::fs::copy_dir;\n\nfun main() {\n\tcopy_dir(\"a\", \"b\");\n}\n",
+        "import std::fs::with_file;\n\nfun main() {\n\twith_file(\"a\", |file| 0);\n}\n",
     )
     .expect("write the probe");
     let checked = vilan(&staged)
@@ -9893,7 +9967,7 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
     assert!(
         stderr.contains(&format!("{file}:4:2"))
             && stderr.contains(
-                "The construct is in `copy_dir`'s body (`fs.vl`), which this call instantiates.",
+                "The construct is in `with_file`'s body (`fs.vl`), which this call instantiates.",
             ),
         "the refusal inside std's body is drawn at the user's call and names the body:\n{stderr}"
     );
@@ -15768,6 +15842,134 @@ fn m181_percent_encoding_is_identical_on_both_backends() {
             "round trips 26 of 26\n",
         )
     );
+}
+
+/// Runs one `native/` probe on both backends and answers node's stdout after
+/// asserting the native leg printed the same bytes and both exited 0.
+fn identical_probe(file: &str, source: &str) -> String {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "node and native print differently");
+    outputs.swap_remove(0)
+}
+
+/// F156: `str::index_of`/`last_index_of` count UTF-16 code units on both
+/// backends — through `é`, `ö` and a surrogate-pair emoji, absence, an empty
+/// needle at either end, and the index fed back into `substring` — and
+/// `Instant::to_iso` is `toISOString()` byte for byte, from the epoch out to
+/// the expanded years at both ends of the `Date` range (`native/index_and_iso.vl`).
+#[test]
+fn f156_index_of_and_to_iso_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_index_and_iso.vl",
+        include_str!("native/index_and_iso.vl"),
+    );
+    assert_eq!(
+        printed,
+        concat!(
+            "[wörld] first=6 last=15\n",
+            "[😀] first=12 last=12\n",
+            "[h] first=0 last=0\n",
+            "[d] first=10 last=19\n",
+            "[zz] first=none last=none\n",
+            "[] first=0 last=20\n",
+            "😀 wörld\n",
+            "empty: 0 0 none\n",
+            "0 1970-01-01T00:00:00.000Z\n",
+            "1700000000000 2023-11-14T22:13:20.000Z\n",
+            "-1 1969-12-31T23:59:59.999Z\n",
+            "-1000000000000 1938-04-24T22:13:20.000Z\n",
+            "951782400000 2000-02-29T00:00:00.000Z\n",
+            "1709251199999 2024-02-29T23:59:59.999Z\n",
+            "-62167219200000 0000-01-01T00:00:00.000Z\n",
+            "-62167219200001 -000001-12-31T23:59:59.999Z\n",
+            "253402300799999 9999-12-31T23:59:59.999Z\n",
+            "253402300800000 +010000-01-01T00:00:00.000Z\n",
+            "8640000000000000 +275760-09-13T00:00:00.000Z\n",
+            "-8640000000000000 -271821-04-20T00:00:00.000Z\n",
+        )
+    );
+}
+
+/// F156: `std::fs`'s options-object calls — `create_dir_all` (twice),
+/// `scan_dir`, `read_dir_all`, `copy_dir`'s merge into an existing tree and
+/// into a fresh deep path, and `remove_dir_all` over a file, a missing path and
+/// a tree — leave the same tree and print the same lines on both backends
+/// (`native/fs_options.vl`). The failures and the symlink cases are
+/// `vilan_rt::fs`'s unit tests: a vilan program cannot catch the throw.
+#[test]
+fn f156_fs_options_calls_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_fs_options.vl",
+        include_str!("native/fs_options.vl"),
+    );
+    assert_eq!(
+        printed,
+        concat!(
+            "made: true\n",
+            "scan src:\n",
+            "  a.txt dir=false file=true link=false\n",
+            "  sub dir=true file=false link=false\n",
+            "all: a.txt sub sub/b.txt sub/deeper\n",
+            "copied a: A\n",
+            "copied b: B\n",
+            "extra: kept\n",
+            "fresh: one one/two one/two/a.txt one/two/sub one/two/sub/b.txt one/two/sub/deeper\n",
+            "scan src after:\n",
+            "  sub dir=true file=false link=false\n",
+            "gone: true\n",
+        )
+    );
+}
+
+/// F156: `std::binary`'s `f64`s go through a `DataView` over a scratch
+/// buffer, natively `vilan_rt::bytes::DataView` — the same little-endian bytes
+/// and the same values back on both backends (`native/binary_f64.vl`).
+#[test]
+fn f156_binary_doubles_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_binary_f64.vl",
+        include_str!("native/binary_f64.vl"),
+    );
+    assert!(
+        printed.starts_with("070000000000000000000000000000000000f83f"),
+        "{printed}"
+    );
+    assert!(printed.ends_with("same=true\n"), "{printed}");
+}
+
+/// F158: `std::base64::encode`/`decode` (standard, padded, strict) and
+/// `JsonValue::keys` print the same lines on both backends
+/// (`native/base64_and_keys.vl`): every length mod 3 and all 256 byte values
+/// round-trip to node's own encodings, fourteen malformed texts are `None`,
+/// and the keys of an object come in insertion order while an array, a
+/// string, a number, `null` and a missing field have none.
+#[test]
+fn f158_base64_and_json_keys_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_base64_and_keys.vl",
+        include_str!("native/base64_and_keys.vl"),
+    );
+    for line in [
+        "foobar -> Zm9vYmFy -> [666f6f626172]\n",
+        "héllo 😀 -> aMOpbGxvIPCfmIA= -> [68c3a96c6c6f20f09f9880]\n",
+        "every byte back: true\n",
+        "Zh== -> none\n",
+        "Zm9= -> none\n",
+        "keys: b,a,c,é\n",
+        "nested: z,y\n",
+        "array: 0\n",
+        "missing: 0\n",
+    ] {
+        assert!(printed.contains(line), "{line:?} missing from:\n{printed}");
+    }
+    assert_eq!(printed.matches(" -> none\n").count(), 14, "{printed}");
 }
 
 /// A179: `std::rpc::dial_within` answers the same on both backends over

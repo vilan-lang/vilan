@@ -211,6 +211,64 @@ impl TextEncoder {
     }
 }
 
+/// `new DataView(buffer)` — `std::bytes`'s `DataView`, which `std::binary`
+/// reads and writes an IEEE-754 double through (F156).
+///
+/// Natively a `ByteBuffer` IS the [`Bytes`] it came from: every native
+/// `Bytes` is a whole buffer of its own (`slice` copies, as `Uint8Array`'s
+/// does), so `bytes.buffer()` is the same storage at offset 0, and a view of
+/// it writes into the bytes as the host's does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DataView(Bytes);
+
+impl DataView {
+    pub fn new(buffer: Bytes) -> DataView {
+        DataView(buffer)
+    }
+
+    /// `getFloat64(offset, littleEndian)`. Past the end is the host's
+    /// `RangeError: Offset is outside the bounds of the DataView`.
+    pub fn read_f64(&self, offset: usize, little_endian: bool) -> f64 {
+        let bytes = self.0.as_slice();
+        let Some(window) = offset.checked_add(8).and_then(|end| bytes.get(offset..end)) else {
+            crate::panic_with("RangeError: Offset is outside the bounds of the DataView");
+        };
+        let mut eight = [0u8; 8];
+        eight.copy_from_slice(window);
+        if little_endian {
+            f64::from_le_bytes(eight)
+        } else {
+            f64::from_be_bytes(eight)
+        }
+    }
+
+    /// `setFloat64(offset, value, littleEndian)`.
+    pub fn write_f64(&self, offset: usize, value: f64, little_endian: bool) {
+        let eight = if little_endian {
+            value.to_le_bytes()
+        } else {
+            value.to_be_bytes()
+        };
+        let mut bytes = self.0.0.borrow_mut();
+        let Some(window) = offset
+            .checked_add(8)
+            .and_then(|end| bytes.get_mut(offset..end))
+        else {
+            crate::panic_with("RangeError: Offset is outside the bounds of the DataView");
+        };
+        window.copy_from_slice(&eight);
+    }
+}
+
+impl Js for DataView {
+    fn js(&self) -> String {
+        crate::panic_with(
+            "printing a `DataView` is a host object's own inspection, which the native backend \
+             does not reproduce",
+        )
+    }
+}
+
 impl Js for TextDecoder {
     fn js(&self) -> String {
         crate::panic_with(

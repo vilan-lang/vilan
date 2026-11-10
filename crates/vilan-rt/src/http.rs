@@ -65,6 +65,7 @@ use std::task::{Context, Poll};
 use crate::bytes::Bytes;
 use crate::executor::{
     Boxed, Failure, IoSource, Parked, caught, raise_cancelled, raise_failure, register_io, spawn,
+    termination_requested,
 };
 use crate::json::JsonValue;
 use crate::{Js, Str, str_new};
@@ -1539,43 +1540,10 @@ fn refuse_protocol(connection: &Connection, status: u16, phrase: &str) {
 
 // ------------------------------------------------------------ termination ---
 
-/// How many termination requests the process has had (F45). A COUNT, not a
-/// flag, because the second one means something the first does not.
-///
-/// Process-wide and atomic because the request arrives from outside the
-/// program's thread: `vilan-rt-signal` routes SIGTERM/SIGINT/SIGHUP here from
-/// the thread its signal crate runs handlers on. Everything else in this
-/// module is the program thread's own, and reads this once per poll.
-static TERMINATION_REQUESTS: AtomicUsize = AtomicUsize::new(0);
-
-/// A request to stop the program's servers GRACEFULLY — what a termination
-/// signal means to a native server (F45; Order 43's R-i).
-///
-/// The first request is the graceful stop: at its next poll every server
-/// stops accepting, closes the connections that are only waiting, and lets a
-/// request already being answered finish (see [`Server`]'s `terminate`), so
-/// the event loop runs out of work, `main` returns, and what runs at process
-/// end runs — the leak census among it. The SECOND request ends the process
-/// at once, with exit code 1 and a sentence on stderr: a server whose open
-/// response never ends (a stream, a long poll) has no graceful end to wait
-/// for, and a second Ctrl-C is how a person says so.
-///
-/// Safe to call from any thread, which is the point: a signal handler's
-/// thread is not the program's.
-pub fn request_termination() {
-    if TERMINATION_REQUESTS.fetch_add(1, Ordering::SeqCst) > 0 {
-        eprintln!(
-            "the program was stopped by a second termination request before its open \
-             connections ended"
-        );
-        std::process::exit(1);
-    }
-}
-
-/// Whether a termination request has arrived.
-fn termination_requested() -> bool {
-    TERMINATION_REQUESTS.load(Ordering::SeqCst) > 0
-}
+// The termination request itself (F45) is the executor's since F157: what it
+// ends is the program's event loop, not only its servers. A server answers it
+// at its next poll ([`Server`]'s `terminate`) and holds the stop open until its
+// last connection has ended ([`IoSource::holds_the_stop`]).
 
 // ----------------------------------------------------------------- server ---
 
@@ -1753,8 +1721,8 @@ impl Server {
     /// request, and an upgraded socket, whose `"close"` subscribers run (an rpc
     /// connection releases what it holds, as a hang-up would make it) — and let
     /// a request already being answered finish. The loop drops the server once
-    /// its last connection has ended, and a program with nothing else pending
-    /// returns from `main`.
+    /// its last connection has ended, and once no server holds the stop open
+    /// the program ends (F157: [`crate::executor::request_termination`]).
     ///
     /// `node:http`'s `close()` keeps an upgraded socket open until its peer
     /// leaves; a signal-driven stop cannot wait on a peer, so this one does not.
@@ -2064,6 +2032,12 @@ impl IoSource for Server {
         // answering `false` is what lets the program EXIT: the loop drops the
         // source and goes back to exiting when the deadline list empties.
         self.0.listener.borrow().is_some() || !self.0.connections.borrow().is_empty()
+    }
+
+    fn holds_the_stop(&self) -> bool {
+        // F157: a server holds a termination's graceful stop open while it is
+        // live — until its terminate has run and its last answer has ended.
+        self.is_live()
     }
 }
 
