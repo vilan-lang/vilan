@@ -1,0 +1,20 @@
+// F156: `std::binary`'s doubles — written and read through a `DataView` over a
+// scratch `Bytes`'s buffer — encode to the same little-endian bytes and decode
+// back to the same values on both backends, the edge values included.
+import std::binary::{ decode_binary, encode_binary };
+
+fun main() {
+	let values = [0.0, 1.5, -2.25, 3.141592653589793, 0.1, 123456789.125, -0.000001];
+	let bytes = encode_binary(values);
+	print(bytes.to_hex());
+	let back: Result<List<f64>, str> = decode_binary(bytes);
+	match back {
+		Ok(let read) => {
+			for value in read {
+				print(i"{value}");
+			}
+			print(i"same={read == values}");
+		},
+		Err(let reason) => print(i"error: {reason}"),
+	}
+}

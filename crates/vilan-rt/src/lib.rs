@@ -2840,6 +2840,30 @@ pub fn str_code_at(text: &str, index: usize) -> u32 {
     0
 }
 
+/// `indexOf` — the UTF-16 code-unit position of the FIRST occurrence of
+/// `needle`, or `-1` (F156). `std::string`'s `index_of` promises the unit
+/// `substring` and `len` count, so the byte offset Rust's `find` answers is
+/// converted: the units of every character before it. An empty needle is at
+/// `0`, as it is in JavaScript. A match can only start on a character
+/// boundary in a valid string (no vilan string holds a lone surrogate — see
+/// [`str_len`]), so the conversion is exact.
+pub fn str_index_of(text: &str, needle: &str) -> i64 {
+    match text.find(needle) {
+        Some(offset) => str_len(&text[..offset]) as i64,
+        None => -1,
+    }
+}
+
+/// `lastIndexOf` — [`str_index_of`] from the other end. An empty needle is at
+/// the text's length, where JavaScript puts it (`rfind("")` is the byte
+/// length, which converts to exactly that).
+pub fn str_last_index_of(text: &str, needle: &str) -> i64 {
+    match text.rfind(needle) {
+        Some(offset) => str_len(&text[..offset]) as i64,
+        None => -1,
+    }
+}
+
 pub fn parse_i32(text: &str) -> Option<i32> {
     text.trim().parse::<i32>().ok()
 }
@@ -3204,6 +3228,24 @@ mod tests {
             guarded(move || with_finally(|| panic_with("boom"), || *flag.borrow_mut() = true));
         assert!(caught.is_err());
         assert!(*ran.borrow());
+    }
+
+    /// F156: `indexOf`/`lastIndexOf` count UTF-16 code units, as node does —
+    /// a two-byte `é` is one unit, an emoji two — and answer `-1` for absence,
+    /// `0` and the length for an empty needle.
+    #[test]
+    fn index_of_counts_utf16_units_the_way_index_of_does() {
+        let text = "héllo wörld 😀 wörld";
+        assert_eq!(str_index_of(text, "wörld"), 6);
+        assert_eq!(str_last_index_of(text, "wörld"), 15);
+        assert_eq!(str_index_of(text, "😀"), 12);
+        assert_eq!(str_index_of(text, "zz"), -1);
+        assert_eq!(str_last_index_of(text, "zz"), -1);
+        assert_eq!(str_index_of(text, ""), 0);
+        assert_eq!(str_last_index_of(text, ""), 20);
+        assert_eq!(str_last_index_of("abc", "c"), 2);
+        assert_eq!(str_index_of("", ""), 0);
+        assert_eq!(str_last_index_of("", "a"), -1);
     }
 
     #[test]

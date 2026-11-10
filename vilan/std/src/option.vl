@@ -397,15 +397,15 @@ impl str {
 		}
 	}
 
-	/// The host's `indexOf` / `lastIndexOf`, which report absence as `-1`. Internal
-	/// and opaque, exactly like `fs`'s `raw_read`: `-1` is a sentinel index —
-	/// arithmetic on it is silently wrong, and `substring` would refuse it one call
-	/// later — so nothing outside this module sees the raw form.
+	/// The host's `indexOf` / `lastIndexOf`, absence `-1` (an `i53`: no `usize`
+	/// holds it, F156). Internal, like `fs`'s `raw_read`: `-1` is a sentinel index
+	/// — arithmetic on it is silently wrong, and `substring` would refuse it — so
+	/// nothing outside this module sees the raw form.
 	[extern(method, "indexOf")]
-	external fun raw_index_of(self, needle: str): usize;
+	external fun raw_index_of(self, needle: str): i53;
 
 	[extern(method, "lastIndexOf")]
-	external fun raw_last_index_of(self, needle: str): usize;
+	external fun raw_last_index_of(self, needle: str): i53;
 
 	/// The index of the FIRST occurrence of `needle`, or `None` when the text does
 	/// not contain it — `contains` tests, this one locates. It is the missing half
@@ -424,7 +424,7 @@ impl str {
 		if at < 0 {
 			None
 		} else {
-			Some(at)
+			Some(at.as_usize())
 		}
 	}
 
@@ -437,7 +437,7 @@ impl str {
 		if at < 0 {
 			None
 		} else {
-			Some(at)
+			Some(at.as_usize())
 		}
 	}
 }

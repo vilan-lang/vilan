@@ -15509,6 +15509,106 @@ fn m181_percent_encoding_is_identical_on_both_backends() {
     );
 }
 
+/// Runs one `native/` probe on both backends and answers node's stdout after
+/// asserting the native leg printed the same bytes and both exited 0.
+fn identical_probe(file: &str, source: &str) -> String {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "node and native print differently");
+    outputs.swap_remove(0)
+}
+
+/// F156: `str::index_of`/`last_index_of` count UTF-16 code units on both
+/// backends — through `é`, `ö` and a surrogate-pair emoji, absence, an empty
+/// needle at either end, and the index fed back into `substring` — and
+/// `Instant::to_iso` is `toISOString()` byte for byte, from the epoch out to
+/// the expanded years at both ends of the `Date` range (`native/index_and_iso.vl`).
+#[test]
+fn f156_index_of_and_to_iso_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_index_and_iso.vl",
+        include_str!("native/index_and_iso.vl"),
+    );
+    assert_eq!(
+        printed,
+        concat!(
+            "[wörld] first=6 last=15\n",
+            "[😀] first=12 last=12\n",
+            "[h] first=0 last=0\n",
+            "[d] first=10 last=19\n",
+            "[zz] first=none last=none\n",
+            "[] first=0 last=20\n",
+            "😀 wörld\n",
+            "empty: 0 0 none\n",
+            "0 1970-01-01T00:00:00.000Z\n",
+            "1700000000000 2023-11-14T22:13:20.000Z\n",
+            "-1 1969-12-31T23:59:59.999Z\n",
+            "-1000000000000 1938-04-24T22:13:20.000Z\n",
+            "951782400000 2000-02-29T00:00:00.000Z\n",
+            "1709251199999 2024-02-29T23:59:59.999Z\n",
+            "-62167219200000 0000-01-01T00:00:00.000Z\n",
+            "-62167219200001 -000001-12-31T23:59:59.999Z\n",
+            "253402300799999 9999-12-31T23:59:59.999Z\n",
+            "253402300800000 +010000-01-01T00:00:00.000Z\n",
+            "8640000000000000 +275760-09-13T00:00:00.000Z\n",
+            "-8640000000000000 -271821-04-20T00:00:00.000Z\n",
+        )
+    );
+}
+
+/// F156: `std::fs`'s options-object calls — `create_dir_all` (twice),
+/// `scan_dir`, `read_dir_all`, `copy_dir`'s merge into an existing tree and
+/// into a fresh deep path, and `remove_dir_all` over a file, a missing path and
+/// a tree — leave the same tree and print the same lines on both backends
+/// (`native/fs_options.vl`). The failures and the symlink cases are
+/// `vilan_rt::fs`'s unit tests: a vilan program cannot catch the throw.
+#[test]
+fn f156_fs_options_calls_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_fs_options.vl",
+        include_str!("native/fs_options.vl"),
+    );
+    assert_eq!(
+        printed,
+        concat!(
+            "made: true\n",
+            "scan src:\n",
+            "  a.txt dir=false file=true link=false\n",
+            "  sub dir=true file=false link=false\n",
+            "all: a.txt sub sub/b.txt sub/deeper\n",
+            "copied a: A\n",
+            "copied b: B\n",
+            "extra: kept\n",
+            "fresh: one one/two one/two/a.txt one/two/sub one/two/sub/b.txt one/two/sub/deeper\n",
+            "scan src after:\n",
+            "  sub dir=true file=false link=false\n",
+            "gone: true\n",
+        )
+    );
+}
+
+/// F156: `std::binary`'s `f64`s go through a `DataView` over a scratch
+/// buffer, natively `vilan_rt::bytes::DataView` — the same little-endian bytes
+/// and the same values back on both backends (`native/binary_f64.vl`).
+#[test]
+fn f156_binary_doubles_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_binary_f64.vl",
+        include_str!("native/binary_f64.vl"),
+    );
+    assert!(
+        printed.starts_with("070000000000000000000000000000000000f83f"),
+        "{printed}"
+    );
+    assert!(printed.ends_with("same=true\n"), "{printed}");
+}
+
 /// A179: `std::rpc::dial_within` answers the same on both backends over
 /// hand-written dials (`native/dial_within.vl`) — a dial that wins with `Ok`
 /// and one that wins with its own `Err`, a deadline that beats a minute-long

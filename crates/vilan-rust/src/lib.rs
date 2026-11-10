@@ -3216,6 +3216,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             "NodeHash" => Ok("vilan_rt::crypto::NodeHash".to_string()),
             // `std::fs`'s `fs.Stats`, which `stat` copies three fields out of.
             "RawStat" => Ok("vilan_rt::fs::RawStat".to_string()),
+            // F156: `std::fs`'s options object and its `Dirent`, and the
+            // `Date` `std::time` renders an `Instant` through.
+            "FsOptions" => Ok("vilan_rt::fs::FsOptions".to_string()),
+            "RawEntry" => Ok("vilan_rt::fs::RawEntry".to_string()),
+            "HostDate" => Ok("vilan_rt::time::HostDate".to_string()),
             // F40: node's `Buffer`, under whatever name the program gave it —
             // recognized by the binding that answers it, not by the name.
             _ if self.node_buffer_struct(id) => {
@@ -11190,6 +11195,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.value_argument(argument_ids, 0, depth)?
                 )));
             }
+            // F156: `std::time`'s `host_date` — the `Date` `Instant::to_iso`
+            // renders through.
+            ExternBinding::New {
+                module: None,
+                symbol: "Date",
+            } if name == "host_date" => {
+                return Ok(Some(format!(
+                    "vilan_rt::time::HostDate::new({})",
+                    self.value_argument(argument_ids, 0, depth)?
+                )));
+            }
+            ExternBinding::New {
+                module: None,
+                symbol: "DataView",
+            } => {
+                return Ok(Some(format!(
+                    "vilan_rt::bytes::DataView::new({})",
+                    self.value_argument(argument_ids, 0, depth)?
+                )));
+            }
             ExternBinding::New {
                 module: None,
                 symbol: "TextDecoder",
@@ -11365,6 +11390,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.place_argument(argument_ids, 0, depth)?,
                 self.value_argument(argument_ids, 1, depth)?
             ),
+            // F156: the buffer behind a native `Bytes` is that `Bytes`.
+            ("Bytes", "buffer") => {
+                format!("({}).clone()", self.place_argument(argument_ids, 0, depth)?)
+            }
+            ("DataView", "read_f64") => format!(
+                "({}).read_f64({}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?
+            ),
+            ("DataView", "write_f64") => format!(
+                "({}).write_f64({}, {}, {})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?,
+                self.value_argument(argument_ids, 2, depth)?,
+                self.value_argument(argument_ids, 3, depth)?
+            ),
             ("Bytes", "slice") => format!(
                 "({}).slice({}, {})",
                 self.place_argument(argument_ids, 0, depth)?,
@@ -11391,6 +11433,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ),
             ("RawStat", "is_directory") => format!(
                 "({}).is_directory()",
+                self.place_argument(argument_ids, 0, depth)?
+            ),
+            // --- FsOptions / RawEntry (`std::fs`'s options object and
+            // `Dirent`, F156) ---
+            ("FsOptions", "set_recursive" | "set_force" | "set_with_file_types") => format!(
+                "({}).{name}({})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
+            ("RawEntry", "name" | "is_directory" | "is_file" | "is_symlink") => {
+                format!(
+                    "({}).{name}()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
+            // --- HostDate (`std::time`'s `Date`, F156) ---
+            ("HostDate", "to_iso_string") => format!(
+                "({}).to_iso_string()",
                 self.place_argument(argument_ids, 0, depth)?
             ),
             // --- NodeHash (node:crypto, `std::rpc::server`'s handshake) ---
@@ -12302,9 +12362,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// (`read_file_encoded`/`read_bytes`, `write_file`/`write_bytes`), exactly
     /// as `std::http`'s socket writes do.
     ///
-    /// The `FsOptions` forms are deliberately absent — `vilan_rt::fs` says why
-    /// — and so are `sha384`/`sha512`, which are the SHA-512 block function
-    /// this slice did not need. Both stay refused BY NAME.
+    /// The `FsOptions` forms joined with F156 (`vilan_rt::fs::FsOptions`);
+    /// `sha384`/`sha512` are absent, the SHA-512 block function this slice did
+    /// not need, and stay refused BY NAME.
     fn host_module_binding(
         &mut self,
         name: &str,
@@ -12398,6 +12458,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             (Some("node:fs/promises"), "readdir", "read_dir") => one(self, "fs::read_dir"),
             (Some("node:fs/promises"), "mkdir", "create_dir") => one(self, "fs::create_dir"),
             (Some("node:fs/promises"), "rmdir", _) => one(self, "fs::remove_dir"),
+            // F156: the four calls that take `std::fs`'s options object, and
+            // the object itself (`Object()` under `new_fs_options` alone: the
+            // symbol is any fresh `{}`).
+            (None, "Object", "new_fs_options") => {
+                Ok(Some("vilan_rt::fs::FsOptions::new()".to_string()))
+            }
+            (Some("node:fs/promises"), "mkdir", "mkdir_with") => two(self, "fs::mkdir_with"),
+            (Some("node:fs/promises"), "rm", "rm_with") => two(self, "fs::rm_with"),
+            (Some("node:fs/promises"), "readdir", "raw_scan_dir") => two(self, "fs::scan_dir"),
+            (Some("node:fs/promises"), "cp", "cp_with") => {
+                let from = self.value_argument(argument_ids, 0, depth)?;
+                let to = self.value_argument(argument_ids, 1, depth)?;
+                let options = self.value_argument(argument_ids, 2, depth)?;
+                Ok(Some(format!(
+                    "vilan_rt::fs::cp_with({from}, {to}, {options})"
+                )))
+            }
+            (None, "__fs_read_dir_all", "read_dir_all") => one(self, "fs::read_dir_all"),
             _ => Ok(None),
         }
     }
@@ -12610,6 +12688,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "vilan_rt::str_code_at(&{}, {})",
                 self.place_argument(argument_ids, 0, depth)?,
                 self.value_argument(argument_ids, 1, depth)?
+            ),
+            // F156: `str::index_of`/`last_index_of`'s raw halves — the host's
+            // `indexOf`/`lastIndexOf`, `-1` for absence, counted in UTF-16 code
+            // units as `substring` is (`vilan_rt::str_index_of` says how).
+            Some(ExternBinding::Method {
+                symbol: Some("indexOf"),
+            }) if name == "raw_index_of" => format!(
+                "vilan_rt::str_index_of(&{}, &{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.place_argument(argument_ids, 1, depth)?
+            ),
+            Some(ExternBinding::Method {
+                symbol: Some("lastIndexOf"),
+            }) if name == "raw_last_index_of" => format!(
+                "vilan_rt::str_last_index_of(&{}, &{})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.place_argument(argument_ids, 1, depth)?
             ),
             _ => return Ok(None),
         };
@@ -16993,6 +17088,10 @@ fn http_host_type(name: &str) -> Option<&'static str> {
         // (`Request::body` decodes the collected body).
         "TextDecoder" => "vilan_rt::bytes::TextDecoder",
         "TextEncoder" => "vilan_rt::bytes::TextEncoder",
+        // F156: `std::binary`'s f64 path — a `DataView` over `bytes.buffer()`,
+        // which natively is the same storage (`vilan_rt::bytes::DataView`).
+        "ByteBuffer" => "vilan_rt::bytes::Bytes",
+        "DataView" => "vilan_rt::bytes::DataView",
         _ => return None,
     })
 }
@@ -17097,8 +17196,12 @@ fn host_handle_name(rendered: &str) -> Option<&'static str> {
         ("vilan_rt::http::Response", "NodeResponse"),
         ("vilan_rt::http::Socket", "NodeSocket"),
         ("vilan_rt::bytes::Bytes", "Bytes"),
+        ("vilan_rt::bytes::DataView", "DataView"),
         ("vilan_rt::crypto::NodeHash", "NodeHash"),
         ("vilan_rt::fs::RawStat", "RawStat"),
+        ("vilan_rt::fs::FsOptions", "FsOptions"),
+        ("vilan_rt::fs::RawEntry", "RawEntry"),
+        ("vilan_rt::time::HostDate", "HostDate"),
         ("vilan_rt_crypto::NodeBuffer", "Buffer"),
     ];
     HANDLES
