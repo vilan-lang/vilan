@@ -1,0 +1,18 @@
+// B723: `a + b` over two `str`s that host-bound methods answer. Neither
+// call carried a type, so the `+` was not seen as a concatenation and was
+// emitted as `Rc<str> + Rc<str>` (E0369). An interpolation operand, a
+// literal and a chain of three ride along as controls.
+import std::io::print;
+
+fun capitalized(word: str): str {
+	word.is_empty() then ret word;
+	word.substring(0, 1).to_uppercase() + word.substring(1, word.len()).to_lowercase()
+}
+
+fun main() {
+	print(capitalized("hELLO"));
+	print(capitalized(""));
+	let text = "Mixed Case";
+	print(text.to_lowercase() + text.to_uppercase() + text.trim());
+	print(i"{text.len()}" + text.substring(0, 5));
+}

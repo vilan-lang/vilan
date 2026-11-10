@@ -23,6 +23,41 @@ written down.
 -->
 
 
+## Unreleased
+
+<!-- family: fix -->
+**B705: natively, a mutating call whose other arguments read its receiver builds - `next.insert(next.position(..).unwrap_or(next.len()), x)` was rustc's E0502.** The lowering hands the receiver as `&mut` to a free function, and Rust's two-phase borrow covers only a method's autoref, so the reads met the live borrow. A mutating intrinsic (`insert`, `remove`, a map's `insert`, ..) whose arguments read the receiver's root binding now evaluates them first, in order, as F30 already did for a receiver in a cell; and F35's hoist for a user call now also covers a `&mut place` the source wrote (`grow(&mut xs, xs.len())`), not only a loaned receiver. The tracker's other shape - a `let v = &mut xs` view held across a later read of `xs` - is not this one and stays open. Pins: `native_differential::b705_an_argument_reading_the_mutated_receiver_is_identical_on_both_backends`. Tracker B705.
+
+---
+
+<!-- family: fix -->
+**B726: natively, `List<T>::new()` read before its first push builds - `mut merged = List<(usize, usize)>::new(); merged.pop()` was a bare `Vec::new()` and rustc's E0282.** A `let` initialized with `List::new()` is now annotated with the binding's type where that type is closed, exactly as one initialized with `[]` always was (`let mut merged: Vec<(usize, usize)> = Vec::new();`); a `Shared::new(List::new())` and an ascription ride the same rule. Pins: `native_differential::b726_a_list_read_before_its_first_push_is_identical_on_both_backends` (a pop before any push, an annotated empty list; both annotated in the emission). Tracker B726.
+
+---
+
+<!-- family: fix -->
+**B725: natively, a function made async that calls itself - or two that call each other - builds; rustc refused it (E0733, an async fn's future may not contain itself).** An awaited call to a function that reaches the function being emitted through the call graph (a self-call, any edge of a mutual recursion) is now `Box::pin(..)`-ed before its `.await`; every other awaited call is emitted as before. Pins: `native_differential::b725_a_recursive_async_function_is_identical_on_both_backends` (self-recursion, a `ping`/`pong` pair; the boxed calls in the emission). Tracker B725.
+
+---
+
+<!-- family: fix -->
+**B723: natively, `a + b` over two `str`s that host-bound methods answer builds - `word.substring(0, 1).to_uppercase() + word.substring(1, word.len()).to_lowercase()` was emitted `Rc<str> + Rc<str>` (E0369).** The same root as B718: neither call had a type, so the `+` was not read as a concatenation. Fixed by B718's change (an extern callee's return types its call); this entry adds the pin. Pins: `native_differential::b723_a_concatenation_of_host_str_results_is_identical_on_both_backends` (two host results, a chain of three, an interpolation operand). Tracker B723.
+
+---
+
+<!-- family: fix -->
+**B722: natively, `*` on a binding a tuple pattern declares builds - `meta.filter(|(name, _)| *name == key)` was rustc's E0277 (`str` compared with `Rc<str>`) and, over an `i32`, E0614.** A destructure's `let` copies its subject, so its bindings hold values natively, but a binding with no initializer of its own kept its `(*name)`. A binding declared by a destructuring pattern - a closure's tuple parameter or a destructuring `let` - now reads its value under `*`, as a by-value parameter does (F128). Pins: `native_differential::b722_a_deref_of_a_destructured_binding_is_identical_on_both_backends`. Tracker B722.
+
+---
+
+<!-- family: fix -->
+**B719: two B709 follow-ups on the native backend - a let-else whose scrutinee is an awaited call builds, and `for f() is Some(let found) { .. found .. }` keeps its binder.** (1) An awaited call is a block natively, and rustc refuses a `}` right before a let-else's `else`; a `!`'s `match` and an `if` value end the same way. A let-else subject that ends in `}` is now parenthesized. (2) A capturing loop condition was emitted `while matches!(..)`, which binds nothing, so every read of the capture in the body was E0425; the head is now rendered before the body as a `while let` (a `&&` chain after the capture is a `while let` let-chain), the captures registered for the body as an `if let`'s are. Pins: `native_differential::b719_a_let_else_over_a_block_and_a_capturing_loop_are_identical_on_both_backends` (an awaited `stat`, an `if` scrutinee after a `!`, the `while let`, a `pop()` let-chain with a nested pattern; the emitted `while let` and the parenthesized subject). Tracker B719.
+
+---
+
+<!-- family: fix -->
+**B718: natively, `!` on the result of a host-bound method builds - `parts[1].parse_f64()!`, `items.get(0usize)!` and `text.parse_f64().ok_or(..)!` were refused as "a `!` assertion on an unresolved receiver" while a user method's `!` built.** The analyzer records no type on a call, and the Rust emitter read a callee's return only off a function WITH a body, so every call to an `external` callee (a host-bound `str`, `List` or `Option` member) had no type at all: `!` had no `Option`/`Result` to dispatch on, and (B723) a `+` of two of them was not seen as a concatenation. An extern callee's written return now types its call, the same channel a bodied callee's return already took. Pins: `native_differential::b718_a_bang_on_a_host_bound_result_is_identical_on_both_backends` (`Option` and `Result`, a call chained after the `!`, a generic `List::get` inside a generic function, a user method as the control). Tracker B718.
+
 ## v0.55.1 — 2026-11-09
 
 > Performance: this release was cut over a performance verdict that was not green (no performance verdict at d194fd7a (perf-d194fd7a259e7c17fcb8dfdffda258fdbce232e7.json) - run the seal's perf leg (scripts/perf_gate.py seal) at this commit, on the reference machine). extension-only patch: no compiler, std or runtime path moved; v0.55.0's verdict and its override note stand

@@ -14329,6 +14329,195 @@ fn f153_a_for_over_the_key_stream_builds_on_both_backends() {
     }
 }
 
+/// B718: `!` on the result of a host-bound (`external`) method — `parse_f64()!`,
+/// a generic `List::get(..)!`, a `Result`'s `ok_or(..)!` — builds natively; it was
+/// refused as "an unresolved receiver" because a call to an extern callee had
+/// no type in the emitter. A user method's `!` is the control.
+#[test]
+fn b718_a_bang_on_a_host_bound_result_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b718_bang_on_host_result.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b718_bang_on_host_result.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\nfalse\nfalse\n7\ntrue\n2\ntrue\n42\ntrue\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// B719: a let-else whose scrutinee ends in `}` natively (an awaited call, an
+/// `if` value) is parenthesized, and `for f() is Some(let found) { .. }` — and a
+/// `&&` chain after a capture — is a `while let` that keeps its binder.
+#[test]
+fn b719_a_let_else_over_a_block_and_a_capturing_loop_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b719_let_else_and_while_let.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b719_let_else_and_while_let.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\n40\ntrue\n2\ncb\n0\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b719_let_else_and_while_let")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("while let Some(found_"),
+        "the emission names `while let Some(found_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(" = ({ let awaited = "),
+        "the let-else's awaited scrutinee is parenthesized:\n{emitted}"
+    );
+}
+
+/// B722: `*` on a binding a tuple pattern declares (a closure's `|(name, _)|`,
+/// a destructuring `let`) reads the value natively: the destructure copies its
+/// subject, and `(*name)` was rustc's E0614 / E0277.
+#[test]
+fn b722_a_deref_of_a_destructured_binding_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b722_tuple_binder_deref.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b722_tuple_binder_deref.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "2\n1\n4\ntrue\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// B723: `a + b` over `str`s two host-bound methods answer is a concatenation
+/// natively; untyped, it was emitted `Rc<str> + Rc<str>` (E0369).
+#[test]
+fn b723_a_concatenation_of_host_str_results_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b723_str_add_of_host_results.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b723_str_add_of_host_results.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "Hello\n\nmixed caseMIXED CASEMixed Case\n10Mixed\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// B725: a function made async that calls itself, and two that call each other,
+/// build natively: the awaited calls around the cycle are boxed (rustc E0733
+/// otherwise — the future would contain itself).
+#[test]
+fn b725_a_recursive_async_function_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b725_async_recursion.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b725_async_recursion.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "4\n0\n6\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b725_async_recursion")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("Box::pin(depth_"),
+        "the emission names `Box::pin(depth_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("Box::pin(pong_"),
+        "the emission names `Box::pin(pong_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("Box::pin(ping_"),
+        "the emission names `Box::pin(ping_`:\n{emitted}"
+    );
+}
+
+/// B726: a `let` initialized with `List<T>::new()` is annotated natively, as one
+/// initialized with `[]` is, so a read before the first push types (rustc E0282
+/// on a bare `Vec::new()`).
+#[test]
+fn b726_a_list_read_before_its_first_push_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b726_list_new_before_push.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b726_list_new_before_push.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "2\n0\ntrue\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b726_list_new_before_push")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains(": Vec<(usize, usize)> = Vec::new()"),
+        "the `let` names its element:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(": Vec<vilan_rt::Str> = Vec::new()"),
+        "an annotated `let` names its element too:\n{emitted}"
+    );
+}
+
+/// B705: a mutating call whose other arguments read its receiver —
+/// `next.insert(next.position(..).unwrap_or(next.len()), x)`, a map keyed off
+/// its own length, a field's list, `grow(&mut xs, xs.len())` — evaluates the
+/// reads before the `&mut` is taken (rustc E0502 otherwise).
+#[test]
+fn b705_an_argument_reading_the_mutated_receiver_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b705_argument_reads_mutated_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b705_argument_reads_mutated_receiver.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "5\n2\n9\n1\n4\n4\n4\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

@@ -254,6 +254,20 @@ fn for_each_resource_subjects(program: &Program<'_>) -> HashSet<Id> {
     subjects
 }
 
+/// B722: every binding a destructuring pattern declares — a `let (a, b) =
+/// ..` and a closure's tuple parameter `|(name, _)| ..` alike. The emitted
+/// `let` takes its subject as a copy (`Expr::Destructure`'s arm), so each such
+/// binding holds a VALUE natively ([`Emitter::local_holds_a_value`]).
+fn destructured_bindings(program: &Program<'_>) -> HashSet<Id> {
+    let mut bindings = Vec::new();
+    for expr in program.entity_map.values() {
+        if let Expr::Destructure(_, pattern) = expr {
+            collect_pattern_bindings(pattern, &mut bindings);
+        }
+    }
+    bindings.into_iter().collect()
+}
+
 fn drop_implementing_nominals(program: &Program<'_>) -> HashMap<Id, DropImpl> {
     let drop_functions: HashSet<Id> = program
         .drop_method_checks
@@ -645,6 +659,15 @@ struct Emitter<'a, 'src> {
     /// drops it after the loop), so it is borrowed `&mut` and its `let` is
     /// emitted `mut`. See [`Emitter::for_each_borrows_its_subject`].
     for_each_resource_subjects: HashSet<Id>,
+    /// B722: the bindings a destructuring pattern declares — see
+    /// [`destructured_bindings`].
+    destructured_bindings: HashSet<Id>,
+    /// B725: the function whose body is being emitted (the innermost
+    /// instance), for [`Emitter::calls_back_into_itself`].
+    current_function: Option<Id>,
+    /// B725: per function, every function its body reaches through the call
+    /// graph — memoized, since each awaited call asks.
+    reachable_functions: HashMap<Id, HashSet<Id>>,
     /// F37: the FIELD reads (`record.live`) that are their field path's last
     /// use — [`Emitter::compute_liveness`]'s path-aware half.
     last_field_uses: HashSet<Id>,
@@ -822,6 +845,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             current_instance: None,
             last_uses: HashSet::new(),
             for_each_resource_subjects: for_each_resource_subjects(program),
+            destructured_bindings: destructured_bindings(program),
+            current_function: None,
+            reachable_functions: HashMap::default(),
             last_field_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
@@ -4594,6 +4620,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(function) = self.program.functions.get(&target) {
             return self.return_type_of(function);
         }
+        // B718: an EXTERN callee (a host-bound method such as `str::parse_f64`
+        // or `List::get`) has no body but always a written return - and the
+        // analyzer records no type on the call itself, so a `!` on its result,
+        // and a `+` of two of them, found nothing to dispatch on.
+        if let Some(function) = self.program.external_functions.get(&target) {
+            return Some(function.return_type_id);
+        }
         // F53: a call through a CLOSURE-typed binding answers the closure
         // type's return — `erase(r).get()` with `erase: |Root| dyn Src` is a
         // slot call whose receiver is that call, and it had no type to
@@ -4730,9 +4763,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 std::mem::replace(&mut self.current_self_traits, HashSet::from([trait_id])),
             )
         });
+        let saved_function = self.current_function.replace(id);
         let emitted = self
             .function_body(&function, span, is_main, &name)
             .map_err(|error| self.locate_refusal(error, function.id));
+        self.current_function = saved_function;
         if let Some((self_type, self_traits)) = saved_self {
             self.current_self_type = self_type;
             self.current_self_traits = self_traits;
@@ -5722,19 +5757,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::If(branch) => self.if_branch(&branch, depth)?,
             Expr::Match(subject, legs) => self.match_expr(subject, &legs, depth, span)?,
             Expr::For(condition, (statements, tail)) => {
+                // B719: the head is rendered BEFORE the body, because a
+                // condition that captures (`for next() is Some(let found)`)
+                // is a `while let` whose bindings the body reads - the
+                // `matches!` it had been bound nothing, and every read of
+                // `found` below named a binding rustc had never seen (E0425).
+                let (head, captured) = match condition {
+                    Some(condition) => match self.capturing_condition(condition, depth)? {
+                        Some((parts, captured)) => (format!("while {parts}"), captured),
+                        None => (
+                            format!("while {}", self.expression(condition, depth)?),
+                            Vec::new(),
+                        ),
+                    },
+                    None => ("loop".to_string(), Vec::new()),
+                };
                 let mut body = String::new();
                 self.loop_jumps.push(None);
                 let emitted = self.emit_block(&statements, tail, &mut body, depth + 1);
                 self.loop_jumps.pop();
+                self.release_captures(&captured);
                 emitted?;
                 let pad = Self::indent(depth);
-                match condition {
-                    Some(condition) => {
-                        let condition = self.expression(condition, depth)?;
-                        format!("while {condition} {{\n{body}{pad}}}")
-                    }
-                    None => format!("loop {{\n{body}{pad}}}"),
-                }
+                format!("{head} {{\n{body}{pad}}}")
             }
             Expr::ForEach(iterable, item, (statements, tail)) => {
                 // F118: a tuple is walked unrolled, and its jumps are labelled.
@@ -6381,7 +6426,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .get(&binding)
             .and_then(|variable| variable.initial)
         else {
-            return false;
+            // B722: a binding a destructure declares has no initializer of
+            // its own, and its `let` copies the subject — `|(name, _)| *name
+            // == key` read `(*name)`, rustc's E0614 on an `i32` and a `str`
+            // compared with an `Rc<str>`.
+            return self.destructured_bindings.contains(&binding);
         };
         // Only initializers that are values by their shape: a call may be a
         // `borrows` one reached through a method, a branch may choose a view
@@ -6869,6 +6918,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &target_text,
             &value_text,
         )))
+    }
+
+    /// B705: the binding a place spine is rooted in (`xs`, `self.items[0]`'s
+    /// `self`, `&mut xs`'s `xs`), when its root is a binding at all.
+    fn root_binding_of_place(&self, place: Id) -> Option<Id> {
+        let place = match self.program.entity_map.get(&place) {
+            Some(&Expr::Reference(operand, _)) => operand,
+            _ => place,
+        };
+        match self.program.entity_map.get(&self.place_root(place)) {
+            Some(&Expr::Local(binding) | &Expr::Parameter(binding)) => Some(binding),
+            _ => None,
+        }
     }
 
     /// The ROOT of a place spine — under every field, tuple slot, subscript
@@ -7436,7 +7498,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ""
         };
         // An annotation is WRITTEN ONLY where the initializer cannot type the
-        // binding — an empty collection literal, and a `Shared` cell built
+        // binding — an empty collection literal or `List::new()` (B726), and a `Shared` cell built
         // around one (F74: `let leases: Shared<List<KeyLease>> =
         // Shared::new([])` read `lease.key` off a `Vec<_>` rustc had not
         // settled yet, E0282) — and nothing else.
@@ -7563,6 +7625,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 else {
                     return false;
                 };
+                // B726: `List::new()` is `Vec::new()`, as open as `[]` — a
+                // binding read before its first push (`merged.pop()`) left
+                // rustc nothing to infer the element from (E0282).
+                if Some(*subject) == self.program.list_new_fn_id {
+                    return true;
+                }
                 matches!(
                     self.program.intrinsics.get(subject),
                     Some(Intrinsic::SharedNew)
@@ -8947,6 +9015,30 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some((format!("if {}", parts.join(" && ")), captured)))
     }
 
+    /// B719: a loop condition that CAPTURES — one capturing `is`-test, or a
+    /// `&&` chain with one among its conjuncts — as the let-chain a `while`
+    /// heads with (`let Some(found) = (next()).clone() && (found > 0)`), and
+    /// the captures it registered for the body; the caller releases them.
+    /// `None` for a condition that binds nothing.
+    fn capturing_condition(
+        &mut self,
+        condition: Id,
+        depth: usize,
+    ) -> Result<Option<(String, Vec<Id>)>, Error> {
+        if let Some((head, captured)) = self.capturing_let_chain(condition, depth)? {
+            let parts = head
+                .strip_prefix("if ")
+                .expect("a let-chain head starts with `if `")
+                .to_string();
+            return Ok(Some((parts, captured)));
+        }
+        if self.is_condition_captures(condition).is_none() {
+            return Ok(None);
+        }
+        let (parts, captured) = self.let_chain_parts(&[PathConjunct::Test(condition)], depth)?;
+        Ok(Some((parts.join(" && "), captured)))
+    }
+
     /// The parts of a let-chain head, one per conjunct: a capturing `is`-test
     /// is a `let`, its subject copied as `if let` copies one (F20), and every
     /// other conjunct is the boolean it is (negated where it must FAIL). The
@@ -8992,6 +9084,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// One capturing `is`-test as a let-chain's `let PATTERN = SUBJECT`, with
     /// the captures it binds.
     fn capturing_let(&mut self, test: Id, depth: usize) -> Result<(String, Vec<Id>), Error> {
+        let (pattern_text, subject_text, bindings) = self.capturing_let_parts(test, depth)?;
+        Ok((format!("let {pattern_text} = {subject_text}"), bindings))
+    }
+
+    /// [`Self::capturing_let`]'s pattern and subject, apart.
+    fn capturing_let_parts(
+        &mut self,
+        test: Id,
+        depth: usize,
+    ) -> Result<(String, String, Vec<Id>), Error> {
         let (subject, pattern, bindings) = self
             .is_condition_captures(test)
             .expect("a `PathConjunct::Test` is a capturing `is`-test");
@@ -8999,7 +9101,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let subject_text = self.copy_a_pattern_subject(subject, subject_text);
         let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(&pattern, subject_type, self.span_of(test))?;
-        Ok((format!("let {pattern_text} = {subject_text}"), bindings))
+        Ok((pattern_text, subject_text, bindings))
     }
 
     /// The conjuncts that hold, all of them, exactly when `condition`
@@ -9090,8 +9192,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let [PathConjunct::Test(test)] = conjuncts[..]
             && runs_nothing
         {
-            let (binding, _) = self.capturing_let(test, depth)?;
-            return Ok(format!("{binding} else {diverging_text};"));
+            let (pattern_text, subject_text, _) = self.capturing_let_parts(test, depth)?;
+            // B719: a `let … else` initializer may not END in `}` (rustc
+            // refuses it as ambiguous with the `else`), and an awaited call,
+            // a `!`'s `match`, a block or an `if` all do — so such a subject
+            // is parenthesized, which is what rustc's own help suggests.
+            let subject_text = if subject_text.ends_with('}') {
+                format!("({subject_text})")
+            } else {
+                subject_text
+            };
+            return Ok(format!(
+                "let {pattern_text} = {subject_text} else {diverging_text};"
+            ));
         }
         let (parts, captured) = self.let_chain_parts(&conjuncts, depth)?;
         let mut body = String::new();
@@ -12998,6 +13111,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .call_expression(call_expr_id, call_id, depth, span)
             .map_err(|error| self.anchor_refusal_at_call(error, call_expr_id))?;
         if self.call_awaits(call_expr_id, call_id) {
+            // B725: an awaited call back into the function being emitted —
+            // directly or around a cycle — would make its future contain
+            // itself (rustc E0733), so the call's future is boxed.
+            let rendered = if self.calls_back_into_itself(call_id) {
+                format!("Box::pin({rendered})")
+            } else {
+                rendered
+            };
             let mut awaited = Self::awaited(&rendered);
             for _ in 0..self.assimilated_task_layers(call_id) {
                 awaited = Self::awaited(&awaited);
@@ -13005,6 +13126,64 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(awaited);
         }
         Ok(rendered)
+    }
+
+    /// B725: whether `call_id` calls a function that reaches the function
+    /// being emitted — a self-call, or one edge of a mutual recursion. An
+    /// `async fn`'s future holds the futures it awaits, so an awaited call
+    /// around such a cycle is a future of infinite size until one edge is
+    /// boxed; boxing every edge of the cycle is the simple sufficient rule.
+    /// A closure's calls count as its enclosing body's (an inline-awaited
+    /// closure's future is part of it), which over-approximates harmlessly.
+    fn calls_back_into_itself(&mut self, call_id: Id) -> bool {
+        let Some(current) = self.current_function else {
+            return false;
+        };
+        let Some(Expr::Local(target)) = self
+            .program
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| self.program.entity_map.get(&call.subject_id))
+        else {
+            return false;
+        };
+        let target = *target;
+        if !self.program.functions.contains_key(&target) {
+            return false;
+        }
+        if target == current {
+            return true;
+        }
+        if !self.reachable_functions.contains_key(&target) {
+            let reached = self.functions_reached_from(target);
+            self.reachable_functions.insert(target, reached);
+        }
+        self.reachable_functions[&target].contains(&current)
+    }
+
+    /// Every function `start`'s body (its closures included) reaches through
+    /// direct calls, transitively.
+    fn functions_reached_from(&self, start: Id) -> HashSet<Id> {
+        let graph = self.program.call_graph();
+        let mut reached = HashSet::new();
+        let mut pending = vec![start];
+        let mut walked = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !walked.insert(node) {
+                continue;
+            }
+            for call in graph.calls_of(node) {
+                if let vilan_core::call_graph::CallTarget::Function(callee) = call.target
+                    && reached.insert(callee)
+                {
+                    pending.push(callee);
+                }
+            }
+            if let Some(children) = graph.closure_children_of(node) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        reached
     }
 
     /// F107 (B149's native half): a call to a function WRITTEN `async` whose
@@ -13581,9 +13760,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // met a live mutable borrow and rustc refused it (E0502). Taking the
         // place has no effect of its own, so evaluating the values ahead of it
         // is the order the program already had.
+        //
+        // B705: and a `&mut place` the source WROTE as the argument
+        // (`grow(&mut xs, xs.len())`), whose borrow is the same live one.
         let borrows_a_read_place = argument_ids.iter().enumerate().any(|(index, argument)| {
-            matches!(conventions.get(index), Some(Receiving::RefMut))
-                && self.place_spine(*argument).is_some_and(|(root, _)| {
+            let place = match self.program.entity_map.get(argument) {
+                Some(&Expr::Reference(place, true)) => Some(place),
+                _ if matches!(conventions.get(index), Some(Receiving::RefMut)) => Some(*argument),
+                _ => None,
+            };
+            place
+                .and_then(|place| self.place_spine(place))
+                .is_some_and(|(root, _)| {
                     argument_ids
                         .iter()
                         .enumerate()
@@ -16436,6 +16624,36 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 arguments.push(name);
             }
             let receiver = self.mutable_place(argument_ids[0], depth)?;
+            arguments.insert(0, receiver);
+            let rendered = self.intrinsic(intrinsic, arguments, span)?;
+            return Ok(format!("{{ {prelude}{rendered} }}"));
+        }
+        // B705: a mutating receiver over a plain local whose OTHER arguments
+        // read the same binding — `next.insert(next.position(..).unwrap_or(
+        // next.len()), x)`, `map.insert(k, map.len())`. The lowering is a free
+        // function taking `&mut receiver` first, and Rust's two-phase borrow
+        // covers only a method's autoref, so the reads met the live `&mut`
+        // (E0502) where the JS backend reads the list before it inserts. The
+        // arguments are hoisted ahead of the borrow, in order, as F30 hoists
+        // them for a cell.
+        if mutating
+            && let Some(receiver_root) = argument_ids
+                .first()
+                .and_then(|receiver| self.root_binding_of_place(*receiver))
+            && argument_ids
+                .iter()
+                .skip(1)
+                .any(|argument| self.reads_binding(*argument, receiver_root))
+        {
+            let mut prelude = String::new();
+            let mut arguments = Vec::new();
+            for (index, argument) in argument_ids.iter().enumerate().skip(1) {
+                let value = self.consumed_value_of_expecting(*argument, None, depth)?;
+                let name = format!("__borrowed{index}");
+                let _ = write!(prelude, "let {name} = {value}; ");
+                arguments.push(name);
+            }
+            let receiver = self.mutable_receiver(argument_ids[0], depth)?;
             arguments.insert(0, receiver);
             let rendered = self.intrinsic(intrinsic, arguments, span)?;
             return Ok(format!("{{ {prelude}{rendered} }}"));
