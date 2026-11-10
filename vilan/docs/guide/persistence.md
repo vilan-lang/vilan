@@ -53,13 +53,18 @@ The whole surface fits in a few lines:
   `Option<Row>`, and `.all(params)` fetches a `List<Row>`.
 - Rows read by column name: `text`, `integer` (i32), `big_integer`
   (i53; use it for epoch-millis timestamps, which outgrow i32),
-  `real` (f64), and `is_null`.
+  `real` (f64) and `bytes` (a BLOB). Each of them refuses a NULL with a
+  panic that names the column; a nullable column reads through its
+  `optional_` twin (`optional_text`, `optional_integer`, …), which answers
+  `None` for NULL.
 
 Two habits to keep:
 
 - Values always go through `?` placeholders. Never interpolate them into
-  the SQL string. A nullable column takes an `Option` (`None` binds NULL)
-  and a flag column takes a `bool` (0 or 1).
+  the SQL string. A parameter list is a `List<dyn SqlValue>`: numbers,
+  `str`, `bool` (0 or 1), `Bytes` (a BLOB) and an `Option` of any of them
+  (`None` binds NULL), so a nullable column takes the `Option` directly.
+  Anything else is a compile error at the element.
 - Don't name a column with an SQL keyword. `desc` is the one that bites
   in practice: spell it `description`.
 

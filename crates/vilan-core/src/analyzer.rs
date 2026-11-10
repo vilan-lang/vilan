@@ -38771,6 +38771,61 @@ impl<'src> Analyzer<'src> {
     /// generic or a `let` annotation's existential —
     /// so its elements must all be ONE type, and values of two types need the
     /// trait object there.
+    /// M175: a value landing at a `dyn Trait` position whose type does not
+    /// implement the trait — `.run([id, point])` at a `List<dyn SqlValue>` —
+    /// is told so by name, with the types that DO implement it, which for a
+    /// trait like `std::db::SqlValue` is the whole answer to "what can go
+    /// here" (a number, a `str`, a `bool`, `Bytes`, an `Option` of one). The
+    /// list is the program's impls of the trait in declaration order, a
+    /// blanket (`impl type S: ..`) left out; it is cut short past sixteen.
+    /// `None` when the position is not an object or the value is one.
+    fn unimplemented_object_steer(&self, expected: Option<&Type>, got: &Type) -> Option<String> {
+        const LISTED: usize = 16;
+        let Some(Type::Dyn(trait_id, _)) = expected else {
+            return None;
+        };
+        if matches!(
+            got,
+            Type::Dyn(..) | Type::Unknown | Type::Unresolved | Type::Generic(_)
+        ) || self.type_implements_trait(got, *trait_id)
+        {
+            return None;
+        }
+        let name = self.traits.get(trait_id)?.name;
+        let empty = HashMap::default();
+        let got = self.pretty_print_type(got, &empty);
+        let mut subjects: Vec<String> = Vec::new();
+        for implementation in &self.implementations {
+            if !implementation.trait_ids.contains(trait_id) {
+                continue;
+            }
+            let subject = implementation.subject.borrow_type(self);
+            if matches!(subject, Type::Generic(_)) {
+                continue;
+            }
+            let rendered = format!("`{}`", self.pretty_print_type(subject, &empty));
+            if !subjects.contains(&rendered) {
+                subjects.push(rendered);
+            }
+        }
+        let implementors = match subjects.len() {
+            0 => String::new(),
+            count if count > LISTED => format!(
+                "; the types that do are {} and {} more",
+                subjects[..LISTED].join(", "),
+                count - LISTED
+            ),
+            1 => format!("; the type that does is {}", subjects[0]),
+            _ => {
+                let last = subjects.pop().unwrap_or_default();
+                format!("; the types that do are {} and {last}", subjects.join(", "))
+            }
+        };
+        Some(format!(
+            " `{got}` does not implement `{name}`, so it cannot become a `dyn {name}`{implementors}."
+        ))
+    }
+
     fn bare_trait_element_steer(
         &self,
         literal: Id,
@@ -48987,6 +49042,18 @@ impl<'src> Analyzer<'src> {
                     | Expr::StructInitializer(..)
                     | Expr::Dereference(_)
                     | Expr::Ascribe(_)
+                    // M175: the scalar leaves erase too — a literal, an
+                    // operator's result — so `[id, 1.5, "label", count + 1]`
+                    // at a `List<dyn SqlValue>` builds a pair per element. An
+                    // operator does not forward an object expectation to its
+                    // operands (the `Unary` and `Binary` arms of
+                    // `infer_type_path`), so the operator is the one wrap.
+                    | Expr::Number(..)
+                    | Expr::String(_)
+                    | Expr::MultilineString(_)
+                    | Expr::Bool(_)
+                    | Expr::Unary(..)
+                    | Expr::Binary(..)
             )
         ) {
             return;
@@ -49680,7 +49747,14 @@ impl<'src> Analyzer<'src> {
                 }
                 Type::Unresolved
             }
+            // M175: an object position is not the operand's expectation — the
+            // operator's RESULT is what erases (`note_dyn_coercion`), so the
+            // operand is typed as if no context had been given.
             Expr::Unary(_, operand_id) => {
+                let constraint = match constraint.as_ref() {
+                    Type::Dyn(..) => std::borrow::Cow::Owned(Type::Unknown),
+                    _ => constraint,
+                };
                 self.infer_type_inner(*operand_id, &constraint, substitution_context, exprs_seen)
             }
             // A view (`&x` / `&mut x`) and a deref (`*v`) both carry the operand's
@@ -50098,6 +50172,15 @@ impl<'src> Analyzer<'src> {
                                 // the object.
                                 let steer = self
                                     .bare_trait_element_steer(expr_id, expected_element.as_ref())
+                                    .or_else(|| {
+                                        // The established element type is the
+                                        // object when the list is one, whether
+                                        // the position or a first element said so.
+                                        self.unimplemented_object_steer(
+                                            Some(&element_type),
+                                            &item_type,
+                                        )
+                                    })
                                     .unwrap_or_else(|| {
                                         // E285: a fragment written straight
                                         // inside a fragment (`<><i>…</i><>…</></>`)
@@ -51095,6 +51178,11 @@ impl<'src> Analyzer<'src> {
             ) => self.bool_type(),
             Expr::Binary(op, lhs_id, rhs_id) => {
                 let (op, lhs_id, rhs_id) = (*op, *lhs_id, *rhs_id);
+                // M175: as `Unary` above — the result erases, not the operands.
+                let constraint = match constraint.as_ref() {
+                    Type::Dyn(..) => std::borrow::Cow::Owned(Type::Unknown),
+                    _ => constraint,
+                };
                 // B370: this is the ONE place a context's type flows into an
                 // arithmetic expression, so it is where the expression's
                 // settled type is recorded for the emission verdicts
@@ -57213,7 +57301,14 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got {got} instead. There are no implicit numeric \
                  conversions; convert with `.as_{target}()`"
             ),
-            None => format!("Expected {expected}, but got {got} instead."),
+            // M175: a value at an object position whose type does not
+            // implement the trait (`params.push(point)` on a
+            // `List<dyn SqlValue>`) names the trait and its implementors.
+            None => format!(
+                "Expected {expected}, but got {got} instead.{}",
+                self.unimplemented_object_steer(Some(expected_type), got_type)
+                    .unwrap_or_default()
+            ),
         }
     }
 

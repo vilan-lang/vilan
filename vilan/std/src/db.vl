@@ -9,6 +9,7 @@
 
 [platform("@process")] mod self;
 
+import pkg::bytes::Bytes;
 import pkg::drop::Drop;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
@@ -59,15 +60,124 @@ export impl Database with Drop {
 	}
 }
 
+/// A value SQLite stores: what a bind list holds (M175, `sql-value.md`). The
+/// numbers, `str`, `bool`, `Bytes` (a BLOB) and an `Option` of any of them (its
+/// value, or NULL) implement it; a struct, a list, a tuple or another enum does
+/// not, so `.run([id, point])` is refused by the checker at `point`. The trait is
+/// open: a program's own newtype may bind as the value it wraps
+/// (`impl UserId with SqlValue { fun sql_value(self): any { self.uuid.sql_value() } }`).
+export trait SqlValue {
+	/// The value as the host's binder takes it.
+	fun sql_value(self): any;
+}
+
+export impl i8 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u8 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl i16 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u16 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl i32 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u32 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl i53 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u53 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl usize with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl f32 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl f64 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl str with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+/// A `bool` binds as the integer 0 or 1 (SQLite has no boolean storage class).
+export impl bool with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+/// A `Bytes` binds as a BLOB, and `Row::bytes` reads one back.
+export impl Bytes with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+/// An `Option` binds as its value, or NULL — at any depth, so a nullable column
+/// takes the `Option` directly.
+export impl Option<type T: SqlValue> with SqlValue {
+	fun sql_value(self): any {
+		match self {
+			Some(let value) => value.sql_value(),
+			None => sql_null(),
+		}
+	}
+}
+
+/// SQL's NULL as the host binder takes it (`null` / `vilan_rt::Any::Null`).
+[extern("__db_null")]
+external fun sql_null(): any;
+
 /// Parameter spreads and column reads need host glue (`stmt.run(...params)`,
-/// `row[name]`) — the `__db_*` runtime helpers. The three column readers share
-/// one helper; the vilan signature supplies the type (trust the schema, and
-/// guard NULLABLE columns with `is_null`).
-///
-/// A bind list holds what SQLite stores (M165): an `Option` is its value or NULL
-/// (converted where it lands in the `List<any>`, as `vilan_rt::Any` holds one
-/// natively), a `bool` binds as 0 or 1, and anything else is refused at the bind,
-/// naming its index in the list.
+/// `row[name]`) — the `__db_*` runtime helpers. The host side takes the bind list
+/// as a `List<any>` of host values, which `Statement`'s three members build from
+/// the typed `List<dyn SqlValue>` (each element's `sql_value()`); the binder
+/// converts a `bool` to 0 or 1. The column readers share one helper and the vilan
+/// signature supplies the type; `Row`'s members refuse a NULL before reading.
 [extern("__db_run")]
 external fun statement_run(statement: Statement, parameters: List<any>): i32;
 
@@ -89,45 +199,138 @@ external fun column_big_integer(row: Row, name: str): i53;
 [extern("__db_column")]
 external fun column_real(row: Row, name: str): f64;
 
+/// A BLOB column's bytes. Its own helper, because the host value of a column SQLite
+/// stores as TEXT or a number is not a `Uint8Array`: such a column reads as the
+/// UTF-8 of its text, SQLite's own `CAST(value AS BLOB)`.
+[extern("__db_bytes")]
+external fun column_bytes(row: Row, name: str): Bytes;
+
 [extern("__db_is_null")]
 external fun column_is_null(row: Row, name: str): bool;
+
+/// The bind list as the host takes it: each element's own `sql_value()`.
+fun host_values(parameters: List<dyn SqlValue>): List<any> {
+	mut values: List<any> = [];
+	for each in parameters {
+		values.push(each.sql_value());
+	}
+	values
+}
 
 export impl Statement {
 	/// Executes with `parameters` bound positionally; returns the inserted rowid (0
 	/// when the statement inserts nothing). Rowids exceed i32 only past 2^31 rows —
 	/// revisit alongside real i53 needs.
-	fun run(self, parameters: List<any>): i32 {
-		statement_run(self, parameters)
+	fun run(self, parameters: List<dyn SqlValue>): i32 {
+		statement_run(self, host_values(parameters))
 	}
 
-	fun all(self, parameters: List<any>): List<Row> {
-		statement_all(self, parameters)
+	fun all(self, parameters: List<dyn SqlValue>): List<Row> {
+		statement_all(self, host_values(parameters))
 	}
 
 	/// The first matching row, or `None` when the query matches nothing.
-	fun first(self, parameters: List<any>): Option<Row> {
-		statement_first(self, parameters)
+	fun first(self, parameters: List<dyn SqlValue>): Option<Row> {
+		statement_first(self, host_values(parameters))
+	}
+}
+
+/// The typed readers' refusal (F149, ruling S5): a NULL behind an `i32` or a `str`
+/// is not a value of that type, so it stops the program naming the column rather
+/// than reading as `0`, `""` or the host's `null`.
+[track_caller]
+fun refuse_null(row: Row, name: str, reader: str) {
+	if column_is_null(row, name) {
+		panic(i"std::db: column '{name}' is NULL (or not in the row) and `Row::{reader}` reads a value; read a nullable column with `Row::optional_{reader}`");
 	}
 }
 
 export impl Row {
+	/// A TEXT column. A NULL (or a column the row does not have) panics, naming the
+	/// column; `optional_text` is the nullable read.
+	[track_caller]
 	fun text(self, name: str): str {
+		refuse_null(self, name, "text");
 		column_text(self, name)
 	}
 
+	/// An INTEGER column at i32 width. A NULL panics, naming the column;
+	/// `optional_integer` is the nullable read.
+	[track_caller]
 	fun integer(self, name: str): i32 {
+		refuse_null(self, name, "integer");
 		column_integer(self, name)
 	}
 
 	/// An INTEGER column at i53 width — timestamps (epoch millis), large ids. Exact
 	/// for values to 2^53 (the i53 representation); a column beyond that arrives
-	/// from `node:sqlite` as a BigInt and is out of v1's reach.
+	/// from `node:sqlite` as a BigInt and is out of v1's reach. A NULL panics,
+	/// naming the column; `optional_big_integer` is the nullable read.
+	[track_caller]
 	fun big_integer(self, name: str): i53 {
+		refuse_null(self, name, "big_integer");
 		column_big_integer(self, name)
 	}
 
+	/// A REAL column. A NULL panics, naming the column; `optional_real` is the
+	/// nullable read.
+	[track_caller]
 	fun real(self, name: str): f64 {
+		refuse_null(self, name, "real");
 		column_real(self, name)
+	}
+
+	/// A BLOB column, as the bytes `Bytes` bound. A NULL panics, naming the column;
+	/// `optional_bytes` is the nullable read.
+	[track_caller]
+	fun bytes(self, name: str): Bytes {
+		refuse_null(self, name, "bytes");
+		column_bytes(self, name)
+	}
+
+	/// A nullable TEXT column: `None` for NULL (or a column the row does not have).
+	fun optional_text(self, name: str): Option<str> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_text(self, name))
+		}
+	}
+
+	/// A nullable INTEGER column at i32 width.
+	fun optional_integer(self, name: str): Option<i32> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_integer(self, name))
+		}
+	}
+
+	/// A nullable INTEGER column at i53 width.
+	fun optional_big_integer(self, name: str): Option<i53> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_big_integer(self, name))
+		}
+	}
+
+	/// A nullable REAL column.
+	fun optional_real(self, name: str): Option<f64> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_real(self, name))
+		}
+	}
+
+	/// A nullable BLOB column.
+	fun optional_bytes(self, name: str): Option<Bytes> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_bytes(self, name))
+		}
 	}
 
 	fun is_null(self, name: str): bool {

@@ -4,8 +4,10 @@
 // call, a `List<Option<i32>>` (each element its payload or NULL), a nested
 // `List<List<str>>` at `List<List<any>>`, an `Option<str>` at `Option<any>`, a
 // mixed literal, and std's own `Database::migrate`, whose bind list is a
-// literal handed straight to a host binding.
-import std::db::{ Database, Migration };
+// literal handed straight to a host binding. (Since M175 a `std::db` bind list
+// is a `List<dyn SqlValue>`, so the `List<str>` binds through `map`, and the
+// `List<any>` slots below are the program's own.)
+import std::db::{ Database, Migration, SqlValue };
 
 fun count(values: List<any>): usize {
 	values.len()
@@ -42,7 +44,8 @@ fun main() {
 	db.prepare("INSERT INTO t VALUES (?, ?, ?)").run(["x", "y", 1]);
 	mut parameters: List<str> = ["x"];
 	parameters.push("y");
-	let found = db.prepare("SELECT n FROM t WHERE a = ? AND b = ?").first(parameters);
+	let bound: List<dyn SqlValue> = parameters.map(|element| element);
+	let found = db.prepare("SELECT n FROM t WHERE a = ? AND b = ?").first(bound);
 	print(found.map_or(|row| row.integer("n"), 0));
 	print(parameters.len());
 	print(count(parameters));

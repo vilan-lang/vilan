@@ -19,16 +19,26 @@ impl Database {
 	fun prepare(self, sql: str): Statement
 	fun migrate(self, migrations: List<Migration>): List<str>  // → the names applied
 }
+trait SqlValue { fun sql_value(self): any }  // what a parameter list holds
+// impls: i8 u8 i16 u16 i32 u32 i53 u53 usize f32 f64, str, bool, Bytes,
+//        Option<T: SqlValue>
+
 impl Statement {
-	fun run(self, parameters: List<any>): i32          // → last insert id
-	fun all(self, parameters: List<any>): List<Row>
-	fun first(self, parameters: List<any>): Option<Row>
+	fun run(self, parameters: List<dyn SqlValue>): i32          // → last insert id
+	fun all(self, parameters: List<dyn SqlValue>): List<Row>
+	fun first(self, parameters: List<dyn SqlValue>): Option<Row>
 }
 impl Row {
-	fun text(self, name: str): str
+	fun text(self, name: str): str          // each typed reader panics on NULL
 	fun integer(self, name: str): i32
 	fun big_integer(self, name: str): i53   // i53-wide INTEGER (epoch millis)
 	fun real(self, name: str): f64
+	fun bytes(self, name: str): Bytes       // a BLOB
+	fun optional_text(self, name: str): Option<str>   // None for NULL
+	fun optional_integer(self, name: str): Option<i32>
+	fun optional_big_integer(self, name: str): Option<i53>
+	fun optional_real(self, name: str): Option<f64>
+	fun optional_bytes(self, name: str): Option<Bytes>
 	fun is_null(self, name: str): bool
 }
 ```
@@ -36,12 +46,31 @@ impl Row {
 Parameters are `?` placeholders. Synchronous by design (fits the rpc
 dispatch path). `desc` and other SQL keywords fail as column names.
 
-A bind list holds numbers, `str`s, `bool`s and `Option`s of them. A `bool`
-binds as the integer 0 or 1, and an `Option` as its value or NULL, so a
-nullable column takes the `Option` directly: `.run([title, status_id])`
-with `status_id: Option<u53>`. Anything else (a struct, a list, a tuple,
-another enum) is refused when the statement runs, naming its index in the
-list: `std::db: cannot bind the parameter at index 2 of 3: …`.
+A parameter list is a `List<dyn SqlValue>`: a number, a `str`, a `bool`
+(bound as the integer 0 or 1), `Bytes` (a BLOB) or an `Option` of one (its
+value, or NULL), so a nullable column takes the `Option` directly:
+`.run([title, status_id])` with `status_id: Option<u53>`. A literal's
+elements become `SqlValue`s where they are written, so `[id, 1.5, "x"]`
+needs no annotation. Anything else (a struct, a list, a tuple, another
+enum) is a compile error at the element, naming its type and the types that
+implement `SqlValue`. A list built with a concrete element type does not
+become one as a whole: build it as a `List<dyn SqlValue>` (`push` each
+value), or rebuild it with `values.map(|value| value)` under that
+annotation. `SqlValue` is open, so a program's own wrapper type can bind
+as the value it holds:
+
+```vilan,fragment
+struct UserId { uuid: str }
+impl UserId with SqlValue {
+	fun sql_value(self): any { self.uuid.sql_value() }
+}
+```
+
+The typed readers read a value: a NULL column (or a name the row does not
+have) stops the program with a panic that names the column, the reader and
+its `optional_` twin (`std::db: column 'edited_at' is NULL (or not in the
+row) and …`), reported at the reader's call. A nullable column
+reads through the `optional_` twin, which answers `None` for NULL.
 
 `Database` is a **`resource`**: it has a single owner and *moves* rather than
 copies, and it closes its `node:sqlite` handle at its owner's last use. A

@@ -1327,6 +1327,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_run",
         "__db_all",
         "__db_get",
+        "__db_null",
+        "__db_bytes",
         "__db_column",
         "__db_is_null",
         "__db_close",
@@ -2125,12 +2127,13 @@ fn helper_source(name: &str) -> &'static str {
         }
         // M165: the bind list as SQLite takes it, the native binder's rule
         // (`vilan-rt-sqlite`'s `bind`): a `bool` is the integer 0 or 1 (node
-        // refuses a JS boolean), and an `Option` already arrived as its payload
-        // or `null` (`__any_option`, at the `any` position it landed at). A
-        // value SQLite cannot hold is refused HERE, naming its index in the
-        // list, rather than by node's own sentence — an array was read as named
-        // parameters ("Unknown named parameter '0'"). The JS value is all that
-        // reaches this far, so the sentence names its shape, not its vilan type.
+        // refuses a JS boolean), an `Option` already arrived as its payload or
+        // `null`, and a `Bytes` is the BLOB it already is. Since M175 the public
+        // bind list is `List<dyn SqlValue>`, which the checker types, and its
+        // elements arrive here through their own `sql_value()`; so typed code
+        // cannot reach the refusal below. It stays as the backstop for std's
+        // internal `List<any>` caller (the migrator's guarded run), naming the
+        // index rather than node's own sentence ("Unknown named parameter '0'").
         "__db_bind" => {
             "function __db_bind(parameters) {\n\
              \treturn parameters.map((value, index) => {\n\
@@ -2146,7 +2149,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t\treturn value;\n\
              \t\t}\n\
              \t\tconst shape = Array.isArray(value) ? \"a struct, tuple, list or enum value\" : typeof value === \"function\" ? \"a closure\" : value === undefined ? \"an absent value\" : \"a host object\";\n\
-             \t\tthrow new Error(\"std::db: cannot bind the parameter at index \" + index + \" of \" + parameters.length + \": \" + shape + \" is not a SQLite value (bind a number, a str, a bool, or an Option of one)\");\n\
+             \t\tthrow new Error(\"std::db: cannot bind the parameter at index \" + index + \" of \" + parameters.length + \": \" + shape + \" is not a SQLite value (bind a number, a str, a bool, Bytes, or an Option of one)\");\n\
              \t});\n\
              }"
         }
@@ -2162,6 +2165,17 @@ fn helper_source(name: &str) -> &'static str {
              \t\tvalue = value[1];\n\
              \t}\n\
              \treturn value;\n\
+             }"
+        }
+        // M175: SQL's NULL, as `Option`'s `SqlValue` impl answers it for `None`.
+        "__db_null" => "function __db_null() {\n\treturn null;\n}",
+        // M195: a BLOB column is the `Uint8Array` node answers; any other
+        // column reads as the UTF-8 of its text, SQLite's `CAST(value AS BLOB)`
+        // (`vilan-rt-sqlite`'s `Row::bytes` answers the same).
+        "__db_bytes" => {
+            "function __db_bytes(row, name) {\n\
+             \tconst value = row[name];\n\
+             \treturn value instanceof Uint8Array ? value : new TextEncoder().encode(String(value));\n\
              }"
         }
         "__db_column" => "function __db_column(row, name) {\n\treturn row[name];\n}",
