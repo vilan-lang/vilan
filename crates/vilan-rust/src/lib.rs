@@ -11637,6 +11637,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     self.place_argument(argument_ids, 0, depth)?
                 )
             }
+            // F163: the connection a request arrived on, which
+            // `Request::peer_address` reads `remote_address_raw` off.
+            ("NodeRequest", "socket") => {
+                format!(
+                    "({}).socket()",
+                    self.place_argument(argument_ids, 0, depth)?
+                )
+            }
             ("NodeSocket", "remote_address_raw") => format!(
                 "({}).remote_address_raw()",
                 self.place_argument(argument_ids, 0, depth)?

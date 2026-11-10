@@ -16463,6 +16463,56 @@ fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
     }
 }
 
+/// F163: `Request::peer_address` answers the connection's remote end as node's
+/// `request.socket.remoteAddress` spells it, on both backends, for each bind
+/// the native server shares with node: `127.0.0.1` (an IPv4 listener sees
+/// `127.0.0.1`), `::1` (an IPv6 one sees `::1`), and `::`, the dual-stack
+/// listener, where an IPv4 client reads back mapped as `::ffff:127.0.0.1`.
+///
+/// A server with NO `host` is not compared: node listens on `::` there (when
+/// the machine has IPv6) and the native server on `0.0.0.0`, so the same
+/// client reads `::ffff:127.0.0.1` on node and `127.0.0.1` natively — the
+/// difference `docs/guide/native.md` records.
+#[cfg(target_os = "linux")]
+#[test]
+fn f163_a_requests_peer_address_is_spelled_alike_on_both_backends() {
+    let staged = stage();
+    let source = include_str!("native/http_peer_address.vl");
+    for (host, dial, expected) in [
+        ("127.0.0.1", "127.0.0.1", "peer=127.0.0.1"),
+        ("::1", "::1", "peer=::1"),
+        ("::", "127.0.0.1", "peer=::ffff:127.0.0.1"),
+    ] {
+        let program = "native_probe_http_peer_address.vl";
+        let rewritten = source.replace(".host(\"127.0.0.1\")", &format!(".host(\"{host}\")"));
+        assert!(rewritten.contains(host), "the probe's host line moved");
+        std::fs::write(staged.join(program), rewritten).expect("write the probe program");
+        let (mut native, mut node) = both_servers(&staged, program);
+        for (leg, command) in [("native", &mut native), ("node", &mut node)] {
+            let server = ServerUnderTest::spawn(command);
+            let port = server.port();
+            let mut stream = std::net::TcpStream::connect((dial, port))
+                .unwrap_or_else(|error| panic!("{leg} on {host}: connect: {error}"));
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                .expect("send the request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("read the response");
+            let body = response
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap_or_default();
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{leg} on {host}: {response:?}"
+            );
+            assert_eq!(body, expected, "{leg} on {host}: the peer address");
+        }
+    }
+}
+
 /// Reads ONE response off a connection that may stay open (F152): the head,
 /// then the body by the head's own framing — a `Content-Length`, chunks to the
 /// zero-size one, or (with neither, on an answer that closes) the rest of the

@@ -1385,6 +1385,15 @@ impl Request {
         }
     }
 
+    /// `request.socket` — the connection this request arrived on, as the
+    /// [`Socket`] a protocol upgrade hands over (F163). `std::http` reads only
+    /// its `remote_address_raw` through it (`Request::peer_address`); a write
+    /// through it would land in the HTTP exchange's own byte stream, which is
+    /// why std keeps the binding private.
+    pub fn socket(&self) -> Socket {
+        Socket(Rc::clone(&self.0.connection))
+    }
+
     /// `request.headers` — the whole field set as the opaque host object
     /// `std::http` declares it at, which `Request::header` reads named entries
     /// out of with `std::json`'s accessors (dynamic property access has no
@@ -4172,5 +4181,63 @@ mod tests {
         assert!(answer.contains("Connection: keep-alive"), "{answer}");
         assert!(ended_quickly, "the idle connection is closed by the stop");
         assert!(closed.get(), "the close callback fires");
+    }
+
+    /// F163: `request.socket.remoteAddress` natively is the accepted
+    /// connection's peer, formatted as node formats it for the same listener —
+    /// `127.0.0.1` on an IPv4 bind, `::1` on an IPv6 one, and an IPv4 client of
+    /// a dual-stack `::` bind as the mapped `::ffff:127.0.0.1` (Rust's
+    /// `Ipv6Addr` display and node's agree on that spelling). Once the
+    /// connection is gone it reads back `undefined`, as node's does.
+    #[test]
+    fn a_requests_socket_reports_the_peer_as_node_formats_it() {
+        for (host, dial, expected) in [
+            ("127.0.0.1", "127.0.0.1", "127.0.0.1"),
+            ("::1", "::1", "::1"),
+            ("::", "127.0.0.1", "::ffff:127.0.0.1"),
+        ] {
+            let seen = Rc::new(RefCell::new(Vec::<Request>::new()));
+            let kept = Rc::clone(&seen);
+            let (answered, peer, after) = block_on(async move {
+                let handler: Handler = Rc::new(move |request: Request, response: Response| {
+                    let kept = Rc::clone(&kept);
+                    crate::executor::pin_future(async move {
+                        let peer = match request.socket().remote_address_raw() {
+                            JsonValue::Text(text) => text.to_string(),
+                            other => format!("{other:?}"),
+                        };
+                        kept.borrow_mut().push(request);
+                        response.end(&peer);
+                    })
+                });
+                let server = create_server(handler);
+                server.listen_on(0, host, Rc::new(|| {}));
+                let port = server.port() as u16;
+                let client = std::thread::spawn(move || {
+                    let mut stream = TcpStream::connect((dial, port)).expect("connect");
+                    stream
+                        .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                        .expect("send");
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).expect("read");
+                    response
+                });
+                until(|| client.is_finished()).await;
+                let probe = server.clone();
+                until(move || probe.0.connections.borrow().is_empty()).await;
+                server.close(Rc::new(|| {}));
+                let request = seen.borrow()[0].clone();
+                let after = request.socket().remote_address_raw();
+                let answered = client.join().expect("the client thread");
+                let (_, _, body) = split(&answered);
+                (answered, body, after)
+            });
+            assert!(answered.starts_with("HTTP/1.1 200"), "{host}: {answered}");
+            assert_eq!(peer, expected, "{host}: the peer as node spells it");
+            assert!(
+                matches!(after, JsonValue::Undefined),
+                "{host}: a closed connection's peer is undefined: {after:?}"
+            );
+        }
     }
 }

@@ -93,6 +93,14 @@ export impl NodeRequest {
 	external fun headers(self): JsonValue;
 }
 
+impl NodeRequest {
+	/// The connection the request arrived on (`request.socket`) — kept inside
+	/// `std::http`: the HTTP exchange owns that socket, and `Request::peer_address`
+	/// is the one fact read off it.
+	[extern(get, "socket")]
+	external fun socket(self): NodeSocket;
+}
+
 /// A raw TCP socket (`net.Socket`), handed over on a protocol upgrade. Frames are
 /// written as bytes; the handshake response is plain text.
 export external struct NodeSocket;
@@ -352,6 +360,25 @@ export impl Request {
 	fun max_body_bytes(own self, limit: usize): Request {
 		self.limit = limit;
 		self
+	}
+
+	/// The address of the connection's remote end — the client, or the proxy in
+	/// front of it — as node reports it (`request.socket.remoteAddress`), e.g.
+	/// `Some("127.0.0.1")` or `Some("::1")`. `None` when the socket is already
+	/// destroyed (the client hung up), where node answers `undefined`.
+	///
+	/// The text is the listener's view of the peer: a server bound to an IPv6
+	/// address that also takes IPv4 (node's default with no `host`) sees an IPv4
+	/// client as `::ffff:127.0.0.1`, and one bound to `127.0.0.1` sees `127.0.0.1`.
+	/// Behind a proxy this is the PROXY's address; an app that trusts a forwarding
+	/// header must read it with `header` instead.
+	fun peer_address(self): Option<str> {
+		let raw = self.node.socket().remote_address_raw();
+		if raw.kind() == JsonKind::String {
+			Some(coerce_str(raw))
+		} else {
+			None
+		}
 	}
 
 	/// The value of a named request header, or `None` when the request did not

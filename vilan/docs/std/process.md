@@ -141,6 +141,7 @@ impl Request {
 	fun body_stream(self): BodyReader   // the body a piece at a time
 	fun max_body_bytes(own self, limit: usize): Request   // this request's cap (a route's)
 	fun header(self, name: str): Option<str>   // a request header, case-insensitive
+	fun peer_address(self): Option<str>        // the connection's remote end; None once it is gone
 }
 impl BodyReader {
 	async fun next(self, size: usize): Option<Bytes>   // at most `size` bytes; None at the end
@@ -470,6 +471,17 @@ but nothing is split for you either; `set-cookie` is node's one unjoined
 header and arrives comma-joined without the space, which a cookie value's
 own commas make unsafe to split, so repeated `set-cookie` is not readable
 through this accessor.
+
+`Request::peer_address` is the address of the connection's remote end, as
+node's `request.socket.remoteAddress` spells it: `Some("127.0.0.1")` from a
+server bound to `127.0.0.1`, `Some("::1")` for a client of `::1`, and an IPv4
+client of a dual-stack listener (bound to `::`, node's default with no
+`host`) mapped as `Some("::ffff:127.0.0.1")`. It is `None` once the socket is
+gone — a client that hung up. Behind a proxy it is the **proxy's** address; an
+app that trusts a forwarding header (`X-Forwarded-For`) reads that with
+`header` instead. The native server binds `0.0.0.0` when no `host` is given
+where node binds `::`, so there the same client reads `127.0.0.1` natively —
+see [the native guide](../guide/native.md).
 
 `ServerBuilder::port(0)` asks the OS for a free port instead of guessing
 one, and the `Server` handed to `on_start` carries the port it actually

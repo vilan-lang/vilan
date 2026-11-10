@@ -97,6 +97,15 @@ answered `408 Request Timeout` when missed), and 5 s idle between requests;
 set them on both backends. HTTP/2 and TLS are not here: a native server is
 deployed behind a proxy that terminates TLS.
 
+**A server with no `host` binds IPv4 natively.** Node's `listen(port)` with no
+host takes `::`, a dual-stack socket, where the native server takes `0.0.0.0`.
+Both answer an IPv4 client on every interface, but only node answers an IPv6
+one, and `Request::peer_address` spells the same IPv4 client differently: node
+reports it mapped, `::ffff:127.0.0.1`, the native server as `127.0.0.1`. Name the
+bind with `ServerBuilder::host` and the two agree: `host("127.0.0.1")` reads
+`127.0.0.1` on both, `host("::1")` reads `::1`, and `host("::")` is dual-stack
+on both and reads an IPv4 client as `::ffff:127.0.0.1`.
+
 **A native server stops gracefully on SIGTERM.** `Server::stop()` works as it
 does on node. Beyond it, a program that starts a server answers SIGTERM, SIGINT
 and SIGHUP (Ctrl-C, and the console's close on Windows) by stopping its
