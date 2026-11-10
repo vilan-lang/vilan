@@ -87,6 +87,7 @@ move an anchor, and a moved anchor is a broken link.
 | [Server-side rendering](guide/ssr.md) | render-and-replace, one component on both legs, the HTML shell |
 | [A full-stack walkthrough](guide/walkthrough.md) | the Notes app end to end: every layer meeting, quoted from a real, tested example |
 | [The dev loop](guide/dev-loop.md) | `run --watch`, hot module replacement, what carries across a swap |
+| [Writing Vilan programs well](guide/wisdom.md) | principles and real cases: symptoms to causes, the questions to ask before building, what a large app learned |
 
 ### std reference
 
