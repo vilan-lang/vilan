@@ -9074,3 +9074,32 @@ fn e360_a_path_through_a_module_a_type_or_an_enum_is_unchanged() {
     .expect("a path through a module, a type and an enum resolves");
     assert_eq!(stdout, "reading m\n0\ntrue\n");
 }
+
+#[test]
+fn b735_a_module_cell_reached_through_another_modules_export_copies_at_the_return() {
+    // B735: the cell is declared in `cells.vl`; one function returning its read
+    // lives beside it, the other in the importer. Both handed the caller the
+    // cell's live storage before the fix (the pushes grew it to 4).
+    let (_, stdout) = compile_and_run_package(
+        &[
+            (
+                "main.vl",
+                "import std::io::print;\nimport pkg::cells::{ plain, from_plain };\n\n\
+                 fun local_read(): List<i32> {\n\tplain.read()\n}\n\n\
+                 fun main() {\n\tmut b = from_plain();\n\tb.push(3);\n\
+                 \tmut c = local_read();\n\tc.push(3);\n\tlet held = local_read();\n\
+                 \tplain.write().push(9);\n\
+                 \tprint(i\"{plain.read().len()} {b.len()} {c.len()} {held.len()}\");\n}\n",
+            ),
+            (
+                "cells.vl",
+                "import std::shared::Shared;\n\n\
+                 export let plain: Shared<List<i32>> = Shared::new([1, 2]);\n\n\
+                 export fun from_plain(): List<i32> {\n\tplain.read()\n}\n",
+            ),
+        ],
+        "main.vl",
+    )
+    .expect("expected a clean run");
+    assert_eq!(stdout, "3 3 3 2\n");
+}

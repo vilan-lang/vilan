@@ -15398,29 +15398,37 @@ impl<'src> Analyzer<'src> {
     /// data (the `Program` is not built until analysis finishes), so the loan-only
     /// rule and later emission agree on which bindings are module-level.
     fn module_level_binding_ids(&self) -> HashSet<Id> {
-        let mut module_scopes: HashSet<Id> = self
-            .scopes
-            .values()
-            .filter(|scope| scope.parent_id.is_none())
-            .map(|scope| scope.id)
-            .collect();
-        for module in self.modules.values() {
-            module_scopes.insert(module.body.1);
-        }
+        let module_bodies = self.module_body_scope_ids();
         self.variables
             .keys()
             .copied()
-            .filter(|variable_id| {
-                self.expr_id_to_scope_id_map
-                    .get(variable_id)
-                    .is_some_and(|scope_id| {
-                        module_scopes.contains(&expansion_home_scope(
-                            &self.generated_expansion_scopes,
-                            *scope_id,
-                        ))
-                    })
-            })
+            .filter(|variable_id| self.is_module_level_binding(*variable_id, &module_bodies))
             .collect()
+    }
+
+    /// The body scopes of every `mod` — with the root scopes, the scopes a
+    /// module-level binding is declared in ([`Self::is_module_level_binding`]).
+    fn module_body_scope_ids(&self) -> HashSet<Id> {
+        self.modules.values().map(|module| module.body.1).collect()
+    }
+
+    /// Whether ONE binding is module-level — [`Self::module_level_binding_ids`]'
+    /// test, asked of a single id so a pass that meets a handful of roots does
+    /// not pay for the whole table. `module_bodies` is
+    /// [`Self::module_body_scope_ids`].
+    fn is_module_level_binding(&self, binding_id: Id, module_bodies: &HashSet<Id>) -> bool {
+        if !self.variables.contains_key(&binding_id) {
+            return false;
+        }
+        let Some(scope_id) = self.expr_id_to_scope_id_map.get(&binding_id) else {
+            return false;
+        };
+        let home = expansion_home_scope(&self.generated_expansion_scopes, *scope_id);
+        module_bodies.contains(&home)
+            || self
+                .scopes
+                .get(&home)
+                .is_some_and(|scope| scope.parent_id.is_none())
     }
 
     fn check_resource_moves(&mut self) {
@@ -28534,10 +28542,21 @@ impl<'src> Analyzer<'src> {
     /// Whether a returned place is storage the returning frame does not own, so
     /// rule 1's return clause owes a copy of it. `declared_inside` is the
     /// closure's own bindings when the seam is a closure's (B64).
+    ///
+    /// B735: a place rooted at a MODULE-LEVEL binding is never the returning
+    /// frame's. The binding outlives every call, exactly as a loaned
+    /// parameter's storage does, so a by-value return of it (`fun get():
+    /// List<i32> { registry }`, `plain.read()` through a module-level
+    /// `Shared`, a field or element of a module-level aggregate) copies —
+    /// read as a local's dead owner, the caller's result had been the binding's
+    /// live storage, so `mut b = get(); b.push(3)` grew the module binding and
+    /// a later write of it showed through `b`. `module_bodies` is
+    /// [`Self::module_body_scope_ids`].
     fn returned_place_owes_a_copy(
         &self,
         place_id: Id,
         declared_inside: Option<&HashSet<Id>>,
+        module_bodies: &HashSet<Id>,
     ) -> bool {
         let Some(root) = self.place_root(place_id) else {
             return false;
@@ -28558,8 +28577,15 @@ impl<'src> Analyzer<'src> {
             // returning it and it belongs to the frame around the closure, which
             // does not die here and can be handed the same storage again on the
             // next call.
-            Some(Convention::Own) | None => {
+            Some(Convention::Own) => {
                 declared_inside.is_some_and(|declared| !declared.contains(&root))
+            }
+            // B735: a module-level binding is no frame's — asked only of a
+            // root that is not a parameter, so the common local return pays
+            // two map lookups and nothing more.
+            None => {
+                declared_inside.is_some_and(|declared| !declared.contains(&root))
+                    || self.is_module_level_binding(root, module_bodies)
             }
         }
     }
@@ -36684,15 +36710,16 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Rule 1's RETURN clause (`proposal/element-clones.md` §3): a place a body
-    /// hands back that it does not own — one rooted at a by-value PARAMETER —
-    /// copies. Without it a call hands the caller a live alias into the
+    /// hands back that it does not own — one rooted at a by-value PARAMETER, or
+    /// at a MODULE-LEVEL binding (B735) — copies. Without it a call hands the caller a live alias into the
     /// caller's own argument (`fun identity(c: List<i32>): List<i32> { c }`),
     /// which breaks the invariant every other elision here rests on, spelled
     /// out in `compute_clone_sites`' own doc: *calls own their result*. It is
     /// also what makes `List::map` share elements — its `push` is handed
     /// `fn(item)`, a call result, and trusts it.
     ///
-    /// A place rooted at a LOCAL is left alone: the frame dies at the return,
+    /// A place rooted at a LOCAL of the returning frame is left alone: the
+    /// frame dies at the return,
     /// so the local is a dead owner and donates its storage (`mut result = …;
     /// result`, which is how every list-producing method ends). Views are
     /// excluded by the type filter — a `borrows` projection returns an alias on
@@ -36751,6 +36778,7 @@ impl<'src> Analyzer<'src> {
         );
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
         let mut view_reads: HashSet<Id> = HashSet::default();
+        let module_bodies = self.module_body_scope_ids();
         for (seam, closure_id, returns_view) in seams {
             let declared_inside = closure_id.map(|id| self.closure_declared_bindings(id));
             let mut leaves = Vec::new();
@@ -36762,9 +36790,13 @@ impl<'src> Analyzer<'src> {
                 // itself (B109).
                 let mut named = Vec::new();
                 self.returned_value_places(leaf, &mut named);
-                let owes_copy = named
-                    .iter()
-                    .any(|place| self.returned_place_owes_a_copy(*place, declared_inside.as_ref()));
+                let owes_copy = named.iter().any(|place| {
+                    self.returned_place_owes_a_copy(
+                        *place,
+                        declared_inside.as_ref(),
+                        &module_bodies,
+                    )
+                });
                 if !owes_copy {
                     continue;
                 }
