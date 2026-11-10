@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**B725: natively, a function made async that calls itself - or two that call each other - builds; rustc refused it (E0733, an async fn's future may not contain itself).** An awaited call to a function that reaches the function being emitted through the call graph (a self-call, any edge of a mutual recursion) is now `Box::pin(..)`-ed before its `.await`; every other awaited call is emitted as before. Pins: `native_differential::b725_a_recursive_async_function_is_identical_on_both_backends` (self-recursion, a `ping`/`pong` pair; the boxed calls in the emission). Tracker B725.
+
+---
+
+<!-- family: fix -->
 **B723: natively, `a + b` over two `str`s that host-bound methods answer builds - `word.substring(0, 1).to_uppercase() + word.substring(1, word.len()).to_lowercase()` was emitted `Rc<str> + Rc<str>` (E0369).** The same root as B718: neither call had a type, so the `+` was not read as a concatenation. Fixed by B718's change (an extern callee's return types its call); this entry adds the pin. Pins: `native_differential::b723_a_concatenation_of_host_str_results_is_identical_on_both_backends` (two host results, a chain of three, an interpolation operand). Tracker B723.
 
 ---

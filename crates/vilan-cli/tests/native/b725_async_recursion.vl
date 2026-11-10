@@ -1,0 +1,27 @@
+// B725: a function made async by an fs call that calls ITSELF, and a pair
+// that call each other. An async fn's future holds the futures it awaits,
+// so each was a future of infinite size (rustc E0733) until the calls
+// around the cycle are boxed.
+import std::{ fs::stat, io::print };
+
+fun depth(path: str, n: i32): i32 {
+	stat(path).is_some() else ret n;
+	n > 3 then ret n;
+	depth(path, n + 1)
+}
+
+fun ping(path: str, n: i32): i32 {
+	stat(path).is_some() else ret 0 - n;
+	n >= 5 then ret n;
+	pong(path, n + 1)
+}
+
+fun pong(path: str, n: i32): i32 {
+	ping(path, n + 2)
+}
+
+fun main() {
+	print(depth("/", 0));
+	print(depth("/nonexistent/b725", 0));
+	print(ping("/", 0));
+}

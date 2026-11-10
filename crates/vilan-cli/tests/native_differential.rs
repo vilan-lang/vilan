@@ -14422,6 +14422,46 @@ fn b723_a_concatenation_of_host_str_results_is_identical_on_both_backends() {
     );
 }
 
+/// B725: a function made async that calls itself, and two that call each other,
+/// build natively: the awaited calls around the cycle are boxed (rustc E0733
+/// otherwise — the future would contain itself).
+#[test]
+fn b725_a_recursive_async_function_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b725_async_recursion.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b725_async_recursion.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "4\n0\n6\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b725_async_recursion")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("Box::pin(depth_"),
+        "the emission names `Box::pin(depth_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("Box::pin(pong_"),
+        "the emission names `Box::pin(pong_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("Box::pin(ping_"),
+        "the emission names `Box::pin(ping_`:\n{emitted}"
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where

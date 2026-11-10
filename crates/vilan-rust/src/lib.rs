@@ -662,6 +662,12 @@ struct Emitter<'a, 'src> {
     /// B722: the bindings a destructuring pattern declares — see
     /// [`destructured_bindings`].
     destructured_bindings: HashSet<Id>,
+    /// B725: the function whose body is being emitted (the innermost
+    /// instance), for [`Emitter::calls_back_into_itself`].
+    current_function: Option<Id>,
+    /// B725: per function, every function its body reaches through the call
+    /// graph — memoized, since each awaited call asks.
+    reachable_functions: HashMap<Id, HashSet<Id>>,
     /// F37: the FIELD reads (`record.live`) that are their field path's last
     /// use — [`Emitter::compute_liveness`]'s path-aware half.
     last_field_uses: HashSet<Id>,
@@ -840,6 +846,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             last_uses: HashSet::new(),
             for_each_resource_subjects: for_each_resource_subjects(program),
             destructured_bindings: destructured_bindings(program),
+            current_function: None,
+            reachable_functions: HashMap::default(),
             last_field_uses: HashSet::new(),
             liveness_walked: HashSet::new(),
             copies_taken: 0,
@@ -4755,9 +4763,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 std::mem::replace(&mut self.current_self_traits, HashSet::from([trait_id])),
             )
         });
+        let saved_function = self.current_function.replace(id);
         let emitted = self
             .function_body(&function, span, is_main, &name)
             .map_err(|error| self.locate_refusal(error, function.id));
+        self.current_function = saved_function;
         if let Some((self_type, self_traits)) = saved_self {
             self.current_self_type = self_type;
             self.current_self_traits = self_traits;
@@ -13082,6 +13092,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .call_expression(call_expr_id, call_id, depth, span)
             .map_err(|error| self.anchor_refusal_at_call(error, call_expr_id))?;
         if self.call_awaits(call_expr_id, call_id) {
+            // B725: an awaited call back into the function being emitted —
+            // directly or around a cycle — would make its future contain
+            // itself (rustc E0733), so the call's future is boxed.
+            let rendered = if self.calls_back_into_itself(call_id) {
+                format!("Box::pin({rendered})")
+            } else {
+                rendered
+            };
             let mut awaited = Self::awaited(&rendered);
             for _ in 0..self.assimilated_task_layers(call_id) {
                 awaited = Self::awaited(&awaited);
@@ -13089,6 +13107,64 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return Ok(awaited);
         }
         Ok(rendered)
+    }
+
+    /// B725: whether `call_id` calls a function that reaches the function
+    /// being emitted — a self-call, or one edge of a mutual recursion. An
+    /// `async fn`'s future holds the futures it awaits, so an awaited call
+    /// around such a cycle is a future of infinite size until one edge is
+    /// boxed; boxing every edge of the cycle is the simple sufficient rule.
+    /// A closure's calls count as its enclosing body's (an inline-awaited
+    /// closure's future is part of it), which over-approximates harmlessly.
+    fn calls_back_into_itself(&mut self, call_id: Id) -> bool {
+        let Some(current) = self.current_function else {
+            return false;
+        };
+        let Some(Expr::Local(target)) = self
+            .program
+            .function_calls
+            .get(&call_id)
+            .and_then(|call| self.program.entity_map.get(&call.subject_id))
+        else {
+            return false;
+        };
+        let target = *target;
+        if !self.program.functions.contains_key(&target) {
+            return false;
+        }
+        if target == current {
+            return true;
+        }
+        if !self.reachable_functions.contains_key(&target) {
+            let reached = self.functions_reached_from(target);
+            self.reachable_functions.insert(target, reached);
+        }
+        self.reachable_functions[&target].contains(&current)
+    }
+
+    /// Every function `start`'s body (its closures included) reaches through
+    /// direct calls, transitively.
+    fn functions_reached_from(&self, start: Id) -> HashSet<Id> {
+        let graph = self.program.call_graph();
+        let mut reached = HashSet::new();
+        let mut pending = vec![start];
+        let mut walked = HashSet::new();
+        while let Some(node) = pending.pop() {
+            if !walked.insert(node) {
+                continue;
+            }
+            for call in graph.calls_of(node) {
+                if let vilan_core::call_graph::CallTarget::Function(callee) = call.target
+                    && reached.insert(callee)
+                {
+                    pending.push(callee);
+                }
+            }
+            if let Some(children) = graph.closure_children_of(node) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        reached
     }
 
     /// F107 (B149's native half): a call to a function WRITTEN `async` whose
