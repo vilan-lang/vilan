@@ -25,11 +25,16 @@ impl Statement {
 	fun first(self, parameters: List<any>): Option<Row>
 }
 impl Row {
-	fun text(self, name: str): str
+	fun text(self, name: str): str          // each typed reader panics on NULL
 	fun integer(self, name: str): i32
 	fun big_integer(self, name: str): i53   // i53-wide INTEGER (epoch millis)
 	fun real(self, name: str): f64
 	fun bytes(self, name: str): Bytes       // a BLOB
+	fun optional_text(self, name: str): Option<str>   // None for NULL
+	fun optional_integer(self, name: str): Option<i32>
+	fun optional_big_integer(self, name: str): Option<i53>
+	fun optional_real(self, name: str): Option<f64>
+	fun optional_bytes(self, name: str): Option<Bytes>
 	fun is_null(self, name: str): bool
 }
 ```
@@ -44,6 +49,12 @@ nullable column takes the `Option` directly: `.run([title, status_id])`
 with `status_id: Option<u53>`. Anything else (a struct, a list, a tuple,
 another enum) is refused when the statement runs, naming its index in the
 list: `std::db: cannot bind the parameter at index 2 of 3: …`.
+
+The typed readers read a value: a NULL column (or a name the row does not
+have) stops the program with a panic that names the column, the reader and
+its `optional_` twin (`std::db: column 'edited_at' is NULL (or not in the
+row) and …`), reported at the reader's call. A nullable column
+reads through the `optional_` twin, which answers `None` for NULL.
 
 `Database` is a **`resource`**: it has a single owner and *moves* rather than
 copies, and it closes its `node:sqlite` handle at its owner's last use. A

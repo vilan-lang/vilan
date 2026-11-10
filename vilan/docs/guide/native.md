@@ -60,7 +60,9 @@ the `Uint8Array` it is on the JS backend: `let b = a` is an alias, and a
 `Bytes::concat` are the two that make a new buffer.
 
 **`std::db` binds and reads a BLOB.** A `Bytes` binds as a BLOB and
-`Row::bytes` reads it back as the bytes that were bound, as on node. One
+`Row::bytes` reads it back as the bytes that were bound, as on node. A
+typed reader (`text`, `integer`, …) meets a NULL with the same panic on both
+backends, naming the column; the `optional_` readers are the nullable door. One
 difference is node's, not the program's: node binds every JS number as a
 REAL, so a column with no declared type (no affinity) stores `7` as `7.0`
 there and as INTEGER natively. Declare the column `INTEGER` (or `NUMERIC`)

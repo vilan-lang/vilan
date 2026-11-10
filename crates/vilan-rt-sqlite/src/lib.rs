@@ -239,11 +239,13 @@ pub struct Row(Rc<Vec<(Str, Any)>>);
 impl Row {
     /// `__db_column` at `str`. The four typed column readers share one host
     /// helper and the vilan signature supplies the type, so each reader here
-    /// coerces the same way `String(row[name])` would.
+    /// coerces the same way `String(row[name])` would. A NULL never reaches a
+    /// typed reader: `db.vl`'s `Row` members refuse it first, naming the column
+    /// (F149, ruling S5), so the arm here is that refusal's backstop.
     pub fn text(&self, name: Str) -> Str {
         match self.at(&name) {
             Any::Text(text) => text,
-            Any::Null => str_new(""),
+            Any::Null => refuse_null(&name),
             Any::Integer(value) => str_new(&value.to_string()),
             Any::Float(value) => str_new(&vilan_rt::js_number(value)),
             Any::Bool(value) => str_new(if value { "true" } else { "false" }),
@@ -298,6 +300,7 @@ impl Row {
 
     fn number(&self, name: &str) -> f64 {
         match self.at(name) {
+            Any::Null => refuse_null(name),
             Any::Integer(value) => value as f64,
             Any::Float(value) => value,
             Any::Bool(value) => {
@@ -307,9 +310,8 @@ impl Row {
                     0.0
                 }
             }
-            // `Number(null)` is `0` and `Number("12")` is `12` — the coercion
-            // the JS reader performs on the same column.
-            Any::Null => 0.0,
+            // `Number("12")` is `12` — the coercion the JS reader performs on
+            // the same column.
             Any::Text(text) => text.trim().parse::<f64>().unwrap_or(f64::NAN),
             Any::Blob(_) => f64::NAN,
         }
@@ -378,7 +380,8 @@ fn read(value: ValueRef<'_>) -> Any {
     }
 }
 
-/// A BLOB read met a NULL: no buffer to answer.
+/// A typed reader met a NULL — the backstop of `db.vl`'s own refusal, which
+/// runs first and says which reader to use instead.
 fn refuse_null(name: &str) -> ! {
     vilan_rt::panic_with(&format!("std::db: column '{name}' is NULL"))
 }
@@ -483,6 +486,34 @@ mod tests {
             row.bytes(str_new("label")).to_vec(),
             "hé".as_bytes().to_vec()
         );
+    }
+
+    /// F149 / S5: a typed reader never answers a NULL as `0` or `""`; `db.vl`
+    /// refuses first, and these arms are its backstop.
+    #[test]
+    fn a_typed_reader_refuses_a_null() {
+        let database = opened();
+        database
+            .prepare(str_new("INSERT INTO account (name) VALUES (?)"))
+            .run(vec![Any::from("ada")]);
+        let row = database
+            .prepare(str_new("SELECT score, note FROM account"))
+            .first(Vec::new())
+            .expect("the row just inserted");
+        for read in [
+            Box::new(|row: &Row| {
+                row.real(str_new("score"));
+            }) as Box<dyn Fn(&Row)>,
+            Box::new(|row: &Row| {
+                row.text(str_new("note"));
+            }),
+            Box::new(|row: &Row| {
+                row.bytes(str_new("note"));
+            }),
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read(&row)));
+            assert!(outcome.is_err(), "a NULL is refused");
+        }
     }
 
     /// A closed database answers the sentence rather than a use-after-free, and

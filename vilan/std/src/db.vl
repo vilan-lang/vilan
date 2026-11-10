@@ -61,9 +61,9 @@ export impl Database with Drop {
 }
 
 /// Parameter spreads and column reads need host glue (`stmt.run(...params)`,
-/// `row[name]`) — the `__db_*` runtime helpers. The three column readers share
-/// one helper; the vilan signature supplies the type (trust the schema, and
-/// guard NULLABLE columns with `is_null`).
+/// `row[name]`) — the `__db_*` runtime helpers. The four typed column readers
+/// share one helper and the vilan signature supplies the type; `Row`'s members
+/// refuse a NULL before reading (F149).
 ///
 /// A bind list holds what SQLite stores (M165): an `Option` is its value or NULL
 /// (converted where it lands in the `List<any>`, as `vilan_rt::Any` holds one
@@ -117,29 +117,102 @@ export impl Statement {
 	}
 }
 
+/// The typed readers' refusal (F149, ruling S5): a NULL behind an `i32` or a `str`
+/// is not a value of that type, so it stops the program naming the column rather
+/// than reading as `0`, `""` or the host's `null`.
+[track_caller]
+fun refuse_null(row: Row, name: str, reader: str) {
+	if column_is_null(row, name) {
+		panic(i"std::db: column '{name}' is NULL (or not in the row) and `Row::{reader}` reads a value; read a nullable column with `Row::optional_{reader}`");
+	}
+}
+
 export impl Row {
+	/// A TEXT column. A NULL (or a column the row does not have) panics, naming the
+	/// column; `optional_text` is the nullable read.
+	[track_caller]
 	fun text(self, name: str): str {
+		refuse_null(self, name, "text");
 		column_text(self, name)
 	}
 
+	/// An INTEGER column at i32 width. A NULL panics, naming the column;
+	/// `optional_integer` is the nullable read.
+	[track_caller]
 	fun integer(self, name: str): i32 {
+		refuse_null(self, name, "integer");
 		column_integer(self, name)
 	}
 
 	/// An INTEGER column at i53 width — timestamps (epoch millis), large ids. Exact
 	/// for values to 2^53 (the i53 representation); a column beyond that arrives
-	/// from `node:sqlite` as a BigInt and is out of v1's reach.
+	/// from `node:sqlite` as a BigInt and is out of v1's reach. A NULL panics,
+	/// naming the column; `optional_big_integer` is the nullable read.
+	[track_caller]
 	fun big_integer(self, name: str): i53 {
+		refuse_null(self, name, "big_integer");
 		column_big_integer(self, name)
 	}
 
+	/// A REAL column. A NULL panics, naming the column; `optional_real` is the
+	/// nullable read.
+	[track_caller]
 	fun real(self, name: str): f64 {
+		refuse_null(self, name, "real");
 		column_real(self, name)
 	}
 
-	/// A BLOB column, as the bytes `Bytes` bound (M195).
+	/// A BLOB column, as the bytes `Bytes` bound. A NULL panics, naming the column;
+	/// `optional_bytes` is the nullable read.
+	[track_caller]
 	fun bytes(self, name: str): Bytes {
+		refuse_null(self, name, "bytes");
 		column_bytes(self, name)
+	}
+
+	/// A nullable TEXT column: `None` for NULL (or a column the row does not have).
+	fun optional_text(self, name: str): Option<str> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_text(self, name))
+		}
+	}
+
+	/// A nullable INTEGER column at i32 width.
+	fun optional_integer(self, name: str): Option<i32> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_integer(self, name))
+		}
+	}
+
+	/// A nullable INTEGER column at i53 width.
+	fun optional_big_integer(self, name: str): Option<i53> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_big_integer(self, name))
+		}
+	}
+
+	/// A nullable REAL column.
+	fun optional_real(self, name: str): Option<f64> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_real(self, name))
+		}
+	}
+
+	/// A nullable BLOB column.
+	fun optional_bytes(self, name: str): Option<Bytes> {
+		if column_is_null(self, name) {
+			None
+		} else {
+			Some(column_bytes(self, name))
+		}
 	}
 
 	fun is_null(self, name: str): bool {

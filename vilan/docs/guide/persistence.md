@@ -53,7 +53,10 @@ The whole surface fits in a few lines:
   `Option<Row>`, and `.all(params)` fetches a `List<Row>`.
 - Rows read by column name: `text`, `integer` (i32), `big_integer`
   (i53; use it for epoch-millis timestamps, which outgrow i32),
-  `real` (f64), `bytes` (a BLOB), and `is_null`.
+  `real` (f64) and `bytes` (a BLOB). Each of them refuses a NULL with a
+  panic that names the column; a nullable column reads through its
+  `optional_` twin (`optional_text`, `optional_integer`, …), which answers
+  `None` for NULL.
 
 Two habits to keep:
 

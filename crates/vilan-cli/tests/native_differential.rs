@@ -15537,6 +15537,77 @@ fn m195_a_blob_round_trips_on_both_backends() {
     }
 }
 
+/// F149 (ruling S5): a typed column reader refuses a NULL on both backends —
+/// a panic naming the column, the reader and its `optional_` door, at the
+/// reader's CALL (the readers are `[track_caller]`). JS answered the host's
+/// `null` behind an `i32`/`str`, and natively `0`/`""`. One program per
+/// reader family: the number readers, the text reader and the BLOB reader
+/// are three different native arms.
+#[test]
+fn f149_a_typed_reader_refuses_a_null_naming_the_column_on_both_backends() {
+    let staged = stage();
+    for reader in ["integer", "real", "text", "bytes"] {
+        let file = format!("native_probe_db_null_{reader}.vl");
+        let source = format!(
+            "import std::db::Database;\n\
+             \n\
+             fun main() {{\n\
+             \tlet db = Database::open(\":memory:\");\n\
+             \tdb.exec(\"CREATE TABLE t (a TEXT, gap)\");\n\
+             \tlet none: Option<i32> = None;\n\
+             \tdb.prepare(\"INSERT INTO t VALUES (?, ?)\").run([\"x\", none]);\n\
+             \tlet row = db.prepare(\"SELECT a, gap FROM t\").first([]).unwrap();\n\
+             \tprint(row.text(\"a\"));\n\
+             \tlet _ = row.{reader}(\"gap\");\n\
+             \tprint(\"unreachable\");\n\
+             }}\n"
+        );
+        std::fs::write(staged.join(&file), &source).expect("write the probe program");
+        let site = site_of(&file, &source, "let _ = row.", &format!("{reader}(\"gap"));
+        let expected = format!(
+            "panicked at {site}: std::db: column 'gap' is NULL (or not in the row) and \
+             `Row::{reader}` reads a value; read a nullable column with \
+             `Row::optional_{reader}`"
+        );
+        for backend in [None, Some("rust")] {
+            let run = run_on(&staged, backend, &file);
+            assert_eq!(run.code, Some(1), "{reader} {backend:?}: {}", run.stderr);
+            assert_eq!(run.stdout, "x\n", "{reader} {backend:?}");
+            assert!(
+                run.stderr.contains(&expected),
+                "{reader} {backend:?}: expected {expected:?} in:\n{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// F149: the `optional_*` readers are a nullable column's door on both
+/// backends — `None` for NULL and for a column the row does not have, `Some`
+/// for a value, at every reader (`optional_bytes` included).
+#[test]
+fn f149_the_optional_readers_answer_none_for_null_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_optional_readers.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/db_optional_readers.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "nulls\nNone\nNone\nNone\nNone\nnone\ntrue\nNone\n",
+                "values\nSome(4)\nSome(1720656000000)\nSome(2.5)\nSome(\"x\")\n00ff\nfalse\nNone\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
 /// B724: a closure that captures a VIEW parameter builds natively and leaves
 /// the caller's place as the JS backend does — a `&mut` parameter written
 /// through a closure handed to `map`, through a closure kept in a local and

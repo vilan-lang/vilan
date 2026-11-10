@@ -29,9 +29,19 @@ function __db_get(statement, parameters) {
 	const row = statement.get(...__db_bind(parameters));
 	return row === undefined ? [ 1 ] : [ 0, row ];
 }
+function __db_is_null(row, name) {
+	return row[name] === null || row[name] === undefined;
+}
 function __db_run(statement, parameters) {
 	const result = statement.run(...__db_bind(parameters));
 	return Number(result.lastInsertRowid ?? 0);
+}
+function __panic(message, location) {
+	const error = new Error(message);
+	error.name = "panicked at " + location;
+	Object.defineProperty(error, "location", { value: location });
+	if (Error.captureStackTrace) Error.captureStackTrace(error, __panic);
+	return error;
 }
 function drop(self) {
 	__db_close(self);
@@ -45,13 +55,23 @@ function all(self, parameters) {
 function first(self, parameters) {
 	return __db_get(self, parameters);
 }
-function text(self, name) {
+function refuse_null(row4, name, reader, caller) {
+	if (__db_is_null(row4, name)) {
+		(() => {
+			throw __panic("std::db: column \'" + name + "\' is NULL (or not in the row) and `Row::" + reader + "` reads a value; read a nullable column with `Row::optional_" + reader + "`", caller);
+		})();
+	}
+}
+function text(self, name, caller) {
+	refuse_null(self, name, "text", caller);
 	return __db_column(self, name);
 }
-function integer(self, name) {
+function integer(self, name, caller) {
+	refuse_null(self, name, "integer", caller);
 	return __db_column(self, name);
 }
-function big_integer(self, name) {
+function big_integer(self, name, caller) {
+	refuse_null(self, name, "big_integer", caller);
 	return __db_column(self, name);
 }
 function $e($f) {
@@ -65,13 +85,13 @@ try {
 	run(insert, [ "ship std::db", 1 ]);
 	const open_tasks = db.prepare("SELECT title FROM task WHERE done = ? ORDER BY id");
 	for (const row of all(open_tasks, [ 0 ])) {
-		console.log("todo: " + text(row, "title"));
+		console.log("todo: " + text(row, "title", "db.vl:18:22"));
 	}
 	const $a = first(db.prepare("SELECT COUNT(*) AS n FROM task"), [  ]);
 	let $b = null;
 	if ($a[0] === 0) {
 		const row2 = $a[1];
-		$b = console.log("" + integer(row2, "n") + " tasks total");
+		$b = console.log("" + integer(row2, "n", "db.vl:21:33") + " tasks total");
 	} else {
 		$b = console.log("no rows");
 	}
@@ -82,7 +102,7 @@ try {
 	let $d = null;
 	if ($c[0] === 0) {
 		const row3 = $c[1];
-		$d = console.log("stamp at " + big_integer(row3, "at"));
+		$d = console.log("stamp at " + big_integer(row3, "at", "db.vl:29:42"));
 	} else {
 		$d = console.log("no stamp");
 	}

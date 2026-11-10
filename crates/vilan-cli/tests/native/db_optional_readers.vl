@@ -1,0 +1,23 @@
+// F149: the `optional_*` readers are a nullable column's door on both
+// backends - `None` for NULL and for a column the row does not have, `Some`
+// for a value - and `is_null` answers the same question.
+import std::db::Database;
+
+fun main() {
+	let db = Database::open(":memory:");
+	db.exec("CREATE TABLE o (label TEXT, n INTEGER, wide INTEGER, r REAL, t TEXT, b BLOB)");
+	let insert = db.prepare("INSERT INTO o VALUES (?, ?, ?, ?, ?, ?)");
+	let none: Option<i32> = None;
+	insert.run(["nulls", none, none, none, none, none]);
+	db.exec("INSERT INTO o VALUES ('values', 4, 1720656000000, 2.5, 'x', x'00ff')");
+	for row in db.prepare("SELECT * FROM o ORDER BY rowid").all([]) {
+		print(row.text("label"));
+		print(row.optional_integer("n"));
+		print(row.optional_big_integer("wide"));
+		print(row.optional_real("r"));
+		print(row.optional_text("t"));
+		print(row.optional_bytes("b").map_or(|bytes| bytes.to_hex(), "none"));
+		print(row.is_null("n"));
+		print(row.optional_text("absent"));
+	}
+}
