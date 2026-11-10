@@ -59,10 +59,13 @@ the `Uint8Array` it is on the JS backend: `let b = a` is an alias, and a
 `set`, `fill` or `copy_into` through either is seen through both. `slice` and
 `Bytes::concat` are the two that make a new buffer.
 
-**`std::db` binds and reads a BLOB.** A `Bytes` binds as a BLOB and
-`Row::bytes` reads it back as the bytes that were bound, as on node. A
-typed reader (`text`, `integer`, …) meets a NULL with the same panic on both
-backends, naming the column; the `optional_` readers are the nullable door. One
+**`std::db` binds and reads the same values.** A parameter list is a
+`List<dyn SqlValue>` on both backends, so what may be bound — a number, a
+`str`, a `bool`, `Bytes` as a BLOB, an `Option` of one — is the checker's
+answer, not a run-time refusal on node and a rustc error here. A BLOB reads
+back through `Row::bytes` as the bytes that were bound. A typed reader
+(`text`, `integer`, …) meets a NULL with the same panic on both backends,
+naming the column; the `optional_` readers are the nullable door. One
 difference is node's, not the program's: node binds every JS number as a
 REAL, so a column with no declared type (no affinity) stores `7` as `7.0`
 there and as INTEGER natively. Declare the column `INTEGER` (or `NUMERIC`)

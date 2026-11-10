@@ -60,15 +60,124 @@ export impl Database with Drop {
 	}
 }
 
+/// A value SQLite stores: what a bind list holds (M175, `sql-value.md`). The
+/// numbers, `str`, `bool`, `Bytes` (a BLOB) and an `Option` of any of them (its
+/// value, or NULL) implement it; a struct, a list, a tuple or another enum does
+/// not, so `.run([id, point])` is refused by the checker at `point`. The trait is
+/// open: a program's own newtype may bind as the value it wraps
+/// (`impl UserId with SqlValue { fun sql_value(self): any { self.uuid.sql_value() } }`).
+export trait SqlValue {
+	/// The value as the host's binder takes it.
+	fun sql_value(self): any;
+}
+
+export impl i8 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u8 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl i16 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u16 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl i32 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u32 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl i53 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl u53 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl usize with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl f32 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl f64 with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+export impl str with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+/// A `bool` binds as the integer 0 or 1 (SQLite has no boolean storage class).
+export impl bool with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+/// A `Bytes` binds as a BLOB, and `Row::bytes` reads one back.
+export impl Bytes with SqlValue {
+	fun sql_value(self): any {
+		self
+	}
+}
+
+/// An `Option` binds as its value, or NULL — at any depth, so a nullable column
+/// takes the `Option` directly.
+export impl Option<type T: SqlValue> with SqlValue {
+	fun sql_value(self): any {
+		match self {
+			Some(let value) => value.sql_value(),
+			None => sql_null(),
+		}
+	}
+}
+
+/// SQL's NULL as the host binder takes it (`null` / `vilan_rt::Any::Null`).
+[extern("__db_null")]
+external fun sql_null(): any;
+
 /// Parameter spreads and column reads need host glue (`stmt.run(...params)`,
-/// `row[name]`) — the `__db_*` runtime helpers. The four typed column readers
-/// share one helper and the vilan signature supplies the type; `Row`'s members
-/// refuse a NULL before reading (F149).
-///
-/// A bind list holds what SQLite stores (M165): an `Option` is its value or NULL
-/// (converted where it lands in the `List<any>`, as `vilan_rt::Any` holds one
-/// natively), a `bool` binds as 0 or 1, a `Bytes` as a BLOB (M195), and anything
-/// else is refused at the bind, naming its index in the list.
+/// `row[name]`) — the `__db_*` runtime helpers. The host side takes the bind list
+/// as a `List<any>` of host values, which `Statement`'s three members build from
+/// the typed `List<dyn SqlValue>` (each element's `sql_value()`); the binder
+/// converts a `bool` to 0 or 1. The column readers share one helper and the vilan
+/// signature supplies the type; `Row`'s members refuse a NULL before reading.
 [extern("__db_run")]
 external fun statement_run(statement: Statement, parameters: List<any>): i32;
 
@@ -99,21 +208,30 @@ external fun column_bytes(row: Row, name: str): Bytes;
 [extern("__db_is_null")]
 external fun column_is_null(row: Row, name: str): bool;
 
+/// The bind list as the host takes it: each element's own `sql_value()`.
+fun host_values(parameters: List<dyn SqlValue>): List<any> {
+	mut values: List<any> = [];
+	for each in parameters {
+		values.push(each.sql_value());
+	}
+	values
+}
+
 export impl Statement {
 	/// Executes with `parameters` bound positionally; returns the inserted rowid (0
 	/// when the statement inserts nothing). Rowids exceed i32 only past 2^31 rows —
 	/// revisit alongside real i53 needs.
-	fun run(self, parameters: List<any>): i32 {
-		statement_run(self, parameters)
+	fun run(self, parameters: List<dyn SqlValue>): i32 {
+		statement_run(self, host_values(parameters))
 	}
 
-	fun all(self, parameters: List<any>): List<Row> {
-		statement_all(self, parameters)
+	fun all(self, parameters: List<dyn SqlValue>): List<Row> {
+		statement_all(self, host_values(parameters))
 	}
 
 	/// The first matching row, or `None` when the query matches nothing.
-	fun first(self, parameters: List<any>): Option<Row> {
-		statement_first(self, parameters)
+	fun first(self, parameters: List<dyn SqlValue>): Option<Row> {
+		statement_first(self, host_values(parameters))
 	}
 }
 

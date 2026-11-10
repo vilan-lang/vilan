@@ -1,0 +1,121 @@
+// M175 + M195 + F149: a bind list is a `List<dyn SqlValue>` on both backends.
+// Every `SqlValue` type round-trips through SQLite - each number width, `str`,
+// `bool` (as 0 or 1), `Bytes` (a BLOB, a NUL and a high byte inside), and an
+// `Option` of one at depth 1 and 2 - in every way a list is filled: a literal
+// (its literal elements, an operator's result, an `if` element), `push`, a
+// generic helper (B679's shape) and a program's own newtype. The `optional_*`
+// readers answer `None` for NULL and `Some` for a value.
+import std::bytes::Bytes;
+import std::db::{ Database, Row, SqlValue };
+
+struct UserId {
+	uuid: str,
+}
+
+impl UserId with SqlValue {
+	fun sql_value(self): any {
+		self.uuid.sql_value()
+	}
+}
+
+fun collect<T: SqlValue>(value: T): List<dyn SqlValue> {
+	mut held: List<dyn SqlValue> = [];
+	held.push(value);
+	held
+}
+
+fun kind(row: Row): str {
+	row.text("kind")
+}
+
+fun main() {
+	let db = Database::open(":memory:");
+	// NUMERIC affinity: node binds a JS number as REAL, which the column stores
+	// as the INTEGER it equals, so `typeof` reads the same on both backends.
+	db.exec("CREATE TABLE v (label TEXT, value NUMERIC)");
+	let insert = db.prepare("INSERT INTO v (label, value) VALUES (?, ?)");
+	let small: i8 = -8;
+	let byte: u8 = 200;
+	let short: i16 = -1600;
+	let word: u16 = 60000;
+	let count: i32 = 7;
+	let wide: u32 = 4000000000;
+	let stamp: i53 = 1720656000000;
+	let id: u53 = 9007199254740991;
+	let index: usize = 3;
+	let half: f32 = 0.5;
+	let ratio: f64 = 2.25;
+	insert.run(["i8", small]);
+	insert.run(["u8", byte]);
+	insert.run(["i16", short]);
+	insert.run(["u16", word]);
+	insert.run(["i32", count]);
+	insert.run(["u32", wide]);
+	insert.run(["i53", stamp]);
+	insert.run(["u53", id]);
+	insert.run(["usize", index]);
+	insert.run(["f32", half]);
+	insert.run(["f64", ratio]);
+	insert.run(["str", "text"]);
+	insert.run(["true", true]);
+	insert.run(["false", false]);
+	let blob = Bytes::alloc(4);
+	blob.set(0, 0);
+	blob.set(1, 255);
+	blob.set(2, 128);
+	blob.set(3, 0);
+	insert.run(["bytes", blob]);
+	let some: Option<i32> = Some(11);
+	let none: Option<i32> = None;
+	let deep: Option<Option<str>> = Some(Some("deep"));
+	let deep_none: Option<Option<str>> = Some(None);
+	insert.run(["some", some]);
+	insert.run(["none", none]);
+	insert.run(["deep", deep]);
+	insert.run(["deep none", deep_none]);
+	insert.run(["literal", -count * 2 + 1]);
+	insert.run(["branch", if count > 3 { some } else { none }]);
+	mut pushed: List<dyn SqlValue> = ["pushed"];
+	pushed.push(Some(1.5));
+	insert.run(pushed);
+	mut generic = collect(some);
+	generic.insert(0, "generic");
+	insert.run(generic);
+	insert.run(["user", UserId { uuid = "u-1" }]);
+	for row in db
+		.prepare("SELECT label, value, typeof(value) AS kind FROM v ORDER BY rowid")
+		.all([]) {
+		let label = row.text("label");
+		let shown = match kind(row) {
+			"integer" => i"{row.big_integer("value")}",
+			"real" => i"{row.real("value")}",
+			"text" => row.text("value"),
+			"blob" => row.bytes("value").to_hex(),
+			_ => "NULL",
+		};
+		print(i"{label}: {kind(row)} {shown}");
+	}
+	let blob_row = db.prepare("SELECT value FROM v WHERE label = ?").first(["bytes"]).unwrap();
+	print(blob_row.bytes("value").len());
+	print(blob_row.optional_bytes("value").is_some());
+	let text_row = db.prepare("SELECT value FROM v WHERE label = ?").first(["str"]).unwrap();
+	print(text_row.bytes("value").to_hex());
+	let none_row = db.prepare("SELECT value FROM v WHERE label = ?").first(["none"]).unwrap();
+	print(none_row.optional_integer("value"));
+	print(none_row.optional_big_integer("value"));
+	print(none_row.optional_real("value"));
+	print(none_row.optional_text("value"));
+	print(none_row.optional_bytes("value").is_none());
+	print(none_row.is_null("value"));
+	let some_row = db.prepare("SELECT value FROM v WHERE label = ?").first(["some"]).unwrap();
+	print(some_row.optional_integer("value"));
+	print(some_row.optional_big_integer("value"));
+	print(some_row.optional_real("value"));
+	let text_some = db.prepare("SELECT value FROM v WHERE label = ?").first([Some("str")]).unwrap();
+	print(text_some.optional_text("value"));
+	print(db
+		.prepare("SELECT count(*) AS n FROM v WHERE value IS ?")
+		.first([none])
+		.unwrap()
+		.integer("n"));
+}

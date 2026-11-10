@@ -12204,11 +12204,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    /// `std::db`'s host seams (F18 slice 2; Order 39's R1; M195's BLOB reader).
+    /// `std::db`'s host seams (F18 slice 2; Order 39's R1; M195's BLOB reader; M175's NULL).
     ///
     /// Keyed on the pair (host symbol, vilan name) for
     /// [`Emitter::json_host_binding`]'s reason, and here the second half does
-    /// real work twice over: the five column readers SHARE the host helper
+    /// real work twice over: the four typed column readers SHARE the host helper
     /// `__db_column` and differ only in the vilan type they read the column
     /// AT, and `exec`/`prepare` are bare `[extern(method)]`s whose host name
     /// defaults to their own.
@@ -12250,6 +12250,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 module: None,
                 symbol,
             }) => match (*symbol, name) {
+                // M175: `Option`'s `SqlValue` impl answers SQL's NULL for `None`.
+                ("__db_null", _) => "vilan_rt::Any::Null".to_string(),
                 ("__db_close", _) => format!("({}).close()", receiver(self)?),
                 ("__db_run", _) => format!(
                     "({}).run({})",

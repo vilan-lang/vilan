@@ -2023,9 +2023,10 @@ impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
 /// `any` — a value whose vilan type is open at the position it fills.
 ///
 /// It exists for ONE shape today and the scope is deliberate: `std::db`'s
-/// `List<any>` bind list, where a query's parameters are heterogeneous by nature
+/// bind list, where a query's parameters are heterogeneous by nature
 /// (`["ada", 1.5]`) and the schema, not the type system, says what each slot
-/// means. On the JS
+/// means. Since M175 the public list is a `List<dyn SqlValue>`, and each
+/// element's `sql_value()` answers one of these for the host binder. On the JS
 /// backend such a value is just a JS value; natively it needs a value type,
 /// and this is the smallest one that covers what SQLite stores: its five
 /// storage classes (NULL, INTEGER, REAL, TEXT, BLOB), plus `bool`, which the

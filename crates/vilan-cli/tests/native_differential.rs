@@ -15515,6 +15515,70 @@ fn b721_a_typed_value_converts_at_an_any_slot_on_both_backends() {
     }
 }
 
+/// M175 + M195 + F149: a `std::db` bind list is a `List<dyn SqlValue>`, and
+/// every `SqlValue` type round-trips on both backends — each number width,
+/// `str`, `bool`, `Bytes` as a BLOB (a NUL and a high byte inside; natively it
+/// was rustc's E0277, and a BLOB column read back as lossy TEXT), an `Option`
+/// at depth 1 and 2 — filled by a literal (literal leaves and an operator's
+/// result included), `push`, a generic helper (B679's shape: an `Option`
+/// through `T` binds its payload on both) and a program's own `SqlValue`
+/// newtype; and the `optional_*` readers answer `None` for NULL.
+#[test]
+fn m175_every_sql_value_round_trips_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_sql_value.vl";
+    std::fs::write(staged.join(file), include_str!("native/db_sql_value.vl"))
+        .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "i8: integer -8\n",
+                "u8: integer 200\n",
+                "i16: integer -1600\n",
+                "u16: integer 60000\n",
+                "i32: integer 7\n",
+                "u32: integer 4000000000\n",
+                "i53: integer 1720656000000\n",
+                "u53: integer 9007199254740991\n",
+                "usize: integer 3\n",
+                "f32: real 0.5\n",
+                "f64: real 2.25\n",
+                "str: text text\n",
+                "true: integer 1\n",
+                "false: integer 0\n",
+                "bytes: blob 00ff8000\n",
+                "some: integer 11\n",
+                "none: null NULL\n",
+                "deep: text deep\n",
+                "deep none: null NULL\n",
+                "literal: integer -13\n",
+                "branch: integer 11\n",
+                "pushed: real 1.5\n",
+                "generic: integer 11\n",
+                "user: text u-1\n",
+                "4\n",
+                "true\n",
+                "74657874\n",
+                "None\n",
+                "None\n",
+                "None\n",
+                "None\n",
+                "true\n",
+                "true\n",
+                "Some(11)\n",
+                "Some(11)\n",
+                "Some(11.0)\n",
+                "Some(\"text\")\n",
+                "2\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
 /// M195: a `Bytes` binds as a BLOB and reads back through `Row::bytes` as
 /// the bytes bound on both backends — a NUL and a high byte inside, an empty
 /// buffer, `typeof` blob, a BLOB as a `WHERE` parameter — and a TEXT column
@@ -15606,6 +15670,27 @@ fn f149_the_optional_readers_answer_none_for_null_on_both_backends() {
             "{backend:?}"
         );
     }
+}
+
+/// M175: a scalar leaf — a literal, an operator's result — erases into a
+/// trait object where it lands, as a local already did, on both backends:
+/// in a list literal, at an annotated `let`, through `push`. JS stored the
+/// bare value (`Cannot read properties of undefined`), and natively rustc
+/// refused it (E0308, E0599). `[id, 1.5, "label"]` at a `List<dyn SqlValue>`
+/// is the shape every bind list has.
+#[test]
+fn m175_a_scalar_leaf_erases_into_a_trait_object_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_dyn_scalar_leaves.vl"),
+        include_str!("native/dyn_scalar_leaves.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_dyn_scalar_leaves.vl"),
+        Verdict::Identical,
+        "a scalar leaf at a trait-object position must erase on both backends"
+    );
 }
 
 /// B724: a closure that captures a VIEW parameter builds natively and leaves

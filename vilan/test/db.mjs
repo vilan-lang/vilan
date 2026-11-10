@@ -16,7 +16,7 @@ function __db_bind(parameters) {
 			return value;
 		}
 		const shape = Array.isArray(value) ? "a struct, tuple, list or enum value" : typeof value === "function" ? "a closure" : value === undefined ? "an absent value" : "a host object";
-		throw new Error("std::db: cannot bind the parameter at index " + index + " of " + parameters.length + ": " + shape + " is not a SQLite value (bind a number, a str, a bool, or an Option of one)");
+		throw new Error("std::db: cannot bind the parameter at index " + index + " of " + parameters.length + ": " + shape + " is not a SQLite value (bind a number, a str, a bool, Bytes, or an Option of one)");
 	});
 }
 function __db_close(database) {
@@ -46,14 +46,30 @@ function __panic(message, location) {
 function drop(self) {
 	__db_close(self);
 }
+function sql_value(self) {
+	return self;
+}
+function sql_value2(self) {
+	return self;
+}
+function sql_value3(self) {
+	return self;
+}
+function host_values(parameters) {
+	let values = [  ];
+	for (const each of parameters) {
+		values.push(each[1].sql_value(each[0]));
+	}
+	return values;
+}
 function run(self, parameters) {
-	return __db_run(self, parameters);
+	return __db_run(self, host_values(parameters));
 }
 function all(self, parameters) {
-	return __db_all(self, parameters);
+	return __db_all(self, host_values(parameters));
 }
 function first(self, parameters) {
-	return __db_get(self, parameters);
+	return __db_get(self, host_values(parameters));
 }
 function refuse_null(row4, name, reader, caller) {
 	if (__db_is_null(row4, name)) {
@@ -74,40 +90,43 @@ function big_integer(self, name, caller) {
 	refuse_null(self, name, "big_integer", caller);
 	return __db_column(self, name);
 }
-function $e($f) {
-	drop($f);
+const $a = Object.create({sql_value: sql_value3});
+const $b = Object.create({sql_value: sql_value});
+const $e = Object.create({sql_value: sql_value2});
+function $h($i) {
+	drop($i);
 }
 const db = new DatabaseSync(":memory:");
 try {
 	db.exec("CREATE TABLE task (id INTEGER PRIMARY KEY, title TEXT, done INTEGER)");
 	const insert = db.prepare("INSERT INTO task (title, done) VALUES (?, ?)");
-	run(insert, [ "write the pilot", 0 ]);
-	run(insert, [ "ship std::db", 1 ]);
+	run(insert, [ [ "write the pilot", $a ], [ 0, $b ] ]);
+	run(insert, [ [ "ship std::db", $a ], [ 1, $b ] ]);
 	const open_tasks = db.prepare("SELECT title FROM task WHERE done = ? ORDER BY id");
-	for (const row of all(open_tasks, [ 0 ])) {
+	for (const row of all(open_tasks, [ [ 0, $b ] ])) {
 		console.log("todo: " + text(row, "title", "db.vl:18:22"));
 	}
-	const $a = first(db.prepare("SELECT COUNT(*) AS n FROM task"), [  ]);
-	let $b = null;
-	if ($a[0] === 0) {
-		const row2 = $a[1];
-		$b = console.log("" + integer(row2, "n", "db.vl:21:33") + " tasks total");
-	} else {
-		$b = console.log("no rows");
-	}
-	$b;
-	db.exec("CREATE TABLE stamp (id INTEGER PRIMARY KEY, at INTEGER)");
-	run(db.prepare("INSERT INTO stamp (at) VALUES (?)"), [ 1720656000000 ]);
-	const $c = first(db.prepare("SELECT at FROM stamp"), [  ]);
+	const $c = first(db.prepare("SELECT COUNT(*) AS n FROM task"), [  ]);
 	let $d = null;
 	if ($c[0] === 0) {
-		const row3 = $c[1];
-		$d = console.log("stamp at " + big_integer(row3, "at", "db.vl:29:42"));
+		const row2 = $c[1];
+		$d = console.log("" + integer(row2, "n", "db.vl:21:33") + " tasks total");
 	} else {
-		$d = console.log("no stamp");
+		$d = console.log("no rows");
 	}
 	$d;
+	db.exec("CREATE TABLE stamp (id INTEGER PRIMARY KEY, at INTEGER)");
+	run(db.prepare("INSERT INTO stamp (at) VALUES (?)"), [ [ 1720656000000, $e ] ]);
+	const $f = first(db.prepare("SELECT at FROM stamp"), [  ]);
+	let $g = null;
+	if ($f[0] === 0) {
+		const row3 = $f[1];
+		$g = console.log("stamp at " + big_integer(row3, "at", "db.vl:29:42"));
+	} else {
+		$g = console.log("no stamp");
+	}
+	$g;
 } finally {
-	$e(db);
+	$h(db);
 }
 //# sourceMappingURL=db.mjs.map
