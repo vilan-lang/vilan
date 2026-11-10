@@ -3,7 +3,10 @@
 Read this fully before touching code. `CLAUDE.md` states the contract (correctness over
 speed of delivery, refactor-first, proven-before-implemented, root causes over
 symptoms); this file is the map and the accumulated scar tissue. Where the two seem to
-conflict, `CLAUDE.md` wins.
+conflict, `CLAUDE.md` wins. `WISDOM.md` is the method behind both: symptoms mapped to
+likely causes, the principles (C1 onward) with when they hold and how to check them, and
+the cases they came from, by tracker id and commit. Start there when a golden moves, a leg
+is red only in CI, the backends disagree, or an answer is wrong only after an edit.
 
 ## The lay of the land
 
