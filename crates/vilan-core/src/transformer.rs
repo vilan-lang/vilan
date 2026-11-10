@@ -1762,9 +1762,8 @@ fn helper_source(name: &str) -> &'static str {
         // listeners go, the request pauses, and `__http_linger` stops the
         // socket and keeps the answer from being overtaken by a reset. The
         // status goes out with `Connection: close` — node destroys the socket
-        // once it is flushed — and RFC 9110's phrase for a `413` (node's table
-        // still says `Payload Too Large`; the native server says the RFC's, so
-        // the two answer one status line). A response already under way cannot
+        // once it is flushed — with node's own reason phrase, which the native
+        // server's table follows (F151). A response already under way cannot
         // become a refusal, so its socket is cut instead. A `5xx` is the
         // server's own fault and is written to stderr too. Answers the
         // cancellation the caller rejects (or throws) with, after failing a
@@ -1776,7 +1775,6 @@ fn helper_source(name: &str) -> &'static str {
              \tif (status >= 500) console.error(\"std::http: \" + message);\n\
              \tif (!response.headersSent) {\n\
              \t\tresponse.statusCode = status;\n\
-             \t\tif (status === 413) response.statusMessage = \"Content Too Large\";\n\
              \t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
              \t\tresponse.setHeader(\"Connection\", \"close\");\n\
              \t\t__http_linger(request);\n\

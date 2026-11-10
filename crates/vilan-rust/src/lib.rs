@@ -11588,6 +11588,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.place_argument(argument_ids, 0, depth)?,
                 self.value_argument(argument_ids, 1, depth)?
             ),
+            // F152: node's three connection deadlines and its sweep interval,
+            // which `std::http` sets before `listen` (the runtime ignores the
+            // last: it checks every deadline on every turn).
+            (
+                "NodeServer",
+                setter @ ("set_headers_timeout"
+                | "set_request_timeout"
+                | "set_keep_alive_timeout"
+                | "set_connections_checking_interval"),
+            ) => format!(
+                "({}).{setter}({})",
+                self.place_argument(argument_ids, 0, depth)?,
+                self.value_argument(argument_ids, 1, depth)?
+            ),
             // --- NodeAddress ---
             ("NodeAddress", "port") => {
                 format!("({}).port()", self.place_argument(argument_ids, 0, depth)?)

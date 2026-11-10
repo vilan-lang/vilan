@@ -86,6 +86,9 @@ impl ServerBuilder {
 	fun host(own self, address: str): ServerBuilder   // bind one address; default: every interface
 	fun max_body_bytes(own self, limit: usize): ServerBuilder   // the body cap; default 1 MiB
 	fun max_body_bytes_under(own self, mount: str, limit: usize): ServerBuilder   // a mount's cap
+	fun headers_timeout(own self, timeout: Duration): ServerBuilder      // default 60 s
+	fun request_timeout(own self, timeout: Duration): ServerBuilder      // default 300 s
+	fun keep_alive_timeout(own self, timeout: Duration): ServerBuilder   // default 5 s
 	fun on_request(own self, handler: async |Request| Response): ServerBuilder
 	fun on_upgrade(own self, handler: |NodeRequest, NodeSocket, Bytes| void): ServerBuilder
 	fun on_start(own self, callback: |Server| void): ServerBuilder
@@ -169,6 +172,55 @@ prints — and the client gets `500 Internal Server Error` with `Connection:
 close` (a response that had already started streaming is cut off instead).
 The server goes on serving the next request, on both backends.
 
+**Connections are kept, and every part of a request has a deadline.** A
+connection serves one request after another, as node's does: an HTTP/1.1
+client keeps it unless it says `Connection: close` (or the response does —
+`set_header("Connection", "close")` is honoured), and an HTTP/1.0 client is
+answered and closed. Each answer says which, in node's own fields
+(`Connection: keep-alive` with `Keep-Alive: timeout=5`, or `Connection:
+close`); a streaming response goes out `Transfer-Encoding: chunked`.
+Requests a client pipelines are answered in the order they were sent, and a
+request that upgrades (a WebSocket) leaves the connection's request loop —
+the socket is the upgrade handler's from then on. The status line's reason
+phrase is node's on both backends (`413 Payload Too Large`, `422
+Unprocessable Entity`, `unknown` for a code node does not name).
+
+Three deadlines bound a connection, node's by name and by default, and set
+the same way on both backends:
+
+- `headers_timeout` (60 s): the request's head must arrive within it,
+  counted from its first byte — from the accept, for a new connection, so a
+  client that connects and sends nothing is bounded too;
+- `request_timeout` (300 s): the whole request, its body included. Only the
+  request is timed: a response that takes long (a stream, a long poll) is not;
+- `keep_alive_timeout` (5 s): how long a connection may sit idle between
+  requests. It is announced in whole seconds, and the server closes one
+  second past it, as node does, so a client acting on the announcement does
+  not race the close.
+
+A request that misses its head or request deadline is answered `408 Request
+Timeout` (unless its response has started), a handler waiting on its body
+ends at the read as it does for a client that hangs up, and the connection
+closes. A zero `Duration` switches a deadline off. Node checks for expired
+requests on an interval (`std::http` sets it to half the nearest deadline,
+or node's own 30 s, whichever is sooner), so a deadline fires up to that
+much late on node; the native server checks continuously.
+
+```vilan,norun
+import std::http::{ Response, Server };
+import std::time::Duration;
+
+fun main() {
+	Server::builder()
+		.port(8080)
+		.headers_timeout(Duration::seconds(10))
+		.keep_alive_timeout(Duration::seconds(30))
+		.on_request(|request| Response::builder().body("ok").build())
+		.build()
+		.start();
+}
+```
+
 **Request bodies: capped, and read when the handler asks.** A handler runs
 on the request's head. The body stays on the wire until the handler calls
 `bytes()` or `body()`; the first call reads it whole, and a later one
@@ -178,7 +230,7 @@ a `401` for a request that is not signed in, a refusal off a declared
 away.
 
 Every read is capped: **1 MiB** unless the app says otherwise. A body over
-the cap is answered `413 Content Too Large` and its connection closed
+the cap is answered `413 Payload Too Large` and its connection closed
 without the rest being read — a declared `Content-Length` over the cap
 before a byte of the body arrives, a chunked body (no declared length) at
 the chunk that crosses it, counted as it arrives. The handler ends at the
@@ -226,11 +278,9 @@ A mounted rpc service's POST leg reads its frame through the same
 `/rpc/` takes a cap of its own with `.max_body_bytes_under("/rpc/", n)`.
 
 A body the handler never read is not left in the way of the connection:
-one within the cap is drained (node discards it and keeps the connection
-alive for the client's next request; the native server, which closes every
-connection, discards it before the close so the client reads its response
-rather than a reset), and one over the cap, or chunked, is not — the
-response says `Connection: close` and the connection is closed.
+one within the cap is drained — discarded, and the connection kept for the
+client's next request, on both backends — and one over the cap, or chunked,
+is not: the response says `Connection: close` and the connection is closed.
 
 **Reading a body as a stream.** `bytes()` holds the whole body in memory
 at once, which is the right shape for a form or a JSON call and the wrong
