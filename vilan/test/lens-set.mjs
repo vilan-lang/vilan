@@ -1201,6 +1201,7 @@ function map(self, fn) {
 }
 function audit(self, before, changes) {
 	const $bf = self[0].v[6];
+	const check = $bf[1];
 	if ($bf[0] === 0) {
 
 	} else {
@@ -1213,7 +1214,7 @@ function audit(self, before, changes) {
 		return;
 	}
 	const problem = peek(self, (held) => {
-		return $bf[1]($bg[1], held, changes);
+		return check($bg[1], held, changes);
 	});
 	const $bh = problem;
 	if ($bh[0] === 0) {
@@ -1224,6 +1225,7 @@ function audit(self, before, changes) {
 }
 function update(self, change, $aW) {
 	const $aX = self[0].v[6];
+	const _check = $aX[1];
 	let $bc = null;
 	if ($aX[0] === 0) {
 		$bc = [ 0, peek3(self, (held) => {

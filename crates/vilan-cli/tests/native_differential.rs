@@ -7354,6 +7354,273 @@ fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
     );
 }
 
+/// **M199**: a pattern over a `Shared` read that only VIEWS what it binds
+/// reads the cell in place natively — the scrutinee is the cell's shared
+/// borrow (`&(*(cell).borrow()).value`) and every capture a reference into it
+/// — where it had copied the payload out whole to look at it (kolt's
+/// dictionary deep-copied a 123,702-entry map per word checked). The analyzer
+/// admits a construct only when no write of the cell, rebind included, can
+/// run while it does (B457's write summaries), nothing in it suspends, and
+/// every capture is immutable, at no value seam and read by no closure.
+///
+/// Seven forms borrow: a `match` over a field spine (lending `&task`), an
+/// `if .. is` over the bare read, a nested tuple pattern under a let-chain,
+/// a comparison, a nested variant payload, an `is` with a `let _` binder,
+/// and a capture STORED into a constructor (the copy moves to the store,
+/// `Some((xs).clone())`, where rule 1 owes it). Seven keep the copy, and
+/// each prints the value the match found: a write in the arm, a write
+/// through a call, a REBIND in the arm (which a live borrow would meet as a
+/// reentrant write), a capture an escaping closure reads, a `mut` capture,
+/// a guard clause (its capture outlives any construct), and an arm that
+/// awaits while another task rebinds the cell.
+#[test]
+fn m199_a_viewed_only_pattern_over_a_shared_read_borrows_the_cell_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_cell_borrows.vl"),
+        CELL_BORROWS_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_cell_borrows.vl"),
+        Verdict::Identical,
+        "the borrowed and the copied forms must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_cell_borrows.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        concat!(
+            "7\n3\n6\ntrue\n3\ntrue\n",
+            "writes_in_arm 2 3\nwrites_through_a_call 2\n3\nrebinds_in_arm 2\n",
+            "stores Some([1, 2, 3]) Some([1, 2])\nescapes 2\n",
+            "mutable_capture 3 Some([1, 2])\nguarded 2\nawaits 2\n",
+        )
+    );
+    let output = vilan(&staged)
+        .env("VILAN_NATIVE_REPORT_COPIES", "1")
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_cell_borrows.vl",
+        ])
+        .output()
+        .expect("emit the program");
+    assert!(output.status.success(), "the probe must emit");
+    let source = String::from_utf8_lossy(&output.stdout);
+    let census = source
+        .lines()
+        .find(|line| line.starts_with("vilan-native: consumed-copies="))
+        .expect("a copy census");
+    assert!(
+        census.ends_with("cell-read-copies=7 cell-read-borrows=7"),
+        "seven forms borrow and seven copy: {census}"
+    );
+    let body = |name: &str| -> String {
+        let start = source
+            .find(&format!("fn {name}_"))
+            .unwrap_or_else(|| panic!("no `{name}` in:\n{source}"));
+        let end = source[start..]
+            .find("\n}\n")
+            .map_or(source.len(), |offset| start + offset);
+        source[start..end].to_string()
+    };
+    for name in [
+        "viewed_match",
+        "viewed_is",
+        "viewed_nested",
+        "viewed_compare",
+        "viewed_variant_payload",
+        "has",
+        "stores",
+    ] {
+        let text = body(name);
+        assert!(
+            text.contains(").borrow())") && !text.contains(").get()"),
+            "`{name}` must read the cell in place:\n{text}"
+        );
+    }
+    for name in [
+        "writes_in_arm",
+        "writes_through_a_call",
+        "rebinds_in_arm",
+        "escapes",
+        "mutable_capture",
+        "guarded",
+        "awaits",
+    ] {
+        let text = body(name);
+        assert!(
+            !text.contains(").borrow())"),
+            "`{name}` must keep its copy:\n{text}"
+        );
+    }
+}
+
+const CELL_BORROWS_PROBE: &str = r#"import std::io::print;
+import std::shared::Shared;
+import std::time::sleep;
+
+[derive(PartialEq)]
+struct Task {
+	title: str,
+	tags: List<str>,
+}
+
+struct Holder {
+	value: Option<Task>,
+	pair: (List<i32>, i32),
+}
+
+fun tag_count(task: &Task): usize {
+	task.tags.len()
+}
+
+// Viewed only: each binds by reference natively and shares on JS.
+fun viewed_match(cell: Shared<Holder>): usize {
+	match cell.read().value {
+		Some(let task) => task.tags.len() + task.title.len() + tag_count(&task),
+		None => 0,
+	}
+}
+
+fun viewed_is(cell: Shared<Option<List<i32>>>): usize {
+	if cell.read() is Some(let items) {
+		ret items.len();
+	}
+	0
+}
+
+fun viewed_nested(cell: Shared<Holder>): i32 {
+	if cell.read().pair is (let xs, let n) && n > 0 {
+		ret xs[0] + n;
+	}
+	-1
+}
+
+fun viewed_compare(cell: Shared<Holder>, other: Task): bool {
+	match cell.read().value {
+		Some(let task) => task == other && other == task,
+		None => false,
+	}
+}
+
+fun viewed_variant_payload(cell: Shared<Option<Option<Task>>>): usize {
+	match cell.read() {
+		Some(Some(let task)) => task.title.len(),
+		Some(None) => 100,
+		None => 200,
+	}
+}
+
+fun has(cell: Shared<Holder>): bool {
+	cell.read().value is Some(let _)
+}
+
+// Must still copy: the old value is what each prints.
+fun writes_in_arm(cell: Shared<(List<i32>, i32)>) {
+	if cell.read() is (let xs, let n) {
+		cell.write().0.push(9);
+		cell.write().1 = 99;
+		print(i"writes_in_arm {xs.len()} {n}");
+	}
+}
+
+fun poke(cell: Shared<(List<i32>, i32)>) {
+	cell.write().0.push(9);
+}
+
+fun writes_through_a_call(cell: Shared<(List<i32>, i32)>) {
+	match cell.read() {
+		(let xs, _) => {
+			poke(cell);
+			print(i"writes_through_a_call {xs.len()}");
+		}
+	}
+}
+
+fun rebinds_in_arm(cell: Shared<Option<List<i32>>>) {
+	if cell.read() is Some(let xs) {
+		cell.write() = Some([]);
+		print(i"rebinds_in_arm {xs.len()}");
+	}
+}
+
+fun stores(cell: Shared<Option<List<i32>>>): Option<List<i32>> {
+	if cell.read() is Some(let xs) {
+		ret Some(xs);
+	}
+	None
+}
+
+fun escapes(cell: Shared<Option<List<i32>>>): || usize {
+	if cell.read() is Some(let xs) {
+		ret || xs.len();
+	}
+	ret || 0;
+}
+
+fun mutable_capture(cell: Shared<Option<List<i32>>>): usize {
+	match cell.read() {
+		Some(mut xs) => {
+			xs.push(1);
+			xs.len()
+		}
+		None => 0,
+	}
+}
+
+fun guarded(cell: Shared<Option<List<i32>>>): usize {
+	cell.read() is Some(let xs) else ret 0;
+	xs.len()
+}
+
+fun awaits(cell: Shared<Option<List<i32>>>) {
+	let _writer = async {
+		sleep(10);
+		cell.write() = Some([]);
+	};
+	if cell.read() is Some(let xs) {
+		sleep(300);
+		print(i"awaits {xs.len()}");
+	}
+}
+
+fun main() {
+	let task = Task { title = "abc", tags = ["x", "y"] };
+	let holder = Shared::new(Holder { value = Some(task), pair = ([4, 5], 2) });
+	print(viewed_match(holder));
+	print(viewed_is(Shared::new(Some([1, 2, 3]))));
+	print(viewed_nested(holder));
+	print(viewed_compare(holder, task));
+	print(viewed_variant_payload(Shared::new(Some(Some(task)))));
+	print(has(holder));
+	writes_in_arm(Shared::new(([1, 2], 3)));
+	let pair = Shared::new(([1, 2], 3));
+	writes_through_a_call(pair);
+	print(pair.read().0.len());
+	rebinds_in_arm(Shared::new(Some([1, 2])));
+	let kept = Shared::new(Some([1, 2]));
+	mut taken = stores(kept);
+	if &mut taken is Some(let xs) {
+		xs.push(3);
+	}
+	print(i"stores {taken.debug()} {kept.read().debug()}");
+	let closed = Shared::new(Some([1, 2]));
+	let count = escapes(closed);
+	closed.write() = Some([]);
+	print(i"escapes {count()}");
+	let counted = Shared::new(Some([1, 2]));
+	print(i"mutable_capture {mutable_capture(counted)} {counted.read().debug()}");
+	print(i"guarded {guarded(counted)}");
+	awaits(Shared::new(Some([1, 2])));
+}
+"#;
+
 const MOVES_PROBE: &str = concat!(
     "import std::io::print;\n",
     "import std::shared::Shared;\n",

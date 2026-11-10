@@ -1327,6 +1327,9 @@ pub fn post_analysis_passes(
     // suspension set `async_infer` just settled.
     let phase_views_start = PhaseClock::now();
     analyzer::check_view_suspensions(program, &call_graph);
+    // M199: the `Shared`-read borrows the analysis left pending on the same
+    // suspension verdict.
+    analyzer::settle_cell_borrows(program);
     let phase_views = phase_views_start.elapsed();
     // `drop` must be synchronous (destruction.md §5): reject an async drop
     // body now that `async_functions` is settled — an awaiting body is async

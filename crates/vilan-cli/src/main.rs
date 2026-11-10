@@ -7964,6 +7964,10 @@ fn compile_to_js(
                             emitted.consumed_copies_elided,
                             emitted.capture_copies,
                         );
+                        native::record_cell_read_census(
+                            emitted.cell_read_copies,
+                            emitted.cell_read_borrows,
+                        );
                         native::record_host_gaps(emitted.host_gaps);
                         native::record_optional_crates(emitted.optional_crates);
                         emitted.source

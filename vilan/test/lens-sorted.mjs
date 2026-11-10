@@ -2630,6 +2630,7 @@ function mutate(self, change) {
 }
 function audit(self, before, changes) {
 	const $cU = self[0].v[6];
+	const check = $cU[1];
 	if ($cU[0] === 0) {
 
 	} else {
@@ -2642,7 +2643,7 @@ function audit(self, before, changes) {
 		return;
 	}
 	const problem = peek2(self, (held) => {
-		return $cU[1]($cV[1], held, changes);
+		return check($cV[1], held, changes);
 	});
 	const $da = problem;
 	if ($da[0] === 0) {
@@ -2809,6 +2810,7 @@ function landed(self, changes, late, $db) {
 }
 function update(self, change, $cJ) {
 	const $cK = self[0].v[6];
+	const _check = $cK[1];
 	let $cP = null;
 	if ($cK[0] === 0) {
 		$cP = [ 0, peek2(self, (held) => {
@@ -2962,6 +2964,7 @@ function landed_one(self, change, $er) {
 }
 function plan(self, change, write, $eo) {
 	const $ep = self[0].v[6];
+	const _check = $ep[1];
 	let $eq = null;
 	if ($ep[0] === 0) {
 		$eq = [ 0, peek2(self, (held) => {
