@@ -36,10 +36,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::{Future, IntoFuture};
+use std::net::{Ipv4Addr, UdpSocket};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -1128,6 +1129,17 @@ struct Runtime {
     timers: RefCell<Vec<Rc<TimerSlot>>>,
     current: Cell<Option<TaskId>>,
     sequence: Cell<u64>,
+    /// F160: the socket another thread wakes this loop's readiness wait
+    /// through, opened by the first wait that needs it.
+    bell: RefCell<BellState>,
+    /// How many macrotask steps the loop has taken ([`turns`]).
+    turns: Cell<u64>,
+    /// F160: what the last readiness wait reported, sorted by socket, for the
+    /// poll right after it ([`reported_quiet`]); empty otherwise.
+    reported: RefCell<Vec<Watch>>,
+    /// F160: the last turn ended in a readiness wait whose report is still
+    /// unread, so the next poll needs no look of its own.
+    fresh: Cell<bool>,
 }
 
 thread_local! {
@@ -1140,6 +1152,10 @@ thread_local! {
             timers: RefCell::new(Vec::new()),
             current: Cell::new(None),
             sequence: Cell::new(0),
+            bell: RefCell::new(BellState::Unopened),
+            turns: Cell::new(0),
+            reported: RefCell::new(Vec::new()),
+            fresh: Cell::new(false),
         }
     };
 }
@@ -1409,19 +1425,29 @@ fn fire_timer(slot: &Rc<TimerSlot>) {
 
 /// A source of external readiness the loop looks at once per turn (F18).
 ///
-/// This is the whole of the executor's I/O story, and it is deliberately a POLL
-/// rather than a readiness notification. `std::net` offers `set_nonblocking` and
-/// nothing else: an `epoll`/`kqueue`/IOCP registration needs libc, which needs a
-/// dependency and `unsafe`, and this crate has neither by rule (Order 37 R8,
-/// Order 39 R1). So a listening socket is a source that ACCEPTS without
-/// blocking, its connections are sources that read and write without blocking,
-/// and the turn model asks each of them "did anything happen" once per turn.
+/// The turn model is a POLL, and stays one: each turn asks every source "did
+/// anything happen" — a listening socket ACCEPTS without blocking, its
+/// connections read and write without blocking — and a `true` answer is one
+/// macrotask, exactly as a fired timer is. That is what keeps the order in
+/// which tasks wake identical with and without I/O.
 ///
-/// The cost is bounded and named: with nothing ready and no timer due, the loop
-/// waits [`IO_POLL_INTERVAL`] before looking again, so an idle server wakes a
-/// thousand times a second and a request waits at most a millisecond longer than
-/// it would under a readiness notification. That is the price of the rule, and
-/// the shape to replace when a platform layer is allowed a dependency.
+/// What changes with F160 is what the loop does when NOTHING happened. Before,
+/// it slept [`IO_POLL_INTERVAL`] and asked again, so an idle server woke a
+/// thousand times a second and every request waited up to a millisecond for
+/// the next look. Now every source DESCRIBES what it waits for
+/// ([`IoSource::interest`]) — sockets that must become readable or writable,
+/// a deadline of its own, or a wake from another thread through a
+/// [`LoopWaker`] — and the loop blocks in the readiness wait a native program
+/// installs ([`install_readiness`]) until one of them, or the next timer, is
+/// due. The wait is `poll(2)` / `WSAPoll`, which is FFI, and this crate has no
+/// dependency and no `unsafe` by rule (Order 37 R8, Order 39 R1), so the wait
+/// is `vilan-rt-poll`'s and everything else — which sockets, which deadline,
+/// what happens after — is this file's.
+///
+/// The tick remains as the FALLBACK, for a program that installed no wait
+/// (this crate's own unit tests; a build that did not link `vilan-rt-poll`),
+/// for a source that cannot describe itself (the trait's default), and for a
+/// wait that failed.
 pub trait IoSource {
     /// Look for work, without blocking. `true` if anything progressed — a
     /// connection accepted, bytes read, bytes written, a request dispatched.
@@ -1429,14 +1455,34 @@ pub trait IoSource {
     /// fired timer does.
     fn poll(&self) -> bool;
 
-    /// F146: when this is the ONLY live source, the loop asks it to WAIT for
-    /// work itself — at most `limit` (the next timer's deadline), or as long
-    /// as it takes with no timer — instead of sleeping [`IO_POLL_INTERVAL`]
-    /// between polls. `true` if it waited (whatever it received is the next
-    /// [`IoSource::poll`]'s to answer); `false`, the default, if it cannot
-    /// block, and the loop sleeps as before. Only a source whose work arrives
-    /// on a channel can say yes: nothing else can wake the loop while it
-    /// blocks, which is why a second live source turns this off.
+    /// F160: what this source waits for, asked right after a [`IoSource::poll`]
+    /// of every source found nothing to do, before the loop blocks — every
+    /// socket whose readiness would give the next poll work
+    /// ([`Interest::watch`]), and the earliest moment its next poll has work
+    /// whatever the sockets do ([`Interest::wake_at`]: a request deadline, a
+    /// linger). Work that arrives from ANOTHER thread is not described here:
+    /// that thread wakes the loop through a [`LoopWaker`] it was handed.
+    ///
+    /// `true` if the description is complete — the loop may then block until
+    /// one of those, or the next timer, is due. `false`, the default, if this
+    /// source cannot say, and the loop falls back to the tick. A description
+    /// may be generous (a deadline that turns out to have nothing behind it
+    /// costs one extra turn), never short: a socket or a moment left out is a
+    /// request that waits for something else to wake the loop.
+    fn interest(&self, interest: &mut Interest) -> bool {
+        let _ = interest;
+        false
+    }
+
+    /// F146: when this is the ONLY live source and no readiness wait is in
+    /// use, the loop asks it to WAIT for work itself — at most `limit` (the
+    /// next timer's deadline), or as long as it takes with no timer — instead
+    /// of sleeping [`IO_POLL_INTERVAL`] between polls. `true` if it waited
+    /// (whatever it received is the next [`IoSource::poll`]'s to answer);
+    /// `false`, the default, if it cannot block, and the loop ticks as before.
+    /// Only a source whose work arrives on a channel can say yes: nothing else
+    /// can wake the loop while it blocks, which is why a second live source
+    /// turns this off.
     fn block(&self, limit: Option<Duration>) -> bool {
         let _ = limit;
         false
@@ -1457,8 +1503,245 @@ pub trait IoSource {
     }
 }
 
-/// How long the loop waits when no source is ready and no timer is due.
+/// How long the loop waits between polls when it cannot wait for readiness
+/// (see [`IoSource`]): no wait installed, a source that cannot describe
+/// itself, or a wait that failed.
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// The operating system's name for a socket, as the readiness wait takes it:
+/// a file descriptor on unix, a `SOCKET` on Windows.
+#[cfg(unix)]
+pub type RawSocket = std::os::fd::RawFd;
+/// The operating system's name for a socket, as the readiness wait takes it:
+/// a file descriptor on unix, a `SOCKET` on Windows.
+#[cfg(windows)]
+pub type RawSocket = std::os::windows::io::RawSocket;
+
+/// A socket [`Interest::watch`] can name — every `std::net` socket. Reading
+/// the raw handle is safe; only waiting on it is not, and that is
+/// `vilan-rt-poll`'s.
+pub trait Pollable {
+    /// The handle the readiness wait names this socket by.
+    fn raw_socket(&self) -> RawSocket;
+}
+
+#[cfg(unix)]
+impl<T: std::os::fd::AsRawFd> Pollable for T {
+    fn raw_socket(&self) -> RawSocket {
+        self.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsRawSocket> Pollable for T {
+    fn raw_socket(&self) -> RawSocket {
+        self.as_raw_socket()
+    }
+}
+
+/// One socket the readiness wait watches, and for what.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Watch {
+    pub socket: RawSocket,
+    /// Wake when it can be read without blocking — bytes, an end of stream, a
+    /// connection to accept, or an error.
+    pub readable: bool,
+    /// Wake when it can be written without blocking, or has failed.
+    pub writable: bool,
+    /// Set by the wait: whether the socket reported anything — ready for
+    /// what it was watched for, an error, or a hang-up.
+    pub ready: bool,
+}
+
+/// What every live source waits for, gathered before the loop blocks (F160).
+pub struct Interest {
+    /// When this turn began, before its poll. A deadline at or before it has
+    /// already been seen by the poll — it fired, or it means nothing now — so
+    /// it is left out rather than turning the wait into a spin.
+    turn: Instant,
+    watches: Vec<Watch>,
+    deadline: Option<Instant>,
+}
+
+impl Interest {
+    fn new(turn: Instant) -> Interest {
+        Interest {
+            turn,
+            watches: Vec::new(),
+            deadline: None,
+        }
+    }
+
+    /// Wake when `socket` can be read (`readable`) or written (`writable`)
+    /// without blocking. Watching for neither is watching nothing: a socket a
+    /// source does not mean to touch is left out, because an error or hang-up
+    /// on it would wake the wait to a poll that does not look.
+    pub fn watch(&mut self, socket: &impl Pollable, readable: bool, writable: bool) {
+        if readable || writable {
+            self.watches.push(Watch {
+                socket: socket.raw_socket(),
+                readable,
+                writable,
+                ready: false,
+            });
+        }
+    }
+
+    /// Wake by `deadline` at the latest. A moment at or before the start of
+    /// this turn is ignored (see [`Interest::turn`]).
+    pub fn wake_at(&mut self, deadline: Instant) {
+        if deadline > self.turn {
+            self.deadline = Some(self.deadline.map_or(deadline, |held| held.min(deadline)));
+        }
+    }
+
+    /// The sockets watched so far — for a source's own tests.
+    #[cfg(test)]
+    pub(crate) fn watches(&self) -> &[Watch] {
+        &self.watches
+    }
+
+    /// The deadline gathered so far — for a source's own tests.
+    #[cfg(test)]
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// An interest for a source's own tests, as of `turn`.
+    #[cfg(test)]
+    pub(crate) fn starting(turn: Instant) -> Interest {
+        Interest::new(turn)
+    }
+}
+
+/// The readiness wait (F160): block until one of the watched sockets is ready
+/// for what it is watched for (or has an error or hang-up to report), or
+/// `timeout` passes — `None` is no limit — and set each [`Watch::ready`]. An
+/// early return is allowed (an interrupted wait, a spurious wake): the loop
+/// only polls again. A late one is not. An `Err` makes the loop tick for that
+/// turn instead.
+pub type ReadinessWait = fn(&mut [Watch], Option<Duration>) -> std::io::Result<()>;
+
+/// The wait [`install_readiness`] installed, process-wide.
+static READINESS: OnceLock<ReadinessWait> = OnceLock::new();
+
+/// Installs the readiness wait the loop blocks in — `vilan_rt_poll::install`,
+/// called from the emitted `main` of a program that does I/O. The first
+/// install wins; a program that never calls this keeps the tick.
+pub fn install_readiness(wait: ReadinessWait) {
+    let _ = READINESS.set(wait);
+}
+
+/// The sending end of a loop's bell: a UDP socket connected to the loop's own.
+struct BellRope {
+    sender: UdpSocket,
+}
+
+/// The loop's bell (F160): a loopback UDP socket the readiness wait always
+/// watches, so ANOTHER thread can end the wait by sending it a datagram. Plain
+/// `std::net`, so it needs nothing the rule forbids, and it is a socket, so it
+/// waits in the same `poll` / `WSAPoll` as everything else on every platform
+/// (a pipe or an eventfd would not, on Windows).
+struct Bell {
+    receiver: UdpSocket,
+    rope: Arc<BellRope>,
+}
+
+impl Bell {
+    fn open() -> std::io::Result<Bell> {
+        let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        receiver.set_nonblocking(true)?;
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+        sender.connect(receiver.local_addr()?)?;
+        sender.set_nonblocking(true)?;
+        Ok(Bell {
+            receiver,
+            rope: Arc::new(BellRope { sender }),
+        })
+    }
+
+    /// Takes every datagram rung since the last drain. Each one only meant
+    /// "look again", and the poll that follows looks.
+    fn drain(&self) {
+        let mut datagram = [0u8; 8];
+        while self.receiver.recv(&mut datagram).is_ok() {}
+    }
+}
+
+/// Where a loop's bell stands.
+enum BellState {
+    /// Not needed yet: no readiness wait has run on this thread.
+    Unopened,
+    Open(Bell),
+    /// The loopback socket could not be opened: this loop ticks.
+    Unavailable,
+}
+
+/// The first bell opened in the process — the program's loop — which a
+/// termination request rings from the signal thread (F45/F157), as it unparks
+/// [`PROGRAM_THREAD`] for a loop asleep on a timer.
+static PROGRAM_BELL: OnceLock<Arc<BellRope>> = OnceLock::new();
+
+/// Runs `with` on this thread's bell, opening it on first use. `None` when no
+/// readiness wait is installed or the bell cannot be opened.
+fn with_bell<R>(with: impl FnOnce(&Bell) -> R) -> Option<R> {
+    READINESS.get()?;
+    RUNTIME.with(|runtime| {
+        let mut state = runtime.bell.borrow_mut();
+        if matches!(*state, BellState::Unopened) {
+            *state = match Bell::open() {
+                Ok(bell) => {
+                    let _ = PROGRAM_BELL.set(Arc::clone(&bell.rope));
+                    BellState::Open(bell)
+                }
+                Err(_) => BellState::Unavailable,
+            };
+        }
+        match &*state {
+            BellState::Open(bell) => Some(with(bell)),
+            _ => None,
+        }
+    })
+}
+
+/// A handle another thread wakes the loop with (F160) — taken ON the loop's
+/// thread, moved to the thread whose work the loop waits for (stdin's reader,
+/// a WebSocket's connect), and woken AFTER that work is where the loop's next
+/// poll finds it. A wake rings the loop's bell when it has one, and unparks
+/// its thread either way, which ends a tick or a timer sleep early.
+#[derive(Clone)]
+pub struct LoopWaker {
+    thread: std::thread::Thread,
+    rope: Option<Arc<BellRope>>,
+}
+
+impl LoopWaker {
+    /// Ends the loop's current wait, or the next one if it is not waiting:
+    /// the datagram stays in the bell until the loop drains it. Cheap, never
+    /// blocks, safe from any thread.
+    pub fn wake(&self) {
+        if let Some(rope) = &self.rope {
+            // A full socket buffer refuses the send, and is itself a ring.
+            let _ = rope.sender.send(&[1]);
+        }
+        self.thread.unpark();
+    }
+}
+
+/// The waker for the loop of the CURRENT thread.
+pub fn loop_waker() -> LoopWaker {
+    LoopWaker {
+        thread: std::thread::current(),
+        rope: with_bell(|bell| Arc::clone(&bell.rope)),
+    }
+}
+
+/// How many turns of the loop — macrotask steps — this thread has taken
+/// (F160's measurement): an idle program that waits for readiness takes
+/// almost none, where the tick took a thousand a second.
+pub fn turns() -> u64 {
+    RUNTIME.with(|runtime| runtime.turns.get())
+}
 
 /// Registers `source` with the loop. A server calls this when it binds.
 pub fn register_io(source: Rc<dyn IoSource>) {
@@ -1469,11 +1752,14 @@ fn io_registered() -> bool {
     RUNTIME.with(|runtime| !runtime.io.borrow().is_empty())
 }
 
+fn io_sources() -> Vec<Rc<dyn IoSource>> {
+    RUNTIME.with(|runtime| runtime.io.borrow().iter().map(Rc::clone).collect())
+}
+
 /// Polls every registered source once, dropping the dead ones. `true` if any of
 /// them progressed.
 fn poll_io() -> bool {
-    let sources: Vec<Rc<dyn IoSource>> =
-        RUNTIME.with(|runtime| runtime.io.borrow().iter().map(Rc::clone).collect());
+    let sources = io_sources();
     let mut progressed = false;
     for source in &sources {
         if source.poll() {
@@ -1484,21 +1770,40 @@ fn poll_io() -> bool {
     progressed
 }
 
+/// Whether a microtask is waiting — work the loop must not block in front of.
+fn microtasks_pending() -> bool {
+    RUNTIME.with(|runtime| !runtime.microtasks.borrow().is_empty())
+}
+
 /// The non-microtask half of one turn.
 ///
 /// With no I/O registered this IS [`advance_timers`], unchanged — which is what
 /// keeps every ordering rule J6 pinned true for every program that does no I/O.
 /// With a live source it is the same one-macrotask-per-turn rule extended by one
 /// kind of macrotask: a poll of the sources, then the single earliest DUE timer
-/// (due, so the wait cannot be spent blind to a socket), then a bounded wait.
+/// (due, so the wait cannot be spent blind to a socket), then a wait — for
+/// readiness (F160), or the tick when the loop cannot wait for readiness.
 fn advance_macrotasks() -> bool {
+    RUNTIME.with(|runtime| runtime.turns.set(runtime.turns.get() + 1));
     if stopped() {
         return false;
     }
     if !io_registered() {
         return advance_timers();
     }
-    if poll_io() {
+    let turn = Instant::now();
+    let requests = TERMINATION_REQUESTS.load(Ordering::SeqCst);
+    // F160: the poll reads only what a wait reported, so it needs a report
+    // as of NOW — the blocking wait's when this turn follows one, else a look
+    // that does not block. Every turn's report is fresh, so a socket whose
+    // bytes arrive while the loop is busy is read at the next turn, never
+    // starved behind its busier neighbours.
+    if !RUNTIME.with(|runtime| runtime.fresh.replace(false)) {
+        readiness_wait(turn, Wait::Look);
+    }
+    let progressed = poll_io();
+    forget_reported();
+    if progressed {
         return true;
     }
     if let Some(slot) = earliest_timer()
@@ -1512,8 +1817,23 @@ fn advance_macrotasks() -> bool {
         // which is allowed to sleep and lets the program exit.
         return advance_timers();
     }
-    let remaining =
-        earliest_timer().map(|slot| slot.deadline.saturating_duration_since(Instant::now()));
+    if microtasks_pending() {
+        // A poll that queued work without calling it progress: run it before
+        // anything waits.
+        return true;
+    }
+    let next_timer = earliest_timer().map(|slot| slot.deadline);
+    if readiness_wait(
+        turn,
+        Wait::Block {
+            requests,
+            next_timer,
+        },
+    ) {
+        RUNTIME.with(|runtime| runtime.fresh.set(true));
+        return true;
+    }
+    let remaining = next_timer.map(|deadline| deadline.saturating_duration_since(Instant::now()));
     // F146: a SOLE source that can block waits for its own work until the next
     // deadline — stdin's reader, parked on a silent terminal or pipe, sleeps in
     // the kernel rather than waking the loop a thousand times a second.
@@ -1523,13 +1843,137 @@ fn advance_macrotasks() -> bool {
     {
         return true;
     }
+    tick(remaining);
+    true
+}
+
+/// F18's wait, now the fallback: at most [`IO_POLL_INTERVAL`], less when the
+/// next timer is nearer. Parked rather than slept, so a [`LoopWaker`] ends it.
+fn tick(remaining: Option<Duration>) {
     let wait = remaining.map_or(IO_POLL_INTERVAL, |remaining| {
         remaining.min(IO_POLL_INTERVAL)
     });
     if !wait.is_zero() {
-        std::thread::sleep(wait);
+        std::thread::park_timeout(wait);
     }
+}
+
+/// The two ways a turn asks the readiness wait (F160).
+enum Wait {
+    /// Before the poll: what is ready right now, without blocking.
+    Look,
+    /// After a poll that found nothing: until a watched socket is ready, the
+    /// nearest deadline — the next timer's or a source's own — passes, or the
+    /// bell rings. `requests` is the termination count when the turn began.
+    Block {
+        requests: usize,
+        next_timer: Option<Instant>,
+    },
+}
+
+/// F160: asks the readiness wait, and keeps what it reported for the poll
+/// ([`reported_quiet`]). `false` if the loop cannot wait for readiness this
+/// turn (see [`IoSource`]) — nothing is then reported, and nothing happened.
+fn readiness_wait(turn: Instant, mode: Wait) -> bool {
+    let Some(wait) = READINESS.get().copied() else {
+        return false;
+    };
+    // Taken back from the last wait, so a server's watch list is not
+    // reallocated every turn; it is cleared on every road out, so nothing is
+    // reported unless this wait reports it.
+    let mut interest = Interest::new(turn);
+    interest.watches = RUNTIME.with(|runtime| std::mem::take(&mut *runtime.reported.borrow_mut()));
+    interest.watches.clear();
+    let give_back = |mut watches: Vec<Watch>| {
+        watches.clear();
+        RUNTIME.with(|runtime| *runtime.reported.borrow_mut() = watches);
+    };
+    for source in io_sources() {
+        if !source.interest(&mut interest) {
+            give_back(interest.watches);
+            return false;
+        }
+    }
+    let Some(bell) = with_bell(|bell| bell.receiver.raw_socket()) else {
+        give_back(interest.watches);
+        return false;
+    };
+    let timeout = match mode {
+        Wait::Look => Some(Duration::ZERO),
+        Wait::Block {
+            requests,
+            next_timer,
+        } => {
+            PROGRAM_THREAD.get_or_init(std::thread::current);
+            // A termination request rings the program's bell — but one that
+            // arrived after this turn began and before the bell first opened
+            // rang nothing. The bell is open now, so a later one will ring it.
+            if TERMINATION_REQUESTS.load(Ordering::SeqCst) != requests {
+                give_back(interest.watches);
+                return true;
+            }
+            let deadline = match (next_timer, interest.deadline) {
+                (Some(timer), Some(own)) => Some(timer.min(own)),
+                (timer, own) => timer.or(own),
+            };
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()))
+        }
+    };
+    let mut watches = interest.watches;
+    watches.push(Watch {
+        socket: bell,
+        readable: true,
+        writable: false,
+        ready: false,
+    });
+    if wait(&mut watches, timeout).is_err() {
+        // A wait that fails must not become a loop that spins: this turn
+        // ticks, and what it reported is not known.
+        if matches!(mode, Wait::Block { .. }) {
+            tick(timeout);
+        }
+        with_bell(Bell::drain);
+        give_back(watches);
+        return true;
+    }
+    if watches.last().is_some_and(|watch| watch.ready) {
+        with_bell(Bell::drain);
+    }
+    watches.pop();
+    watches.sort_unstable_by_key(|watch| watch.socket);
+    RUNTIME.with(|runtime| *runtime.reported.borrow_mut() = watches);
     true
+}
+
+/// Whether the wait that reported for this turn's poll WATCHED `socket` for
+/// reading (`readable`) or for writing (`!readable`) and it reported nothing
+/// at all — no readiness, no error, no hang-up (F160). A source then skips
+/// the read or the write it would only have had refused: whatever arrives
+/// after the report is the next turn's, whose report is fresh. `false`
+/// whenever nothing is known — no wait reported, or the socket was not
+/// watched that way.
+pub fn reported_quiet(socket: &impl Pollable, readable: bool) -> bool {
+    let socket = socket.raw_socket();
+    RUNTIME.with(|runtime| {
+        let reported = runtime.reported.borrow();
+        reported
+            .binary_search_by_key(&socket, |watch| watch.socket)
+            .is_ok_and(|index| {
+                let watch = &reported[index];
+                !watch.ready
+                    && if readable {
+                        watch.readable
+                    } else {
+                        watch.writable
+                    }
+            })
+    })
+}
+
+/// Forgets what the last wait reported: only the poll right after it may
+/// read it.
+fn forget_reported() {
+    RUNTIME.with(|runtime| runtime.reported.borrow_mut().clear());
 }
 
 /// The registry's one source, when it holds exactly one (F146).
@@ -1554,8 +1998,10 @@ static TERMINATION_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 /// what the SECOND request's sentence reads, on the signal thread.
 static HOLDING_THE_STOP: AtomicUsize = AtomicUsize::new(0);
 
-/// The thread the event loop runs on, recorded by its first timer wait, so a
-/// request can wake a loop parked on a far deadline ([`wait_until`]).
+/// The thread the event loop runs on, recorded by its first timer wait or
+/// readiness wait, so a request can wake a loop parked on a far deadline
+/// ([`wait_until`]) or ticking; a loop blocked in its readiness wait hears
+/// [`PROGRAM_BELL`] instead.
 static PROGRAM_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
 /// A request to stop the program GRACEFULLY — what a termination signal means
@@ -1591,6 +2037,11 @@ pub fn request_termination() {
             );
         }
         std::process::exit(1);
+    }
+    // F160: a loop blocked in its readiness wait hears the bell; one asleep
+    // on a timer, or ticking, is unparked.
+    if let Some(rope) = PROGRAM_BELL.get() {
+        let _ = rope.sender.send(&[1]);
     }
     if let Some(thread) = PROGRAM_THREAD.get() {
         thread.unpark();
@@ -2552,5 +3003,71 @@ mod tests {
         register_io(source);
         assert!(advance_macrotasks());
         assert_eq!(limits.borrow().len(), 1, "asked once, declined");
+    }
+
+    // -- F160: the interest a readiness wait is built from --
+
+    #[test]
+    fn f160_an_interest_keeps_the_nearest_deadline_after_the_turn_began() {
+        let turn = Instant::now();
+        let mut interest = Interest::new(turn);
+        interest.wake_at(turn);
+        assert_eq!(
+            interest.deadline, None,
+            "the turn's own poll saw that moment"
+        );
+        interest.wake_at(turn + Duration::from_millis(50));
+        interest.wake_at(turn + Duration::from_millis(20));
+        interest.wake_at(turn + Duration::from_millis(80));
+        assert_eq!(interest.deadline, Some(turn + Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn f160_a_socket_watched_for_nothing_is_left_out() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
+        let mut interest = Interest::new(Instant::now());
+        interest.watch(&socket, false, false);
+        assert!(interest.watches.is_empty());
+        interest.watch(&socket, true, false);
+        assert_eq!(
+            interest.watches,
+            [Watch {
+                socket: socket.raw_socket(),
+                readable: true,
+                writable: false,
+                ready: false,
+            }]
+        );
+    }
+
+    /// No wait installed — this crate's own tests never install one — so a
+    /// source that describes itself still ticks, and a waker made here only
+    /// unparks: the fallback the readiness wait stands on.
+    #[test]
+    fn f160_without_a_readiness_wait_the_loop_ticks_and_a_waker_unparks() {
+        struct Describing;
+        impl IoSource for Describing {
+            fn poll(&self) -> bool {
+                false
+            }
+            fn interest(&self, _interest: &mut Interest) -> bool {
+                true
+            }
+            fn is_live(&self) -> bool {
+                true
+            }
+        }
+        assert!(READINESS.get().is_none());
+        assert!(loop_waker().rope.is_none(), "no bell without a wait");
+        register_io(Rc::new(Describing));
+        let before = turns();
+        let started = Instant::now();
+        assert!(advance_macrotasks(), "a tick is a turn");
+        assert_eq!(turns(), before + 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "one tick, not a block: {:?}",
+            started.elapsed()
+        );
     }
 }

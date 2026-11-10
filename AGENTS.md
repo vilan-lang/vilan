@@ -10,7 +10,7 @@ is red only in CI, the backends disagree, or an answer is wrong only after an ed
 
 ## The lay of the land
 
-Rust workspace, sixteen crates, plus the language's own tree:
+Rust workspace, seventeen crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -90,6 +90,13 @@ Rust workspace, sixteen crates, plus the language's own tree:
   `keys()`. The KEYS are not here — std's `KeyDecoder` (vilan) decodes the bytes
   `vilan-rt`'s stdin pump reads, the same on both backends. Unlike its three siblings it
   cannot be `forbid(unsafe_code)`: every `unsafe` block carries its reason.
+- `crates/vilan-rt-poll` — the event loop's readiness WAIT for emitted Rust (F160): blocking
+  until one of several sockets is ready is FFI (`poll(2)` on unix, `WSAPoll` on Windows), so
+  `libc`/`windows-sys` live here behind one call, `vilan_rt::executor::install_readiness`.
+  Which sockets, which deadline and the loopback bell another thread rings are `vilan-rt`'s
+  (`IoSource::interest`, `LoopWaker`); a generated cargo project names this crate only when
+  the program starts a server, dials a WebSocket or reads stdin — without it the loop keeps
+  its 1 ms tick. Its `unsafe` is the one FFI call per platform, with its reason.
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

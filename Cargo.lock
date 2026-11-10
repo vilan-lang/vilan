@@ -1474,6 +1474,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vilan-rt-poll"
+version = "0.55.1"
+dependencies = [
+ "libc",
+ "vilan-rt",
+ "windows-sys",
+]
+
+[[package]]
 name = "vilan-rt-signal"
 version = "0.55.1"
 dependencies = [

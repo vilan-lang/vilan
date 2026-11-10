@@ -90,7 +90,7 @@ pub fn record_host_gaps(gaps: Vec<String>) {
 /// The optional runtime crates the last emit reached, and so which of them the
 /// cargo project written for it depends on (F18 slice 2's `vilan-rt-sqlite`,
 /// F40's `vilan-rt-crypto`, F45's `vilan-rt-signal`, A173 S2's `vilan-rt-term`,
-/// M185's `vilan-rt-image`). Recorded on the same terms as the three above, for
+/// M185's `vilan-rt-image`, F160's `vilan-rt-poll`). Recorded on the same terms as the three above, for
 /// the same reason: the fact belongs to the COMPILE and the manifest is written
 /// after it.
 static OPTIONAL_CRATES: std::sync::Mutex<vilan_rust::OptionalCrates> =
@@ -100,6 +100,7 @@ static OPTIONAL_CRATES: std::sync::Mutex<vilan_rust::OptionalCrates> =
         signal: false,
         term: false,
         image: false,
+        poll: false,
     });
 
 pub fn record_optional_crates(reached: vilan_rust::OptionalCrates) {

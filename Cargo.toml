@@ -40,6 +40,11 @@ members = [
     # already the CLI's) in a crate of its own. `vilan-rt-signal` links it, so
     # it rides every program that starts an HTTP server and no other.
     "crates/vilan-rt-net",
+    # F160: the loop's readiness wait — `poll(2)` on unix, `WSAPoll` on
+    # Windows — is FFI, so `libc` and `windows-sys` (both already the CLI's)
+    # live in a seventh optional crate, linked only by a program that does I/O
+    # the loop waits on (a server, a WebSocket dial, a stdin read).
+    "crates/vilan-rt-poll",
     # M185 (proposal/image.md): `std::image`'s codec core over the `image`
     # crate, kept free of vilan types so ONE implementation serves both
     # backends — `vilan-rt-image` links it natively (a fifth optional crate,

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use vilan_embedded::{
     CONTENT_HASH, FILES, IMAGE_CORE_MANIFEST, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES,
-    RT_IMAGE_MANIFEST, RT_MANIFEST, RT_NET_MANIFEST, RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST,
+    RT_IMAGE_MANIFEST, RT_MANIFEST, RT_NET_MANIFEST, RT_POLL_MANIFEST, RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST,
     RT_TERM_MANIFEST, materialize_into,
 };
 
@@ -192,6 +192,8 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
         ("vilan-rt-net", RT_NET_MANIFEST, "windows-sys"),
         // A173 S2: a PLATFORM dependency block is kept like the plain one.
         ("vilan-rt-term", RT_TERM_MANIFEST, "libc"),
+        // F160: the same two platform blocks, for the readiness wait.
+        ("vilan-rt-poll", RT_POLL_MANIFEST, "libc"),
         // M185: the glue keeps its sibling path dependency on the core, and
         // the core its crates.io one.
         (
@@ -230,6 +232,7 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
     ] {
         assert!(RT_TERM_MANIFEST.contains(block), "{RT_TERM_MANIFEST}");
         assert!(RT_NET_MANIFEST.contains(block), "{RT_NET_MANIFEST}");
+        assert!(RT_POLL_MANIFEST.contains(block), "{RT_POLL_MANIFEST}");
     }
 
     let cache_root = scratch::root().join(format!(

@@ -1,0 +1,40 @@
+# The readiness wait behind the native event loop (tracker F160).
+#
+# SEPARATE from `vilan-rt`, for the reason `vilan-rt-term` is: `vilan-rt` takes
+# no crates.io dependencies and forbids `unsafe` (Order 37's R8), and waiting
+# for any one of several sockets to become ready is reached only through FFI —
+# `poll(2)` on unix, `WSAPoll` on Windows — which Rust's std does not expose.
+# Everything else about the wait (which sockets, which deadline, the bell
+# another thread rings) is `vilan-rt`'s; this crate is the one blocking call.
+# The cargo project `vilan build --backend rust` writes names it ONLY when the
+# program does I/O the loop waits on (an HTTP server, a WebSocket dial, a
+# stdin read); without it the loop keeps its 1 ms tick.
+#
+# `libc` (unix) and `windows-sys` (Windows), both already in the compiler's own
+# lockfile and so in the third-party notices. NOT `mio` or `polling`: neither
+# is in the lockfile, both are a registration API (edge-triggered, or
+# re-armed per event) the loop's level-triggered turn would be rebuilt around,
+# and `mio` registers only its own socket types on Windows, which would move
+# every socket out of `std::net`. A level-triggered `poll` over the handful of
+# sockets one turn watches is the whole need. This crate's `unsafe` is the one
+# FFI call per platform, with its reason.
+[package]
+name = "vilan-rt-poll"
+version = "0.55.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The readiness wait behind the event loop of programs the vilan compiler emits as Rust."
+publish = false
+
+[dependencies]
+vilan-rt = { path = "../vilan-rt" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
+
+# The workspace clippy exception list (root Cargo.toml, backlog N21).
+[lints]
+workspace = true
