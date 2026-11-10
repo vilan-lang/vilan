@@ -286,9 +286,28 @@ pub async fn mkdir_with(path: Str, options: FsOptions) {
     }
     // `create_dir_all` answers an existing directory with success and an
     // existing file with the OS's `EEXIST`, which is node's split.
-    if let Err(error) = std::fs::create_dir_all(Path::new(&*path)) {
+    let target = Path::new(&*path);
+    if let Err(error) = std::fs::create_dir_all(target) {
+        // A FILE above the path is node's `ENOTDIR` on every OS. Unix says so
+        // itself; Windows reports the file as the ancestor that "already
+        // exists" (os error 183), which would print `EEXIST`.
+        if blocked_by_a_file(target) {
+            let error = std::io::Error::from(std::io::ErrorKind::NotADirectory);
+            fail("mkdir", &path, &error);
+        }
         fail("mkdir", &path, &error);
     }
+}
+
+/// Whether the nearest existing ancestor of `path` (the path itself left out)
+/// is something other than a directory — what makes a recursive `mkdir` fail
+/// with node's `ENOTDIR`. A link is followed, as `mkdir` follows it.
+fn blocked_by_a_file(path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .find_map(|ancestor| std::fs::metadata(ancestor).ok())
+        .is_some_and(|metadata| !metadata.is_dir())
 }
 
 /// `rm(path, options)`. A directory needs `recursive` (`EISDIR`-shaped
