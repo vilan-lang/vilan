@@ -1,0 +1,60 @@
+// B721: a TYPED value meeting an `any`-typed slot converts at the boundary,
+// element-wise for a list and payload-wise for an option - a `List<str>`
+// variable at a `List<any>` parameter, the same list read again after the
+// call, a `List<Option<i32>>` (each element its payload or NULL), a nested
+// `List<List<str>>` at `List<List<any>>`, an `Option<str>` at `Option<any>`, a
+// mixed literal, and std's own `Database::migrate`, whose bind list is a
+// literal handed straight to a host binding.
+import std::db::{ Database, Migration };
+
+fun count(values: List<any>): usize {
+	values.len()
+}
+
+fun count_nested(rows: List<List<any>>): usize {
+	mut total: usize = 0;
+	for row in rows {
+		total += row.len();
+	}
+	total
+}
+
+fun present(value: Option<any>): bool {
+	match value {
+		Some(_) => true,
+		None => false,
+	}
+}
+
+fun main() {
+	let db = Database::open(":memory:");
+	let applied = db.migrate([
+		Migration { name = "001", sql = "CREATE TABLE t (a TEXT, b TEXT, n INTEGER)" },
+		Migration { name = "002", sql = "CREATE INDEX t_a ON t (a)" },
+	]);
+	print(applied.len());
+	print(db.migrate([
+		Migration { name = "001", sql = "CREATE TABLE t (a TEXT, b TEXT, n INTEGER)" },
+		Migration { name = "002", sql = "CREATE INDEX t_a ON t (a)" },
+	]).len());
+	db.prepare("INSERT INTO t VALUES (?, ?, ?)").run(["x", "y", 1]);
+	mut parameters: List<str> = ["x"];
+	parameters.push("y");
+	let found = db.prepare("SELECT n FROM t WHERE a = ? AND b = ?").first(parameters);
+	print(found.map_or(|row| row.integer("n"), 0));
+	print(parameters.len());
+	print(count(parameters));
+	let numbers: List<i32> = [1, 2, 3];
+	print(count(numbers));
+	let maybes: List<Option<i32>> = [Some(2), None];
+	db.prepare("INSERT INTO t VALUES ('m', 'm', ?)").run([maybes[0]]);
+	print(count(maybes));
+	let nested: List<List<str>> = [["a", "b"], ["c"]];
+	print(count_nested(nested));
+	let label: Option<str> = Some("label");
+	let nothing: Option<str> = None;
+	print(present(label));
+	print(present(nothing));
+	print(count(["mixed", 1, true, label]));
+	print(db.prepare("SELECT count(*) AS n FROM t").first([]).map_or(|row| row.integer("n"), 0));
+}

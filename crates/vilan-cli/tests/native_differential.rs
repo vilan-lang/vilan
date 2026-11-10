@@ -15488,6 +15488,78 @@ fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
     }
 }
 
+/// B721: a typed value at an `any`-typed slot converts at the boundary,
+/// element-wise for a list and payload-wise for an option — a `List<str>`
+/// variable at std::db's `List<any>` (read again after the call), a
+/// `List<Option<i32>>`, a nested `List<List<str>>`, an `Option<str>` at
+/// `Option<any>`, a mixed literal, and std's own `Database::migrate`, whose
+/// bind list literal goes straight to a host binding. Natively every one was
+/// rustc's E0308 (`expected Vec<Any>, found Vec<Rc<str>>`), so no program that
+/// migrated built.
+#[test]
+fn b721_a_typed_value_converts_at_an_any_slot_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_typed_values_at_any.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/typed_values_at_any.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "2\n0\n1\n2\n2\n3\n2\n3\ntrue\nfalse\n4\n2\n",
+            "{backend:?}"
+        );
+    }
+}
+
+/// B724: a closure that captures a VIEW parameter builds natively and leaves
+/// the caller's place as the JS backend does — a `&mut` parameter written
+/// through a closure handed to `map`, through a closure kept in a local and
+/// called between direct writes, through a `&mut self` method's closure, past
+/// an early return, and handed on to another `&mut` callee; and a `&`
+/// parameter read inside a closure. Natively the first was rustc's E0525 (the
+/// closure `FnMut` where every closure is an `Rc<dyn Fn>`) and every one a
+/// borrow that must outlive `'static`.
+#[test]
+fn b724_a_closure_captures_a_view_parameter_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_view_parameter_captures.vl"),
+        include_str!("native/view_parameter_captures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_view_parameter_captures.vl"),
+        Verdict::Identical,
+        "a closure capturing a view parameter must build and write back on both backends"
+    );
+}
+
+/// B720: a closure whose body builds a variant that fixes only SOME of its
+/// enum's parameters (`|found| Ok(found)`, which says nothing of `E`) is typed
+/// at the call's position natively — `Result` through `map_or` with an `Err`
+/// fallback, a body with both arms, a user enum of two parameters, and a
+/// closure binding with its type written. The analyzer records such a
+/// variant's enum with its arguments ERASED, which the emitter read as closed
+/// and wrote as `Result<>` (rustc E0107).
+#[test]
+fn b720_a_closure_building_a_partial_variant_is_typed_at_its_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_partial_variant_closures.vl"),
+        include_str!("native/partial_variant_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_partial_variant_closures.vl"),
+        Verdict::Identical,
+        "a closure building a partial variant must take its position's type on both backends"
+    );
+}
+
 /// M185: `std::image` prints the same pixels on both backends — the point of
 /// running ONE codec core (`vilan-image`) natively through `vilan-rt-image` and
 /// on node as its wasm32 build. Decode and sniff, the pixel limit's sentence,
