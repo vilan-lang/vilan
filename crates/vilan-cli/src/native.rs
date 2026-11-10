@@ -44,6 +44,17 @@ static CONSUMED_COPIES_ELIDED: AtomicUsize = AtomicUsize::new(0);
 /// counts (`vilan_rust::Emitted::capture_copies`).
 static CAPTURE_COPIES: AtomicUsize = AtomicUsize::new(0);
 
+/// M199: the pattern subjects read out of a `Shared` cell the last emit copied
+/// out whole, and the ones it borrowed in place
+/// (`vilan_rust::Emitted::cell_read_copies`).
+static CELL_READ_COPIES: AtomicUsize = AtomicUsize::new(0);
+static CELL_READ_BORROWS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn record_cell_read_census(copied: usize, borrowed: usize) {
+    CELL_READ_COPIES.store(copied, Ordering::Relaxed);
+    CELL_READ_BORROWS.store(borrowed, Ordering::Relaxed);
+}
+
 pub fn record_copy_census(copied: usize, elided: usize, captured: usize) {
     CONSUMED_COPIES.store(copied, Ordering::Relaxed);
     CONSUMED_COPIES_ELIDED.store(elided, Ordering::Relaxed);
@@ -54,10 +65,13 @@ pub fn record_copy_census(copied: usize, elided: usize, captured: usize) {
 fn report_copy_census() {
     if std::env::var_os("VILAN_NATIVE_REPORT_COPIES").is_some() {
         println!(
-            "vilan-native: consumed-copies={} elided={} capture-copies={}",
+            "vilan-native: consumed-copies={} elided={} capture-copies={} cell-read-copies={} \
+             cell-read-borrows={}",
             CONSUMED_COPIES.load(Ordering::Relaxed),
             CONSUMED_COPIES_ELIDED.load(Ordering::Relaxed),
-            CAPTURE_COPIES.load(Ordering::Relaxed)
+            CAPTURE_COPIES.load(Ordering::Relaxed),
+            CELL_READ_COPIES.load(Ordering::Relaxed),
+            CELL_READ_BORROWS.load(Ordering::Relaxed)
         );
     }
 }

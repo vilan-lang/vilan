@@ -700,6 +700,7 @@ impl<'src> Analyzer<'src> {
         for (write_id, slot, rebinds) in all.iter().flat_map(|rows| &rows.cell_writes) {
             let slot = cells.find(*slot);
             cells.writes.insert(*write_id, (slot, *rebinds));
+            cells.written.insert(slot);
             if !rebinds {
                 cells.mutated.insert(slot);
             }

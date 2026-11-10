@@ -456,6 +456,18 @@ copies every read out of the cell's borrow where it stands. This is not
 §6.9's view of a captured binding, which is taken after the call's other
 arguments.
 
+A **pattern** over a read is a capture like any other (§6.1): `if cell.read()
+is Some(let xs)` binds what the cell held when the pattern matched, and a write
+to the cell inside the arm (in place, through a call, or by a rebind) never
+reaches `xs`. Rule 2 lets an implementation skip the copy when nothing could
+tell: when no write of the cell can run while the `match` or `if` that binds
+the captures runs, nothing in it suspends, and every capture is only viewed
+(immutable, handed out of no value seam, captured by no closure), both backends
+read the payload in place (the native one under the cell's shared borrow)
+instead of copying it out whole. A guard clause's capture (`cell.read() is
+Some(let xs) else ret;`) outlives its statement, so it is copied unless no
+write mutates the cell in place anywhere.
+
 ## 6.8 Resources and destruction
 
 *(Design: [destruction](https://github.com/vilan-lang/proposals/blob/main/proposal/destruction.md).)* Rule 1 copies values, and a

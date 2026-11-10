@@ -125,6 +125,13 @@ pub struct Emitted {
     /// prelude clones over 114 closures (closure-captures-on-native.md §4.2)
     /// that no census could count.
     pub capture_copies: usize,
+    /// M199's measurement: how many pattern subjects read out of a `Shared`
+    /// cell this emit COPIED out of the cell (the payload, whole, to match it)
+    /// and how many it BORROWED in place ([`Emitter::borrowed_cell_subject`]).
+    /// A subject of a natively `Copy` type is neither: its read copies a
+    /// scalar.
+    pub cell_read_copies: usize,
+    pub cell_read_borrows: usize,
 }
 
 /// The runtime crates a program links only when it REACHES them — each one a
@@ -673,6 +680,11 @@ struct Emitter<'a, 'src> {
     /// B722: the bindings a destructuring pattern declares — see
     /// [`destructured_bindings`].
     destructured_bindings: HashSet<Id>,
+    /// M199: the captures of a pattern whose subject this emitter BORROWS
+    /// out of a `Shared` cell ([`Emitter::borrowed_cell_subject`]): each is a
+    /// `&T` into the cell's storage natively while it is a `T` in vilan, read
+    /// as a loaned `self` is (a value read copies out of it).
+    borrowed_captures: HashSet<Id>,
     /// B725: the function whose body is being emitted (the innermost
     /// instance), for [`Emitter::calls_back_into_itself`].
     current_function: Option<Id>,
@@ -693,6 +705,9 @@ struct Emitter<'a, 'src> {
     copies_elided: usize,
     /// F50's column: the capture-prelude copies — see [`Emitted::capture_copies`].
     capture_copies: usize,
+    /// M199's columns — see [`Emitted::cell_read_copies`].
+    cell_read_copies: usize,
+    cell_read_borrows: usize,
     /// A124 R3: the Rust trait each OBJECT type lowers to — one per vilan trait
     /// at its concrete arguments (`dyn Source<i32>` and `dyn Source<str>` are
     /// two), keyed like a nominal instance. See [`Emitter::ensure_object_trait`].
@@ -859,6 +874,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             last_uses: HashSet::new(),
             for_each_resource_subjects: for_each_resource_subjects(program),
             destructured_bindings: destructured_bindings(program),
+            borrowed_captures: HashSet::new(),
             current_function: None,
             reachable_functions: HashMap::default(),
             last_field_uses: HashSet::new(),
@@ -866,6 +882,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             copies_taken: 0,
             copies_elided: 0,
             capture_copies: 0,
+            cell_read_copies: 0,
+            cell_read_borrows: 0,
             object_traits: HashMap::default(),
             object_impls: HashSet::new(),
             drop_nominals: drop_implementing_nominals(program),
@@ -950,6 +968,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             consumed_copies: self.copies_taken,
             consumed_copies_elided: self.copies_elided,
             capture_copies: self.capture_copies,
+            cell_read_copies: self.cell_read_copies,
+            cell_read_borrows: self.cell_read_borrows,
         })
     }
 
@@ -6601,6 +6621,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         if self.program.for_each_views.contains_key(&binding)
             || self.program.payload_view_captures.contains_key(&binding)
+            || self.borrowed_captures.contains(&binding)
         {
             return false;
         }
@@ -6665,6 +6686,100 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .is_some_and(|function| function.returns_view || function.returns_mut_view)
     }
 
+    /// M199: a pattern subject read out of a `Shared` cell — the read, or a
+    /// spine of fields and tuple slots over one — as a REFERENCE into the
+    /// cell under its shared borrow: `&(*(cell).borrow()).value`. The `Ref`
+    /// is the scrutinee's temporary, so it lives to the end of the `match` /
+    /// `if let` / `matches!` that reads it. `None` for any other subject
+    /// (a subscript in the spine, a `write()` view), which keeps its copy.
+    fn borrowed_cell_subject(
+        &mut self,
+        subject: Id,
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let mut steps = Vec::new();
+        let mut current = subject;
+        loop {
+            match self.program.entity_map.get(&current) {
+                Some(&Expr::Field(inner, _, index)) => {
+                    steps.push(Step::Field(inner, index));
+                    current = inner;
+                }
+                Some(&Expr::TupleIndex(inner, offset, width)) => {
+                    let Some(slot) = self.tuple_slot_path(current, offset, width) else {
+                        return Ok(None);
+                    };
+                    steps.push(Step::Slot(slot));
+                    current = inner;
+                }
+                _ => break,
+            }
+        }
+        let Some((cell, false)) = self.shared_view_of(current) else {
+            return Ok(None);
+        };
+        let handle = self.expecting_nothing(|emitter| emitter.expression(cell, depth))?;
+        let path = self.spine_path(
+            format!("(*({handle}).borrow())"),
+            &steps,
+            subject,
+            (depth, "__index"),
+            &mut String::new(),
+            &mut 0,
+        )?;
+        Ok(Some(format!("&{path}")))
+    }
+
+    /// Whether these patterns bind the same under a REFERENCE subject as
+    /// under a value one (Rust's default binding modes): no string literal,
+    /// whose native pattern compares a `&str` against the subject it is
+    /// handed ([`Self::pattern`]'s guards), and no `str`-backed variant,
+    /// which is one.
+    fn pattern_binds_through_a_reference(&self, patterns: &[ExprPattern]) -> bool {
+        fn plain(emitter: &Emitter<'_, '_>, pattern: &ExprPattern) -> bool {
+            match pattern {
+                ExprPattern::Literal(id) => {
+                    Emitter::string_pattern_text(emitter.program, *id).is_none()
+                }
+                ExprPattern::Variant(enum_id, _, payload) => {
+                    emitter
+                        .program
+                        .enums
+                        .get(enum_id)
+                        .is_none_or(|declaration| declaration.backing != Some(Backing::Str))
+                        && payload.iter().all(|inner| plain(emitter, inner))
+                }
+                ExprPattern::Tuple(elements) => {
+                    elements.iter().all(|(inner, _)| plain(emitter, inner))
+                }
+                ExprPattern::Array(elements) => elements.iter().all(|inner| plain(emitter, inner)),
+                ExprPattern::Binding(_) | ExprPattern::Wildcard => true,
+            }
+        }
+        patterns.iter().all(|pattern| plain(self, pattern))
+    }
+
+    /// M199's census: one pattern subject, counted as a cell-read COPY or
+    /// BORROW when it reads a `Shared` cell — a read, or a spine of fields,
+    /// slots and subscripts over one — and its value is no native `Copy`.
+    fn count_a_cell_read_subject(&mut self, subject: Id, borrowed: bool) {
+        let mut current = subject;
+        while let Some(
+            &Expr::Field(inner, _, _) | &Expr::TupleIndex(inner, _, _) | &Expr::Index(inner, _),
+        ) = self.program.entity_map.get(&current)
+        {
+            current = inner;
+        }
+        if !matches!(self.shared_view_of(current), Some((_, false))) {
+            return;
+        }
+        if borrowed {
+            self.cell_read_borrows += 1;
+        } else if !self.is_natively_copy(subject) {
+            self.cell_read_copies += 1;
+        }
+    }
+
     /// A pattern subject as the pattern consumes it: a copy where the subject
     /// names storage, so every capture binds a value (rule 1) rather than a
     /// reference under Rust's default binding modes (F20).
@@ -6719,6 +6834,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return false;
         };
         match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) | Some(Expr::Parameter(binding))
+                if self.borrowed_captures.contains(binding) =>
+            {
+                true
+            }
             Some(Expr::Local(binding)) | Some(Expr::Parameter(binding)) => self
                 .program
                 .parameters
@@ -9116,19 +9236,20 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 }
                 let captured = self.is_condition_captures(*condition);
                 let head = match &captured {
-                    Some((subject, pattern, bindings)) => {
-                        let subject_text = self.expression(*subject, depth)?;
+                    Some((_, _, bindings)) => {
                         // The same copy a destructuring `match` takes (F20): an
                         // `if let` over a PLACE binds its captures by REFERENCE
                         // under Rust's default binding modes, so
                         // `std::compare`'s `if this is Some(let x)` on a
                         // `&Option<i32>` bound `x: &i32` and `x == y` had no
                         // `PartialEq` across the reference. A capture is a copy
-                        // (rule 1), and copying the subject is how it binds one.
-                        let subject_text = self.copy_a_pattern_subject(*subject, subject_text);
-                        let subject_type = self.settled_value_type(*subject);
-                        let pattern_text =
-                            self.pattern(pattern, subject_type, self.span_of(*condition))?;
+                        // (rule 1), and copying the subject is how it binds one
+                        // — unless the subject is a `Shared` read the analyzer
+                        // lets this `if` borrow (M199), which
+                        // [`Self::capturing_let_parts`] decides as it does for
+                        // a let-chain's test.
+                        let (pattern_text, subject_text, _) =
+                            self.capturing_let_parts(*condition, depth)?;
                         for binding in bindings {
                             self.is_captures.insert(*binding);
                         }
@@ -9281,8 +9402,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let (subject, pattern, bindings) = self
             .is_condition_captures(test)
             .expect("a `PathConjunct::Test` is a capturing `is`-test");
-        let subject_text = self.expression(subject, depth)?;
-        let subject_text = self.copy_a_pattern_subject(subject, subject_text);
+        let borrowed = if self.program.borrowed_cell_subjects.contains(&subject)
+            && self.pattern_binds_through_a_reference(std::slice::from_ref(&pattern))
+        {
+            self.borrowed_cell_subject(subject, depth)?
+        } else {
+            None
+        };
+        self.count_a_cell_read_subject(subject, borrowed.is_some());
+        let subject_text = match borrowed {
+            Some(text) => {
+                self.borrowed_captures.extend(bindings.iter().copied());
+                text
+            }
+            None => {
+                let subject_text = self.expression(subject, depth)?;
+                self.copy_a_pattern_subject(subject, subject_text)
+            }
+        };
         let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(&pattern, subject_type, self.span_of(test))?;
         Ok((pattern_text, subject_text, bindings))
@@ -9472,7 +9609,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // each leg reads its captures out by value: one owner per payload,
         // and the value's own `drop` never runs, as on the JS backend.
         let consumes_a_drop_value = destructures && self.has_a_drop_impl(subject_type);
-        if consumes_a_drop_value {
+        let patterns: Vec<ExprPattern> = legs.iter().map(|leg| leg.pattern.clone()).collect();
+        let borrowed = if self.program.borrowed_cell_subjects.contains(&subject)
+            && !consumes_a_drop_value
+            && self.pattern_binds_through_a_reference(&patterns)
+        {
+            self.borrowed_cell_subject(subject, depth)?
+        } else {
+            None
+        };
+        self.count_a_cell_read_subject(subject, borrowed.is_some());
+        if let Some(text) = borrowed {
+            // M199: the analyzer proved no write of the cell can run while
+            // this `match` does, nothing in it suspends, and every capture
+            // only views what it binds — so the legs read the cell in place
+            // under its shared borrow (the scrutinee's temporary, live to the
+            // end of the `match`), and each capture is a reference into it.
+            subject_text = text;
+            for leg in legs {
+                let mut bindings = Vec::new();
+                collect_pattern_bindings(&leg.pattern, &mut bindings);
+                self.borrowed_captures.extend(bindings);
+            }
+        } else if consumes_a_drop_value {
             if let Some(leg) = legs.iter().find(|leg| leg.guard.is_some()) {
                 return Err(unsupported(
                     "a guarded leg of a `match` that consumes a value with a `Drop` impl (the \
@@ -9846,7 +10005,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         span: Span,
     ) -> Result<String, Error> {
-        let subject_text = self.expression(subject, depth)?;
+        // M199: a test whose bindings nothing can read runs no user code
+        // between the subject and its answer, so a subject read out of a
+        // `Shared` cell is tested under the cell's borrow, in place, rather
+        // than copied out whole to be looked at once (`cell.read().value is
+        // Some(let _)`).
+        let borrowed = if self.pattern_binds_through_a_reference(std::slice::from_ref(pattern)) {
+            self.borrowed_cell_subject(subject, depth)?
+        } else {
+            None
+        };
+        self.count_a_cell_read_subject(subject, borrowed.is_some());
+        let subject_text = match borrowed {
+            Some(text) => text,
+            None => self.expression(subject, depth)?,
+        };
         let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(pattern, subject_type, span)?;
         Ok(format!("matches!({subject_text}, {pattern_text})"))

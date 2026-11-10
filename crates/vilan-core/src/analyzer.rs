@@ -18,6 +18,7 @@ use crate::type_::{
 use crate::util::{join_with, plural};
 
 mod auto_annotations;
+mod cell_borrows;
 mod dbg_stack;
 mod held_tables;
 mod hint_labels;
@@ -34,6 +35,7 @@ mod r11_records;
 mod retain_tables;
 mod row_families;
 mod written_types;
+pub use cell_borrows::{PendingCellBorrow, settle_cell_borrows};
 
 pub use dbg_stack::{
     DbgStackBinding, DbgStackInvalidation, DbgStackMove, DbgStackSite, DbgStackValue,
@@ -6029,6 +6031,8 @@ pub struct Analyzer<'src> {
     /// tree is final, and read by rule 2's cell-aware elision. Empty until
     /// then, which names no cell and so elides nothing.
     shared_cells: SharedCells,
+    /// M199: the `Shared::read` declarations ([`Analyzer::is_shared_read_call`]).
+    shared_read_callees: HashSet<Id>,
     /// B267: the bindings whose `Shared` read may ALIAS the cell instead of
     /// copying it. Two readers, and they pull opposite ways, which is the whole
     /// of the rule: rule 1's binding copy is skipped at these sites, and rule
@@ -8503,6 +8507,7 @@ impl<'src> Analyzer<'src> {
             reference_count: HashMap::default(),
             last_use: liveness::LastUse::default(),
             shared_cells: SharedCells::default(),
+            shared_read_callees: HashSet::default(),
             shared_read_bindings: HashSet::default(),
             elided_shared_reads: HashSet::default(),
             donated_projections: HashSet::default(),
@@ -28324,6 +28329,14 @@ impl<'src> Analyzer<'src> {
         self.shared_cells.reads.contains_key(&expr_id)
     }
 
+    /// The same question asked of the callee rather than of the cell table
+    /// (M199), so it answers while the held rows are being collected — before
+    /// `shared_cells` exists — and after, alike.
+    fn is_shared_read_call(&self, expr_id: Id) -> bool {
+        self.call_callee_and_receiver(expr_id)
+            .is_some_and(|(callee_id, _)| self.shared_read_callees.contains(&callee_id))
+    }
+
     /// Whether a pattern's subject names existing storage, so its captures bind
     /// pieces of something with another owner — [`Self::is_place_expr`] plus
     /// **`*view`**.
@@ -28344,9 +28357,18 @@ impl<'src> Analyzer<'src> {
     /// pieces of something with another owner and both rules apply. An OWNED
     /// call result needs no rule: its elements have no other owner, which is
     /// what B53 §2's "destructuring a FRESH value binds without copying" says.
+    ///
+    /// M199: a bare **`Shared.read()`** is admitted too, for B256's reason —
+    /// it lowers to the cell's own slot, so its captures bind pieces of the
+    /// CELL's storage. It had been read as an owned call, and its captures
+    /// aliased the cell outright: `if cell.read() is (let xs, let n) {
+    /// cell.write().0.push(9); xs.len() }` answered 3 on JS where rule 1 (and
+    /// the native backend) answer 2. A field of a read (`cell.read().value`)
+    /// was always a place.
     fn is_capture_subject_place(&self, expr_id: Id) -> bool {
         match self.expr_id_to_expr_map.get(&expr_id) {
             Some(Expr::Dereference(_)) => true,
+            Some(Expr::Call(_)) if self.is_shared_read_call(expr_id) => true,
             Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
             Some(Expr::Tuple(_)) => self.tuple_of_capture_places(expr_id).is_some(),
             _ => self.is_place_expr(expr_id),
@@ -28685,12 +28707,22 @@ impl<'src> Analyzer<'src> {
     /// reasoning and is deliberately NOT admitted here: it elides copies no
     /// resource program pays for, and widening it moves goldens for a gain
     /// nothing has asked for.
+    ///
+    /// M199: a subject read out of a `Shared` cell — the read itself, or a
+    /// field, slot or element of one — is the CELL's storage, so it is stable
+    /// exactly when no write mutates that cell in place anywhere (B267's own
+    /// first shape: a rebind installs a fresh value and leaves the storage
+    /// the capture names alone). The narrower, per-construct answer for a
+    /// cell some write does mutate is [`Self::cell_borrow_candidates`]'.
     fn share_subject_is_stable(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
         // B691: a tuple of places is stable when every element is.
         if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
             return element_ids
                 .iter()
                 .all(|element_id| self.share_subject_is_stable(*element_id, written_roots));
+        }
+        if let Some(cell) = self.shared_read_spine_cell(subject_id) {
+            return !self.shared_cells.mutated.contains(&cell);
         }
         if self.readonly_root(subject_id).is_some() {
             return true;
@@ -28769,7 +28801,25 @@ impl<'src> Analyzer<'src> {
     /// [`Self::collect_written_roots`] records. Narrowing it to the ARM would
     /// not be sound without that root step — `let v = &mut t` outside the arm
     /// and `v.1 = 9` inside it is a write whose own root is `v`.
+    ///
+    /// M199: a subject read out of a `Shared` cell names the CELL's storage,
+    /// which no root walk reaches (the read is a call): it is mutated in place
+    /// when some write mutates that cell in place. `if cell.read() is (_, let
+    /// n) { cell.write().1 = 99; n }` read the slot after the write.
     fn subject_is_mutated_in_place(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id)
+            && element_ids
+                .iter()
+                .any(|element_id| self.subject_is_mutated_in_place(*element_id, written_roots))
+        {
+            return true;
+        }
+        if self
+            .shared_read_spine_cell(subject_id)
+            .is_some_and(|cell| self.shared_cells.mutated.contains(&cell))
+        {
+            return true;
+        }
         self.capture_subject_places(subject_id)
             .into_iter()
             .filter_map(|place_id| self.place_root(place_id))
@@ -36813,7 +36863,16 @@ impl<'src> Analyzer<'src> {
     /// classification, 158–342 ms of a 5.7 s debug checks phase on kolt's
     /// client leg against the drop planner's gate at 950–1230 ms in the same
     /// phase. It is named residue rather than left unmentioned.
-    fn compute_capture_clone_sites(&mut self, held: &held_tables::HeldFold) -> CapturePlan {
+    fn compute_capture_clone_sites(
+        &mut self,
+        held: &held_tables::HeldFold,
+        pending_borrows: &mut [cell_borrows::PendingCellBorrow],
+    ) -> CapturePlan {
+        let pending_by_subject: HashMap<Id, usize> = pending_borrows
+            .iter()
+            .enumerate()
+            .map(|(index, borrow)| (borrow.subject, index))
+            .collect();
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
@@ -36848,13 +36907,18 @@ impl<'src> Analyzer<'src> {
             // (M149 moved the restored regions' first classification here
             // from the move scan's binding walk, which anchored it).
             self.id_windows.set_anchor(capture_id);
-            let Some((type_id, capture_is_mutable)) = self
+            let Some((type_id, capture_is_mutable, capture_name)) = self
                 .variables
                 .get(&capture_id)
-                .map(|variable| (variable.type_id, variable.mutable))
+                .map(|variable| (variable.type_id, variable.mutable, variable.name))
             else {
                 continue;
             };
+            // M199: `let _` binds nothing anyone can read, so there is nothing
+            // to copy and nothing to read at the match.
+            if capture_name == "_" {
+                continue;
+            }
             // B81/B88, and asked FIRST because it is orthogonal to every
             // filter below: whether a capture must be READ at the match is
             // settled by the subject alone, where whether it must be COPIED is
@@ -36912,6 +36976,18 @@ impl<'src> Analyzer<'src> {
             {
                 shared.insert(capture_id);
                 continue;
+            }
+            // M199: a capture of a `Shared` read under a construct no write of
+            // the cell reaches shares too — once the construct is known not
+            // to suspend, which only `settle_cell_borrows` can say. Until
+            // then it keeps its copy site (the conservative answer) and is
+            // already SHARED for rule 2, which must not move out of storage
+            // the settle may leave it aliasing.
+            if let Some(&index) = pending_by_subject.get(&subject_id)
+                && self.shares_under_a_cell_borrow(capture_id, capture_is_mutable, seam_roots)
+            {
+                shared.insert(capture_id);
+                pending_borrows[index].shared_captures.push(capture_id);
             }
             classified.push((capture_id, subject_id, copy));
         }
@@ -37539,6 +37615,29 @@ impl<'src> Analyzer<'src> {
             .any(|(write_id, (written, rebinds))| {
                 *written == cell
                     && !rebinds
+                    && self.source_of_id(*write_id) == Some(source)
+                    && self.one_span_space(expr_id, *write_id)
+                    && self.span_map.get(write_id).is_some_and(|write_span| {
+                        write_span.start >= start && write_span.end <= end
+                    })
+            })
+    }
+
+    /// M199: whether ANY write of `cell` — a rebind as much as an in-place
+    /// write — lies inside `expr_id`'s source span. The span half of
+    /// [`WriteSubject::CellAny`], as [`Self::spans_an_in_place_write`] is
+    /// [`WriteSubject::Cell`]'s.
+    fn spans_a_cell_write(&self, expr_id: Id, cell: CellSlot) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        let (start, end) = (span.start, span.end);
+        self.shared_cells
+            .writes
+            .iter()
+            .any(|(write_id, (written, _))| {
+                *written == cell
                     && self.source_of_id(*write_id) == Some(source)
                     && self.one_span_space(expr_id, *write_id)
                     && self.span_map.get(write_id).is_some_and(|write_span| {
@@ -77430,6 +77529,10 @@ enum WriteSubject<'a> {
     /// A `Shared` cell, written IN PLACE (B457: a rebind installs a fresh
     /// value and leaves the storage a read handed out alone).
     Cell(CellSlot),
+    /// A `Shared` cell, written AT ALL — a rebind as much as an in-place
+    /// write (M199): what a live BORROW of the cell's storage cannot survive,
+    /// where a read that only aliases the storage survives a rebind.
+    CellAny(CellSlot),
     /// A module-level `mut` binding, written at all — an assignment to it or
     /// to a place under it, or a call lending such a place `&mut` (B647).
     Module(Id, &'a ModuleWrites),
@@ -77453,6 +77556,7 @@ impl WriteSubject<'_> {
     fn spans_a_write(&self, analyzer: &Analyzer<'_>, expr_id: Id) -> bool {
         match self {
             WriteSubject::Cell(cell) => analyzer.spans_an_in_place_write(expr_id, *cell),
+            WriteSubject::CellAny(cell) => analyzer.spans_a_cell_write(expr_id, *cell),
             WriteSubject::Module(binding, writes) => {
                 analyzer.spans_a_module_write(expr_id, *binding, writes)
             }
@@ -77463,7 +77567,7 @@ impl WriteSubject<'_> {
     /// runs code: a cell's `read()`/`write()`.
     fn is_the_access(&self, analyzer: &Analyzer<'_>, call_id: Id) -> bool {
         match self {
-            WriteSubject::Cell(_) => {
+            WriteSubject::Cell(_) | WriteSubject::CellAny(_) => {
                 analyzer.shared_cells.reads.contains_key(&call_id)
                     || analyzer.shared_cells.writes.contains_key(&call_id)
             }
@@ -77475,6 +77579,7 @@ impl WriteSubject<'_> {
     fn unknown(&self, analyzer: &Analyzer<'_>) -> bool {
         match self {
             WriteSubject::Cell(cell) => analyzer.shared_cells.mutated.contains(cell),
+            WriteSubject::CellAny(cell) => analyzer.shared_cells.written.contains(cell),
             WriteSubject::Module(binding, writes) => writes.through_values.contains(binding),
         }
     }
@@ -77500,6 +77605,11 @@ struct SharedCells {
     /// outside this set can never be aliased into by a later write, whatever
     /// calls run in between.
     mutated: HashSet<CellSlot>,
+    /// Component representatives SOME write reaches at all, a rebind included
+    /// (M199): a read nothing writes is safe to BORROW natively, where
+    /// [`Self::mutated`] is only the JS backend's aliasing question.
+    #[serde(default)]
+    written: HashSet<CellSlot>,
     /// Every `Shared.read()` call expression, and the slot it reads through.
     reads: HashMap<Id, CellSlot>,
     /// Every `Shared.write()` call expression: the slot it writes through, and
@@ -78676,6 +78786,15 @@ pub struct Program<'src> {
     /// WHETHER TO COPY, and a resource capture is in this set and never in
     /// that map (R1).
     pub materialized_captures: HashSet<Id>,
+    /// M199: the `Shared`-read constructs waiting on the suspension verdict
+    /// ([`cell_borrows::settle_cell_borrows`] empties it).
+    pub pending_cell_borrows: Vec<cell_borrows::PendingCellBorrow>,
+    /// M199: the pattern subjects — a `Shared` read, or a field / slot spine
+    /// over one — the native backend binds BY REFERENCE into the cell: the
+    /// `match` / `if` no write of the cell reaches and nothing suspends, and
+    /// every capture only views what it binds. Filled by
+    /// [`cell_borrows::settle_cell_borrows`].
+    pub borrowed_cell_subjects: HashSet<Id>,
     /// Every interned type id that classifies as a RESOURCE (destruction.md §3),
     /// so the transformer can re-ask the question about a type it only learns
     /// per monomorphization — a generic capture bound at `T` copies for a
@@ -92490,6 +92609,14 @@ fn analyze_over_world<'src>(
     // — folded from the live regions' contributions (one walk) and the
     // restored regions' rows (`held_tables.rs`); each decision below is then
     // taken over every candidate, so no output row is ever served.
+    // M199: the `Shared::read` declarations, for the capture plan's subject
+    // test — asked while the held rows are collected, before `shared_cells`
+    // (whose reads would otherwise answer it) exists.
+    analyzer.shared_read_callees = intrinsics
+        .iter()
+        .filter(|(_, intrinsic)| matches!(intrinsic, Intrinsic::SharedValue))
+        .map(|(id, _)| *id)
+        .collect();
     let held_live = analyzer.collect_held_rows();
     crate::phase_pass_mark("analyzer.collect_held_rows()");
     let mut held = analyzer.fold_held(&held_live);
@@ -92512,7 +92639,11 @@ fn analyze_over_world<'src>(
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
-    let capture_plan = analyzer.compute_capture_clone_sites(&held);
+    // M199: the `Shared`-read constructs no write of their cell reaches,
+    // before the capture plan that shares under them.
+    let mut pending_cell_borrows = analyzer.cell_borrow_candidates(&held, &calls_index);
+    crate::phase_pass_mark("analyzer.cell_borrow_candidates()");
+    let capture_plan = analyzer.compute_capture_clone_sites(&held, &mut pending_cell_borrows);
     crate::phase_pass_mark("analyzer.compute_capture_clone_sites()");
     let resource_types = analyzer.compute_resource_types();
     crate::phase_pass_mark("analyzer.compute_resource_types()");
@@ -93819,6 +93950,8 @@ fn analyze_over_world<'src>(
         parameter_entry_clones,
         capture_clone_sites: capture_plan.sites,
         materialized_captures: capture_plan.materialized,
+        pending_cell_borrows,
+        borrowed_cell_subjects: HashSet::default(),
         resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         drop_extents: std::mem::take(&mut analyzer.drop_extents),
