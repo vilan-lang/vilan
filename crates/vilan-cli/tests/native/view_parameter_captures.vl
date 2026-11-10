@@ -1,0 +1,78 @@
+// B724: a closure that captures a VIEW parameter - a `&mut` one it writes
+// through, and a `&` one it reads - builds natively and leaves the caller's
+// place as the JS backend does: the closure handed to `map`, a closure kept in
+// a local and called between direct writes, a `&mut self` method whose closure
+// writes `self`, an early return, the parameter handed on to another `&mut`
+// callee, and the caller reading its place after each call.
+struct Table { names: List<str> }
+
+impl Table {
+	fun intern(&mut self, name: str): usize {
+		match self.names.position(|each| *each == name) {
+			Some(let at) => at,
+			None => {
+				self.names.push(name);
+				self.names.len() - 1
+			},
+		}
+	}
+
+	fun intern_each(&mut self, names: List<str>): List<usize> {
+		names.map(|name| self.intern(name))
+	}
+}
+
+fun intern_all(table: &mut Table, names: List<str>): List<usize> {
+	names.map(|name| table.intern(name))
+}
+
+fun interleaved(table: &mut Table): usize {
+	let add = |name: str| table.intern(name);
+	add("p");
+	table.names.push("direct");
+	add("q");
+	table.names.len()
+}
+
+fun stop_early(table: &mut Table, stop: bool): i32 {
+	let add = |name: str| table.intern(name);
+	add("early");
+	if stop {
+		ret 1;
+	}
+	add("late");
+	2
+}
+
+fun handed_on(table: &mut Table) {
+	let add = |name: str| table.intern(name);
+	add("handed");
+	grow(table, ["grown"]);
+	add("after");
+}
+
+fun grow(table: &mut Table, names: List<str>) {
+	for name in names {
+		table.names.push(name);
+	}
+}
+
+fun lengths(table: &Table, names: List<str>): List<usize> {
+	names.map(|name| table.names.len() + name.len())
+}
+
+fun main() {
+	mut table = Table { names = [] };
+	print(intern_all(&mut table, ["a", "b", "a"]));
+	print(table.names);
+	print(table.intern_each(["b", "c"]));
+	print(table.names);
+	print(interleaved(&mut table));
+	print(table.names);
+	print(stop_early(&mut table, true));
+	print(stop_early(&mut table, false));
+	print(table.names);
+	handed_on(&mut table);
+	print(table.names);
+	print(lengths(&table, ["", "four"]));
+}

@@ -15326,6 +15326,29 @@ fn b721_a_typed_value_converts_at_an_any_slot_on_both_backends() {
     }
 }
 
+/// B724: a closure that captures a VIEW parameter builds natively and leaves
+/// the caller's place as the JS backend does — a `&mut` parameter written
+/// through a closure handed to `map`, through a closure kept in a local and
+/// called between direct writes, through a `&mut self` method's closure, past
+/// an early return, and handed on to another `&mut` callee; and a `&`
+/// parameter read inside a closure. Natively the first was rustc's E0525 (the
+/// closure `FnMut` where every closure is an `Rc<dyn Fn>`) and every one a
+/// borrow that must outlive `'static`.
+#[test]
+fn b724_a_closure_captures_a_view_parameter_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_view_parameter_captures.vl"),
+        include_str!("native/view_parameter_captures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_view_parameter_captures.vl"),
+        Verdict::Identical,
+        "a closure capturing a view parameter must build and write back on both backends"
+    );
+}
+
 /// M185: `std::image` prints the same pixels on both backends — the point of
 /// running ONE codec core (`vilan-image`) natively through `vilan-rt-image` and
 /// on node as its wasm32 build. Decode and sniff, the pixel limit's sentence,

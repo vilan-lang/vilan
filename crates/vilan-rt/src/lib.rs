@@ -1048,6 +1048,44 @@ impl<T: Js> Js for Weak<T> {
 /// named separately so the emitted source says which rule put it there.
 pub type Captured<T> = Shared<T>;
 
+/// B724: a `&mut` parameter some closure captures, as the body sees it — a
+/// [`Captured`] cell filled from the caller's place on entry, and written back
+/// to that place when the guard drops: at every return, and on a panic's
+/// unwind, so a caller that catches the panic reads what the body wrote, as it
+/// does on the JS backend, where the place IS the object.
+///
+/// A closure cannot hold the loan itself: every closure is an `Rc<dyn Fn>`,
+/// which owns its captures for as long as any handle lives. The copy is the
+/// place observably because the place is loaned exclusively to the body for
+/// the call, and no closure that captures it outlives the call (C16).
+pub struct WriteBack<'a, T: Clone> {
+    target: &'a mut T,
+    cell: Captured<T>,
+}
+
+impl<'a, T: Clone> WriteBack<'a, T> {
+    pub fn new(target: &'a mut T) -> Self {
+        let cell = Captured::new(target.clone());
+        WriteBack { target, cell }
+    }
+
+    /// Another handle to the cell — what the body names the parameter by.
+    pub fn cell(&self) -> Captured<T> {
+        self.cell.clone()
+    }
+}
+
+impl<T: Clone> Drop for WriteBack<'_, T> {
+    fn drop(&mut self) {
+        // Not [`Shared::get`]: a write back during an unwind that met the
+        // cell still borrowed would panic inside a panic. The place keeps
+        // the value it had at the last settled write instead.
+        if let Ok(value) = self.cell.inner.value.try_borrow() {
+            *self.target = value.clone();
+        }
+    }
+}
+
 // ------------------------------------------------------- reference equality ---
 
 /// The equality a value holding a FUNCTION has: JavaScript's `===`, which for a

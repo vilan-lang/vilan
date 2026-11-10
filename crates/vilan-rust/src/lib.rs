@@ -473,6 +473,11 @@ struct Emitter<'a, 'src> {
     /// merely loads `std::json` would otherwise report two boxes its binary
     /// does not contain.
     boxed_emitted: HashSet<Id>,
+    /// B724: the VIEW parameters some closure captures — the subset of
+    /// [`Emitter::boxed`] whose cell is filled from the caller's place on
+    /// entry, a `&mut` one's written back to it on every exit
+    /// ([`Emitter::compute_captured_view_parameters`]).
+    captured_views: HashMap<Id, Convention>,
     /// F124: how each LOAN GROUP that holds an alias (`let c = b;` over a view
     /// `b`) is lowered — see [`Emitter::compute_loan_groups`].
     loans: LoanPlan,
@@ -800,6 +805,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             literal_guards: None,
             boxed: HashSet::new(),
             boxed_emitted: HashSet::new(),
+            captured_views: HashMap::default(),
             loans: LoanPlan::default(),
             module_bindings: HashSet::new(),
             module_binding_cells: BTreeMap::new(),
@@ -940,6 +946,40 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn compute_boxed_bindings(&mut self) {
         self.boxed
             .extend(vilan_core::captures::captured_mut_bindings(self.program));
+        self.compute_captured_view_parameters();
+        self.boxed.extend(self.captured_views.keys().copied());
+    }
+
+    /// B724: a VIEW parameter a closure captures is boxed as a captured `mut`
+    /// local is — the closure holds the counted cell, and every use in the
+    /// body goes through it — with the cell filled from the caller's place on
+    /// entry, and a `&mut` one's written back to that place on every exit, the
+    /// panic's unwind included (`vilan_rt::WriteBack`).
+    ///
+    /// The closure itself cannot hold the loan: every closure is an `Rc<dyn
+    /// Fn>`, which owns what it captures for as long as any handle lives, so a
+    /// borrowed `&T` in it must outlive `'static`, and a `&mut T` it writes
+    /// through is also `FnMut` where `Fn` is wanted (E0525). The copy is
+    /// observably the place: a `&mut` place is LOANED exclusively to this body
+    /// for the call, so nothing else reads it between the fill and the write
+    /// back, and a `&` place cannot be written while it is lent; and C16
+    /// refuses a view-capturing closure to any callee that keeps it, so no
+    /// handle on the cell outlives the call.
+    fn compute_captured_view_parameters(&mut self) {
+        let mut memo = vilan_core::captures::ClosureCaptures::default();
+        let mut closures: Vec<Id> = self.program.closures.keys().copied().collect();
+        closures.sort_by_key(|closure| closure.0);
+        for closure_id in closures {
+            let captures =
+                vilan_core::captures::closure_captures(self.program, closure_id, &mut memo);
+            for binding in captures.iter() {
+                if let Some(parameter) = self.program.parameters.get(binding)
+                    && matches!(parameter.convention, Convention::Ref | Convention::RefMut)
+                {
+                    self.captured_views.insert(*binding, parameter.convention);
+                }
+            }
+        }
     }
 
     /// F124, the aliasing-loans model (`F99-aliasing-loans.md`): a root
@@ -1523,6 +1563,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
             if self.boxed.contains(parameter) {
                 self.boxed_emitted.insert(*parameter);
                 let name = self.binding_name(*parameter);
+                match self.captured_views.get(parameter) {
+                    Some(Convention::RefMut) => {
+                        let _ = write!(
+                            prologue,
+                            "let __write_back_{name} = vilan_rt::WriteBack::new({name}); \
+                             let {name} = __write_back_{name}.cell(); "
+                        );
+                        continue;
+                    }
+                    Some(_) => {
+                        let _ = write!(
+                            prologue,
+                            "let {name} = vilan_rt::Captured::new((*{name}).clone()); "
+                        );
+                        continue;
+                    }
+                    None => {}
+                }
                 let _ = write!(prologue, "let {name} = vilan_rt::Captured::new({name}); ");
             }
         }
