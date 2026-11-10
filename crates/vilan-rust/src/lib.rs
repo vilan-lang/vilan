@@ -3349,6 +3349,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         .unwrap_or_else(|| "()".to_string())
                 ))
             }
+            // B720: an ERASED `Result` (see [`Self::is_grounded`]) that no
+            // position or argument closed is refused by name rather than
+            // written as the `Result<>` rustc refuses (E0107).
+            "Result" if rendered.len() != 2 => Err(unsupported(
+                "a `Result` whose type arguments the analysis left open",
+                span,
+            )),
             "Result" => Ok(format!("Result<{}>", rendered.join(", "))),
             _ => Ok(self.ensure_enum(id, arguments, span)?.name),
         }
@@ -10048,6 +10055,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             | None => false,
             // B605: an object type is closed only when its trait's arguments
             // are — `dyn Pipe<Option<P>>` names the callee's `P`.
+            // B720: a generic declaration with its arguments ERASED — the
+            // empty list the analyzer records for a variant whose payload
+            // fixed only some of its enum's parameters (`Ok(found)`) — is open
+            // at every parameter, though it has no argument to say so.
+            Some(Type::Struct(_, arguments) | Type::Enum(_, arguments))
+                if arguments.is_empty() && self.declares_generics(type_id) =>
+            {
+                false
+            }
             Some(
                 Type::Struct(_, arguments)
                 | Type::Enum(_, arguments)
@@ -10062,6 +10078,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.is_grounded(element) && self.is_grounded(length)
             }
             Some(_) => true,
+        }
+    }
+
+    /// Whether a nominal type's DECLARATION has generic parameters — the
+    /// count an argument list is read against (B720's erased form).
+    fn declares_generics(&self, type_id: TypeId) -> bool {
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, _)) => {
+                self.program
+                    .structs
+                    .get(struct_id)
+                    .is_some_and(|declaration| {
+                        !declaration.generic_parameter_constraint_ids.is_empty()
+                    })
+            }
+            Some(Type::Enum(enum_id, _)) => {
+                self.program.enums.get(enum_id).is_some_and(|declaration| {
+                    !declaration.generic_parameter_constraint_ids.is_empty()
+                })
+            }
+            _ => false,
         }
     }
 

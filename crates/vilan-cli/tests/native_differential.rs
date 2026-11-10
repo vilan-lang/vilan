@@ -15349,6 +15349,28 @@ fn b724_a_closure_captures_a_view_parameter_on_both_backends() {
     );
 }
 
+/// B720: a closure whose body builds a variant that fixes only SOME of its
+/// enum's parameters (`|found| Ok(found)`, which says nothing of `E`) is typed
+/// at the call's position natively — `Result` through `map_or` with an `Err`
+/// fallback, a body with both arms, a user enum of two parameters, and a
+/// closure binding with its type written. The analyzer records such a
+/// variant's enum with its arguments ERASED, which the emitter read as closed
+/// and wrote as `Result<>` (rustc E0107).
+#[test]
+fn b720_a_closure_building_a_partial_variant_is_typed_at_its_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_partial_variant_closures.vl"),
+        include_str!("native/partial_variant_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_partial_variant_closures.vl"),
+        Verdict::Identical,
+        "a closure building a partial variant must take its position's type on both backends"
+    );
+}
+
 /// M185: `std::image` prints the same pixels on both backends — the point of
 /// running ONE codec core (`vilan-image`) natively through `vilan-rt-image` and
 /// on node as its wasm32 build. Decode and sniff, the pixel limit's sentence,

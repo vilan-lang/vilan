@@ -1,0 +1,42 @@
+// B720: a closure whose body builds a variant that fixes only SOME of its
+// enum's parameters - `Ok(found)` says nothing of `E` - types as that enum
+// with a hole where the payload said nothing, and the call it is handed to
+// closes the hole from its other arguments or its position, as the JS backend
+// never had to ask: `Result` through `map_or` with an `Err` fallback, a body
+// with both arms, a user enum with two parameters, and the closure kept in a
+// local with its return written by the binding's annotation.
+enum Either<A, B> {
+	Left(A),
+	Right(B),
+}
+
+fun pick(all: List<str>, wanted: str): Result<str, str> {
+	all.filter(|each| *each == wanted).first().map_or(|found| Ok(found), Err(i"no {wanted}"))
+}
+
+fun checked(value: Option<i32>): Result<i32, str> {
+	value.map_or(|n| if n > 0 { Ok(n) } else { Err("not positive") }, Err("missing"))
+}
+
+fun side(value: Option<i32>): Either<i32, str> {
+	value.map_or(|n| Either::Left(n), Either::Right("none"))
+}
+
+fun describe(either: Either<i32, str>): str {
+	match either {
+		Either::Left(let n) => i"left {n}",
+		Either::Right(let s) => i"right {s}",
+	}
+}
+
+fun main() {
+	print(pick(["a", "b"], "b"));
+	print(pick(["a"], "z"));
+	print(checked(Some(3)));
+	print(checked(Some(-1)));
+	print(checked(None));
+	print(describe(side(Some(4))));
+	print(describe(side(None)));
+	let wrap: |str| Result<str, i32> = |text| Ok(text);
+	print(wrap("kept").is_ok());
+}
