@@ -15609,6 +15609,34 @@ fn f156_binary_doubles_are_identical_on_both_backends() {
     assert!(printed.ends_with("same=true\n"), "{printed}");
 }
 
+/// F158: `std::base64::encode`/`decode` (standard, padded, strict) and
+/// `JsonValue::keys` print the same lines on both backends
+/// (`native/base64_and_keys.vl`): every length mod 3 and all 256 byte values
+/// round-trip to node's own encodings, fourteen malformed texts are `None`,
+/// and the keys of an object come in insertion order while an array, a
+/// string, a number, `null` and a missing field have none.
+#[test]
+fn f158_base64_and_json_keys_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_base64_and_keys.vl",
+        include_str!("native/base64_and_keys.vl"),
+    );
+    for line in [
+        "foobar -> Zm9vYmFy -> [666f6f626172]\n",
+        "héllo 😀 -> aMOpbGxvIPCfmIA= -> [68c3a96c6c6f20f09f9880]\n",
+        "every byte back: true\n",
+        "Zh== -> none\n",
+        "Zm9= -> none\n",
+        "keys: b,a,c,é\n",
+        "nested: z,y\n",
+        "array: 0\n",
+        "missing: 0\n",
+    ] {
+        assert!(printed.contains(line), "{line:?} missing from:\n{printed}");
+    }
+    assert_eq!(printed.matches(" -> none\n").count(), 14, "{printed}");
+}
+
 /// A179: `std::rpc::dial_within` answers the same on both backends over
 /// hand-written dials (`native/dial_within.vl`) — a dial that wins with `Ok`
 /// and one that wins with its own `Err`, a deadline that beats a minute-long

@@ -12758,6 +12758,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 "vilan_rt::str_new(&vilan_rt::Json::json(&{}))",
                 self.place_argument(argument_ids, 0, depth)?
             ),
+            // F158: `JsonValue::keys`'s host half, reached only past its object
+            // check.
+            ("Object.keys", "json_object_keys") => {
+                format!("({}).keys()", self.place_argument(argument_ids, 0, depth)?)
+            }
             ("Object.hasOwn", "has_json_field") => format!(
                 "({}).has_field(&{})",
                 self.place_argument(argument_ids, 0, depth)?,
