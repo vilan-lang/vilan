@@ -1512,10 +1512,6 @@ pub struct Function<'src> {
     /// reachable only through a trait bound, never on a concrete type's own
     /// surface (`proposal/transport-rpc.md` §3.2).
     pub trait_only: bool,
-    /// Declared `[element]` (native-ui.md §12): an element constructor. A tag
-    /// whose name resolves to this function is a TYPED element, lowered onto
-    /// what it returns ([`Analyzer::lower_typed_element`]).
-    pub element: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4317,12 +4313,21 @@ type ExposeFieldCheck<'src> = (
 );
 
 /// native-ui.md §12: one named element's head as the walk saw it — the web
-/// chain `elements.rs` built, `view("tag")` and its links — recorded so the
-/// element can be lowered onto an `[element]` function once its tag resolves
+/// chain `elements.rs` built, `view("tag")` — recorded so the element can be
+/// lowered onto an `[element]` function once its tag resolves
 /// ([`Analyzer::lower_typed_element`]).
+///
+/// Every named element of every program is recorded, because the walk cannot
+/// know yet whether an `[element]` function is in reach (one declared later,
+/// or in a module loaded after this one, still types the tag). So the record
+/// is a PUSH and nothing else (M202): no lookup, no hashing. The drain reads
+/// the records only when the world declares an `[element]` function
+/// (`Analyzer::element_functions`), and drops them unread when it does not.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 struct ElementHead<'src> {
+    /// The `view` callee's entity: the std item the drain decides.
+    callee: Id,
     /// The `view("tag")` call's entity.
     call: Id,
     tag: &'src str,
@@ -4332,15 +4337,18 @@ struct ElementHead<'src> {
     /// `written_call_arguments` row sit, to take the argument out of both.
     call_constraint: Option<usize>,
     call_written_arguments: Option<usize>,
-    /// The head's links, in source order.
-    links: Vec<ElementChainLink<'src>>,
 }
 
-/// One link of a named element's chain ([`ElementHead`]).
+/// One link of a named element's chain: a link `elements.rs` generated, or one
+/// the head wrote. Recorded by a push, like [`ElementHead`]; the drain finds
+/// its head through `subject` ([`Analyzer::typed_element_candidates`]).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 struct ElementChainLink<'src> {
     id: Id,
+    /// The entity the link is called on: the head's call, or the link before
+    /// it in the chain.
+    subject: Id,
     /// What `elements.rs` generated it from, or `None` for a `.method(..)`
     /// link the head wrote (B620's), spanned by `written`.
     generated: Option<crate::elements::GeneratedLink<'src>>,
@@ -4349,6 +4357,15 @@ struct ElementChainLink<'src> {
     /// written bare `.name`) and its `written_call_arguments` row sit.
     constraint: Option<usize>,
     written_arguments: Option<usize>,
+}
+
+/// One named element a drain may lower ([`Analyzer::lower_typed_element`]):
+/// its head and its chain's links in source order, assembled from the walk's
+/// records by [`Analyzer::typed_element_candidates`].
+#[derive(Debug)]
+struct ElementCandidate<'src> {
+    head: ElementHead<'src>,
+    links: Vec<ElementChainLink<'src>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -6135,14 +6152,24 @@ pub struct Analyzer<'src> {
     // element back (`resolve_method_call`'s `Found` arm reads it); the same
     // call written after the element is not in here and takes any method.
     element_head_links: HashMap<Id, (&'src str, Span)>,
-    // native-ui.md §12: every NAMED element head the walk met, keyed by its
-    // `view` callee's entity — what `lower_typed_element` needs to rewrite the
+    // native-ui.md §12: every function declared `[element]` — an element
+    // constructor: a tag whose name resolves to one is a TYPED element,
+    // lowered onto what it returns (`lower_typed_element`). Filled at the one
+    // place a `Function` is inserted, so it rides every clone and every
+    // stored world (the std prefix, a base-cache world) with the functions it
+    // names. A set beside `functions` rather than a flag on `Function` (M202):
+    // the flag grew every `Function` by a word, which every lookup in that
+    // map paid on every program; and while the set is empty the drain decides
+    // every element head is the web one without resolving a tag.
+    element_functions: HashSet<Id>,
+    // native-ui.md §12: every NAMED element head the walk met since the last
+    // drain, in walk order — what `lower_typed_element` needs to rewrite the
     // element's web chain into the typed one once its tag resolves.
-    element_heads: HashMap<Id, ElementHead<'src>>,
-    // native-ui.md §12: the head an entity of an element's chain belongs to —
-    // the head CALL and each link `elements.rs` generated or the head wrote —
-    // valued by the head's callee. A link finds its head through its subject.
-    element_chain_heads: HashMap<Id, Id>,
+    element_heads: Vec<ElementHead<'src>>,
+    // native-ui.md §12: every link of those heads' chains (generated by
+    // `elements.rs` or written in the head), in walk order: a link is pushed
+    // after its subject, so the drain finds each link's head in one pass.
+    element_links: Vec<ElementChainLink<'src>>,
     // native-ui.md §12: the links of a TYPED element that are web-only forms,
     // refused by name when the element lowered. Each resolves to an
     // `Expr::Error` without a second diagnostic, which keeps the rest of the
@@ -8569,8 +8596,9 @@ impl<'src> Analyzer<'src> {
             tuple_element_types: HashMap::default(),
             entry_labels: HashMap::default(),
             element_head_links: HashMap::default(),
-            element_heads: HashMap::default(),
-            element_chain_heads: HashMap::default(),
+            element_functions: HashSet::default(),
+            element_heads: Vec::new(),
+            element_links: Vec::new(),
             refused_element_links: HashSet::default(),
             spaced_generic_calls: HashMap::default(),
             spaced_generic_operands: HashSet::default(),
@@ -42608,32 +42636,28 @@ impl<'src> Analyzer<'src> {
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
             }
         }
-        if !self.element_chain_heads.is_empty() {
-            self.record_element_link(id, subject_id, member, head_tag.is_some());
+        // native-ui.md §12: a link of a named element's chain — one
+        // `elements.rs` generated, or one the head wrote. A link written AFTER
+        // the element (`<div />.f()`) is neither: the element's value,
+        // whichever lowering, is that call's receiver like any other.
+        let generated = crate::elements::generated_link(member);
+        if generated.is_some() || head_tag.is_some() {
+            self.record_element_link(id, subject_id, member.1, generated);
         }
         None
     }
 
-    /// native-ui.md §12: when the link `id` belongs to a named element's
-    /// chain — a link `elements.rs` generated, or one the head wrote — its
-    /// record for the typed lowering. Out of the walk's recursion: the member
+    /// native-ui.md §12: the record of a link of a named element's chain, for
+    /// the typed lowering — a push, read only by a drain whose world declares
+    /// an `[element]` function (M202). Out of the walk's recursion: the member
     /// and its arguments are already walked.
     fn record_element_link(
         &mut self,
         id: Id,
         subject_id: Id,
-        member: &'src Spanned<Node<'src>>,
-        head_written: bool,
+        written: Span,
+        generated: Option<crate::elements::GeneratedLink<'src>>,
     ) {
-        let Some(&head) = self.element_chain_heads.get(&subject_id) else {
-            return;
-        };
-        let generated = crate::elements::generated_link(member);
-        if generated.is_none() && !head_written {
-            // Written AFTER the element (`<div />.f()`): the element's value,
-            // whichever lowering, is this call's receiver like any other.
-            return;
-        }
         // The member's constraint is the last one its arm pushed.
         let constraint =
             self.constraints
@@ -42649,16 +42673,14 @@ impl<'src> Analyzer<'src> {
             .len()
             .checked_sub(1)
             .filter(|&index| self.written_call_arguments[index].0 == id);
-        self.element_chain_heads.insert(id, head);
-        if let Some(record) = self.element_heads.get_mut(&head) {
-            record.links.push(ElementChainLink {
-                id,
-                generated,
-                written: member.1,
-                constraint,
-                written_arguments,
-            });
-        }
+        self.element_links.push(ElementChainLink {
+            id,
+            subject: subject_id,
+            generated,
+            written,
+            constraint,
+            written_arguments,
+        });
     }
 
     /// `walk_expr_node_inner`'s `Node::Let` arm, out of line (N169): its
@@ -43465,18 +43487,14 @@ impl<'src> Analyzer<'src> {
             && let ([(Node::String(tag), _)], [tag_argument]) =
                 (arguments.0.as_slice(), argument_ids.as_slice())
         {
-            self.element_heads.insert(
-                subject_id,
-                ElementHead {
-                    call: id,
-                    tag,
-                    tag_argument: *tag_argument,
-                    call_constraint: Some(self.constraints.len()),
-                    call_written_arguments: Some(self.written_call_arguments.len() - 1),
-                    links: Vec::new(),
-                },
-            );
-            self.element_chain_heads.insert(id, subject_id);
+            self.element_heads.push(ElementHead {
+                callee: subject_id,
+                call: id,
+                tag,
+                tag_argument: *tag_argument,
+                call_constraint: Some(self.constraints.len()),
+                call_written_arguments: Some(self.written_call_arguments.len() - 1),
+            });
         }
         // Defer call type-checking to constraint solving.
         self.constraints
@@ -44647,6 +44665,9 @@ impl<'src> Analyzer<'src> {
                 }
             }
             let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
+            if function.element {
+                self.element_functions.insert(id);
+            }
             self.functions.insert(
                 id,
                 Function {
@@ -44684,7 +44705,6 @@ impl<'src> Analyzer<'src> {
                         .collect(),
                     rpc: function.rpc,
                     trait_only: function.trait_only,
-                    element: function.element,
                 },
             );
             Some(Expr::Function(id))
@@ -70248,7 +70268,47 @@ impl<'src> Analyzer<'src> {
         self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
     }
 
-    /// native-ui.md §12: lower the named element whose head calls `callee`
+    /// native-ui.md §12 (M202): the named elements this drain may lower, keyed
+    /// by their `view` callee's entity. Only a function declared `[element]`
+    /// can make a tag typed, so in a world that declares none the answer is
+    /// empty without a tag resolved or a record read: every element is the
+    /// web one, as it would have resolved to anyway. Either way the walk's
+    /// records are spent — every head they describe is decided by this drain.
+    fn typed_element_candidates(&mut self) -> HashMap<Id, ElementCandidate<'src>> {
+        if self.element_functions.is_empty() {
+            self.element_heads.clear();
+            self.element_links.clear();
+            return HashMap::default();
+        }
+        // The head each entity of a chain belongs to — the head's call, then
+        // each link in turn — valued by the head's callee. A link was
+        // recorded after its subject, so one pass in walk order finds every
+        // link's head.
+        let mut chain_heads: HashMap<Id, Id> = HashMap::default();
+        let mut candidates: HashMap<Id, ElementCandidate<'src>> = HashMap::default();
+        for head in std::mem::take(&mut self.element_heads) {
+            chain_heads.insert(head.call, head.callee);
+            candidates.insert(
+                head.callee,
+                ElementCandidate {
+                    head,
+                    links: Vec::new(),
+                },
+            );
+        }
+        for link in std::mem::take(&mut self.element_links) {
+            let Some(&callee) = chain_heads.get(&link.subject) else {
+                continue;
+            };
+            chain_heads.insert(link.id, callee);
+            if let Some(candidate) = candidates.get_mut(&callee) {
+                candidate.links.push(link);
+            }
+        }
+        candidates
+    }
+
+    /// native-ui.md §12: lower the named element `candidate` describes
     /// onto the `[element]` function its tag names, when it names one —
     /// `true` if it did, and `false` (nothing touched) for a web element.
     ///
@@ -70271,29 +70331,20 @@ impl<'src> Analyzer<'src> {
     /// - a `.child(value)` is already the typed form;
     /// - an `on:event(..)` item, a `.method(..)` link written in the head and
     ///   a hyphenated attribute name are web-only forms, each refused by name.
-    fn lower_typed_element(&mut self, callee: Id) -> bool {
-        let Some(head) = self.element_heads.get(&callee) else {
-            return false;
-        };
+    fn lower_typed_element(&mut self, candidate: &ElementCandidate<'src>) -> bool {
+        let ElementCandidate { head, links } = candidate;
+        let callee = head.callee;
         let tag = head.tag;
-        let tag_argument = head.tag_argument;
         let scope_id = self.get_scope_id_for_entity(callee);
-        let Some(tag_span) = self.span_map.get(&tag_argument).copied() else {
+        let Some(tag_span) = self.span_map.get(&head.tag_argument).copied() else {
             return false;
         };
         let Some(function_id) = self.resolve_value_name_at(tag, scope_id, tag_span.start) else {
             return false;
         };
-        if !self
-            .functions
-            .get(&function_id)
-            .is_some_and(|function| function.element)
-        {
+        if !self.element_functions.contains(&function_id) {
             return false;
         }
-        let Some(head) = self.element_heads.remove(&callee) else {
-            return false;
-        };
         // The callee: the function, spanned by the tag the author wrote.
         let reference_count = self.reference_count.entry(function_id).or_insert(0);
         *reference_count += 1;
@@ -70313,7 +70364,7 @@ impl<'src> Analyzer<'src> {
             row.2.clear();
         }
         let source = self.source_of_id(callee);
-        for link in head.links {
+        for link in links {
             let diagnostics_before = self.diagnostics.len();
             match link.generated {
                 Some(crate::elements::GeneratedLink::Child) => continue,
@@ -70323,7 +70374,7 @@ impl<'src> Analyzer<'src> {
                     bare,
                 }) => {
                     if !name.contains('-') {
-                        self.retarget_element_attribute(&link, name, name_span, bare);
+                        self.retarget_element_attribute(link, name, name_span, bare);
                         continue;
                     }
                     self.diagnostics.push(Error {
@@ -71090,6 +71141,8 @@ impl<'src> Analyzer<'src> {
         // B270's drain runs FIRST: a std reference has no scope to wait for, and
         // resolving it before the locals means an `Expr::Local` is already in
         // place when the ordinary pass walks the same chain.
+        let mut element_candidates = self.typed_element_candidates();
+        let mut guarded_element_heads = Vec::new();
         for (id, module, item) in std::mem::take(&mut self.prepped_std_items) {
             // M110 S6: what the drain mints for a row belongs to the row's item.
             self.id_windows.set_drain_anchor(id);
@@ -71097,8 +71150,19 @@ impl<'src> Analyzer<'src> {
             // function is that function's call, not std's `view`. Decided
             // here, where every import has bound and no local has resolved
             // yet — the head's callee is about to become one or the other.
-            if self.element_heads.contains_key(&id) && self.lower_typed_element(id) {
-                continue;
+            // A tag a guard clause may publish a capture over is decided with
+            // the held-back locals below, once the guard verdict is in: the
+            // capture, a value, shadows the function as a `let` would (B222).
+            if !element_candidates.is_empty()
+                && let Some(candidate) = element_candidates.remove(&id)
+            {
+                if self.guard_may_publish(id, candidate.head.tag) {
+                    guarded_element_heads.push((id, module, item, candidate));
+                    continue;
+                }
+                if self.lower_typed_element(&candidate) {
+                    continue;
+                }
             }
             self.resolve_prepped_std_item(id, module, item);
         }
@@ -73424,6 +73488,14 @@ impl<'src> Analyzer<'src> {
         // about.
         for (id, name) in guarded_locals {
             self.resolve_prepped_local(id, name);
+        }
+        // native-ui.md §12: and the element heads held back with them, their
+        // tags resolving in the same complete scope.
+        for (id, module, item, candidate) in guarded_element_heads {
+            self.id_windows.set_drain_anchor(id);
+            if !self.lower_typed_element(&candidate) {
+                self.resolve_prepped_std_item(id, module, item);
+            }
         }
 
         // B237: and the assignments to those names, wired now that their
@@ -78284,6 +78356,9 @@ pub struct Program<'src> {
     pub entity_scope_map: HashMap<Id, Id>,
     pub function_calls: IndexMap<Id, FunctionCall>,
     pub functions: IndexMap<Id, Function<'src>>,
+    /// The functions declared `[element]` (native-ui.md §12): a tag whose
+    /// name resolves to one lowers to a typed chain on what it returns.
+    pub element_functions: HashSet<Id>,
     pub external_functions: IndexMap<Id, ExternalFunction<'src>>,
     pub traits: IndexMap<Id, Trait<'src>>,
     pub generic_dispatch: HashMap<Id, GenericDispatch<'src>>,
@@ -94187,6 +94262,7 @@ fn analyze_over_world<'src>(
         entity_scope_map: analyzer.expr_id_to_scope_id_map,
         function_calls: analyzer.function_calls,
         functions: analyzer.functions,
+        element_functions: analyzer.element_functions,
         external_functions: analyzer.external_functions,
         traits: analyzer.traits,
         generic_dispatch: analyzer.generic_dispatch,

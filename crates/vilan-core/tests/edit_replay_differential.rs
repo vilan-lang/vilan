@@ -2540,3 +2540,171 @@ fn m152_programs_with_dependencies_answer_what_a_clean_analysis_answers() {
         "the layered leg must build a world over the prefix ({layered_builds} did)"
     );
 }
+
+// --- native-ui.md §12: typed elements across worlds (M202) --------------------
+
+/// A builder module whose constructor `row` is a plain `fun` — the edit below
+/// types `[element]` onto it, which turns `main.vl`'s `<row wrap />` from std's
+/// web element into `row().wrap()`.
+const TYPED_ELEMENT_UI: &str = "export struct Row {\n\tlog: str,\n}\n\n\
+     export impl Row {\n\tfun wrap(self): Row {\n\t\tRow { log = self.log + \" wrap\" }\n\t}\n}\n\n\
+     export fun row(): Row {\n\tRow { log = \"row\" }\n}\n";
+
+const TYPED_ELEMENT_MAIN: &str =
+    "import pkg::ui::row;\n\nfun main() {\n\tlet built = <row wrap />;\n\tprint(\"built\");\n}\n";
+
+/// The marker typed onto the imported constructor, and taken off again: once
+/// with the editor in the edited module, once with that module moving under a
+/// seed in the importer (the prefix-module shape of `LEAF_EDITS`).
+const TYPED_ELEMENT_EDITS: &[Edit] = &[
+    Edit {
+        label: "`[element]` typed onto the constructor an importer's tag names",
+        file: "ui.vl",
+        seed: None,
+        replacements: &[("export fun row(): Row", "[element]\nexport fun row(): Row")],
+    },
+    Edit {
+        label: "`[element]` typed onto the constructor, under the importer's seed",
+        file: "ui.vl",
+        seed: Some("main.vl"),
+        replacements: &[("export fun row(): Row", "[element]\nexport fun row(): Row")],
+    },
+];
+
+/// Whether `javascript` lowered `<row>` onto the `[element]` function: the
+/// constructor is called and std's `view("row")` is not.
+fn lowered_typed(javascript: &str) -> bool {
+    !javascript.contains("view(\"row\")") && javascript.contains("row()")
+}
+
+/// **M202: an `[element]` marker typed into a module the tag's module imports**
+/// — the walk records every element head and the drain decides it only in a
+/// world that declares an `[element]` function, so the decision must follow
+/// the marker through every incremental shape: the editor in the edited
+/// module or in its importer, with and without the std prefix. Each state answers what a clean
+/// analysis answers and emits what a clean analysis of its shape emits, and
+/// the edit really moves the lowering (web, typed, web again on the undo).
+#[test]
+fn m202_an_element_marker_typed_into_an_imported_module_answers_what_a_clean_analysis_answers() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    let mut divergences = Vec::new();
+    let mut lowerings = Vec::new();
+    for prefix in [None, Some(true)] {
+        for edit in TYPED_ELEMENT_EDITS {
+            vilan_core::analyzer::base_cache_clear();
+            vilan_core::incremental::set_std_prefix(prefix);
+            let mut package = Package::write(
+                "typed_element_marker",
+                Platform::default(),
+                &[("main.vl", TYPED_ELEMENT_MAIN), ("ui.vl", TYPED_ELEMENT_UI)],
+            );
+            let seed = package.path(edit.seed.unwrap_or(edit.file));
+            let first = observe(&package, vec![seed.clone()], Leg::Incremental);
+            lowerings.push(first.javascript.as_deref().map(lowered_typed));
+            let before = package.text(edit.file).to_string();
+            let (find, replace) = edit.replacements[0];
+            let after = before.replacen(find, replace, 1);
+            for (phase, text) in [("edit", after), ("undo", before)] {
+                package.set(edit.file, text);
+                let incremental = observe(&package, vec![seed.clone()], Leg::Incremental);
+                let clean = observe(&package, Vec::new(), Leg::Clean);
+                let same_shape = observe(&package, vec![seed.clone()], Leg::CleanSameShape);
+                if incremental.rendering != clean.rendering {
+                    divergences.push(format!(
+                        "{} ({phase}, prefix {prefix:?}): the incremental analysis differs \
+                         from the clean one at {}",
+                        edit.label,
+                        first_difference(&incremental.rendering, &clean.rendering)
+                    ));
+                }
+                if incremental.javascript != same_shape.javascript {
+                    divergences.push(format!(
+                        "{} ({phase}, prefix {prefix:?}): the emitted JS differs from a clean \
+                         analysis of the same shape",
+                        edit.label
+                    ));
+                }
+                lowerings.push(incremental.javascript.as_deref().map(lowered_typed));
+            }
+            package.remove();
+        }
+    }
+    vilan_core::incremental::set_std_prefix(None);
+    vilan_core::analyzer::base_cache_clear();
+    assert!(
+        divergences.is_empty(),
+        "{} step(s) observe the incremental analysis:\n{}",
+        divergences.len(),
+        divergences.join("\n")
+    );
+    // Per leg: the base text (web), the edit (typed), the undo (web).
+    let expected = [Some(false), Some(true), Some(false)];
+    assert_eq!(
+        lowerings,
+        [expected; 4].concat(),
+        "every state emits, and the marker moves `<row>` between the web and the typed \
+         lowering"
+    );
+}
+
+/// A builder appended to a std module through the document overlay: std's
+/// own `[element]` function (std::ui's constructors are about to be ones).
+const STD_TYPED_ELEMENT: &str = "\nexport struct Tally {\n\tcount: i32,\n}\n\n\
+     export impl Tally {\n\tfun child(self, value: i32): Tally {\n\
+     \t\tTally { count = self.count + value }\n\t}\n}\n\n\
+     [element]\nexport fun tally(): Tally {\n\tTally { count = 0 }\n}\n";
+
+/// **M202: an `[element]` function in std, over the std prefix.** The
+/// function's module is walked into the PREFIX world and the tag into the
+/// package's: whether the world declares an `[element]` function is the
+/// prefix's fact, and must reach the package's drain both when the prefix is
+/// built and when a later analysis is served the stored one. Each analysis
+/// answers what a clean one does, and each lowers `<tally>` onto the function.
+#[test]
+fn m202_an_element_function_in_std_types_a_tag_over_the_std_prefix() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let path = std::fs::canonicalize(replay_harness::std_root().join(STD_EDIT_FILE))
+        .expect("std's math module");
+    let math = std::fs::read_to_string(&path).expect("read std's math module");
+    vilan_core::analyzer::set_document_overlay(&path, Some(format!("{math}{STD_TYPED_ELEMENT}")));
+    let package = Package::write(
+        "std_typed_element",
+        Platform::default(),
+        &[(
+            "main.vl",
+            "import std::math::tally;\n\nfun main() {\n\tprint(<tally>{2}{3}</tally>.count);\n}\n",
+        )],
+    );
+    let built = std::panic::catch_unwind(|| observe_over_the_prefix(&package));
+    let served = std::panic::catch_unwind(|| observe_over_the_prefix(&package));
+    package.remove();
+    vilan_core::analyzer::set_document_overlay(&path, None);
+    vilan_core::analyzer::base_cache_clear();
+    let (built, served) = (
+        built.expect("the first analysis over the prefix answers what a clean one does"),
+        served.expect("the served analysis answers what a clean one does"),
+    );
+    assert!(
+        built.census.prefix_world && served.census.prefix_world && served.census.prefix_hits == 1,
+        "both analyses are prefix worlds and the second is served the stored prefix: {:?} / {:?}",
+        built.census,
+        served.census
+    );
+    for (leg, observation) in [("built", &built), ("served", &served)] {
+        let javascript = observation
+            .javascript
+            .as_deref()
+            .unwrap_or_else(|| panic!("the {leg} analysis emits: {}", observation.rendering));
+        assert!(
+            javascript.contains("tally()") && !javascript.contains("view(\"tally\")"),
+            "the {leg} analysis lowers `<tally>` onto std's `[element]` function:\n{javascript}"
+        );
+    }
+}
