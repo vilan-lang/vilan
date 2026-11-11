@@ -18534,8 +18534,6 @@ pub const IMAGE_OPTIMIZED_PACKAGES: &[&str] = &[
     "weezl",
 ];
 
-/// The `Cargo.toml` of the project the backend writes, pointing at the runtime
-/// crate by path. `edition 2024` matches the workspace's own.
 /// native-ui.md P1: each `std::gfx` host symbol's function in
 /// `vilan_rt_gfx::host`, and which of its arguments the function only READS
 /// and so takes by reference (a string, `Bytes`, a host value); every other
@@ -18577,6 +18575,8 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         .map(|(_, function, places)| (*function, *places))
 }
 
+/// The `Cargo.toml` of the project the backend writes, pointing at the runtime
+/// crate by path. `edition 2024` matches the workspace's own.
 pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) -> String {
     // F18 slice 2 (Order 39's R1) and F40: an optional runtime crate is named
     // only when the program reached it. A program that did not pays neither
