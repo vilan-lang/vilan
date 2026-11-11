@@ -61,7 +61,14 @@ members = [
 # and a `toml_datetime` pin that would force the compiler's own `toml` from
 # 0.8.23 down to 0.8.2 — so the crate keeps its own `Cargo.lock` and its own CI job
 # (`scripts/ci-local.sh webview`), and is still embedded for user builds.
-exclude = ["crates/vilan-rt-webview"]
+#
+# native-ui.md P1 (R11, RULED 2026-11-10): `std::gfx`'s runtime crate is NOT a
+# member either, for WEIGHT this time: `wgpu` + `winit` + `parley` are 304
+# packages the compiler does not need, every one of them clean of advisories
+# and on `about.toml`'s licence list. It keeps its own `Cargo.lock`, notices and
+# CI job (`scripts/ci-local.sh gfx`), and is not yet embedded or linked by
+# anything (no `std::gfx` surface exists yet).
+exclude = ["crates/vilan-rt-webview", "crates/vilan-rt-gfx"]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace
 # --all-targets -- -D warnings` is a CI leg, so every finding is an error and an

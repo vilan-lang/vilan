@@ -1,0 +1,30 @@
+# cargo-about config for THIS crate's notices (native-ui.md R11): the crate is
+# outside the compiler's workspace with a lockfile of its own, so its notices
+# are its own file. The accepted list is the compiler's (the root
+# `about.toml`), unchanged: every licence the GPU, window and text stack
+# carries is already on it, and a crate that would add one turns the `gfx` CI
+# leg (`scripts/ci-local.sh gfx`) red until it is accepted here BY NAME, with
+# its reason, as `vilan-rt-webview/about.toml` does for its two.
+#
+#   cd crates/vilan-rt-gfx
+#   cargo about generate -c about.toml ../../about.hbs -o notices.txt
+#   tr -d '\r' <notices.txt >THIRD-PARTY-NOTICES.txt && rm notices.txt
+#
+# (Some licence texts arrive with Windows line endings; the leg compares with
+# carriage returns removed, so the committed file has none.)
+#
+# The notices are what a program linking this crate ships; the test font
+# (`tests/fonts/`, OFL-1.1) is test data, never linked, and carries its own
+# licence file beside it.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "CC0-1.0",
+]
+# No `targets` filter, as the compiler's: the notices cover the WHOLE lockfile,
+# every platform's crates included.

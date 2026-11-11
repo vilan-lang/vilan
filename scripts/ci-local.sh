@@ -39,7 +39,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # misformatted tree is a 20-second red rather than a 10-minute one, then the
 # suite, then the two builds, then the cross-check. THIS LIST IS THE JOB LIST —
 # ci_local_script.rs holds it against ci.yml's jobs in both directions.
-LEGS="fmt vilan-fmt clippy test doctest audit wasm perf webview windows"
+LEGS="fmt vilan-fmt clippy test doctest audit wasm perf webview gfx windows"
 
 # Legs with no ci.yml job, and why (see THE WINDOWS LEG above). A leg named here
 # must not appear in any workflow `run:` step; the pin checks that too, so a leg
@@ -240,15 +240,47 @@ leg_webview() {
     return "$status"
 }
 
+# native-ui.md P1 (R11, RULED 2026-11-10): `std::gfx`'s runtime crate,
+# `crates/vilan-rt-gfx` (`wgpu` + `winit` + `parley`), is OUTSIDE the
+# compiler's workspace with a lockfile of its own, so no leg above reaches it;
+# this one holds it to the same bars with NO exception: its fmt, clippy, its
+# tests, `cargo audit --deny unsound`, and its own notices
+# (`crates/vilan-rt-gfx/about.toml`, the compiler's accepted list unchanged)
+# regenerated and compared byte for byte. It needs a GPU adapter (ci.yml's
+# `gfx` job installs Mesa's software Vulkan, `mesa-vulkan-drivers`), `xvfb`,
+# `cargo-audit` and `cargo-about`; no development package (fontconfig is
+# opened at run time).
+#
+# - `VILAN_REQUIRE_GFX=1`: the golden images (`tests/golden.rs`, a tolerance
+#   of one per channel) and the window proof (`tests/window.rs`, the window
+#   example under xvfb) skip elsewhere when there is no software adapter or no
+#   xvfb, and must not skip here.
+leg_gfx() {
+    (
+        cd crates/vilan-rt-gfx
+        cargo fmt --check || exit 1
+        cargo clippy --all-targets -- -D warnings || exit 1
+        VILAN_REQUIRE_GFX=1 cargo test || exit 1
+        cargo audit --deny unsound || exit 1
+        notices=$(mktemp)
+        cargo about generate -c about.toml ../../about.hbs -o "$notices" || exit 1
+        tr -d '\r' <"$notices" | cmp - THIRD-PARTY-NOTICES.txt || exit 1
+        rm -f "$notices"
+    )
+}
+
 # LOCAL ONLY. Not the windows suite — the windows COMPILE. See the header.
-# The second command is the webview crate's (outside the workspace, so the
-# first does not reach it): `wry`'s WebView2 half and `tao`'s Win32 half
+# The second and third commands are the webview and GPU crates' (outside the
+# workspace, so the first does not reach them): `wry`'s WebView2 half and
+# `tao`'s Win32 half, and `wgpu`'s DirectX 12 and `winit`'s Win32 halves,
 # cross-check from Linux, which nothing in CI does.
 leg_windows() {
     status=0
     cargo clippy --workspace --exclude vilan-rt-sqlite --all-targets \
         --target x86_64-pc-windows-msvc -- -D warnings || status=$?
     (cd crates/vilan-rt-webview && cargo clippy --all-targets \
+        --target x86_64-pc-windows-msvc -- -D warnings) || status=$?
+    (cd crates/vilan-rt-gfx && cargo clippy --all-targets \
         --target x86_64-pc-windows-msvc -- -D warnings) || status=$?
     return "$status"
 }

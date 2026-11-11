@@ -1,0 +1,110 @@
+# The GPU graphics layer of native vilan programs: the Rust half of `std::gfx`
+# (native-ui.md, part P1; every question of its section 9 RULED 2026-11-10).
+#
+# A window (`winit`), a GPU device (`wgpu`), and a renderer of our own for the
+# primitives a user interface is made of — rounded rectangles with borders and
+# gradients, analytic shadows, text runs, underlines and images, under clips,
+# transforms and opacity layers — drawn as instanced quads whose shape the
+# fragment shader computes. Text is shaped by `parley` and rasterised by
+# `swash` behind a small internal interface (R3, R15), into a glyph atlas this
+# crate owns.
+#
+# NOT YET LINKED BY ANYTHING. No `std::gfx` surface exists: the vilan surface,
+# and the emitted program that would name this crate in its generated cargo
+# project, follow in later slices (after the executor slice of native-ui.md
+# section 11.4). Until then the crate is proven on its own: unit tests, golden
+# images rendered offscreen, and a window example under xvfb.
+#
+# OUTSIDE the compiler's workspace (R11), as `vilan-rt-webview` is: the root
+# `Cargo.toml` lists this directory under `exclude`, and the crate carries its
+# OWN `Cargo.lock`. Not for licences or advisories this time (every licence is
+# on the compiler's list and the audit passes) but for WEIGHT: the stack is
+# 304 packages in its lockfile against the compiler's 191, and nobody building the
+# compiler should compile a GPU stack. Its own CI job (`scripts/ci-local.sh
+# gfx`, ci.yml's `gfx`) holds it to fmt, clippy, its tests (golden images and
+# the window proof REQUIRED there), `cargo audit --deny unsound` and its own
+# licence notices.
+#
+# Every direct dependency is pinned EXACTLY: a renderer's output is held to
+# committed golden images, and a minor release of the GPU, text or font stack
+# is exactly the kind of change that moves a pixel.
+[package]
+name = "vilan-rt-gfx"
+version = "0.55.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "The GPU graphics layer (std::gfx) of programs the vilan compiler emits as Rust."
+publish = false
+# The test font (Noto Mono, OFL-1.1) and the golden images are TEST data: they
+# stay in the repository and out of anything packaged from this crate. The
+# crate itself bundles no font; a program draws with the system's fonts or
+# with fonts it registers (`TextSystem::register_font`).
+exclude = ["tests/"]
+
+[dependencies]
+# Native backends only: Vulkan (Linux, Windows, Android), Metal (macOS), DirectX
+# 12 (Windows) and OpenGL ES / desktop GL as the fallback where none of those
+# exists. `webgpu` (the browser) is left out until the browser part (P6) has
+# its own paper; nothing in the renderer rules it out — no storage buffers, no
+# compute, limits held to WebGL2's (see `gpu.rs`).
+wgpu = { version = "=30.0.1", default-features = false, features = [
+    "std",
+    "parking_lot",
+    "wgsl",
+    "vulkan",
+    "metal",
+    "dx12",
+    "gles",
+] }
+# Windows and input. Default features off, each kept one named: X11 and
+# Wayland, Wayland's client library opened at run time (no build-time
+# dependency on libwayland), and the Adwaita client-side decorations WITHOUT
+# their title text: the titled variant draws the title with `ab_glyph`, whose
+# `ttf-parser` is unmaintained (RUSTSEC-2026-0192) and is otherwise nowhere in
+# this tree. A Wayland compositor that draws its own decorations (KDE, wlroots)
+# shows the title as usual; GNOME's client-side bar shows it blank.
+winit = { version = "=0.30.13", default-features = false, features = [
+    "rwh_06",
+    "x11",
+    "wayland",
+    "wayland-dlopen",
+    "wayland-csd-adwaita-notitle",
+] }
+# Shaping and paragraph layout. Default features (`system`: the platform's
+# font enumeration — fontconfig, DirectWrite, CoreText) kept. Thai, Lao, Khmer
+# and Burmese dictionary line breaking (`complex-scripts`) is left out for its
+# size; those scripts still shape and break at spaces.
+parley = { version = "=0.12.0" }
+# Named directly for one feature: fontconfig is opened at RUN time instead of
+# linked at build time, so a build machine needs no libfontconfig development
+# package. Where the library is missing at run time the system font list is
+# empty and registered fonts still work. Same version `parley` resolves.
+fontique = { version = "=0.12.0", features = ["fontconfig-dlopen"] }
+# Glyph rasterisation: outlines, colour outlines (COLR) and colour bitmaps
+# (emoji). Default features (`scale`, `render`) are the rasteriser.
+swash = { version = "=0.2.10" }
+# Instance data is uploaded as plain bytes.
+bytemuck = { version = "=1.25.2", features = ["derive"] }
+# Blocks on the adapter and device requests (wgpu's are futures).
+pollster = { version = "=1.0.1" }
+
+[dev-dependencies]
+# Golden images are PNG files.
+png = { version = "=0.18.1" }
+
+# The window example closes ITSELF through the X server, with the same
+# WM_DELETE_WINDOW message a window manager sends, so the xvfb proof exercises
+# the real close path. `x11rb` is already in the tree (winit's X11 backend).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "=0.13.2" }
+
+# A workspace of its own: the compiler's root manifest EXCLUDES this
+# directory, and without this table cargo would keep walking up past it (to an
+# enclosing checkout, when this tree is a worktree inside one).
+[workspace]
+
+# Not the compiler's `[workspace.lints]` (this crate is not in that workspace):
+# the same bar, stated here. No `unsafe` anywhere in the crate: `wgpu` and
+# `winit` carry the platform FFI.
+[lints.rust]
+unsafe_code = "forbid"

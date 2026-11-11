@@ -12,6 +12,11 @@
 #
 # Line 3: the same exemption for the split-emission fixture and its goldens
 # (proposal/bundle-splitting.md S2), compared the same byte-for-byte way.
+#
+# Line 4: the GPU crate's golden images and test font are binary, stated
+# rather than left to `text=auto`'s detection (native-ui.md P1).
 * text=auto eol=lf
 vilan/test/** -text
 crates/vilan-cli/tests/split/** -text
+crates/vilan-rt-gfx/tests/golden/** -text
+crates/vilan-rt-gfx/tests/fonts/*.ttf -text

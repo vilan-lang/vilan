@@ -120,6 +120,24 @@ Rust workspace, seventeen crates, plus the language's own tree:
   (`vilan_rt_webview::run`), the program and its executor run on a second one, and an open
   window is an `IoSource` the shell wakes through a `LoopWaker`. Building or running it
   locally needs `libwebkit2gtk-4.1-dev` and `libgtk-3-dev` (and `xvfb` for the proof).
+- `crates/vilan-rt-gfx` — the GPU graphics layer, the Rust half of `std::gfx` (native-ui.md
+  part P1; its section 9 RULED): a `Scene` of primitives in dp (rounded rectangle with
+  gradient and per-side border, analytic shadow, text run, underline, image; clip, transform,
+  opacity layer), drawn by a renderer of its own on `wgpu` (instanced quads, shapes from a
+  signed distance in the shader, paint order by an overlap test, R14) into a `winit` window or
+  an offscreen texture read back as RGBA; text shaped by `parley` and rasterised by `swash`
+  behind a crate-private interface (R15) into a glyph atlas with mask and colour pages that
+  evicts. NOT a workspace member (R11: weight, 304 packages in its lockfile; every licence is on the
+  compiler's list and the audit is clean), so it keeps its own `Cargo.lock`, `about.toml` and
+  `THIRD-PARTY-NOTICES.txt`, and `scripts/ci-local.sh gfx` (ci.yml's `gfx` job) runs its fmt,
+  clippy, tests, audit and notices; the `windows` leg cross-lints it. NOT YET LINKED BY
+  ANYTHING: no `std::gfx` surface exists and no generated project names it; the vilan surface
+  and the window loop's meeting with the executor (Q8) follow. Its golden images
+  (`tests/golden/`, tolerance one per channel) and the window example's xvfb proof skip with a
+  printed reason where there is no software adapter (Mesa's `mesa-vulkan-drivers`) or no
+  `xvfb`, and are REQUIRED under `VILAN_REQUIRE_GFX=1`; regenerate the goldens with
+  `VILAN_REGENERATE_GFX_GOLDENS=1` and LOOK at every image before committing it. Its test
+  font (Noto Mono, OFL-1.1, `tests/fonts/`) is test data; the crate bundles no font.
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the
