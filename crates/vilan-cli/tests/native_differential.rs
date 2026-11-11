@@ -17211,7 +17211,9 @@ fn gfx_p1_only_a_gfx_program_names_the_gfx_crate() {
         },
     );
     assert!(
-        drawn.contains("vilan-rt-gfx = { path = \"/cache/vilan-rt-gfx\" }"),
+        // Separator-neutral: the manifest joins the cache path with the
+        // platform's separator.
+        drawn.contains("vilan-rt-gfx = { path = \"/cache"),
         "{drawn}"
     );
     let plain = vilan_rust::cargo_manifest(

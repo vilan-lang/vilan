@@ -508,9 +508,14 @@ fn the_gfx_example_draws_on_change_counts_a_click_and_ends_cleanly() {
         "a failing frame callback ended the program with {code:?}:\n{}\n--- stderr\n{stderr}",
         seen.join("\n")
     );
+    // Where the message arrives depends on the wrapper: older
+    // `xvfb-run` scripts run their command with `2>&1`, so the program's
+    // stderr comes out of the wrapper's stdout (ubuntu-latest's; CI saw exit
+    // 1 with an empty stderr); later ones keep the two apart. Once, wherever it lands.
+    let reported = format!("{}\n{stderr}", seen.join("\n"));
     assert_eq!(
-        stderr.matches("the frame callback failed").count(),
+        reported.matches("the frame callback failed").count(),
         1,
-        "the failure is reported once:\n{stderr}"
+        "the failure is reported once:\n{reported}"
     );
 }
