@@ -3450,6 +3450,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.reaches_gfx = true;
                 Ok("vilan_rt_gfx::Image".to_string())
             }
+            // native-ui.md P2: `std::ui`'s element handle, read by its box
+            // reader the same way.
+            _ if self.struct_read_by(id, "__ui_node_number") => {
+                self.reaches_gfx = true;
+                Ok("vilan_rt_gfx::host::ui::Node".to_string())
+            }
             _ => {
                 let what = format!("the host type `{name}`");
                 self.host_gap(what, span).map(|_| "()".to_string())
@@ -12987,7 +12993,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `__gfx_`-prefixed name. A window crosses as its id, a frame as its
     /// token, everything else as numbers, strings, `Bytes`, `|| void`
     /// callbacks and the two host values (`TextLayout`, `Texture`), which
-    /// the runtime READS and so takes by reference.
+    /// the runtime READS and so takes by reference. `std::ui`'s `__ui_*`
+    /// helpers (P2) ride the same table and the same reach: its element
+    /// handle (`Node`) is a third host value, read the same way.
     fn gfx_host_binding(
         &mut self,
         binding: Option<&ExternBinding<'src>>,
@@ -18568,6 +18576,27 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__gfx_texture_from_rgba", "texture_from_rgba", &[2]),
         ("__gfx_texture_size", "texture_size", &[0]),
         ("__gfx_offscreen", "offscreen", &[]),
+        // native-ui.md P2: `std::ui` (`vilan/std/src/ui.vl`), the element
+        // tree in `vilan_rt_gfx::host::ui`. An element crosses as its
+        // `Node` handle, which the functions read and so take by reference.
+        ("__ui_node", "ui::node", &[]),
+        ("__ui_set", "ui::set", &[0]),
+        ("__ui_set_length", "ui::set_length", &[0]),
+        ("__ui_set_corners", "ui::set_corners", &[0]),
+        ("__ui_set_color", "ui::set_color", &[0]),
+        ("__ui_set_border", "ui::set_border", &[0]),
+        ("__ui_set_shadow", "ui::set_shadow", &[0]),
+        ("__ui_set_font", "ui::set_font", &[0, 2]),
+        ("__ui_append_text", "ui::append_text", &[0, 1]),
+        ("__ui_set_label", "ui::set_label", &[0, 1]),
+        ("__ui_set_texture", "ui::set_texture", &[0, 1]),
+        ("__ui_add_child", "ui::add_child", &[0, 1]),
+        ("__ui_layout", "ui::layout", &[0]),
+        ("__ui_paint", "ui::paint", &[1]),
+        ("__ui_node_number", "ui::node_number", &[0]),
+        ("__ui_outline", "ui::outline", &[0]),
+        ("__ui_outline_number", "ui::outline_number", &[]),
+        ("__ui_outline_text", "ui::outline_text", &[]),
     ];
     FUNCTIONS
         .iter()

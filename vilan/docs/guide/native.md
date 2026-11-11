@@ -50,7 +50,9 @@ What the backend reaches today:
   app ([below](#a-desktop-window))
 - **GPU windows**: `std::gfx` — a window the program draws itself, with the GPU:
   rectangles, shadows, text and textures in display pixels, frames on demand,
-  pointer and key input as values ([below](#a-gpu-drawn-window))
+  pointer and key input as values ([below](#a-gpu-drawn-window)), and `std::ui`
+  on it — rows, columns, stacks, text and images laid out for the program, style
+  as values ([below](#elements-and-layout))
 - **rpc clients**: `std::rpc`'s WebSocket client over `ws://` — a generated
   client's `connect` (and `connect_with` a credential), `connect_socket`,
   calls, mirrors, the reconnect loop with its backoff, and a dial that honours
@@ -247,9 +249,9 @@ A native program can also draw its window itself. [`std::gfx`](../std/gfx.md)
 opens a window and, whenever a frame is due, hands the program's frame callback
 a `Frame` to fill with primitives — rounded rectangles with gradients and
 borders, shadows, text, underlines, textures — in display pixels (`dp`), and
-hands its event callback the window's input as `Event` values. There is no
-element tree yet (that is the UI framework's, a later part), so a program lays
-out and hit-tests by hand. `vilan/examples/gfx` is a counter: a card, a label,
+hands its event callback the window's input as `Event` values. A program that
+draws this way lays out and hit-tests by hand (the next section lays out for
+you). `vilan/examples/gfx` is a counter: a card, a label,
 and a button that lights up under the pointer, darkens while pressed and adds
 one on a click. Its core:
 
@@ -361,6 +363,63 @@ to ship beside a binary that draws.
 it a virtual one, and Mesa's software Vulkan draws without a GPU. To draw with
 no display at all — a test, a thumbnail — `Offscreen::new(width,
 height).render(draw)` draws one frame into a `std::image` picture.
+
+## Elements and layout
+
+[`std::ui`](../std/ui.md) builds a GPU window's contents from five element kinds
+and lays them out: `row` and `column` put their children in a line, `gap`
+apart, with `padding`, `grow`, `shrink`, `align`, `justify` and `wrap`; `stack`
+puts its children on top of one another, each at its `anchor`; `text` is a
+paragraph that wraps to the width it is given; `image` shows a texture by its
+`fit`. None has a look of its own: a look is a `Style` value — background,
+border, radius, shadow, opacity, text style — composed with `+`, and only its
+text fields are inherited. There are no margins: space between siblings is a
+gap, space inside an element its padding.
+
+```vilan,native
+import std::gfx::{ Color, Window, dp };
+import std::io::print;
+import std::ui::{ Align, Element, column, mount, row, style, text };
+
+fun header(): Element {
+	row()
+		.padding(dp(16))
+		.gap(dp(12))
+		.align(Align::Center)
+		.style(style().background(Color::rgb(33, 36, 46)).text_color(Color::white()))
+		.child(text().child("vilan").style(style().text_size(dp(20)).weight(700)))
+		.child(row().grow(1.0))
+		.child("Guide")
+		.element()
+}
+
+fun main() {
+	let window = match Window::builder().title("Docs").size(dp(640), dp(400)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	mount(window, column()
+		.child(header())
+		.child(column().padding(dp(24)).gap(dp(12))
+			.child(text().child("Layout without a style sheet").style(style().text_size(dp(24))))
+			.child("Rows and columns place their children in a line; a paragraph wraps to the width it is given.")));
+}
+main();
+```
+
+`mount` makes the tree the window's frame callback: each frame lays it out at
+the window's size and scale and draws it, so a resize lays it out again. The
+tree is RETAINED — built once, kept, laid out again only when something that
+moves a box changed — and every box is snapped to the device pixel grid by the
+renderer's own rule, so a 1 dp line stays one pixel at 150%.
+`vilan/examples/ui` is a whole documentation page: a header, a sidebar, a
+content column with wrapped paragraphs, and a picture card with a badge on its
+corner; its end-to-end test holds the page to recorded rectangles at two window
+sizes and two scales, and to golden images. Hit testing, events, focus,
+scrolling and properties bound to signals are the next part.
 
 ## Debug by default
 

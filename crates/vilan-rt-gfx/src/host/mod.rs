@@ -71,6 +71,7 @@
 
 mod input;
 mod shell;
+pub mod ui;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};
@@ -494,15 +495,16 @@ impl IoSource for WindowSource {
                 };
             }
             if !slot.events.is_empty() {
-                return match &slot.on_event {
-                    Some(callback) => Work::Events(Rc::clone(callback)),
-                    None => {
-                        // Nobody listens: the events are dropped, as a
-                        // browser drops an event with no listener.
-                        slot.events.clear();
-                        Work::Nothing
-                    }
-                };
+                match &slot.on_event {
+                    Some(callback) => return Work::Events(Rc::clone(callback)),
+                    // Nobody listens: the events are dropped, as a browser
+                    // drops an event with no listener — and the poll goes on
+                    // to a due frame. Answering `Nothing` here left that
+                    // frame due with no turn owed for it: a window with no
+                    // event callback that the pointer entered (a crossing
+                    // event is queued with the frame's request) never drew.
+                    None => slot.events.clear(),
+                }
             }
             if slot.frame_due && slot.window.is_some() {
                 slot.frame_due = false;

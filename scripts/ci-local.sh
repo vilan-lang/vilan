@@ -261,6 +261,12 @@ leg_webview() {
 #   through the X server, with its scene held to golden images offscreen. It
 #   builds the compiler, so this leg needs the workspace's toolchain and
 #   `cargo-nextest` too; REQUIRED here by the same `VILAN_REQUIRE_GFX=1`.
+# - The `std::ui` proof (`crates/vilan-cli/tests/ui_screen.rs`, native-ui.md
+#   P2): `vilan/examples/ui` built the same way, its screen laid out at two
+#   window sizes and two scales and held to recorded rectangles, drawn
+#   offscreen and held to golden images, and shown in a window under xvfb;
+#   REQUIRED here too. The crate's own `cargo test` above runs the element
+#   tree's unit pins (`src/ui/tests.rs`).
 leg_gfx() {
     status=0
     (
@@ -274,7 +280,8 @@ leg_gfx() {
         tr -d '\r' <"$notices" | cmp - THIRD-PARTY-NOTICES.txt || exit 1
         rm -f "$notices"
     ) || status=$?
-    VILAN_REQUIRE_GFX=1 cargo nextest run -p vilan-cli --test gfx_window || status=$?
+    VILAN_REQUIRE_GFX=1 cargo nextest run -p vilan-cli --test gfx_window --test ui_screen ||
+        status=$?
     return "$status"
 }
 

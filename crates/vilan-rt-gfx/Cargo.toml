@@ -19,7 +19,7 @@
 # `Cargo.toml` lists this directory under `exclude`, and the crate carries its
 # OWN `Cargo.lock`. Not for licences or advisories this time (every licence is
 # on the compiler's list and the audit passes) but for WEIGHT: the stack is
-# 306 packages in its lockfile (this crate, `vilan-rt` and `vilan-rt-poll`
+# 307 packages in its lockfile (this crate, `vilan-rt` and `vilan-rt-poll`
 # among them) against the compiler's 191, and nobody building the compiler
 # should compile a GPU stack. Its own CI job (`scripts/ci-local.sh
 # gfx`, ci.yml's `gfx`) holds it to fmt, clippy, its tests (golden images and
@@ -84,6 +84,18 @@ fontique = { version = "=0.12.0", features = ["fontconfig-dlopen"] }
 # Glyph rasterisation: outlines, colour outlines (COLR) and colour bitmaps
 # (emoji). Default features (`scale`, `render`) are the rasteriser.
 swash = { version = "=0.2.10" }
+# `std::ui`'s layout (native-ui.md P2, R4): flexbox for rows and columns, and
+# a one-cell grid for stacks (every child in the same cell, anchored by its
+# own alignment), under std::ui's vocabulary — the solver is invisible in the
+# surface, and grid is never offered to a program. Default features off, each
+# kept one named: the tree with its per-node cache (`taffy_tree`), flexbox,
+# grid. No CSS parser, no block or float layout, no `calc`.
+taffy = { version = "=0.15.1", default-features = false, features = [
+    "std",
+    "taffy_tree",
+    "flexbox",
+    "grid",
+] }
 # Instance data is uploaded as plain bytes.
 bytemuck = { version = "=1.25.2", features = ["derive"] }
 # Blocks on the adapter and device requests (wgpu's are futures).

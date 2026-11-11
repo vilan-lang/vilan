@@ -118,6 +118,7 @@ mod order;
 mod renderer;
 mod scene;
 mod text;
+pub mod ui;
 mod units;
 mod window;
 

@@ -127,7 +127,7 @@ Rust workspace, seventeen crates, plus the language's own tree:
   signed distance in the shader, paint order by an overlap test, R14) into a `winit` window or
   an offscreen texture read back as RGBA; text shaped by `parley` and rasterised by `swash`
   behind a crate-private interface (R15) into a glyph atlas with mask and colour pages that
-  evicts. NOT a workspace member (R11: weight, 306 packages in its lockfile; every licence is on the
+  evicts. NOT a workspace member (R11: weight, 307 packages in its lockfile; every licence is on the
   compiler's list and the audit is clean), so it keeps its own `Cargo.lock`, `about.toml` and
   `THIRD-PARTY-NOTICES.txt`, and `scripts/ci-local.sh gfx` (ci.yml's `gfx` job) runs its fmt,
   clippy, tests, audit and notices; the `windows` leg cross-lints it. LINKED BY USE: a program
@@ -151,6 +151,14 @@ Rust workspace, seventeen crates, plus the language's own tree:
   `xvfb`, and are REQUIRED under `VILAN_REQUIRE_GFX=1`; regenerate the goldens with
   `VILAN_REGENERATE_GFX_GOLDENS=1` and LOOK at every image before committing it. Its test
   font (Noto Mono, OFL-1.1, `tests/fonts/`) is test data; the crate bundles no font.
+  Its `src/ui/` is `std::ui`'s element tree (native-ui.md P2): the RETAINED tree lives here, in
+  one `taffy` tree per program with the solver (flexbox for rows and columns, a one-cell grid for
+  stacks), and a vilan element is a handle on it (`host::ui`'s `Node`, freed when it has neither
+  a handle nor a parent); text measures itself through the text system during layout, layout and
+  paint are separate passes keyed by two generations, and every box is snapped with `Units`'
+  rule, the renderer's. `vilan/std/src/ui.vl`'s `__ui_*` externs ride `std::gfx`'s host table and
+  reach; its end-to-end proof is `crates/vilan-cli/tests/ui_screen.rs` (recorded rectangles,
+  goldens, a window), in the same `gfx` leg.
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

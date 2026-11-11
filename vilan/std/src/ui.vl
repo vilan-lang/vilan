@@ -1,0 +1,994 @@
+// `std::ui` — elements, layout and style for a window `std::gfx` draws, for a
+// native program (native-ui.md part P2; its section 9 RULED 2026-11-10, its section
+// 12 the element contract).
+//
+// Five element kinds carry every layout, and none has a look of its own:
+//
+//   row, column   children in a line along x or y: gap, padding, grow, shrink,
+//                 align, justify, wrap (flexbox semantics, our vocabulary)
+//   stack         children on top of one another, each anchored to an edge, a
+//                 corner, the centre, or the whole stack
+//   text          a paragraph, wrapped to the width layout gives it
+//   image         a texture, drawn by its fit rule
+//
+// Everything else (a button, a card, a sidebar) is a function that answers these.
+// No margins (R5): space between siblings is the parent's `gap`, space inside an
+// element its `padding`. `dp` is the only length unit; a fraction of the parent
+// (`fraction(1, 3)`) and `Length::Auto` are the other lengths.
+//
+// THE ELEMENT CONTRACT (section 12): each kind is a zero-parameter function that
+// answers a builder, every attribute is a builder method, and children arrive
+// through `child`, which takes anything `Child` — an element, or a `str` for a
+// text. Written as calls: `row().gap(dp(8)).child(text().child("hi"))`.
+//
+// STYLE (R7) is a value: a `Style` of optional fields (background, border,
+// radius, shadow, opacity, text style), composed with `+` (the right side wins
+// field by field) and set with `.style(s)`. No selectors, no cascade. The TEXT
+// fields are the one inherited thing: a font, a size, a colour, a line height
+// set on an element flow down to every text under it that does not set its own.
+//
+// RETAINED (R9): an element is built once and kept. The tree lives in the GPU crate
+// (`vilan-rt-gfx`, its `ui` module) with the layout solver; an element here is a
+// handle on it, so a copy is the same element and an element is in one place in the
+// tree. `mount` lays the tree out at the window's size and scale and repaints it on
+// every frame the window draws — a resize or a scale change lays it out again; a
+// frame with nothing changed appends the scene painted last.
+//
+// NATIVE ONLY, as `std::gfx` is: the JavaScript backend refuses a program that
+// reaches it, by name, when it builds; `vilan check` does not.
+//
+// Not here yet (native-ui.md section 8): hit testing, conditions (`hovered()`,
+// `pressed()`), focus, events and `scroll` are part P3, with properties bound to
+// signals; grid layout is a later slice. Accessibility roles and labels are
+// carried from this version and published by a later one (R10).
+
+[platform("@process")] mod self;
+
+import pkg::gfx::{ Border, Color, Corners, Dp, FontFamily, Frame, Rect, Size, Texture, Window, dp };
+import pkg::operators::Add;
+import pkg::option::Option::{ self, None, Some };
+
+// --- The seam ------------------------------------------------------------------
+//
+// `vilan-rt-gfx`'s `host::ui` module, over the program's one element tree. An
+// element crosses as its `Node`; every attribute once, as numbers, when it is set.
+// The codes are kept by `crates/vilan-rt-gfx/src/host/ui.rs` too:
+//
+//   __ui_set property     0 grow, 1 shrink, 2 gap, 3 align, 4 justify, 5 wrap,
+//                         6 anchor, 7 role, 8 opacity, 9 text size, 10 line
+//                         height, 11 weight, 12 italic, 13 fit, 14..17 padding
+//                         top, right, bottom, left
+//   __ui_set_length       0 width, 1 height, 2 min width, 3 max width, 4 min
+//                         height, 5 max height; unit 0 auto, 1 dp, 2 fraction
+//   __ui_set_color        0 background, 1 text colour
+//   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image
+//
+// The enums' codes are their declaration order.
+
+/// An element's handle on the host's tree, inside every `Element`. A host value: a
+/// copy is the same element.
+export external struct Node;
+
+[extern("__ui_node")]
+external fun ui_node(kind: i32): Node;
+
+[extern("__ui_set")]
+external fun ui_set(node: Node, property: i32, value: f64): void;
+
+[extern("__ui_set_length")]
+external fun ui_set_length(node: Node, property: i32, unit: i32, value: f64): void;
+
+[extern("__ui_set_corners")]
+external fun ui_set_corners(
+	node: Node,
+	top_left: f64,
+	top_right: f64,
+	bottom_right: f64,
+	bottom_left: f64,
+): void;
+
+[extern("__ui_set_color")]
+external fun ui_set_color(
+	node: Node,
+	property: i32,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): void;
+
+[extern("__ui_set_border")]
+external fun ui_set_border(
+	node: Node,
+	top: f64,
+	right: f64,
+	bottom: f64,
+	left: f64,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): void;
+
+[extern("__ui_set_shadow")]
+external fun ui_set_shadow(
+	node: Node,
+	x: f64,
+	y: f64,
+	blur: f64,
+	spread: f64,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): void;
+
+[extern("__ui_set_font")]
+external fun ui_set_font(node: Node, family: i32, name: str): void;
+
+[extern("__ui_append_text")]
+external fun ui_append_text(node: Node, run: str): void;
+
+[extern("__ui_set_label")]
+external fun ui_set_label(node: Node, label: str): void;
+
+[extern("__ui_set_texture")]
+external fun ui_set_texture(node: Node, texture: Texture): void;
+
+[extern("__ui_add_child")]
+external fun ui_add_child(parent: Node, child: Node): void;
+
+[extern("__ui_layout")]
+external fun ui_layout(root: Node, width: f64, height: f64, scale_factor: f64): void;
+
+[extern("__ui_paint")]
+external fun ui_paint(frame: u32, root: Node): void;
+
+/// The element's box from its last layout, in dp: x (0), y (1), width (2),
+/// height (3).
+[extern("__ui_node_number")]
+external fun ui_node_number(node: Node, which: i32): f64;
+
+/// Takes the outline of a root's tree; answers its length.
+[extern("__ui_outline")]
+external fun ui_outline(root: Node): i32;
+
+/// An outline entry's depth (0) and box in dp: x (1), y (2), width (3), height (4).
+[extern("__ui_outline_number")]
+external fun ui_outline_number(index: i32, which: i32): f64;
+
+/// An outline entry's kind (0) and label (1).
+[extern("__ui_outline_text")]
+external fun ui_outline_text(index: i32, which: i32): str;
+
+// --- Lengths -------------------------------------------------------------------
+
+/// A size: a length in dp, a fraction of the parent's content box, or `Auto` —
+/// decided by the element's content and its parent (a row's child is as wide as its
+/// content; across a row it stretches unless the row's `align` says not to).
+export enum Length {
+	Auto,
+	Fixed(Dp),
+	Fraction(f64),
+}
+
+/// `fraction(1, 3)` — a third of the parent's content box.
+export fun fraction(numerator: f64, denominator: f64): Length {
+	Length::Fraction(numerator / denominator)
+}
+
+/// Anything a size attribute takes: a `Dp` (`width(dp(240))`) or a `Length`
+/// (`width(fraction(1, 2))`, `width(Length::Auto)`).
+export trait IntoLength {
+	fun into_length(self): Length;
+}
+
+export impl Dp with IntoLength {
+	fun into_length(self): Length {
+		Length::Fixed(self)
+	}
+}
+
+export impl Length with IntoLength {
+	fun into_length(self): Length {
+		self
+	}
+}
+
+fun set_length(node: Node, property: i32, length: Length) {
+	match length {
+		Length::Auto => ui_set_length(node, property, 0, 0.0),
+		Length::Fixed(let value) => ui_set_length(node, property, 1, value.value()),
+		Length::Fraction(let value) => ui_set_length(node, property, 2, value),
+	}
+}
+
+// --- Alignment -----------------------------------------------------------------
+
+/// Where a row's or a column's children sit ACROSS its axis (a row's children
+/// vertically). `Stretch` until `align` says otherwise.
+export enum Align {
+	Start,
+	Center,
+	End,
+	/// As tall as the row (as wide as the column), unless the child sizes itself.
+	Stretch,
+	/// A row's children with their first baselines on one line.
+	Baseline,
+}
+
+/// How a row's or a column's children share the space ALONG its axis. `Start` until
+/// `justify` says otherwise.
+export enum Justify {
+	Start,
+	Center,
+	End,
+	/// The first and last against the ends, the rest spaced evenly between.
+	SpaceBetween,
+	/// Equal space around each child (half of it at the ends).
+	SpaceAround,
+	/// Equal space between the children and at the ends.
+	SpaceEvenly,
+}
+
+/// Where a child sits in a `stack`: an edge (centred along it), a corner, the
+/// centre, or the whole stack (`Fill`). A stack's child is at the top left until it
+/// says otherwise; outside a stack an anchor means nothing. A root element fills
+/// its window unless it sizes itself.
+export enum Anchor {
+	TopLeft,
+	Top,
+	TopRight,
+	Left,
+	Center,
+	Right,
+	BottomLeft,
+	Bottom,
+	BottomRight,
+	Fill,
+}
+
+/// How an `image` draws its texture in its box.
+export enum Fit {
+	/// Keep the aspect, inside the box, centred. The default.
+	Contain,
+	/// Keep the aspect, filling the box, centred; the overflow is clipped.
+	Cover,
+	/// Stretch to exactly the box.
+	Fill,
+	/// The texture at its own size (a pixel a dp), centred; the overflow is
+	/// clipped.
+	None,
+}
+
+/// What an element is to someone using assistive technology (R10). Carried from
+/// this version; a later one publishes it to the system's accessibility API.
+export enum Role {
+	Group,
+	Heading,
+	Paragraph,
+	Button,
+	Link,
+	TextField,
+	Checkbox,
+	List,
+	ListItem,
+	Image,
+}
+
+fun align_code(align: Align): f64 {
+	match align {
+		Align::Start => 0.0,
+		Align::Center => 1.0,
+		Align::End => 2.0,
+		Align::Stretch => 3.0,
+		Align::Baseline => 4.0,
+	}
+}
+
+fun justify_code(justify: Justify): f64 {
+	match justify {
+		Justify::Start => 0.0,
+		Justify::Center => 1.0,
+		Justify::End => 2.0,
+		Justify::SpaceBetween => 3.0,
+		Justify::SpaceAround => 4.0,
+		Justify::SpaceEvenly => 5.0,
+	}
+}
+
+fun anchor_code(anchor: Anchor): f64 {
+	match anchor {
+		Anchor::TopLeft => 0.0,
+		Anchor::Top => 1.0,
+		Anchor::TopRight => 2.0,
+		Anchor::Left => 3.0,
+		Anchor::Center => 4.0,
+		Anchor::Right => 5.0,
+		Anchor::BottomLeft => 6.0,
+		Anchor::Bottom => 7.0,
+		Anchor::BottomRight => 8.0,
+		Anchor::Fill => 9.0,
+	}
+}
+
+fun fit_code(fit: Fit): f64 {
+	match fit {
+		Fit::Contain => 0.0,
+		Fit::Cover => 1.0,
+		Fit::Fill => 2.0,
+		Fit::None => 3.0,
+	}
+}
+
+fun role_code(role: Role): f64 {
+	match role {
+		Role::Group => 0.0,
+		Role::Heading => 1.0,
+		Role::Paragraph => 2.0,
+		Role::Button => 3.0,
+		Role::Link => 4.0,
+		Role::TextField => 5.0,
+		Role::Checkbox => 6.0,
+		Role::List => 7.0,
+		Role::ListItem => 8.0,
+		Role::Image => 9.0,
+	}
+}
+
+// --- Style ---------------------------------------------------------------------
+
+/// A shadow under an element's box: moved by `x`, `y`, blurred by `blur` (as CSS's
+/// `box-shadow` blur), grown on every side by `spread`.
+export struct DropShadow {
+	x: Dp,
+	y: Dp,
+	blur: Dp,
+	spread: Dp,
+	color: Color,
+}
+
+export impl DropShadow {
+	/// A shadow moved by `x`, `y` and blurred by `blur`, with no spread.
+	fun new(x: Dp, y: Dp, blur: Dp, color: Color): DropShadow {
+		DropShadow { x, y, blur, spread = dp(0), color }
+	}
+
+	fun spread(own self, spread: Dp): DropShadow {
+		self.spread = spread;
+		self
+	}
+}
+
+/// How an element looks: every field optional, a field left `None` changes nothing.
+/// A value — build it once, keep it, combine it: `a + b` is `a` with every field
+/// `b` sets replaced by `b`'s. Setting it on an element (`.style(s)`) sets the
+/// fields it has; a second `.style` composes onto the first the same way.
+///
+/// The text fields (`font` to `italic`) are INHERITED: set on a row, they reach
+/// every text inside it that does not set its own. The others belong to the one
+/// element.
+///
+/// (Part P3 adds conditions here — `when(hovered(), |s| ..)` — as a list of
+/// conditional styles that `+` concatenates.)
+export struct Style {
+	background: Option<Color>,
+	/// Drawn INSIDE the box: a border never moves the content or the layout.
+	border: Option<Border>,
+	radius: Option<Corners>,
+	shadow: Option<DropShadow>,
+	/// 0 to 1, multiplying the element and everything inside it.
+	opacity: Option<f64>,
+	font: Option<FontFamily>,
+	text_size: Option<Dp>,
+	text_color: Option<Color>,
+	/// The distance between baselines, as a multiple of the text size.
+	line_height: Option<f64>,
+	/// 100 (thin) to 900 (black); 400 is regular, 700 bold.
+	weight: Option<i32>,
+	italic: Option<bool>,
+}
+
+/// A style that sets nothing, to build on: `style().background(c).radius(dp(8))`.
+export fun style(): Style {
+	Style {
+		background = None,
+		border = None,
+		radius = None,
+		shadow = None,
+		opacity = None,
+		font = None,
+		text_size = None,
+		text_color = None,
+		line_height = None,
+		weight = None,
+		italic = None,
+	}
+}
+
+export impl Style {
+	fun background(own self, color: Color): Style {
+		self.background = Some(color);
+		self
+	}
+
+	/// Border widths per side and a colour: `border(Border::all(dp(1), line))`.
+	fun border(own self, border: Border): Style {
+		self.border = Some(border);
+		self
+	}
+
+	/// The same radius at every corner.
+	fun radius(own self, radius: Dp): Style {
+		self.radius = Some(Corners::all(radius));
+		self
+	}
+
+	fun corners(own self, corners: Corners): Style {
+		self.radius = Some(corners);
+		self
+	}
+
+	fun shadow(own self, shadow: DropShadow): Style {
+		self.shadow = Some(shadow);
+		self
+	}
+
+	fun opacity(own self, opacity: f64): Style {
+		self.opacity = Some(opacity);
+		self
+	}
+
+	fun font(own self, font: FontFamily): Style {
+		self.font = Some(font);
+		self
+	}
+
+	fun text_size(own self, size: Dp): Style {
+		self.text_size = Some(size);
+		self
+	}
+
+	fun text_color(own self, color: Color): Style {
+		self.text_color = Some(color);
+		self
+	}
+
+	fun line_height(own self, line_height: f64): Style {
+		self.line_height = Some(line_height);
+		self
+	}
+
+	fun weight(own self, weight: i32): Style {
+		self.weight = Some(weight);
+		self
+	}
+
+	fun italic(own self, italic: bool): Style {
+		self.italic = Some(italic);
+		self
+	}
+}
+
+/// `a + b`: `b`'s fields where it sets them, `a`'s elsewhere.
+export impl Style with Add {
+	fun add(self, b: Style): Style {
+		Style {
+			background = b.background.or(self.background),
+			border = b.border.or(self.border),
+			radius = b.radius.or(self.radius),
+			shadow = b.shadow.or(self.shadow),
+			opacity = b.opacity.or(self.opacity),
+			font = b.font.or(self.font),
+			text_size = b.text_size.or(self.text_size),
+			text_color = b.text_color.or(self.text_color),
+			line_height = b.line_height.or(self.line_height),
+			weight = b.weight.or(self.weight),
+			italic = b.italic.or(self.italic),
+		}
+	}
+}
+
+fun set_color(node: Node, property: i32, color: Color) {
+	ui_set_color(node, property, color.red, color.green, color.blue, color.alpha);
+}
+
+/// Sets on `node` every field `style` has.
+fun apply_style(node: Node, style: Style) {
+	match style.background {
+		Some(let color) => set_color(node, 0, color),
+		None => {},
+	}
+	match style.border {
+		Some(let border) => ui_set_border(
+			node,
+			border.widths.top.value(),
+			border.widths.right.value(),
+			border.widths.bottom.value(),
+			border.widths.left.value(),
+			border.color.red,
+			border.color.green,
+			border.color.blue,
+			border.color.alpha,
+		),
+		None => {},
+	}
+	match style.radius {
+		Some(let corners) => ui_set_corners(
+			node,
+			corners.top_left.value(),
+			corners.top_right.value(),
+			corners.bottom_right.value(),
+			corners.bottom_left.value(),
+		),
+		None => {},
+	}
+	match style.shadow {
+		Some(let shadow) => ui_set_shadow(
+			node,
+			shadow.x.value(),
+			shadow.y.value(),
+			shadow.blur.value(),
+			shadow.spread.value(),
+			shadow.color.red,
+			shadow.color.green,
+			shadow.color.blue,
+			shadow.color.alpha,
+		),
+		None => {},
+	}
+	match style.opacity {
+		Some(let opacity) => ui_set(node, 8, opacity),
+		None => {},
+	}
+	match style.font {
+		Some(let font) => match font {
+			FontFamily::SansSerif => ui_set_font(node, 0, ""),
+			FontFamily::Serif => ui_set_font(node, 1, ""),
+			FontFamily::Monospace => ui_set_font(node, 2, ""),
+			FontFamily::Named(let name) => ui_set_font(node, 3, name),
+		},
+		None => {},
+	}
+	match style.text_size {
+		Some(let size) => ui_set(node, 9, size.value()),
+		None => {},
+	}
+	match style.text_color {
+		Some(let color) => set_color(node, 1, color),
+		None => {},
+	}
+	match style.line_height {
+		Some(let line_height) => ui_set(node, 10, line_height),
+		None => {},
+	}
+	match style.weight {
+		Some(let weight) => ui_set(node, 11, weight.as_f64()),
+		None => {},
+	}
+	match style.italic {
+		Some(let italic) => ui_set(node, 12, if italic { 1.0 } else { 0.0 }),
+		None => {},
+	}
+}
+
+// --- Elements ------------------------------------------------------------------
+
+/// An element of any kind: what a builder converts to (`Child`), and what a
+/// function that answers "some element" answers. Retained: a copy is the same
+/// element, and an element is in one place in a tree.
+export struct Element {
+	node: Node,
+}
+
+export impl Element {
+	/// Its box from the last layout of its tree, in dp from the root's top-left
+	/// corner, snapped to the device pixel grid of that layout's scale.
+	fun bounds(self): Rect {
+		Rect::new(
+			dp(ui_node_number(self.node, 0)),
+			dp(ui_node_number(self.node, 1)),
+			dp(ui_node_number(self.node, 2)),
+			dp(ui_node_number(self.node, 3)),
+		)
+	}
+
+	/// Every element in its tree, itself first, in paint order (a parent before its
+	/// children, siblings in order), with its box from the last layout.
+	fun outline(self): List<OutlineEntry> {
+		let count = ui_outline(self.node);
+		mut entries: List<OutlineEntry> = [];
+		mut index = 0;
+		for {
+			if index >= count {
+				jump break;
+			}
+			entries.push(OutlineEntry {
+				depth = ui_outline_number(index, 0).as_usize(),
+				kind = ui_outline_text(index, 0),
+				label = ui_outline_text(index, 1),
+				bounds = Rect::new(dp(ui_outline_number(index, 1)), dp(ui_outline_number(index, 2)), dp(ui_outline_number(index, 3)), dp(ui_outline_number(index, 4))),
+			});
+			index += 1;
+		}
+		entries
+	}
+}
+
+/// One element as `Element::outline` lists it: how deep in the tree (the root is
+/// 0), its kind (`"row"`, `"text"` ...), its accessibility label (`""` when it has
+/// none), its box.
+export struct OutlineEntry {
+	depth: usize,
+	kind: str,
+	label: str,
+	bounds: Rect,
+}
+
+/// Anything `child` takes: every element kind, an `Element`, and a `str`, which
+/// becomes a `text` holding it (and inheriting the parent's text style).
+export trait Child {
+	fun into_element(self): Element;
+}
+
+export impl Element with Child {
+	fun into_element(self): Element {
+		self
+	}
+}
+
+export impl str with Child {
+	fun into_element(self): Element {
+		text().child(self).element
+	}
+}
+
+/// The attributes every element kind has: its size, how it grows and shrinks in a
+/// row or a column, its padding, its anchor in a stack, its style, and its
+/// accessibility role and label. Each sets the element and answers it, so they
+/// chain.
+export trait Attributes {
+	/// The element these set.
+	fun element(self): Element;
+
+	/// `width(dp(240))`, `width(fraction(1, 2))`, `width(Length::Auto)`.
+	fun width<L: IntoLength>(self, width: L): Self {
+		set_length(self.element().node, 0, width.into_length());
+		self
+	}
+
+	fun height<L: IntoLength>(self, height: L): Self {
+		set_length(self.element().node, 1, height.into_length());
+		self
+	}
+
+	fun min_width<L: IntoLength>(self, width: L): Self {
+		set_length(self.element().node, 2, width.into_length());
+		self
+	}
+
+	fun max_width<L: IntoLength>(self, width: L): Self {
+		set_length(self.element().node, 3, width.into_length());
+		self
+	}
+
+	fun min_height<L: IntoLength>(self, height: L): Self {
+		set_length(self.element().node, 4, height.into_length());
+		self
+	}
+
+	fun max_height<L: IntoLength>(self, height: L): Self {
+		set_length(self.element().node, 5, height.into_length());
+		self
+	}
+
+	/// Its share of a row's or a column's leftover space along the axis, against
+	/// its siblings' shares. 0 (none) until set.
+	fun grow(self, grow: f64): Self {
+		ui_set(self.element().node, 0, grow);
+		self
+	}
+
+	/// Its share of a row's or a column's shortfall when the children do not fit. 1
+	/// until set; 0 keeps it at least as large as its content.
+	fun shrink(self, shrink: f64): Self {
+		ui_set(self.element().node, 1, shrink);
+		self
+	}
+
+	/// The space inside it, between its edge and its content, on every side.
+	fun padding(self, padding: Dp): Self {
+		let node = self.element().node;
+		for side in [14, 15, 16, 17] {
+			ui_set(node, side, padding.value());
+		}
+		self
+	}
+
+	/// The padding on the left and the right.
+	fun padding_x(self, padding: Dp): Self {
+		let node = self.element().node;
+		ui_set(node, 15, padding.value());
+		ui_set(node, 17, padding.value());
+		self
+	}
+
+	/// The padding at the top and the bottom.
+	fun padding_y(self, padding: Dp): Self {
+		let node = self.element().node;
+		ui_set(node, 14, padding.value());
+		ui_set(node, 16, padding.value());
+		self
+	}
+
+	fun padding_top(self, padding: Dp): Self {
+		ui_set(self.element().node, 14, padding.value());
+		self
+	}
+
+	fun padding_right(self, padding: Dp): Self {
+		ui_set(self.element().node, 15, padding.value());
+		self
+	}
+
+	fun padding_bottom(self, padding: Dp): Self {
+		ui_set(self.element().node, 16, padding.value());
+		self
+	}
+
+	fun padding_left(self, padding: Dp): Self {
+		ui_set(self.element().node, 17, padding.value());
+		self
+	}
+
+	/// Where it sits in a `stack`.
+	fun anchor(self, anchor: Anchor): Self {
+		ui_set(self.element().node, 6, anchor_code(anchor));
+		self
+	}
+
+	/// Sets every field `style` has (a second `style` composes onto the first).
+	fun style(self, style: Style): Self {
+		apply_style(self.element().node, style);
+		self
+	}
+
+	/// What it is to assistive technology.
+	fun role(self, role: Role): Self {
+		ui_set(self.element().node, 7, role_code(role));
+		self
+	}
+
+	/// What assistive technology reads for it, and the name `outline` lists it by.
+	fun label(self, label: str): Self {
+		ui_set_label(self.element().node, label);
+		self
+	}
+}
+
+/// The elements with children: rows, columns and stacks.
+export trait Parent with Attributes {
+	/// Appends a child: an element of any kind, or a `str` (a `text` holding it).
+	/// An element is in one place: one already inside another is refused.
+	fun child<C: Child>(self, content: C): Self {
+		ui_add_child(self.element().node, content.into_element().node);
+		self
+	}
+}
+
+/// What rows and columns add: how their children are spaced, aligned and wrapped.
+export trait Flex with Parent {
+	/// The space between neighbouring children, along the axis (and between the
+	/// lines when it wraps).
+	fun gap(self, gap: Dp): Self {
+		ui_set(self.element().node, 2, gap.value());
+		self
+	}
+
+	/// Where the children sit across the axis.
+	fun align(self, align: Align): Self {
+		ui_set(self.element().node, 3, align_code(align));
+		self
+	}
+
+	/// How the children share the space along the axis.
+	fun justify(self, justify: Justify): Self {
+		ui_set(self.element().node, 4, justify_code(justify));
+		self
+	}
+
+	/// Children that do not fit along the axis start a new line, instead of
+	/// shrinking onto one.
+	fun wrap(self): Self {
+		ui_set(self.element().node, 5, 1.0);
+		self
+	}
+}
+
+fun new_element(kind: i32): Element {
+	Element { node = ui_node(kind) }
+}
+
+/// Children left to right. See `row()`.
+export struct Row {
+	element: Element,
+}
+
+/// Children top to bottom. See `column()`.
+export struct Column {
+	element: Element,
+}
+
+/// Children on top of one another. See `stack()`.
+export struct Stack {
+	element: Element,
+}
+
+/// A paragraph. See `text()`.
+export struct Text {
+	element: Element,
+}
+
+/// A texture in a box. See `image()`. (`std::image::Image` is a decoded picture;
+/// this is the element that shows a `std::gfx::Texture`.)
+export struct ImageElement {
+	element: Element,
+}
+
+// NOTE(elem-58): each constructor below gains `[element]` when that attribute
+// lands, so `<row gap(dp(8))>..</row>` lowers onto exactly these calls.
+
+/// Children left to right, `gap` apart, stretched to the row's height (`align`),
+/// packed at the start (`justify`).
+export fun row(): Row {
+	Row { element = new_element(0) }
+}
+
+/// Children top to bottom, `gap` apart, stretched to the column's width (`align`),
+/// packed at the top (`justify`).
+export fun column(): Column {
+	Column { element = new_element(1) }
+}
+
+/// Children on top of one another, later ones above, each at the top left until it
+/// says otherwise (`anchor`). As large as its largest child unless it sizes itself.
+export fun stack(): Stack {
+	Stack { element = new_element(2) }
+}
+
+/// A paragraph: its `child` runs, one after another, in the text style it
+/// inherits and sets. As wide as its one line unless its parent gives it less,
+/// then wrapped at that width — never narrower than its longest word.
+export fun text(): Text {
+	Text { element = new_element(3) }
+}
+
+/// A texture, drawn by its fit rule (`Fit::Contain` until set). Its natural size is
+/// the texture's, a pixel a dp; given one side, it keeps the aspect.
+export fun image(): ImageElement {
+	ImageElement { element = new_element(4) }
+}
+
+export impl Row with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl Row with Parent {}
+
+export impl Row with Flex {}
+
+export impl Row with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl Column with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl Column with Parent {}
+
+export impl Column with Flex {}
+
+export impl Column with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl Stack with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl Stack with Parent {}
+
+export impl Stack with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl Text with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl Text with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl Text {
+	/// Appends a run of text to the paragraph.
+	fun child(self, run: str): Text {
+		ui_append_text(self.element.node, run);
+		self
+	}
+}
+
+export impl ImageElement with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl ImageElement with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl ImageElement {
+	/// The picture it shows.
+	fun texture(self, texture: Texture): ImageElement {
+		ui_set_texture(self.element.node, texture);
+		self
+	}
+
+	/// How the picture fills the box.
+	fun fit(self, fit: Fit): ImageElement {
+		ui_set(self.element.node, 13, fit_code(fit));
+		self
+	}
+}
+
+// --- Layout and drawing --------------------------------------------------------
+
+/// Lays `root`'s tree out in a `size` viewport (the root fills it unless it sizes
+/// itself), snapped to the device pixel grid at `scale_factor` — what `mount`
+/// does for every frame, for a test or a measurement to read back with `bounds`
+/// and `outline`. The solver runs only when something that moves a box changed,
+/// or the size did; a new scale alone snaps again.
+export fun layout<C: Child>(root: C, size: Size, scale_factor: f64) {
+	ui_layout(root.into_element().node, size.width.value(), size.height.value(), scale_factor);
+}
+
+/// Lays `root` out at `frame`'s size and scale and draws it into `frame`. For a
+/// frame callback of your own (drawing more around it), and for `Offscreen`.
+export fun draw<C: Child>(frame: Frame, root: C) {
+	let element = root.into_element();
+	let size = frame.size();
+	ui_layout(element.node, size.width.value(), size.height.value(), frame.scale_factor());
+	ui_paint(frame.token, element.node);
+}
+
+/// Shows `root` in `window`: it becomes the window's frame callback, laying the
+/// tree out at the window's size and scale on every frame and drawing it. The
+/// window draws a frame when it opens, resizes or changes scale, so the tree
+/// follows the window; asking for a frame (`window.request_redraw()`) after a
+/// change shows it.
+export fun mount<C: Child>(window: Window, root: C) {
+	let element = root.into_element();
+	window.on_frame(|frame: Frame| {
+		draw(frame, element);
+	});
+}

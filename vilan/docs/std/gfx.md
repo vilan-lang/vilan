@@ -4,8 +4,9 @@
 gradients and borders, shadows, text, underlines and textures, under clips,
 transforms and opacity layers. Every length is in display pixels (`dp`), frames
 are drawn only when something changed, and input arrives as values. It is the
-layer a native UI framework will stand on (native-ui.md, part P1); there is no
-element tree here yet, so a program lays out and hit-tests by hand. The
+layer a native UI framework stands on (native-ui.md, part P1): a program that
+draws with it directly lays out and hit-tests by hand, and one that would rather
+not builds its window from [`std::ui`](ui.md)'s elements, laid out for it. The
 [native guide](../guide/native.md#a-gpu-drawn-window) walks through a whole
 program.
 

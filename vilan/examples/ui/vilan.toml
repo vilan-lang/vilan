@@ -1,0 +1,15 @@
+# A documentation page laid out by `std::ui` (native-ui.md P2) in a window
+# `std::gfx` draws: a header row, a sidebar column, a content column with
+# wrapped paragraphs, a picture card with a badge anchored to its corner.
+# NATIVE ONLY — the JavaScript build refuses `std::ui` by name — so it is built
+# with the Rust backend:
+#
+#   vilan run --backend rust .                                  the window
+#   vilan run --backend rust . -- --rects 960 640 1 --font F    the boxes
+#
+# It needs a GPU adapter (any Vulkan, Metal, DirectX 12 or OpenGL driver, or
+# Mesa's software Vulkan) and, on Linux, an X11 or Wayland session. See the
+# native guide's "Elements and layout" section.
+[package]
+name = "ui"
+root = "."

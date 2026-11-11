@@ -120,6 +120,7 @@ modules — sits at `std::<name>`.
 | [images](std/image.md) | `std::image`: decode, resize, crop, encode (process) |
 | [windows](std/window.md) | `std::window`: a desktop window on a web page (process, native only) |
 | [GPU graphics](std/gfx.md) | `std::gfx`: a window drawn with the GPU, frames on demand, input as values (process, native only) |
+| [elements and layout](std/ui.md) | `std::ui`: rows, columns, stacks, text and images laid out for a GPU window; style as values (process, native only) |
 | [misc](std/misc.md) | io, task, `js::promise`, context, crypto, jwt, `web::asset` |
 
 ### Specification

@@ -922,6 +922,15 @@ pub const MOVED_STD_MODULES: &[(&str, &str)] = &[
     ("rpc_server", "rpc::server"),
 ];
 
+/// Old paths in [`MOVED_STD_MODULES`] that name a LIVE std module again: `ui`,
+/// the web UI's path until v0.44.0, is `std::ui` — the native UI framework —
+/// since native-ui.md P2 (its R1 named it). Such a path resolves, so its old
+/// meaning shows only as a miss one segment deeper, for a name the module it
+/// moved to holds and the new module does not (`std::ui::View` steers to
+/// `std::web::ui`, `std::ui::row` is `std::ui`'s own). `std::web` is the same
+/// shape for its namespace and keeps its own handling.
+pub const RECLAIMED_STD_MODULES: &[&str] = &["ui"];
+
 /// The path [`MOVED_STD_MODULES`] gives the old std module `old` (the segment
 /// after `std::`), or `None` when `old` did not move.
 pub fn moved_std_module(old: &str) -> Option<&'static str> {

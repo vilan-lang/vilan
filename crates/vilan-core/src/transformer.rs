@@ -1323,8 +1323,9 @@ pub(crate) struct NativeOnly {
 
 /// The `__`-named free externs only the NATIVE backend implements, by the std
 /// module that declares them: `std::window`'s desktop window (F1 M2), which is
-/// the operating system's webview, and `std::gfx`'s GPU window (native-ui.md
-/// P1), which is drawn by a renderer linked into the binary — neither has a
+/// the operating system's webview, `std::gfx`'s GPU window (native-ui.md P1),
+/// which is drawn by a renderer linked into the binary, and `std::ui`'s
+/// elements (P2), laid out and drawn by that same renderer — none has a
 /// JavaScript twin. Keyed by PREFIX: each module's externs share one, and only
 /// that module declares names with it. The interpreter refuses them as host
 /// capabilities too.
@@ -1344,6 +1345,14 @@ pub(crate) fn native_only_extern(symbol: &str) -> Option<NativeOnly> {
                 module: "std::gfx",
                 why: "a GPU window is drawn by a renderer linked into a native binary, and a \
                       JavaScript build has none",
+            },
+        ),
+        (
+            "__ui_",
+            NativeOnly {
+                module: "std::ui",
+                why: "its elements are laid out and drawn by the GPU renderer linked into a \
+                      native binary, and a JavaScript build has none",
             },
         ),
     ];

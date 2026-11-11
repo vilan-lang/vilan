@@ -1,0 +1,389 @@
+// A documentation page laid out by `std::ui` in a GPU-drawn window: a header
+// row, a sidebar column, and a content column with wrapped paragraphs, a picture
+// card whose badge is anchored to its corner, and a caption beside it. Nothing
+// here is positioned by hand — every box comes from the elements' gap, padding,
+// grow, align and anchor — and nothing reacts to input (that is part P3).
+//
+// Resize the window: the header and the body follow its width, the paragraphs
+// wrap again, and the sidebar keeps its 200 dp.
+//
+// Modes, for the end-to-end test:
+//
+//   --rects <width> <height> <scale> --font <ttf>
+//                           lay the screen out at that size and scale with the
+//                           given font, and print every element's box in device
+//                           pixels, one line each, in paint order
+//   --smoke                 open the window, draw one frame with the screen laid
+//                           out at the window's size, print the root's box and
+//                           close
+//   --golden <png> --font <ttf>
+//                           draw the screen offscreen with a software adapter and
+//                           the given font at 100% and 150%, and compare each
+//                           with its PNG (one per channel of tolerance); with
+//                           VILAN_REGENERATE_GFX_GOLDENS set, write them instead
+
+import std::bytes::Bytes;
+import std::fs::{ read_bytes, write_bytes };
+import std::gfx::{
+	Border,
+	Color,
+	Edges,
+	FontFamily,
+	Frame,
+	Offscreen,
+	Size,
+	Texture,
+	Window,
+	dp,
+	register_font,
+};
+import std::image::{ Format, Image };
+import std::io::print;
+import std::process::{ args, env, exit };
+import std::range::Range;
+import std::ui::{
+	Align,
+	Anchor,
+	DropShadow,
+	Element,
+	Fit,
+	Justify,
+	Role,
+	Style,
+	column,
+	draw,
+	image,
+	layout,
+	mount,
+	row,
+	stack,
+	style,
+	text,
+};
+
+/// The screen's text colour, and the header's background.
+fun ink(): Color {
+	Color::rgb(33, 36, 46)
+}
+
+/// The screen's one accent colour.
+fun accent(): Color {
+	Color::rgb(45, 95, 230)
+}
+
+/// A 160 x 100 picture drawn by the program: a diagonal gradient with a grid,
+/// so a stretch, a crop or a misplaced texture shows in the golden image.
+fun picture(): Texture {
+	let width = 160;
+	let height = 100;
+	let pixels = Bytes::alloc((width * height * 4).as_usize());
+	for y in Range::new(0, height) {
+		for x in Range::new(0, width) {
+			let index = ((y * width + x) * 4).as_usize();
+			let line = x % 20 == 0 || y % 20 == 0;
+			pixels.set(index, if line { 255 } else { 40 + x });
+			pixels.set(index + 1, if line { 255 } else { 90 + y });
+			pixels.set(index + 2, if line { 255 } else { 200 });
+			pixels.set(index + 3, 255);
+		}
+	}
+	match Texture::from_rgba(width.as_u32(), height.as_u32(), pixels) {
+		Ok(let texture) => texture,
+		Err(let reason) => {
+			print(i"picture: {reason}");
+			exit(2);
+			Texture::from_rgba(1, 1, Bytes::alloc(4)).unwrap()
+		},
+	}
+}
+
+fun header(): Element {
+	let link = style().text_color(Color::rgb(200, 210, 255));
+	row()
+		.padding_x(dp(24))
+		.padding_y(dp(14))
+		.gap(dp(20))
+		.align(Align::Center)
+		.style(style().background(ink()).text_color(Color::white()))
+		.label("header")
+		.child(text()
+			.child("vilan")
+			.style(style().text_size(dp(20)).weight(700))
+			.role(Role::Heading)
+			.label("brand"))
+		// An empty row that grows: the links sit at the right end.
+		.child(row().grow(1.0).label("spacer"))
+		.child(text().child("Guide").style(link).role(Role::Link).label("guide"))
+		.child(text().child("Library").style(link).role(Role::Link).label("library"))
+		.child(text().child("Examples").style(link).role(Role::Link).label("examples"))
+		.element()
+}
+
+fun sidebar(): Element {
+	let entry = |name: str, current: bool| {
+		let look = if current {
+			style().background(Color::rgb(225, 232, 255)).text_color(accent()).radius(dp(6))
+		} else {
+			style()
+		};
+		text().child(name).padding_x(dp(10)).padding_y(dp(6)).style(look).role(Role::ListItem)
+	};
+	// `shrink(0.0)`: the content beside it wants more than the window has, and
+	// a row takes the shortfall from every child that may shrink.
+	column()
+		.width(dp(200))
+		.shrink(0.0)
+		.padding(dp(16))
+		.gap(dp(4))
+		.style(style()
+			.background(Color::rgb(246, 246, 250))
+			.border(Border {
+				widths = Edges { top = dp(0), right = dp(1), bottom = dp(0), left = dp(0) },
+				color = Color::rgb(220, 220, 228),
+			}))
+		.role(Role::List)
+		.label("sidebar")
+		.child(entry("Overview", false))
+		.child(entry("Elements", true))
+		.child(entry("Layout", false))
+		.child(entry("Style", false))
+		.child(entry("Drawing", false))
+		.element()
+}
+
+/// The picture with a badge anchored to its top-right corner.
+fun card(picture: Texture): Element {
+	let badge = text()
+		.child("NEW")
+		.padding_x(dp(8))
+		.padding_y(dp(3))
+		.anchor(Anchor::TopRight)
+		.style(style()
+			.background(Color::rgb(230, 60, 70))
+			.text_color(Color::white())
+			.text_size(dp(11))
+			.weight(700)
+			.radius(dp(9)))
+		.label("badge");
+	stack()
+		.padding(dp(8))
+		.style(style()
+			.background(Color::white())
+			.radius(dp(10))
+			.shadow(DropShadow::new(dp(0), dp(2), dp(10), Color::rgba(0, 0, 0, 0.2))))
+		.label("card")
+		.child(image()
+			.texture(picture)
+			.fit(Fit::Cover)
+			.width(dp(240))
+			.height(dp(120))
+			.style(style().radius(dp(6)))
+			.role(Role::Image)
+			.label("picture"))
+		.child(badge)
+		.element()
+}
+
+fun paragraph(words: str): Element {
+	text().child(words).role(Role::Paragraph).element()
+}
+
+fun content(picture: Texture): Element {
+	column()
+		.grow(1.0)
+		.padding(dp(28))
+		.gap(dp(16))
+		.label("content")
+		.child(text()
+			.child("Layout without a style sheet")
+			.style(style().text_size(dp(26)).weight(700))
+			.role(Role::Heading)
+			.label("title"))
+		.child(paragraph("Rows and columns place their children in a line, a gap apart; a stack puts them on top of one another, each anchored to an edge or a corner. A paragraph wraps to the width its column gives it, and nothing here was positioned by hand."))
+		.child(row()
+			.gap(dp(20))
+			.align(Align::Start)
+			.label("feature")
+			.child(card(picture))
+			.child(column()
+				.grow(1.0)
+				.shrink(1.0)
+				.gap(dp(8))
+				.label("caption")
+				.child(text()
+					.child("A picture, cropped to cover its box")
+					.style(style().weight(600)))
+				.child(paragraph("The badge sits in the card's top-right corner because the card is a stack and the badge asks for that anchor. Make the window narrower and this column gives up its width first."))))
+		.child(paragraph("Style is a value: a background, a border, a radius, a shadow, a text style. Text style alone is inherited, so the header's white reaches every word inside it."))
+		.element()
+}
+
+/// The whole screen. `font`, when given, is set at the root and inherited by
+/// every text (the end-to-end test's registered font).
+fun screen(font: Option<str>, picture: Texture): Element {
+	let base: Style = match font {
+		Some(let family) => style().font(FontFamily::Named(family)),
+		None => style(),
+	};
+	column()
+		.style(base
+			.background(Color::rgb(252, 252, 253))
+			.text_color(ink())
+			.text_size(dp(15))
+			.line_height(1.4))
+		.label("screen")
+		.child(header())
+		.child(row()
+			.grow(1.0)
+			.align(Align::Stretch)
+			.justify(Justify::Start)
+			.label("body")
+			.child(sidebar())
+			.child(content(picture)))
+		.element()
+}
+
+fun main() {
+	let arguments = args();
+	if arguments.contains("--rects") {
+		rects(arguments);
+		ret;
+	}
+	if arguments.contains("--golden") {
+		golden(arguments);
+		ret;
+	}
+	let window = match Window::builder().title("vilan ui").size(dp(960), dp(640)).open() {
+		Ok(let window) => window,
+		// No display, no GPU: say why.
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let root = screen(None, picture());
+	if arguments.contains("--smoke") {
+		window.on_frame(|frame: Frame| {
+			draw(frame, root);
+			let bounds = root.bounds();
+			print(i"frame {bounds.width.value()} x {bounds.height.value()} at {frame.scale_factor()}");
+			window.close();
+		});
+		ret;
+	}
+	mount(window, root);
+}
+
+/// The family the font at `--font` registers, or the program ends.
+fun test_font(arguments: List<str>): str {
+	match register_font(read_bytes(after(arguments, "--font"))) {
+		Ok(let families) => families[0],
+		Err(let reason) => {
+			print(i"font: {reason}");
+			exit(2);
+			""
+		},
+	}
+}
+
+/// Rects mode: every box, in device pixels.
+fun rects(arguments: List<str>) {
+	let width = after(arguments, "--rects").parse_f64().unwrap_or(0.0);
+	let height = arguments[index_of(arguments, "--rects") + 2].parse_f64().unwrap_or(0.0);
+	let scale = arguments[index_of(arguments, "--rects") + 3].parse_f64().unwrap_or(1.0);
+	let root = screen(Some(test_font(arguments)), picture());
+	layout(root, Size::new(dp(width), dp(height)), scale);
+	print(i"screen {width} x {height} dp at {scale}");
+	for entry in root.outline() {
+		let device = |length: f64| (length * scale).round();
+		print(i"{"  ".repeat(entry.depth)}{entry.kind} {entry.label} {device(entry.bounds.x.value())} {device(entry.bounds.y.value())} {device(entry.bounds.width.value())} {device(entry.bounds.height.value())}");
+	}
+}
+
+/// Golden mode: the screen offscreen, at 100% and 150%, held to a PNG each.
+fun golden(arguments: List<str>) {
+	let golden = after(arguments, "--golden");
+	let root = screen(Some(test_font(arguments)), picture());
+	for scale in [1.0, 1.5] {
+		let path = i"{golden}-{(scale * 100.0).round()}.png";
+		let drawn = Offscreen::new(dp(960), dp(640))
+			.scale_factor(scale)
+			.software(true)
+			.render(|frame: Frame| draw(frame, root));
+		match drawn {
+			Ok(let image) => compare(path, image),
+			Err(let reason) => {
+				print(i"golden: {reason}");
+				exit(2);
+			},
+		}
+	}
+}
+
+/// Writes `image` to `path` (regenerating), or compares it with the PNG there.
+fun compare(path: str, image: Image) {
+	if env("VILAN_REGENERATE_GFX_GOLDENS").is_some() {
+		match image.encode(Format::Png, 100) {
+			Ok(let png) => write_bytes(path, png),
+			Err(let reason) => print(i"golden: {reason}"),
+		}
+		print(i"golden: wrote {path}");
+		ret;
+	}
+	let expected = match Image::decode(read_bytes(path)) {
+		Ok(let expected) => expected,
+		Err(let reason) => {
+			print(i"golden: {path}: {reason}");
+			exit(1);
+			ret;
+		},
+	};
+	if expected.width() != image.width() || expected.height() != image.height() {
+		print(i"golden: {path} is {expected.width()} x {expected.height()}, the frame {image.width()} x {image.height()}");
+		exit(1);
+		ret;
+	}
+	let differing = differing_channels(expected.rgba(), image.rgba());
+	if differing == 0 {
+		print(i"golden: {path} matches");
+	} else {
+		print(i"golden: {path}: {differing} channels differ by more than 1");
+		exit(1);
+	}
+}
+
+/// Channels that differ by more than one: software Vulkan and software GL
+/// differ by one in a handful.
+fun differing_channels(expected: Bytes, drawn: Bytes): i32 {
+	mut differing = 0;
+	for index in Range::new(0, drawn.len().as_i32()) {
+		let difference = expected.get(index.as_usize()) - drawn.get(index.as_usize());
+		if difference > 1 || difference < -1 {
+			differing += 1;
+		}
+	}
+	differing
+}
+
+fun index_of(arguments: List<str>, flag: str): usize {
+	for index in Range::new(0, arguments.len().as_i32()) {
+		if arguments[index.as_usize()] == flag {
+			ret index.as_usize();
+		}
+	}
+	print(i"{flag} is missing");
+	exit(2);
+	0
+}
+
+fun after(arguments: List<str>, flag: str): str {
+	let index = index_of(arguments, flag) + 1;
+	if index >= arguments.len() {
+		print(i"{flag} needs a value");
+		exit(2);
+		ret "";
+	}
+	arguments[index]
+}
+
+main();

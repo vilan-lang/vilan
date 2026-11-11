@@ -60,6 +60,7 @@
 - [Images](std/image.md)
 - [Windows](std/window.md)
 - [GPU graphics](std/gfx.md)
+- [Elements and layout](std/ui.md)
 - [Misc](std/misc.md)
 
 # The specification

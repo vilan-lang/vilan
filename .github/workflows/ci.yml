@@ -523,8 +523,10 @@ jobs:
   # build time. It also BUILDS THE COMPILER, as the webview job does: the
   # `std::gfx` end-to-end proof (`crates/vilan-cli/tests/gfx_window.rs`)
   # compiles `vilan/examples/gfx` with the Rust backend and runs it in a window
-  # under xvfb, REQUIRED here too. Its own cache entry: the compiler's
-  # `target/` and the GPU crate's.
+  # under xvfb, REQUIRED here too, and so is the `std::ui` proof
+  # (`crates/vilan-cli/tests/ui_screen.rs`): `vilan/examples/ui` laid out to
+  # its recorded rectangles, drawn to its golden images, shown in a window.
+  # Its own cache entry: the compiler's `target/` and the GPU crate's.
   gfx:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -554,7 +556,7 @@ jobs:
       # pinned to the version that wrote the committed file.
       - name: cargo-about, at the version the notices were written with
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
-      - name: The GPU crate holds its gates, its goldens match, a window opens, and a vilan program draws in one
+      - name: The GPU crate holds its gates, its goldens match, a window opens, a vilan program draws in one, and a std::ui screen lays out to its recorded rectangles
         run: scripts/ci-local.sh gfx
 
   # **This is the job to make a required status check** (process.md §2.5, where

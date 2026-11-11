@@ -81,6 +81,7 @@ guide/native.md h1 native-binaries
 guide/native.md h2 what-it-reaches-and-what-it-refuses-by-name
 guide/native.md h2 a-desktop-window
 guide/native.md h2 a-gpu-drawn-window
+guide/native.md h2 elements-and-layout
 guide/native.md h2 debug-by-default
 guide/native.md h2 numbers
 guide/native.md h2 where-the-emitted-rust-goes
@@ -654,6 +655,14 @@ std/transient.md h2 transientsource
 std/transient.md h2 transient-a-flow-of-tasks
 std/transient.md h2 tasksource-one-task
 std/transient.md h2 a-remote-mirror
+std/ui.md h1 elements-and-layout
+std/ui.md h2 elements
+std/ui.md h2 attributes-every-element-has
+std/ui.md h2 rows-and-columns
+std/ui.md h2 stacks
+std/ui.md h2 text-and-images
+std/ui.md h2 style
+std/ui.md h2 showing-it
 std/window.md h1 windows
 std/window.md h2 how-a-desktop-program-ends
 std/window.md h2 not-here-yet
