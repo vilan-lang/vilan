@@ -281,7 +281,8 @@ an `if` or `match` inside a hole runs once at build, exactly as it does
 in a chain; reactive structure is `.show` in head position and the
 `when`/`swap`/`each` values in holes, with `Signal` values in slots. The sugar adds no
 semantics: an element means `std::web::ui::view` whatever the file has
-imported, so element syntax needs no `view` import of its own (a `View`
+imported — unless its tag names an `[element]` function, which makes it
+a [typed element](../spec/grammar.md) — so element syntax needs no `view` import of its own (a `View`
 you write as a TYPE still needs one, and the editor offers it), and
 everything this guide says about ownership, boundaries, and binding
 types applies unchanged.

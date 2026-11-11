@@ -3742,6 +3742,7 @@ pub fn reprint_listing_skips(
         return Err(decline(source, DeclineReason::DoesNotParse, None));
     };
     let mut printer = Printer::new(source, options);
+    printer.typed_tags = TypedTagCandidates::of(&items);
     let prev_end = printer.print_items(&items, 0, true);
     // Comments after the last item (trailing end-of-file comments).
     printer.flush_comments_before(source.len(), prev_end);
@@ -4356,6 +4357,59 @@ struct Printer<'src> {
     /// kept a node as written - met again by a rollback's reprint, so the
     /// caller deduplicates.
     skipped: Vec<usize>,
+    /// native-ui.md §12: the tags this file might lower as TYPED elements,
+    /// whose heads keep their written order ([`TypedTagCandidates`]).
+    typed_tags: TypedTagCandidates<'src>,
+}
+
+/// native-ui.md §12: the tag names in one file that may resolve to an
+/// `[element]` function — whose element is then a typed method chain, where
+/// the order of the head's items is the order of the calls and is the
+/// author's, not the canonical HTML one. The formatter reads one file and
+/// resolves no names, so the set is the CONSERVATIVE over-approximation a
+/// file can state: every function it declares `[element]` and every name an
+/// `import` or `use` binds (a leaf, or its alias), and every name at all when
+/// a glob import may bind any. A web tag left in written order because it
+/// shares one of those names costs a reorder, never a wrong program.
+#[derive(Default)]
+struct TypedTagCandidates<'src> {
+    names: std::collections::HashSet<&'src str>,
+    every_name: bool,
+}
+
+impl<'src> TypedTagCandidates<'src> {
+    fn of(items: &NodeList<'src>) -> Self {
+        let mut candidates = TypedTagCandidates::default();
+        for item in items {
+            candidates.collect(item);
+        }
+        candidates
+    }
+
+    fn collect(&mut self, node: &Spanned<Node<'src>>) {
+        match &node.0 {
+            Node::Func(function) if function.element => {
+                self.names.insert(function.name.0);
+            }
+            Node::Import(branch, _) | Node::Use(branch) => {
+                let mut entries = Vec::new();
+                crate::analyzer::flatten_namespace_branch(branch, Vec::new(), &mut entries);
+                for (_, name, _, alias) in entries {
+                    if name == crate::node::GLOB_IMPORT_LEAF {
+                        self.every_name = true;
+                    }
+                    self.names
+                        .insert(alias.map(|(alias, _)| alias).unwrap_or(name));
+                }
+            }
+            _ => {}
+        }
+        node.0.for_each_child(&mut |child| self.collect(child));
+    }
+
+    fn may_be_typed(&self, tag: &str) -> bool {
+        self.every_name || self.names.contains(tag)
+    }
 }
 
 /// `[resource]`, on a line of its own above the declaration like every other
@@ -4402,6 +4456,7 @@ impl<'src> Printer<'src> {
             tuple_forced: false,
             width_element_splits: 0,
             skipped: Vec::new(),
+            typed_tags: TypedTagCandidates::default(),
         }
     }
 
@@ -6577,6 +6632,10 @@ impl<'src> Printer<'src> {
             self.print_platform_attribute(&func.platform_fence);
             self.end_attribute_line();
         }
+        if func.element {
+            self.out.push_str("[element]");
+            self.end_attribute_line();
+        }
         if func.is_async {
             self.out.push_str("async ");
         }
@@ -7861,9 +7920,18 @@ impl<'src> Printer<'src> {
     /// head would carry its comments to the wrong item, and the comment cursor
     /// only ever moves forward — the style sorter's own refusal, for the same
     /// reason.
+    ///
+    /// A third (native-ui.md §12): a tag that may name an `[element]`
+    /// function is left as written. A typed element's head items are method
+    /// calls in the order written, and that order is the author's to keep.
+    /// The token-level twin needs no such rule: it canonicalizes BOTH streams
+    /// it compares, so a head the printer kept compares equal to itself.
     fn element_head_order(&self, body: &crate::node::ElementBody<'src>) -> Vec<usize> {
         let written = || (0..body.head.len()).collect::<Vec<usize>>();
         if body.head.len() < 2 {
+            return written();
+        }
+        if self.typed_tags.may_be_typed(self.element_tag_text(body)) {
             return written();
         }
         let spans = Self::element_item_spans(body);
@@ -17774,6 +17842,74 @@ mod element_head_layout {
             );
             assert_eq!(format(&once), once, "not a fixed point: {once}");
         }
+    }
+}
+
+#[cfg(test)]
+mod typed_element_head_layout {
+    //! native-ui.md §12: a TYPED element's head items are method calls in the
+    //! order written, so the E151 sorter leaves them alone. The formatter
+    //! resolves no names; it keeps the written order for every tag that MAY
+    //! name an `[element]` function — one the file declares so, a name an
+    //! import binds, or any name under a glob import — and sorts the rest.
+    use super::bailing_constructs::assert_construct;
+    use super::format;
+
+    const BUILDER: &str = "struct Row {}\n\nimpl Row {\n\tfun zeta(self): Row {\n\t\tself\n\t}\n\tfun alpha(self): Row {\n\t\tself\n\t}\n}\n\n";
+
+    #[test]
+    fn a_tag_the_file_declares_an_element_keeps_its_written_order() {
+        let source = format!(
+            "{BUILDER}[element]\nfun row(): Row {{\n\tRow {{}}\n}}\n\nfun main() {{\n\tlet built = <row zeta alpha(1) />;\n}}\n"
+        );
+        assert_construct(&source, &source);
+    }
+
+    #[test]
+    fn a_web_tag_beside_a_typed_one_is_still_sorted() {
+        let source = format!(
+            "{BUILDER}[element]\nfun row(): Row {{\n\tRow {{}}\n}}\n\nfun main() {{\n\tlet built = <row zeta alpha />;\n\tlet page = <div zeta alpha />;\n}}\n"
+        );
+        let expected = source.replace("<div zeta alpha />", "<div alpha zeta />");
+        assert_construct(&source, &expected);
+    }
+
+    #[test]
+    fn a_tag_an_import_binds_keeps_its_written_order() {
+        for (import, tag) in [
+            ("import pkg::ui::row;", "row"),
+            ("import pkg::ui::row as line;", "line"),
+            ("use ui::row;", "row"),
+        ] {
+            let source =
+                format!("{import}\n\nfun main() {{\n\tlet built = <{tag} zeta alpha />;\n}}\n");
+            assert_eq!(format(&source), source, "{import}");
+        }
+    }
+
+    #[test]
+    fn a_glob_import_keeps_every_heads_written_order() {
+        let source =
+            "export import pkg::ui::*;\n\nfun main() {\n\tlet page = <div zeta alpha />;\n}\n";
+        assert_eq!(format(source), source);
+    }
+
+    #[test]
+    fn a_function_without_the_marker_does_not_keep_its_tags_order() {
+        let source =
+            "fun div(): i32 {\n\t1\n}\n\nfun main() {\n\tlet page = <div zeta alpha />;\n}\n";
+        assert_eq!(
+            format(source),
+            source.replace("<div zeta alpha />", "<div alpha zeta />")
+        );
+    }
+
+    #[test]
+    fn the_element_attribute_prints_on_its_own_line_in_the_class_band() {
+        assert_construct(
+            "[deprecated(\"x\")] [element] fun row(): i32 { 1 }\n",
+            "[deprecated(\"x\")]\n[element]\nfun row(): i32 {\n\t1\n}\n",
+        );
     }
 }
 

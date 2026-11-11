@@ -4245,7 +4245,7 @@ fn a_library_module_reached_through_a_symlink_is_still_library_territory() {
 /// against it, and the emitted JS comes back. The B33 pins need real modules on
 /// disk — the load-time relation and the canonical tie-break both span files,
 /// and the naive-sort counterexample is only expressible across two of them.
-fn compile_package(files: &[(&str, &str)], entry: &str) -> Result<String, Vec<String>> {
+pub(crate) fn compile_package(files: &[(&str, &str)], entry: &str) -> Result<String, Vec<String>> {
     let outcome = analyze_package(files, entry);
     match outcome.javascript {
         Some(javascript) => Ok(javascript),

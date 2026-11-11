@@ -81,7 +81,7 @@ Beside them, two families of words are matched by text in one position
 and are ordinary identifiers everywhere else: the ATTRIBUTE names in
 `[...]` position (`derive`, `service`, `client_service`, `extern`,
 `must_use`, `track_caller`, `rpc`, `trait_only`, `doc`, `expose`, `platform`,
-`deprecated`, `internal`, `resource`, `hint`, `reactive` — `resource` was a
+`deprecated`, `internal`, `resource`, `hint`, `reactive`, `element` — `resource` was a
 keyword until B413 made it the `[resource]` attribute), and the jump TARGETS `break` and
 `continue` after `jump`. All remain usable as ordinary identifiers
 elsewhere, with one exception: `void` may not be a

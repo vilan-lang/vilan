@@ -945,10 +945,13 @@ pub fn fingerprints(program: &Program) -> Fingerprints {
             unknown_interfaces += 1;
         }
         // `[track_caller]` is interface: a caller's emitted call gains or loses
-        // the hidden trailing `Location` argument when it flips.
+        // the hidden trailing `Location` argument when it flips. So is
+        // `[element]` (native-ui.md §12): a tag naming the function lowers to
+        // a typed chain with it and to the web `view(..)` chain without.
         let rendered = format!(
-            "{signature}|track_caller={}|async={}|contexts={}|declared={:?}|borrows={:?}|bumps={:?}|{}",
+            "{signature}|track_caller={}|element={}|async={}|contexts={}|declared={:?}|borrows={:?}|bumps={:?}|{}",
             function.track_caller,
+            function.element,
             function.is_async || program.async_functions.contains(id),
             program.context_dependent_functions.contains(id),
             context_names(program.declared_function_contexts.get(id)),

@@ -87,7 +87,7 @@ export      = { lead-attribute }   (* the item's own prefix, in THE order below 
 lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
                | resource-attr | extern-attr | "[" "must_use" "]"
                | "[" "track_caller" "]" | "[" "rpc" "]"
-               | "[" "trait_only" "]" | derive-attr | service-attr
+               | "[" "trait_only" "]" | "[" "element" "]" | derive-attr | service-attr
                | client-service-attr | macro-attr ;
 ```
 
@@ -128,7 +128,8 @@ each on its own line:
 4. the checks — `[must_use]`, then `[track_caller]`, then `[rpc]`, then
    `[trait_only]`;
 5. the fence — `[platform(..)]`;
-6. the class — `[resource]`.
+6. the class — `[resource]` on a type, `[element]` on a function (no
+   declaration takes both).
 
 So `[derive(Wire)]` ⏎ `export struct Handle { … }`, `[platform("browser")]`
 ⏎ `export impl …`, `[deprecated("use g")]` ⏎ `[must_use]` ⏎ `export async
@@ -222,6 +223,7 @@ function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ extern-attr ] [ "[" "must_use" "]" ] [ "[" "track_caller" "]" ]
            [ "[" "rpc" "]" ] [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
+           [ "[" "element" "]" ]             (* a free, bodied, parameterless fun: §3.6's typed element *)
            [ "async" ] [ "external" ]
            "fun" MEMBER [ generic-params ]   (* IDENT unless an impl/trait member *)
            "(" [ parameter { "," parameter } [ "," ] ] ")"
@@ -570,8 +572,8 @@ A macro attribute's arguments are captured as **source spans**: the
 macro receives their text, not their values (§10). The built-in
 attribute names (`derive`, `service`, `client_service`, `extern`,
 `must_use`, `track_caller`, `rpc`, `trait_only`, `doc`, `expose`,
-`platform`, `deprecated`, `internal`, `resource`, `hint`, `reactive`) are not
-available as user macro-attribute names.
+`platform`, `deprecated`, `internal`, `resource`, `hint`, `reactive`,
+`element`) are not available as user macro-attribute names.
 
 `[reactive(..)]` is a field's store knobs, read by `[derive(Storable)]`
 (`std::reactive::store`) and by nothing else: `coarse` makes the field one slot,
@@ -880,6 +882,66 @@ same call written after the element, `<div />.len()`, is an ordinary
 postfix call on a `View` value and takes any method, whatever it
 returns. A name no method answers keeps the ordinary member error. The
 lowering of an admitted link is unchanged.
+
+A **typed element** is one whose tag NAMES, in the scope of the element,
+a function declared `[element]` (native-ui.md §12). The tag resolves as a
+name written there would: a local binding shadows an outer function, an
+`import` (renamed or not) brings one in, and a binding declared later in
+the block is not yet in scope. Such an element lowers to a method chain on
+what that function returns, and is checked as that chain:
+
+| Source | Lowers to |
+|---|---|
+| `<row …>` | `row()` |
+| an attribute `gap(8)` | `.gap(8)`, in source order |
+| a bare attribute `wrap` | `.wrap()` |
+| a child — a nested element, a quoted string, a `{…}` hole | `.child(value)`, in source order |
+
+```vilan
+struct Row {
+	log: str,
+}
+
+impl Row {
+	fun gap(self, value: i32): Row {
+		Row { log = self.log + i" gap={value}" }
+	}
+	fun wrap(self): Row {
+		Row { log = self.log + " wrap" }
+	}
+	fun child(self, value: str): Row {
+		Row { log = self.log + " " + value }
+	}
+}
+
+[element]
+fun row(): Row {
+	Row { log = "row" }
+}
+
+fun main() {
+	let name = "b";
+	print(<row wrap gap(8)>"a"{name}</row>.log);   // row wrap gap=8 a b
+}
+```
+
+Nothing is string-keyed: an unknown attribute is an unknown method of the
+builder, reported at the attribute's name, and a value of the wrong type
+is that method's ordinary mismatch, at the value. An `[element]` function
+is a free, bodied `fun` with no parameters — the tag calls it with none —
+and the attribute is refused anywhere else (a method, an `external fun`,
+a function with parameters, any other declaration). The web element's own
+forms have no meaning on a typed tag and are each refused by name: a
+dotted `.method(…)` link, an `on:event(…)` item and a hyphenated
+attribute. Every other tag — including one whose name is a function
+WITHOUT the marker (`fun button()` leaves `<button>` alone) — is the web
+element above, unchanged. `vilan fmt` sorts no typed element's head: its
+items are calls, in the order written. The formatter reads one file, so it
+keeps the written order for every tag that may name an `[element]`
+function — one the file declares so, a name an `import` binds, and every
+tag under a glob import. The tag has no type-argument form, so a generic
+`[element]` function's type parameters are inferred exactly as the
+hand-written chain's would be.
 
 A **fragment** `<>…</>` is the nameless head, and it is a different
 lowering rather than an element with no tag: it desugars to a LIST

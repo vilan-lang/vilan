@@ -1728,7 +1728,10 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 // B620: E213's rule, the same function, for a head method
                 // that does not hand the element back.
                 let typed = text.get(start..offset).unwrap_or_default();
-                let mut candidates = self.element_head_completions(chain, tag);
+                let mut candidates = match self.typed_element_builder(tag, offset) {
+                    Some(builder) => self.typed_element_head_completions(chain, builder),
+                    None => self.element_head_completions(chain, tag),
+                };
                 candidates.retain(|candidate| typed_prefix_admits(candidate, typed));
                 return stamp_replacements(candidates, replaced);
             }
@@ -1994,6 +1997,33 @@ impl<'a, 'src> Analysis<'a, 'src> {
         if !chain {
             items.extend(attribute_completions(tag));
             items.extend(event_completions());
+        }
+        items
+    }
+
+    /// native-ui.md §12: the builder a TYPED element's tag constructs — the
+    /// nominal the `[element]` function the tag names returns — or `None` for
+    /// a web element. The tag resolves through the scope at the cursor, as
+    /// the analyzer resolves it at the tag.
+    fn typed_element_builder(&self, tag: &str, offset: usize) -> Option<Id> {
+        let program = self.program;
+        let function_id = self.binding_in_scope(tag, self.to_analyzed_offset(offset))?;
+        let function = program.functions.get(&function_id)?;
+        if !function.element {
+            return None;
+        }
+        nominal_type_id(program, function.return_type_id?)
+    }
+
+    /// The candidates in a TYPED element's head (native-ui.md §12): every
+    /// head item is an attribute, and an attribute is a method of the
+    /// builder, so the builder's instance methods are the whole vocabulary,
+    /// offered undotted. A dotted link is a web-only form the analyzer
+    /// refuses on a typed tag, so after a `.` nothing is offered.
+    fn typed_element_head_completions(&self, chain: bool, builder: Id) -> Vec<Completion> {
+        let mut items = Vec::new();
+        if !chain {
+            self.push_methods(builder, true, None, &mut items);
         }
         items
     }

@@ -1914,6 +1914,74 @@ const LAZY_PROBE: &str = concat!(
     "}\n",
 );
 
+/// native-ui.md §12: a TYPED element lowers to its builder's method chain
+/// before either backend sees it, so both run the same calls in the same
+/// order — attributes in source order, a bare attribute, text and expression
+/// children, a nested typed element, a `const` one.
+#[test]
+fn a_typed_element_builds_the_same_chain_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_typed_element.vl"),
+        TYPED_ELEMENT_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_typed_element.vl"),
+        Verdict::Identical,
+        "a typed element must lower to the same chain on both backends"
+    );
+}
+
+const TYPED_ELEMENT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Row {\n",
+    "\tlog: str,\n",
+    "}\n",
+    "\n",
+    "impl Row {\n",
+    "\tfun gap(self, value: i32): Row {\n",
+    "\t\tRow { log = self.log + i\" gap={value}\" }\n",
+    "\t}\n",
+    "\tfun wrap(self): Row {\n",
+    "\t\tRow { log = self.log + \" wrap\" }\n",
+    "\t}\n",
+    "\tfun child(self, value: str): Row {\n",
+    "\t\tRow { log = self.log + \" child=\" + value }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Column {\n",
+    "\tlog: str,\n",
+    "}\n",
+    "\n",
+    "impl Column {\n",
+    "\tfun child(self, value: Row): Column {\n",
+    "\t\tColumn { log = self.log + \" [\" + value.log + \"]\" }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "[element]\n",
+    "fun row(): Row {\n",
+    "\tRow { log = \"row\" }\n",
+    "}\n",
+    "\n",
+    "[element]\n",
+    "fun column(): Column {\n",
+    "\tColumn { log = \"column\" }\n",
+    "}\n",
+    "\n",
+    "const let folded = <row gap(3)>\"k\"</row>;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet b = \"bee\";\n",
+    "\tprint(<row wrap gap(8) wrap>\"a\"{b}</row>.log);\n",
+    "\tprint(<column><row gap(1) />{<row wrap>\"x\"</row>}</column>.log);\n",
+    "\tprint(folded.log);\n",
+    "}\n",
+);
+
 /// The canonical key, as the JS backend's `__hash` computes it (F20): a
 /// primitive keys as ITSELF and an aggregate keys as its `JSON.stringify` text,
 /// so the four `Hash` arms are the four JS primitive kinds and nothing else.
