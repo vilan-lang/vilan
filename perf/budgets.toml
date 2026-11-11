@@ -320,3 +320,38 @@ class = "ci"
 ratio = 1.01
 reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0042 of the ceiling at next 7ca039b0 where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
 item = "M199"
+
+[[bump]]
+subject = "example:browser"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0051 of the ceiling at next c1d58aaa where the limit stood at x1.0050"
+item = "M202"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0080 of the ceiling at next c1d58aaa where the limit stood at x1.0050"
+item = "M202"
+
+[[bump]]
+subject = "example:reactive-ui"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0048 of the ceiling at next c1d58aaa where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+item = "M202"
+
+[[bump]]
+subject = "example:router"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0044 of the ceiling at next c1d58aaa where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+item = "M202"
+
+[[bump]]
+subject = "example:rpc"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0044 of the ceiling at next c1d58aaa where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+item = "M202"
