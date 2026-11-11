@@ -59,6 +59,7 @@
 - [Process modules](std/process.md)
 - [Images](std/image.md)
 - [Windows](std/window.md)
+- [GPU graphics](std/gfx.md)
 - [Misc](std/misc.md)
 
 # The specification

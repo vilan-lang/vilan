@@ -248,14 +248,21 @@ leg_webview() {
 # (`crates/vilan-rt-gfx/about.toml`, the compiler's accepted list unchanged)
 # regenerated and compared byte for byte. It needs a GPU adapter (ci.yml's
 # `gfx` job installs Mesa's software Vulkan, `mesa-vulkan-drivers`), `xvfb`,
-# `cargo-audit` and `cargo-about`; no development package (fontconfig is
-# opened at run time).
+# `cargo-audit`, `cargo-about` and `cargo-nextest`; no development package
+# (fontconfig is opened at run time).
 #
 # - `VILAN_REQUIRE_GFX=1`: the golden images (`tests/golden.rs`, a tolerance
 #   of one per channel) and the window proof (`tests/window.rs`, the window
 #   example under xvfb) skip elsewhere when there is no software adapter or no
 #   xvfb, and must not skip here.
+# - The `std::gfx` end-to-end proof (`crates/vilan-cli/tests/gfx_window.rs`):
+#   the compiler builds `vilan/examples/gfx` with the Rust backend, and the
+#   counter runs in a real window under xvfb, driven by pointer input injected
+#   through the X server, with its scene held to golden images offscreen. It
+#   builds the compiler, so this leg needs the workspace's toolchain and
+#   `cargo-nextest` too; REQUIRED here by the same `VILAN_REQUIRE_GFX=1`.
 leg_gfx() {
+    status=0
     (
         cd crates/vilan-rt-gfx
         cargo fmt --check || exit 1
@@ -266,7 +273,9 @@ leg_gfx() {
         cargo about generate -c about.toml ../../about.hbs -o "$notices" || exit 1
         tr -d '\r' <"$notices" | cmp - THIRD-PARTY-NOTICES.txt || exit 1
         rm -f "$notices"
-    )
+    ) || status=$?
+    VILAN_REQUIRE_GFX=1 cargo nextest run -p vilan-cli --test gfx_window || status=$?
+    return "$status"
 }
 
 # LOCAL ONLY. Not the windows suite — the windows COMPILE. See the header.

@@ -168,6 +168,13 @@ pub struct OptionalCrates {
     /// loop. Outside the compiler's workspace, with its own lockfile, which
     /// the CLI seeds the generated project with.
     pub window: bool,
+    /// A window drawn by the GPU — `vilan-rt-gfx` (`wgpu` + `winit` + its
+    /// own renderer; native-ui.md P1). Reached by `std::gfx`: the emitted
+    /// `main` then hands the main thread to the crate's host, which runs the
+    /// program's loop inside the window system's (R8). Outside the
+    /// compiler's workspace, with its own lockfile, which the CLI seeds the
+    /// generated project with.
+    pub gfx: bool,
 }
 
 impl OptionalCrates {
@@ -194,6 +201,9 @@ impl OptionalCrates {
         }
         if self.window {
             names.push("vilan-rt-webview");
+        }
+        if self.gfx {
+            names.push("vilan-rt-gfx");
         }
         names
     }
@@ -630,6 +640,12 @@ struct Emitter<'a, 'src> {
     /// thread for the platform's event loop. Set where `__window_open` and
     /// `__window_close` are lowered.
     reaches_window: bool,
+    /// Whether this program reaches `std::gfx` (native-ui.md P1), and so
+    /// links `vilan-rt-gfx`: the emitted `main` installs its host first and
+    /// runs the program's loop through the host's `run_pending` / `block_on`
+    /// (R8). Set where an `__gfx_*` extern is lowered, and by a reference to
+    /// one of the two host values `std::gfx` declares.
+    reaches_gfx: bool,
     /// Whether the function being emitted DECLARES an `async |T| U` return
     /// type (J2's `async_returning`) — so the closure literal it hands back is
     /// a future-answering one.
@@ -897,6 +913,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             reaches_image: false,
             reaches_poll: false,
             reaches_window: false,
+            reaches_gfx: false,
             returns_an_async_closure: false,
             closure_captures: Vec::new(),
             expects_payload_view: None,
@@ -979,6 +996,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             );
         }
 
+        // native-ui.md P1 (R8): a program that reaches `std::gfx` runs its
+        // loop INSIDE the window system's, on the main thread: the host is
+        // installed before anything else (it opens the window system's loop
+        // and makes the executor a hosted one woken through it), and the
+        // owned loop's entry is the host's. Known only now, as every reach.
+        if self.reaches_gfx {
+            main_body = self.hand_main_to_the_gfx_host(main_body)?;
+        }
+
         // F1 M2: a program with a window gives the main thread to the
         // platform's event loop (macOS requires it; GTK and Windows bind a
         // window to the thread that made it) and runs on a second thread —
@@ -1022,6 +1048,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 image: self.reaches_image,
                 poll: self.reaches_poll,
                 window: self.reaches_window,
+                gfx: self.reaches_gfx,
             },
             boxed_bindings: self.boxed_emitted.len(),
             consumed_copies: self.copies_taken,
@@ -3412,6 +3439,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             _ if self.image_struct(id) => {
                 self.reaches_image = true;
                 Ok("vilan_rt_image::Image".to_string())
+            }
+            // native-ui.md P1: `std::gfx`'s two host values, recognized the
+            // same way, by the helper that reads each.
+            _ if self.struct_read_by(id, "__gfx_layout_number") => {
+                self.reaches_gfx = true;
+                Ok("vilan_rt_gfx::TextLayout".to_string())
+            }
+            _ if self.struct_read_by(id, "__gfx_texture_size") => {
+                self.reaches_gfx = true;
+                Ok("vilan_rt_gfx::Image".to_string())
             }
             _ => {
                 let what = format!("the host type `{name}`");
@@ -9792,6 +9829,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let expecting = self.expected_type;
                 self.consumed_value_of_expecting(leg.body, expecting, depth + 1)?
             };
+            // A leg that BINDS the whole `str` subject (`let other => ..`)
+            // binds the `&str` the subject was matched as; the body reads a
+            // vilan `str`, so the binding is an `Rc<str>` again inside it (a
+            // copy of the text, as the subject's own copy would be). A guard
+            // would read the `&str`, and is refused by name rather than
+            // emitted as Rust that does not build.
+            let body = match (&leg.pattern, matches_a_string) {
+                (ExprPattern::Binding(binding), true) => {
+                    if leg.guard.is_some() {
+                        return Err(unsupported(
+                            "a guarded leg that binds a `match`'s whole `str` subject (bind it \
+                             without the guard and test it in the leg's body)",
+                            self.span_of(leg.body),
+                        ));
+                    }
+                    let name = self.binding_name(*binding);
+                    format!("{{ let {name}: vilan_rt::Str = vilan_rt::str_new({name}); {body} }}")
+                }
+                _ => body,
+            };
             let body = if consumes_a_drop_value {
                 let mut bindings = Vec::new();
                 collect_pattern_bindings(&leg.pattern, &mut bindings);
@@ -12740,6 +12797,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(rendered) = self.window_host_binding(binding, argument_ids, depth)? {
             return Ok(Some(rendered));
         }
+        if let Some(rendered) = self.gfx_host_binding(binding, argument_ids, depth)? {
+            return Ok(Some(rendered));
+        }
         self.crypto_host_binding(target, name, binding, argument_ids, depth)
     }
 
@@ -12860,12 +12920,116 @@ impl<'a, 'src> Emitter<'a, 'src> {
         Ok(Some(rendered))
     }
 
-    /// Whether an `external struct` is `std::image::Image` — decided by the
-    /// helper that READS it: the declared first parameter of a
-    /// `[extern("__image_width")]`. `Image` is a name a program may well give
-    /// a host class of its own (a DOM `HTMLImageElement`, say), so the name is
-    /// never read; [`Emitter::node_buffer_struct`] is the same rule.
-    fn image_struct(&self, struct_id: Id) -> bool {
+    /// native-ui.md P1 (R8): `main` for a program that reaches `std::gfx`.
+    /// Three edits to the `main` every program gets, and nothing else: the
+    /// host's `install` first (above the other installs, which it subsumes
+    /// or sits beside), and the loop functions the emitted `main` already
+    /// calls replaced by the host's twins — `vilan_rt::executor::run_pending`
+    /// after a synchronous body, `vilan_rt::executor::block_on` around an
+    /// async one. Both keep `main_guard` around them, so a root failure the
+    /// host re-raises after the window loop ends is the program's failure,
+    /// in node's shape.
+    ///
+    /// Refused by name: a program that also reaches `std::window` (each
+    /// wants the main thread, for a different window system's loop), and a
+    /// `main` answering its exit code (it exits the moment its body returns,
+    /// as `process.exit(main())` does, so no window loop would ever run).
+    fn hand_main_to_the_gfx_host(&self, main_body: String) -> Result<String, Error> {
+        if self.reaches_window {
+            return Err(Error {
+                trace: Vec::new(),
+                note: None,
+                msg: "this program reaches both `std::window` and `std::gfx`, and each \
+                      needs the main thread for its own window system's loop (a webview's, \
+                      a GPU window's): one program opens one kind of window. Draw the page's \
+                      content with `std::gfx`, or show it in `std::window`"
+                    .to_string(),
+                span: Span::new((), 0..0),
+            });
+        }
+        const SYNC_LOOP: &str = "    vilan_rt::executor::run_pending();\n";
+        const ASYNC_LOOP: &str = "vilan_rt::main_guard(|| vilan_rt::executor::block_on(";
+        let hosted = if main_body.contains(SYNC_LOOP) {
+            main_body.replacen(SYNC_LOOP, "    vilan_rt_gfx::host::run_pending();\n", 1)
+        } else if main_body.contains(ASYNC_LOOP) {
+            main_body.replacen(
+                ASYNC_LOOP,
+                "vilan_rt::main_guard(|| vilan_rt_gfx::host::block_on(",
+                1,
+            )
+        } else {
+            return Err(Error {
+                trace: Vec::new(),
+                note: None,
+                msg: "this program reaches `std::gfx`, and its `main` answers an exit code: \
+                      the process exits the moment `main` returns, so no window loop would \
+                      run. Declare `fun main()` with no return type, and end the program by \
+                      closing its last window"
+                    .to_string(),
+                span: Span::new((), 0..0),
+            });
+        };
+        Ok(hosted.replacen(
+            "fn main() {\n",
+            "fn main() {\n    vilan_rt_gfx::host::install();\n",
+            1,
+        ))
+    }
+
+    /// native-ui.md P1: `std::gfx`'s host helpers, each one call into
+    /// `vilan-rt-gfx`'s `host` module, and each RECORDS the reach — the
+    /// manifest names the crate, `main` hands the program to the host
+    /// ([`Emitter::hand_main_to_the_gfx_host`]), and the termination signals
+    /// and the readiness wait are linked too: a GPU window stops on SIGTERM
+    /// as a server does, and its program's sockets are waited on by the
+    /// readiness wait's helper thread. Keyed on the host symbol alone, as
+    /// [`Emitter::window_host_binding`] is: only `std::gfx` declares a
+    /// `__gfx_`-prefixed name. A window crosses as its id, a frame as its
+    /// token, everything else as numbers, strings, `Bytes`, `|| void`
+    /// callbacks and the two host values (`TextLayout`, `Texture`), which
+    /// the runtime READS and so takes by reference.
+    fn gfx_host_binding(
+        &mut self,
+        binding: Option<&ExternBinding<'src>>,
+        argument_ids: &[Id],
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        let Some(ExternBinding::Function {
+            module: None,
+            symbol,
+        }) = binding
+        else {
+            return Ok(None);
+        };
+        let Some((function, places)) = gfx_host_function(symbol) else {
+            return Ok(None);
+        };
+        let mut arguments = Vec::with_capacity(argument_ids.len());
+        for index in 0..argument_ids.len() {
+            arguments.push(if places.contains(&index) {
+                format!("&{}", self.place_argument(argument_ids, index, depth)?)
+            } else {
+                self.value_argument(argument_ids, index, depth)?
+            });
+        }
+        self.reaches_gfx = true;
+        self.reaches_signal = true;
+        self.reaches_poll = true;
+        Ok(Some(format!(
+            "vilan_rt_gfx::host::{function}({})",
+            arguments.join(", ")
+        )))
+    }
+
+    /// Whether an `external struct` is the host value read by `symbol`'s
+    /// first parameter — `std::image::Image` by `__image_width`, `std::gfx`'s
+    /// `TextLayout` by `__gfx_layout_number` and `Texture` by
+    /// `__gfx_texture_size`. Decided by the helper that READS the struct,
+    /// never by its name: `Image`, `Texture` and `TextLayout` are names a
+    /// program may well give a host class of its own (a DOM
+    /// `HTMLImageElement`, say); [`Emitter::node_buffer_struct`] is the same
+    /// rule.
+    fn struct_read_by(&self, struct_id: Id, reader: &str) -> bool {
         if !self
             .program
             .structs
@@ -12879,8 +13043,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 external.extern_binding,
                 Some(ExternBinding::Function {
                     module: None,
-                    symbol: "__image_width",
-                })
+                    symbol,
+                }) if symbol == reader
             ) && external
                 .parameters
                 .first()
@@ -12892,6 +13056,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     )
                 })
         })
+    }
+
+    /// Whether an `external struct` is `std::image::Image` — decided by the
+    /// helper that READS it: the declared first parameter of a
+    /// `[extern("__image_width")]`. `Image` is a name a program may well give
+    /// a host class of its own (a DOM `HTMLImageElement`, say), so the name is
+    /// never read; [`Emitter::node_buffer_struct`] is the same rule.
+    fn image_struct(&self, struct_id: Id) -> bool {
+        self.struct_read_by(struct_id, "__image_width")
     }
 
     /// F40 (RULED (a)): the bindings `vilan-rt-crypto` answers — OS
@@ -18363,6 +18536,47 @@ pub const IMAGE_OPTIMIZED_PACKAGES: &[&str] = &[
 
 /// The `Cargo.toml` of the project the backend writes, pointing at the runtime
 /// crate by path. `edition 2024` matches the workspace's own.
+/// native-ui.md P1: each `std::gfx` host symbol's function in
+/// `vilan_rt_gfx::host`, and which of its arguments the function only READS
+/// and so takes by reference (a string, `Bytes`, a host value); every other
+/// argument is a scalar or a callback, passed by value. `gfx.vl` declares the
+/// symbols; `vilan-rt-gfx`'s `host` module documents each function.
+fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
+    const FUNCTIONS: &[(&str, &str, &[usize])] = &[
+        ("__gfx_open", "open", &[0]),
+        ("__gfx_close", "close", &[]),
+        ("__gfx_request_redraw", "request_redraw", &[]),
+        ("__gfx_on_frame", "on_frame", &[]),
+        ("__gfx_on_event", "on_event", &[]),
+        ("__gfx_window_number", "window_number", &[]),
+        ("__gfx_event_next", "event_next", &[]),
+        ("__gfx_event_number", "event_number", &[]),
+        ("__gfx_event_integer", "event_integer", &[]),
+        ("__gfx_event_text", "event_text", &[]),
+        ("__gfx_frame_token", "frame_token", &[]),
+        ("__gfx_frame_number", "frame_number", &[]),
+        ("__gfx_rectangle", "rectangle", &[]),
+        ("__gfx_shadow", "shadow", &[]),
+        ("__gfx_text", "text", &[1]),
+        ("__gfx_underline", "underline", &[]),
+        ("__gfx_texture", "texture", &[1]),
+        ("__gfx_push_clip", "push_clip", &[]),
+        ("__gfx_push_transform", "push_transform", &[]),
+        ("__gfx_push_layer", "push_layer", &[]),
+        ("__gfx_pop", "pop", &[]),
+        ("__gfx_text_layout", "text_layout", &[0, 2]),
+        ("__gfx_layout_number", "layout_number", &[0]),
+        ("__gfx_register_font", "register_font", &[0]),
+        ("__gfx_texture_from_rgba", "texture_from_rgba", &[2]),
+        ("__gfx_texture_size", "texture_size", &[0]),
+        ("__gfx_offscreen", "offscreen", &[]),
+    ];
+    FUNCTIONS
+        .iter()
+        .find(|(name, _, _)| *name == symbol)
+        .map(|(_, function, places)| (*function, *places))
+}
+
 pub fn cargo_manifest(name: &str, runtime_path: &str, optional: OptionalCrates) -> String {
     // F18 slice 2 (Order 39's R1) and F40: an optional runtime crate is named
     // only when the program reached it. A program that did not pays neither

@@ -520,7 +520,11 @@ jobs:
   # the software Vulkan driver and its loader, xvfb, the X libraries winit
   # opens at run time, fontconfig (opened at run time too) and one font for the
   # window example. No development package: nothing here links a C library at
-  # build time. Its own cache entry: a `target/` of the GPU stack only.
+  # build time. It also BUILDS THE COMPILER, as the webview job does: the
+  # `std::gfx` end-to-end proof (`crates/vilan-cli/tests/gfx_window.rs`)
+  # compiles `vilan/examples/gfx` with the Rust backend and runs it in a window
+  # under xvfb, REQUIRED here too. Its own cache entry: the compiler's
+  # `target/` and the GPU crate's.
   gfx:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -532,11 +536,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
-          tool: cargo-audit
+          tool: cargo-nextest,cargo-audit
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: gfx
           workspaces: |
+            . -> target
             crates/vilan-rt-gfx -> target
           save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
       - name: Software Vulkan, a virtual display, and what winit opens at run time
@@ -549,7 +554,7 @@ jobs:
       # pinned to the version that wrote the committed file.
       - name: cargo-about, at the version the notices were written with
         run: cargo install cargo-about --version 0.9.1 --locked --features cli
-      - name: The GPU crate holds its gates, its goldens match and a window opens
+      - name: The GPU crate holds its gates, its goldens match, a window opens, and a vilan program draws in one
         run: scripts/ci-local.sh gfx
 
   # **This is the job to make a required status check** (process.md §2.5, where

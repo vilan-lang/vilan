@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use vilan_embedded::{
     CONTENT_HASH, FILES, IMAGE_CORE_MANIFEST, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES,
-    RT_IMAGE_MANIFEST, RT_MANIFEST, RT_NET_MANIFEST, RT_POLL_MANIFEST, RT_SIGNAL_MANIFEST,
-    RT_SQLITE_MANIFEST, RT_TERM_MANIFEST, RT_WEBVIEW_LOCK, RT_WEBVIEW_MANIFEST, materialize_into,
+    RT_GFX_LOCK, RT_GFX_MANIFEST, RT_IMAGE_MANIFEST, RT_MANIFEST, RT_NET_MANIFEST,
+    RT_POLL_MANIFEST, RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, RT_TERM_MANIFEST, RT_WEBVIEW_LOCK,
+    RT_WEBVIEW_MANIFEST, materialize_into,
 };
 
 mod scratch;
@@ -214,7 +215,30 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
             RT_WEBVIEW_MANIFEST,
             "tao = { version = \"=0.37.2\"",
         ),
+        // native-ui.md P1: the GPU crate, outside the workspace (R11), its
+        // exact pins and its two sibling path dependencies kept.
+        (
+            "vilan-rt-gfx",
+            RT_GFX_MANIFEST,
+            "wgpu = { version = \"=30.0.1\"",
+        ),
+        (
+            "vilan-rt-gfx",
+            RT_GFX_MANIFEST,
+            "winit = { version = \"=0.30.13\"",
+        ),
+        (
+            "vilan-rt-gfx",
+            RT_GFX_MANIFEST,
+            "vilan-rt-poll = { path = \"../vilan-rt-poll\" }",
+        ),
     ];
+    // native-ui.md P1: the GPU crate's shader is source the collector carries
+    // (its renderer `include_str!`s it).
+    assert!(
+        keys.contains(&"vilan-rt-gfx/src/shader.wgsl"),
+        "the shader was not embedded"
+    );
     // F1 M2: nothing under a crate's own `target/` is ever embedded — the
     // webview crate, outside the compiler's workspace, builds into one beside
     // its sources, and its build scripts write `.rs` files there.
@@ -294,7 +318,29 @@ fn the_webview_lockfile_embedded_is_the_crates_own() {
     }
 }
 
-/// Every `.rs` file under `directory`, as the table's keys spell them.
+/// native-ui.md P1 (R11): the lockfile a `std::gfx` program's project is
+/// seeded with IS the GPU crate's own, and it holds the `wgpu` and `winit` the
+/// manifest pins exactly.
+#[test]
+fn the_gfx_lockfile_embedded_is_the_crates_own() {
+    let on_disk = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vilan-rt-gfx/Cargo.lock"),
+    )
+    .expect("the GPU crate's lockfile");
+    assert_eq!(RT_GFX_LOCK, on_disk);
+    for package in [
+        "name = \"wgpu\"\nversion = \"30.0.1\"",
+        "name = \"winit\"\nversion = \"0.30.13\"",
+    ] {
+        assert!(
+            RT_GFX_LOCK.contains(package),
+            "the lockfile holds {package}"
+        );
+    }
+}
+
+/// Every `.rs` (and `.wgsl`) file under `directory`, as the table's keys
+/// spell them.
 fn walk_rust(directory: &Path, prefix: &Path, out: &mut Vec<String>) {
     for entry in fs::read_dir(directory)
         .expect("read the runtime crate")
@@ -309,7 +355,10 @@ fn walk_rust(directory: &Path, prefix: &Path, out: &mut Vec<String>) {
                 continue;
             }
             walk_rust(&path, &relative, out);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "rs" || extension == "wgsl")
+        {
             out.push(
                 relative
                     .components()

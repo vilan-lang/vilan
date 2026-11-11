@@ -1,0 +1,1331 @@
+// `std::gfx` — a window drawn by the GPU, for a native program (native-ui.md part
+// P1; its section 9 RULED 2026-11-10).
+//
+// A program opens a window, and each frame its frame callback is handed a `Frame`
+// to fill with primitives in display pixels (dp): rounded rectangles with gradients
+// and borders, shadows, text, underlines and textures, under clips, transforms and
+// opacity layers. Frames are drawn ON DEMAND — when the window opens, resizes or
+// changes scale, and when the program asks (`request_redraw`) — so an idle window
+// costs nothing. Input arrives as `Event` values through the window's event
+// callback.
+//
+// NATIVE ONLY. Its runtime is the `vilan-rt-gfx` crate (`wgpu` + `winit` + a
+// renderer of its own, text by `parley`), which a generated cargo project links
+// only when the program reaches this module. The JavaScript backend refuses a
+// program that reaches it, by name, when it builds; `vilan check` does not,
+// because a check is the same for both backends. A process module: a browser
+// entry that reaches it is refused by the platform check.
+//
+// ONE THREAD (R8): the window system's loop owns the main thread and runs the
+// program's event loop inside it, so every callback here runs on the thread that
+// draws, between the window system's events, never beside them.
+//
+// `dp` is the only length unit (native-ui.md section 5), and it is a TYPE here
+// (`Dp`), not a bare number: device pixels never appear in this surface at all
+// — positions, sizes and every primitive are in dp, the scale factor is a plain
+// ratio — and `Dp` keeps a dp length from being mixed with a number that is not
+// one (a scale, an opacity, a count) without saying so. `dp(8)` makes one;
+// `Dp + Dp`, `Dp - Dp`, `Dp * f64` and `Dp / f64` are lengths; `.value()` is
+// the number.
+//
+// Closing the LAST window stops the program the way SIGTERM does: servers stop
+// accepting and drain, the event loop ends, `main` returns, exit code 0.
+//
+// Not here yet (native-ui.md section 8): paths and icons, more than one window,
+// rotation, text editing, input methods, publishing accessibility. Shared code
+// never names this module (D4).
+
+[platform("@process")] mod self;
+
+import pkg::bytes::Bytes;
+import pkg::compare::{ Ordering, PartialEq, PartialOrd };
+import pkg::image::Image;
+import pkg::operators::{ Add, Div, Mul, Sub };
+import pkg::option::Option::{ self, None, Some };
+import pkg::result::Result::{ self, Err, Ok };
+
+// --- The seam ------------------------------------------------------------------
+//
+// `vilan-rt-gfx`'s `host` module. A window crosses as its id and a frame as its
+// token; a primitive crosses as the numbers it is made of (one call each, nothing
+// allocated per primitive); an event as a kind code and numbers read one at a time.
+// The event table is kept by `crates/vilan-rt-gfx/src/host/input.rs` too:
+//
+//   kind  event              numbers                                text
+//   0     pointer moved      x, y
+//   1     pointer pressed    x, y, button, modifiers
+//   2     pointer released   x, y, button, modifiers
+//   3     pointer left
+//   4     scrolled           x, y, delta x, delta y, modifiers
+//   5     key pressed        repeat, modifiers, named               the key
+//   6     key released       repeat, modifiers, named               the key
+//   7     text input                                                the text
+//   8     resized            width, height
+//   9     scale changed      scale factor
+//   10    close requested
+//
+// A button is 0 left, 1 right, 2 middle, 3 back, 4 forward, 5 + n other; the
+// modifiers are bits, 1 shift, 2 control, 4 alt, 8 meta; `named` is 1 for a key
+// that types nothing (its name is winit's, which is the web's) and 0 for a key that
+// types its text.
+
+[extern("__gfx_open")]
+async external fun gfx_open(
+	title: str,
+	width: f64,
+	height: f64,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): Result<u32, str>;
+
+[extern("__gfx_close")]
+external fun gfx_close(window: u32): void;
+
+[extern("__gfx_request_redraw")]
+external fun gfx_request_redraw(window: u32): void;
+
+[extern("__gfx_on_frame")]
+external fun gfx_on_frame(window: u32, callback: || void): void;
+
+[extern("__gfx_on_event")]
+external fun gfx_on_event(window: u32, callback: || void): void;
+
+/// The window's width (0) and height (1) in dp, its scale factor (2).
+[extern("__gfx_window_number")]
+external fun gfx_window_number(window: u32, which: i32): f64;
+
+[extern("__gfx_event_next")]
+external fun gfx_event_next(window: u32): i32;
+
+[extern("__gfx_event_number")]
+external fun gfx_event_number(index: i32): f64;
+
+[extern("__gfx_event_integer")]
+external fun gfx_event_integer(index: i32): i32;
+
+[extern("__gfx_event_text")]
+external fun gfx_event_text(): str;
+
+[extern("__gfx_frame_token")]
+external fun gfx_frame_token(): u32;
+
+/// The frame being filled: its width (1) and height (2) in dp, its scale (3).
+[extern("__gfx_frame_number")]
+external fun gfx_frame_number(which: i32): f64;
+
+[extern("__gfx_rectangle")]
+external fun gfx_rectangle(
+	frame: u32,
+	x: f64,
+	y: f64,
+	width: f64,
+	height: f64,
+	radius_top_left: f64,
+	radius_top_right: f64,
+	radius_bottom_right: f64,
+	radius_bottom_left: f64,
+	fill: i32,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+	end_red: f64,
+	end_green: f64,
+	end_blue: f64,
+	end_alpha: f64,
+	start_x: f64,
+	start_y: f64,
+	end_x: f64,
+	end_y: f64,
+	border_top: f64,
+	border_right: f64,
+	border_bottom: f64,
+	border_left: f64,
+	border_red: f64,
+	border_green: f64,
+	border_blue: f64,
+	border_alpha: f64,
+): void;
+
+[extern("__gfx_shadow")]
+external fun gfx_shadow(
+	frame: u32,
+	x: f64,
+	y: f64,
+	width: f64,
+	height: f64,
+	radius: f64,
+	blur: f64,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): void;
+
+[extern("__gfx_text")]
+external fun gfx_text(
+	frame: u32,
+	layout: TextLayout,
+	x: f64,
+	y: f64,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): void;
+
+[extern("__gfx_underline")]
+external fun gfx_underline(
+	frame: u32,
+	x: f64,
+	y: f64,
+	width: f64,
+	thickness: f64,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): void;
+
+[extern("__gfx_texture")]
+external fun gfx_texture(
+	frame: u32,
+	texture: Texture,
+	x: f64,
+	y: f64,
+	width: f64,
+	height: f64,
+	radius_top_left: f64,
+	radius_top_right: f64,
+	radius_bottom_right: f64,
+	radius_bottom_left: f64,
+): void;
+
+[extern("__gfx_push_clip")]
+external fun gfx_push_clip(
+	frame: u32,
+	x: f64,
+	y: f64,
+	width: f64,
+	height: f64,
+	radius_top_left: f64,
+	radius_top_right: f64,
+	radius_bottom_right: f64,
+	radius_bottom_left: f64,
+): void;
+
+[extern("__gfx_push_transform")]
+external fun gfx_push_transform(frame: u32, x: f64, y: f64, scale: f64): void;
+
+[extern("__gfx_push_layer")]
+external fun gfx_push_layer(frame: u32, opacity: f64): void;
+
+[extern("__gfx_pop")]
+external fun gfx_pop(frame: u32): void;
+
+[extern("__gfx_text_layout")]
+external fun gfx_text_layout(
+	text: str,
+	family: i32,
+	name: str,
+	size: f64,
+	line_height: f64,
+	weight: f64,
+	italic: bool,
+	max_width: f64,
+): TextLayout;
+
+/// A layout's width (0) and height (1) in dp, first baseline (2), lines (3).
+[extern("__gfx_layout_number")]
+external fun gfx_layout_number(layout: TextLayout, which: i32): f64;
+
+[extern("__gfx_register_font")]
+external fun gfx_register_font(data: Bytes): Result<List<str>, str>;
+
+[extern("__gfx_texture_from_rgba")]
+external fun gfx_texture_from_rgba(width: u32, height: u32, pixels: Bytes): Result<Texture, str>;
+
+/// A texture's width (0) or height (1) in pixels.
+[extern("__gfx_texture_size")]
+external fun gfx_texture_size(texture: Texture, which: i32): u32;
+
+[extern("__gfx_offscreen")]
+external fun gfx_offscreen(
+	width: f64,
+	height: f64,
+	scale_factor: f64,
+	software: bool,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+	draw: || void,
+): Result<Bytes, str>;
+
+// --- Lengths -------------------------------------------------------------------
+
+/// A length in display pixels: the 8 of a design measured in pixels. One dp is one
+/// logical pixel times the display's scale factor, so `dp(8)` is 8 device pixels at
+/// 100% and 12 at 150%. A border or hairline under 2 dp is never thinner than one
+/// device pixel and snaps to the pixel grid (native-ui.md R16).
+export struct Dp {
+	value: f64,
+}
+
+/// `dp(8)` — a length of 8 display pixels.
+export fun dp(value: f64): Dp {
+	Dp { value }
+}
+
+export impl Dp {
+	/// The number of display pixels.
+	fun value(self): f64 {
+		self.value
+	}
+
+	/// The shorter of the two.
+	fun min(self, other: Dp): Dp {
+		Dp { value = self.value.min(other.value) }
+	}
+
+	/// The longer of the two.
+	fun max(self, other: Dp): Dp {
+		Dp { value = self.value.max(other.value) }
+	}
+}
+
+export impl Dp with Add {
+	fun add(self, b: Dp): Dp {
+		Dp { value = self.value + b.value }
+	}
+}
+
+export impl Dp with Sub {
+	fun sub(self, b: Dp): Dp {
+		Dp { value = self.value - b.value }
+	}
+}
+
+/// A length scaled by a plain number: `width * 0.5`. A length times a length is not
+/// a length, so there is no `Dp * Dp`.
+export impl Dp with Mul<f64> {
+	fun mul(self, b: f64): Dp {
+		Dp { value = self.value * b }
+	}
+}
+
+export impl Dp with Div<f64> {
+	fun div(self, b: f64): Dp {
+		Dp { value = self.value / b }
+	}
+}
+
+export impl Dp with PartialEq {
+	fun eq(self, b: Dp): bool {
+		self.value == b.value
+	}
+}
+
+export impl Dp with PartialOrd {
+	fun partial_compare(self, b: Dp): Option<Ordering> {
+		self.value.partial_compare(b.value)
+	}
+}
+
+// --- Geometry ------------------------------------------------------------------
+
+/// A point in dp, from the window's (or the frame's) top-left corner.
+export struct Point {
+	x: Dp,
+	y: Dp,
+}
+
+export impl Point {
+	fun new(x: Dp, y: Dp): Point {
+		Point { x, y }
+	}
+}
+
+/// A width and a height in dp.
+export struct Size {
+	width: Dp,
+	height: Dp,
+}
+
+export impl Size {
+	fun new(width: Dp, height: Dp): Size {
+		Size { width, height }
+	}
+}
+
+/// An axis-aligned rectangle in dp: its top-left corner and its size.
+export struct Rect {
+	x: Dp,
+	y: Dp,
+	width: Dp,
+	height: Dp,
+}
+
+export impl Rect {
+	fun new(x: Dp, y: Dp, width: Dp, height: Dp): Rect {
+		Rect { x, y, width, height }
+	}
+
+	fun right(self): Dp {
+		self.x + self.width
+	}
+
+	fun bottom(self): Dp {
+		self.y + self.height
+	}
+
+	/// Whether `point` is inside: the left and top edges are, the right and bottom
+	/// are not — so rectangles that share an edge never both contain a point on it.
+	/// Hit testing by hand is this.
+	fun contains(self, point: Point): bool {
+		point.x >= self.x && point.x < self.right() && point.y >= self.y && point.y < self.bottom()
+	}
+
+	/// The rectangle moved in by `amount` on every side.
+	fun inset(self, amount: Dp): Rect {
+		Rect {
+			x = self.x + amount,
+			y = self.y + amount,
+			width = self.width - amount * 2.0,
+			height = self.height - amount * 2.0,
+		}
+	}
+
+	/// The rectangle moved by `dx`, `dy`.
+	fun offset(self, dx: Dp, dy: Dp): Rect {
+		Rect { x = self.x + dx, y = self.y + dy, width = self.width, height = self.height }
+	}
+}
+
+/// One length per corner, clockwise from the top left: corner radii.
+export struct Corners {
+	top_left: Dp,
+	top_right: Dp,
+	bottom_right: Dp,
+	bottom_left: Dp,
+}
+
+export impl Corners {
+	/// The same radius at every corner.
+	fun all(radius: Dp): Corners {
+		Corners {
+			top_left = radius,
+			top_right = radius,
+			bottom_right = radius,
+			bottom_left = radius,
+		}
+	}
+
+	/// Square corners.
+	fun none(): Corners {
+		Corners::all(dp(0))
+	}
+}
+
+/// One length per side, clockwise from the top: border widths.
+export struct Edges {
+	top: Dp,
+	right: Dp,
+	bottom: Dp,
+	left: Dp,
+}
+
+export impl Edges {
+	/// The same width on every side.
+	fun all(width: Dp): Edges {
+		Edges { top = width, right = width, bottom = width, left = width }
+	}
+}
+
+/// A translation and a UNIFORM scale, applied as `point * scale + (x, y)`. Uniform
+/// on purpose: a rounded rectangle stays a rounded rectangle and text is drawn at
+/// the scaled size rather than stretched. Rotation is a later part.
+export struct Transform {
+	x: Dp,
+	y: Dp,
+	scale: f64,
+}
+
+export impl Transform {
+	fun translate(x: Dp, y: Dp): Transform {
+		Transform { x, y, scale = 1.0 }
+	}
+
+	/// A scale must be finite and positive; a frame with another fails.
+	fun scale(scale: f64): Transform {
+		Transform { x = dp(0), y = dp(0), scale }
+	}
+}
+
+// --- Colour and paint ----------------------------------------------------------
+
+/// A colour in sRGB with straight alpha, each channel 0 to 1 — as a design tool
+/// writes colours. The renderer blends in linear light.
+export struct Color {
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+}
+
+export impl Color {
+	/// An opaque colour from 8-bit channels, 0 to 255.
+	fun rgb(red: i32, green: i32, blue: i32): Color {
+		Color::rgba(red, green, blue, 1.0)
+	}
+
+	/// A colour from 8-bit channels and an alpha from 0 to 1.
+	fun rgba(red: i32, green: i32, blue: i32, alpha: f64): Color {
+		Color {
+			red = red.as_f64() / 255.0,
+			green = green.as_f64() / 255.0,
+			blue = blue.as_f64() / 255.0,
+			alpha,
+		}
+	}
+
+	fun white(): Color {
+		Color { red = 1.0, green = 1.0, blue = 1.0, alpha = 1.0 }
+	}
+
+	fun black(): Color {
+		Color { red = 0.0, green = 0.0, blue = 0.0, alpha = 1.0 }
+	}
+
+	fun transparent(): Color {
+		Color { red = 0.0, green = 0.0, blue = 0.0, alpha = 0.0 }
+	}
+
+	/// The same colour with its alpha multiplied by `factor`.
+	fun faded(self, factor: f64): Color {
+		Color { red = self.red, green = self.green, blue = self.blue, alpha = self.alpha * factor }
+	}
+}
+
+/// A two-stop linear gradient between two points in the frame's coordinates: before
+/// `start` the start colour holds, past `end` the end colour. Interpolated in sRGB,
+/// as CSS's `linear-gradient` is.
+export struct LinearGradient {
+	start: Point,
+	end: Point,
+	start_color: Color,
+	end_color: Color,
+}
+
+/// How a rectangle's inside is painted.
+export enum Fill {
+	Solid(Color),
+	Linear(LinearGradient),
+}
+
+/// Border widths per side and the border's colour, drawn INSIDE the bounds.
+export struct Border {
+	widths: Edges,
+	color: Color,
+}
+
+export impl Border {
+	/// The same width on every side.
+	fun all(width: Dp, color: Color): Border {
+		Border { widths = Edges::all(width), color }
+	}
+
+	fun none(): Border {
+		Border { widths = Edges::all(dp(0)), color = Color::transparent() }
+	}
+}
+
+// --- Primitives ----------------------------------------------------------------
+
+/// A rectangle: corner radii, a fill, a border. Square, borderless and solid until
+/// the builder methods say otherwise:
+/// `Rectangle::new(bounds, color).radius(dp(8)).border(Border::all(dp(1), line))`.
+export struct Rectangle {
+	bounds: Rect,
+	corners: Corners,
+	fill: Fill,
+	border: Border,
+}
+
+export impl Rectangle {
+	fun new(bounds: Rect, color: Color): Rectangle {
+		Rectangle {
+			bounds,
+			corners = Corners::none(),
+			fill = Fill::Solid(color),
+			border = Border::none(),
+		}
+	}
+
+	/// The same radius at every corner.
+	fun radius(own self, radius: Dp): Rectangle {
+		self.corners = Corners::all(radius);
+		self
+	}
+
+	fun corners(own self, corners: Corners): Rectangle {
+		self.corners = corners;
+		self
+	}
+
+	fun fill(own self, fill: Fill): Rectangle {
+		self.fill = fill;
+		self
+	}
+
+	fun gradient(own self, gradient: LinearGradient): Rectangle {
+		self.fill = Fill::Linear(gradient);
+		self
+	}
+
+	fun border(own self, border: Border): Rectangle {
+		self.border = border;
+		self
+	}
+}
+
+/// A blurred rounded rectangle, computed in the shader. Offset and spread are the
+/// caller's: move or grow `bounds`. `blur` is CSS's `box-shadow` blur.
+export struct Shadow {
+	bounds: Rect,
+	radius: Dp,
+	blur: Dp,
+	color: Color,
+}
+
+/// A straight line under text, `thickness` tall with its top at `origin.y`; a
+/// thickness under 2 dp is a hairline, as a border's is.
+export struct Underline {
+	origin: Point,
+	width: Dp,
+	thickness: Dp,
+	color: Color,
+}
+
+// --- Text ----------------------------------------------------------------------
+
+/// A generic family, or a family by name: an installed font, or one registered with
+/// `register_font`.
+export enum FontFamily {
+	SansSerif,
+	Serif,
+	Monospace,
+	Named(str),
+}
+
+/// How a run of text looks: 14 dp regular sans-serif with a line height of 1.25
+/// until the builder methods say otherwise.
+export struct TextStyle {
+	family: FontFamily,
+	size: Dp,
+	/// The distance between baselines, as a multiple of `size`.
+	line_height: f64,
+	/// 100 (thin) to 900 (black); 400 is regular, 700 bold.
+	weight: i32,
+	italic: bool,
+}
+
+export impl TextStyle {
+	fun new(): TextStyle {
+		TextStyle {
+			family = FontFamily::SansSerif,
+			size = dp(14),
+			line_height = 1.25,
+			weight = 400,
+			italic = false,
+		}
+	}
+
+	fun family(own self, family: FontFamily): TextStyle {
+		self.family = family;
+		self
+	}
+
+	fun size(own self, size: Dp): TextStyle {
+		self.size = size;
+		self
+	}
+
+	fun line_height(own self, line_height: f64): TextStyle {
+		self.line_height = line_height;
+		self
+	}
+
+	fun weight(own self, weight: i32): TextStyle {
+		self.weight = weight;
+		self
+	}
+
+	fun italic(own self, italic: bool): TextStyle {
+		self.italic = italic;
+		self
+	}
+}
+
+/// A shaped paragraph: text laid out in a style, once, ready to be drawn any number
+/// of times at any scale. Shaping is the costly part of text (tens of microseconds
+/// a paragraph), so make a layout when the text or its style changes and keep it,
+/// rather than making one every frame. A host value: a copy is the same layout, and
+/// two are `==` only when they are one.
+export external struct TextLayout;
+
+export impl TextLayout {
+	/// `text` in `style`, on one line.
+	fun new(text: str, style: TextStyle): TextLayout {
+		layout(text, style, -1.0)
+	}
+
+	/// `text` in `style`, wrapped at `max_width`.
+	fun wrapped(text: str, style: TextStyle, max_width: Dp): TextLayout {
+		layout(text, style, max_width.value.max(0.0))
+	}
+
+	/// The paragraph's size: its widest line, and the sum of its line heights.
+	fun size(self): Size {
+		Size { width = dp(gfx_layout_number(self, 0)), height = dp(gfx_layout_number(self, 1)) }
+	}
+
+	/// The first line's baseline, from the layout's top: for aligning text with
+	/// other content on its baseline.
+	fun first_baseline(self): Dp {
+		dp(gfx_layout_number(self, 2))
+	}
+
+	fun line_count(self): usize {
+		gfx_layout_number(self, 3).as_usize()
+	}
+}
+
+fun layout(text: str, style: TextStyle, max_width: f64): TextLayout {
+	let (family, name) = match style.family {
+		FontFamily::SansSerif => (0, ""),
+		FontFamily::Serif => (1, ""),
+		FontFamily::Monospace => (2, ""),
+		FontFamily::Named(let name) => (3, name),
+	};
+	gfx_text_layout(
+		text,
+		family,
+		name,
+		style.size.value,
+		style.line_height,
+		style.weight.as_f64(),
+		style.italic,
+		max_width,
+	)
+}
+
+/// Registers the faces in a font file (TrueType, OpenType, or a collection) for
+/// every layout made after; answers the family names they registered under, or why
+/// the data holds no face that can be read.
+export fun register_font(data: Bytes): Result<List<str>, str> {
+	gfx_register_font(data)
+}
+
+// --- Textures ------------------------------------------------------------------
+
+/// Pixels to draw: RGBA, 8 bits a channel, uploaded to the GPU on the first frame
+/// that draws them and freed after the last copy is gone. A host value: a copy is
+/// the same texture.
+export external struct Texture;
+
+export impl Texture {
+	/// A picture decoded by `std::image` (its pixels are copied once).
+	fun from_image(image: Image): Result<Texture, str> {
+		gfx_texture_from_rgba(image.width().as_u32(), image.height().as_u32(), image.rgba())
+	}
+
+	/// `width * height * 4` bytes of RGBA, rows top to bottom (copied).
+	fun from_rgba(width: u32, height: u32, pixels: Bytes): Result<Texture, str> {
+		gfx_texture_from_rgba(width, height, pixels)
+	}
+
+	fun width(self): u32 {
+		gfx_texture_size(self, 0)
+	}
+
+	fun height(self): u32 {
+		gfx_texture_size(self, 1)
+	}
+}
+
+// --- Frames --------------------------------------------------------------------
+
+/// The frame being drawn, handed to a frame callback: everything drawn into it is
+/// the frame, in paint order, in dp. A frame is filled ONLY while its callback
+/// runs; drawing into one after it returned fails the program. Every `push_` is
+/// closed by a `pop` before the callback returns, or the frame fails with the
+/// reason.
+export struct Frame {
+	token: u32,
+	size: Size,
+	scale_factor: f64,
+}
+
+export impl Frame {
+	/// The frame's size: the window's, in dp.
+	fun size(self): Size {
+		self.size
+	}
+
+	/// Device pixels per dp for this frame.
+	fun scale_factor(self): f64 {
+		self.scale_factor
+	}
+
+	fun rectangle(self, rectangle: Rectangle) {
+		let bounds = rectangle.bounds;
+		let corners = rectangle.corners;
+		let border = rectangle.border;
+		let (fill, first, second, start, end) = match rectangle.fill {
+			Fill::Solid(let color) => (
+				0,
+				color,
+				color,
+				Point::new(dp(0), dp(0)),
+				Point::new(dp(0), dp(0))
+			),
+			Fill::Linear(let gradient) => (
+				1,
+				gradient.start_color,
+				gradient.end_color,
+				gradient.start,
+				gradient.end
+			),
+		};
+		gfx_rectangle(
+			self.token,
+			bounds.x.value,
+			bounds.y.value,
+			bounds.width.value,
+			bounds.height.value,
+			corners.top_left.value,
+			corners.top_right.value,
+			corners.bottom_right.value,
+			corners.bottom_left.value,
+			fill,
+			first.red,
+			first.green,
+			first.blue,
+			first.alpha,
+			second.red,
+			second.green,
+			second.blue,
+			second.alpha,
+			start.x.value,
+			start.y.value,
+			end.x.value,
+			end.y.value,
+			border.widths.top.value,
+			border.widths.right.value,
+			border.widths.bottom.value,
+			border.widths.left.value,
+			border.color.red,
+			border.color.green,
+			border.color.blue,
+			border.color.alpha,
+		);
+	}
+
+	fun shadow(self, shadow: Shadow) {
+		let bounds = shadow.bounds;
+		gfx_shadow(
+			self.token,
+			bounds.x.value,
+			bounds.y.value,
+			bounds.width.value,
+			bounds.height.value,
+			shadow.radius.value,
+			shadow.blur.value,
+			shadow.color.red,
+			shadow.color.green,
+			shadow.color.blue,
+			shadow.color.alpha,
+		);
+	}
+
+	/// Draws a shaped paragraph with its top-left corner at `origin`.
+	fun text(self, layout: TextLayout, origin: Point, color: Color) {
+		gfx_text(
+			self.token,
+			layout,
+			origin.x.value,
+			origin.y.value,
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha,
+		);
+	}
+
+	fun underline(self, underline: Underline) {
+		let color = underline.color;
+		gfx_underline(
+			self.token,
+			underline.origin.x.value,
+			underline.origin.y.value,
+			underline.width.value,
+			underline.thickness.value,
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha,
+		);
+	}
+
+	/// Draws `texture` stretched over `bounds`, clipped to `corners`.
+	fun texture(self, texture: Texture, bounds: Rect, corners: Corners) {
+		gfx_texture(
+			self.token,
+			texture,
+			bounds.x.value,
+			bounds.y.value,
+			bounds.width.value,
+			bounds.height.value,
+			corners.top_left.value,
+			corners.top_right.value,
+			corners.bottom_right.value,
+			corners.bottom_left.value,
+		);
+	}
+
+	/// Clips what follows, until the matching `pop`, to a rounded rectangle. Nested
+	/// clips intersect.
+	fun push_clip(self, bounds: Rect, corners: Corners) {
+		gfx_push_clip(
+			self.token,
+			bounds.x.value,
+			bounds.y.value,
+			bounds.width.value,
+			bounds.height.value,
+			corners.top_left.value,
+			corners.top_right.value,
+			corners.bottom_right.value,
+			corners.bottom_left.value,
+		);
+	}
+
+	/// Transforms what follows, until the matching `pop`, inside the transform
+	/// already in force.
+	fun push_transform(self, transform: Transform) {
+		gfx_push_transform(self.token, transform.x.value, transform.y.value, transform.scale);
+	}
+
+	/// Multiplies the opacity of what follows, until the matching `pop`, by
+	/// `opacity` (0 to 1). Applied per primitive: overlapping primitives inside one
+	/// translucent layer show through each other.
+	fun push_layer(self, opacity: f64) {
+		gfx_push_layer(self.token, opacity);
+	}
+
+	/// Closes the most recently opened clip, transform or layer.
+	fun pop(self) {
+		gfx_pop(self.token);
+	}
+}
+
+/// The frame being filled right now, as its callback is handed it.
+fun current_frame(): Frame {
+	Frame {
+		token = gfx_frame_token(),
+		size = Size { width = dp(gfx_frame_number(1)), height = dp(gfx_frame_number(2)) },
+		scale_factor = gfx_frame_number(3),
+	}
+}
+
+// --- Input ---------------------------------------------------------------------
+
+/// What happened in a window, as its event callback is handed it. Positions and
+/// sizes are dp.
+export enum Event {
+	/// The pointer moved to this point. Motion between two turns arrives as one
+	/// move, to where the pointer is.
+	PointerMoved(Point),
+	PointerPressed(Pointer),
+	PointerReleased(Pointer),
+	/// The pointer left the window.
+	PointerLeft,
+	Scrolled(Scroll),
+	KeyPressed(KeyPress),
+	KeyReleased(KeyPress),
+	/// Text typed (a key that types something, after its `KeyPressed`).
+	TextInput(str),
+	/// The window's new size. A frame at that size follows in the same turn.
+	Resized(Size),
+	/// The window moved to a display with another scale factor.
+	ScaleChanged(f64),
+	/// The person asked to close the window (its close button). The window closes
+	/// after this event's turn; closing the last stops the program.
+	CloseRequested,
+}
+
+/// A pointer button pressed or released, where the pointer was.
+export struct Pointer {
+	position: Point,
+	button: Button,
+	modifiers: Modifiers,
+}
+
+export enum Button {
+	Left,
+	Right,
+	Middle,
+	Back,
+	Forward,
+	Other(i32),
+}
+
+/// The modifier keys held. `meta` is the Windows key, or Command on macOS.
+export struct Modifiers {
+	shift: bool,
+	control: bool,
+	alt: bool,
+	meta: bool,
+}
+
+/// A scroll, in dp: positive `x` and `y` mean the content should move right and
+/// down. A mouse wheel's notches arrive at 32 dp per line.
+export struct Scroll {
+	position: Point,
+	x: Dp,
+	y: Dp,
+	modifiers: Modifiers,
+}
+
+/// A key pressed or released.
+export struct KeyPress {
+	key: KeyName,
+	/// Held down long enough to repeat.
+	repeat: bool,
+	modifiers: Modifiers,
+}
+
+/// A key, named as `std::process::Key` names a terminal's where they are the same
+/// key. A key that types a character is `Char` with the character, shift applied
+/// (`"a"`, `"A"`, `" "`); the modifiers are the press's, never folded into the key.
+/// A key with no name here (Shift alone, Caps Lock, a media key) is `Other` with
+/// the name the web's `KeyboardEvent.key` gives it.
+export enum KeyName {
+	Char(str),
+	Enter,
+	Tab,
+	Backspace,
+	Delete,
+	Insert,
+	Escape,
+	Up,
+	Down,
+	Left,
+	Right,
+	Home,
+	End,
+	PageUp,
+	PageDown,
+	/// F1 to F24.
+	F(i32),
+	Other(str),
+}
+
+fun read_point(x: i32, y: i32): Point {
+	Point { x = dp(gfx_event_number(x)), y = dp(gfx_event_number(y)) }
+}
+
+fun read_modifiers(index: i32): Modifiers {
+	let bits = gfx_event_integer(index);
+	Modifiers {
+		shift = bits & 1 != 0,
+		control = bits & 2 != 0,
+		alt = bits & 4 != 0,
+		meta = bits & 8 != 0,
+	}
+}
+
+fun read_button(index: i32): Button {
+	match gfx_event_integer(index) {
+		0 => Button::Left,
+		1 => Button::Right,
+		2 => Button::Middle,
+		3 => Button::Back,
+		4 => Button::Forward,
+		let other => Button::Other(other - 5),
+	}
+}
+
+fun read_key(): KeyPress {
+	let name = gfx_event_text();
+	let key = if gfx_event_integer(2) == 0 { KeyName::Char(name) } else { named_key(name) };
+	KeyPress { key, repeat = gfx_event_integer(0) != 0, modifiers = read_modifiers(1) }
+}
+
+fun named_key(name: str): KeyName {
+	match name {
+		"Enter" => KeyName::Enter,
+		"Tab" => KeyName::Tab,
+		"Backspace" => KeyName::Backspace,
+		"Delete" => KeyName::Delete,
+		"Insert" => KeyName::Insert,
+		"Escape" => KeyName::Escape,
+		"ArrowUp" => KeyName::Up,
+		"ArrowDown" => KeyName::Down,
+		"ArrowLeft" => KeyName::Left,
+		"ArrowRight" => KeyName::Right,
+		"Home" => KeyName::Home,
+		"End" => KeyName::End,
+		"PageUp" => KeyName::PageUp,
+		"PageDown" => KeyName::PageDown,
+		"F1" => KeyName::F(1),
+		"F2" => KeyName::F(2),
+		"F3" => KeyName::F(3),
+		"F4" => KeyName::F(4),
+		"F5" => KeyName::F(5),
+		"F6" => KeyName::F(6),
+		"F7" => KeyName::F(7),
+		"F8" => KeyName::F(8),
+		"F9" => KeyName::F(9),
+		"F10" => KeyName::F(10),
+		"F11" => KeyName::F(11),
+		"F12" => KeyName::F(12),
+		"F13" => KeyName::F(13),
+		"F14" => KeyName::F(14),
+		"F15" => KeyName::F(15),
+		"F16" => KeyName::F(16),
+		"F17" => KeyName::F(17),
+		"F18" => KeyName::F(18),
+		"F19" => KeyName::F(19),
+		"F20" => KeyName::F(20),
+		"F21" => KeyName::F(21),
+		"F22" => KeyName::F(22),
+		"F23" => KeyName::F(23),
+		"F24" => KeyName::F(24),
+		let other => KeyName::Other(other),
+	}
+}
+
+/// The event `gfx_event_next` took, as the value the program reads.
+fun read_event(kind: i32): Event {
+	match kind {
+		0 => Event::PointerMoved(read_point(0, 1)),
+		1 => Event::PointerPressed(Pointer {
+			position = read_point(0, 1),
+			button = read_button(2),
+			modifiers = read_modifiers(3),
+		}),
+		2 => Event::PointerReleased(Pointer {
+			position = read_point(0, 1),
+			button = read_button(2),
+			modifiers = read_modifiers(3),
+		}),
+		3 => Event::PointerLeft,
+		4 => Event::Scrolled(Scroll {
+			position = read_point(0, 1),
+			x = dp(gfx_event_number(2)),
+			y = dp(gfx_event_number(3)),
+			modifiers = read_modifiers(4),
+		}),
+		5 => Event::KeyPressed(read_key()),
+		6 => Event::KeyReleased(read_key()),
+		7 => Event::TextInput(gfx_event_text()),
+		8 => Event::Resized(Size {
+			width = dp(gfx_event_number(0)),
+			height = dp(gfx_event_number(1)),
+		}),
+		9 => Event::ScaleChanged(gfx_event_number(0)),
+		_ => Event::CloseRequested,
+	}
+}
+
+// --- Windows -------------------------------------------------------------------
+
+/// An open window. A handle: it holds the window's id, and the window lives on the
+/// window system's side until it is closed — by the person using it, or by `close`.
+export struct Window {
+	id: u32,
+}
+
+/// What `open` makes: the title bar's text, the size in dp, and the colour every
+/// frame starts from.
+export struct WindowBuilder {
+	title: str,
+	width: Dp,
+	height: Dp,
+	background: Color,
+}
+
+export impl Window {
+	/// An untitled 800 x 600 dp window on white, until `title`, `size` and
+	/// `background` say otherwise.
+	fun builder(): WindowBuilder {
+		WindowBuilder { title = "", width = dp(800), height = dp(600), background = Color::white() }
+	}
+
+	/// Sets the frame callback, replacing the one before, and asks for a frame so
+	/// it is seen. It runs whenever a frame is drawn, handed the frame to fill; it
+	/// must not wait on anything (a frame is drawn now or not at all).
+	fun on_frame(self, draw: |Frame| void) {
+		gfx_on_frame(self.id, || {
+			draw(current_frame());
+		});
+	}
+
+	/// Sets the event callback, replacing the one before: each event the window
+	/// receives, in order. A window with no event callback drops its events.
+	fun on_event(self, handle: |Event| void) {
+		let id = self.id;
+		gfx_on_event(id, || {
+			for {
+				let kind = gfx_event_next(id);
+				if kind < 0 {
+					jump break;
+				}
+				handle(read_event(kind));
+			}
+		});
+	}
+
+	/// Asks for a frame, soon. Any number of requests before it is drawn are one
+	/// frame. Nothing else draws: a program that changes what it shows asks.
+	fun request_redraw(self) {
+		gfx_request_redraw(self.id);
+	}
+
+	/// Closes the window. Closing the last window stops the program as closing it
+	/// by hand does; closing one already closed does nothing.
+	fun close(self) {
+		gfx_close(self.id);
+	}
+
+	/// The window's inner size, in dp (0 x 0 once it is closed).
+	fun size(self): Size {
+		Size {
+			width = dp(gfx_window_number(self.id, 0)),
+			height = dp(gfx_window_number(self.id, 1)),
+		}
+	}
+
+	/// Device pixels per logical pixel on the window's display: 1.0, 1.25, 1.5,
+	/// 2.0.
+	fun scale_factor(self): f64 {
+		gfx_window_number(self.id, 2)
+	}
+}
+
+export impl WindowBuilder {
+	/// The text in the window's title bar.
+	fun title(own self, title: str): WindowBuilder {
+		self.title = title;
+		self
+	}
+
+	/// The window's inner size. Both sides must be at least 1 dp, or `open` answers
+	/// an `Err`.
+	fun size(own self, width: Dp, height: Dp): WindowBuilder {
+		self.width = width;
+		self.height = height;
+		self
+	}
+
+	/// The colour every frame is cleared to before the frame callback draws.
+	fun background(own self, color: Color): WindowBuilder {
+		self.background = color;
+		self
+	}
+
+	/// Opens the window, and answers it once it exists (a frame for it follows). An
+	/// `Err` says why it could not: no window system (a machine with no display),
+	/// no GPU the renderer can use, a size under 1 dp.
+	fun open(self): Result<Window, str> {
+		let color = self.background;
+		match gfx_open(
+			self.title,
+			self.width.value,
+			self.height.value,
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha,
+		) {
+			Ok(let id) => Ok(Window { id }),
+			Err(let reason) => Err(reason),
+		}
+	}
+}
+
+// --- Offscreen -----------------------------------------------------------------
+
+/// A frame drawn into a picture instead of a window: for tests (a golden image) and
+/// headless drawing (a thumbnail, a server that draws). It needs a GPU adapter but
+/// no window system.
+export struct Offscreen {
+	width: Dp,
+	height: Dp,
+	scale_factor: f64,
+	background: Color,
+	software: bool,
+}
+
+export impl Offscreen {
+	/// A `width` x `height` dp frame at scale 1 on white, drawn by any adapter.
+	fun new(width: Dp, height: Dp): Offscreen {
+		Offscreen {
+			width,
+			height,
+			scale_factor = 1.0,
+			background = Color::white(),
+			software = false,
+		}
+	}
+
+	/// Device pixels per dp: the picture is `width * scale_factor` pixels wide.
+	fun scale_factor(own self, scale_factor: f64): Offscreen {
+		self.scale_factor = scale_factor;
+		self
+	}
+
+	fun background(own self, color: Color): Offscreen {
+		self.background = color;
+		self
+	}
+
+	/// Draw with a SOFTWARE adapter only (Mesa's lavapipe or llvmpipe), for output
+	/// that is the same on every machine that has one: golden images.
+	fun software(own self, software: bool): Offscreen {
+		self.software = software;
+		self
+	}
+
+	/// Draws one frame with `draw` and answers the picture:
+	/// `round(width * scale_factor)` x `round(height * scale_factor)` pixels.
+	/// Synchronous — it waits for the GPU, and the first call also makes the device
+	/// (a tenth of a second and more). An `Err` says why: no adapter, a size under
+	/// one pixel.
+	fun render(self, draw: |Frame| void): Result<Image, str> {
+		let color = self.background;
+		let pixels = gfx_offscreen(
+			self.width.value,
+			self.height.value,
+			self.scale_factor,
+			self.software,
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha,
+			|| {
+				draw(current_frame());
+			},
+		)!;
+		Image::from_rgba(
+			(self.width.value * self.scale_factor).round().as_usize(),
+			(self.height.value * self.scale_factor)
+				.round()
+				.as_usize(),
+			pixels,
+		)
+	}
+}

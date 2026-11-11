@@ -48,6 +48,9 @@ What the backend reaches today:
 - **desktop windows**: `std::window` — a window showing a web page in the
   operating system's webview, which is how a native server becomes a desktop
   app ([below](#a-desktop-window))
+- **GPU windows**: `std::gfx` — a window the program draws itself, with the GPU:
+  rectangles, shadows, text and textures in display pixels, frames on demand,
+  pointer and key input as values ([below](#a-gpu-drawn-window))
 - **rpc clients**: `std::rpc`'s WebSocket client over `ws://` — a generated
   client's `connect` (and `connect_with` a credential), `connect_socket`,
   calls, mirrors, the reconnect loop with its backoff, and a dial that honours
@@ -238,6 +241,127 @@ session bus, and a desktop's own bus can stall a headless start), and
 NO_AT_BRIDGE=1 dbus-run-session -- xvfb-run -a dist/native/main/target/debug/main
 ```
 
+## A GPU-drawn window
+
+A native program can also draw its window itself. [`std::gfx`](../std/gfx.md)
+opens a window and, whenever a frame is due, hands the program's frame callback
+a `Frame` to fill with primitives — rounded rectangles with gradients and
+borders, shadows, text, underlines, textures — in display pixels (`dp`), and
+hands its event callback the window's input as `Event` values. There is no
+element tree yet (that is the UI framework's, a later part), so a program lays
+out and hit-tests by hand. `vilan/examples/gfx` is a counter: a card, a label,
+and a button that lights up under the pointer, darkens while pressed and adds
+one on a click. Its core:
+
+```vilan,native
+import std::gfx::{ Color, Event, Frame, Point, Rect, Rectangle, TextLayout, TextStyle, Window, dp };
+import std::io::print;
+import std::reactive::{ Owner, Signal, SignalCell, run_with_owner };
+import std::shared::Shared;
+
+fun main() {
+	let window = match Window::builder().title("Counter").size(dp(240), dp(120)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let button = Rect::new(dp(60), dp(40), dp(120), dp(40));
+	let count: SignalCell<i32> = Signal::new(0);
+	let style = TextStyle::new().size(dp(18));
+	let label: Shared<TextLayout> = Shared::new(TextLayout::new("0", style));
+	let hover: Shared<bool> = Shared::new(false);
+
+	// The count changed: shape its label again, and ask for a frame.
+	run_with_owner(Owner::new(), || {
+		count.effect_on_change(|value: i32| {
+			label.write() = TextLayout::new(i"{value}", style);
+			window.request_redraw();
+		});
+	});
+	window.on_frame(|frame: Frame| {
+		let fill = if hover.read() { Color::rgb(70, 120, 250) } else { Color::rgb(45, 95, 230) };
+		frame.rectangle(Rectangle::new(button, fill).radius(dp(8)));
+		frame.text(label.read(), Point::new(button.x + dp(12), button.y + dp(10)), Color::white());
+	});
+	window.on_event(|event: Event| {
+		match event {
+			Event::PointerMoved(let position) => {
+				let over = button.contains(position);
+				if over != hover.read() {
+					hover.write() = over;
+					window.request_redraw();
+				}
+			},
+			Event::PointerReleased(let release) => {
+				if button.contains(release.position) {
+					count.set_with(|value: i32| value + 1);
+				}
+			},
+			_ => {},
+		}
+	});
+}
+main();
+```
+
+```sh
+vilan run --backend rust .
+```
+
+**Frames on demand.** Nothing draws on a timer. A frame is drawn when the window
+opens, resizes or changes scale, when the system shows part of it again, and
+when the program asks with `request_redraw` — here, when the hover changes and
+when the count does. An idle window costs no CPU and no GPU time. Text is
+shaped into a `TextLayout` once, when it changes, and drawn in every frame that
+shows it.
+
+**Closing the window ends the program cleanly**, as a desktop window's does:
+the close button's request arrives as `Event::CloseRequested`, the window closes
+after that turn, and closing the last window is the graceful stop SIGTERM makes
+— servers drain, `main` returns, exit code 0. A failure in a callback is the
+program's failure, exit code 1.
+
+**Native only, by name.** `vilan build` (the JavaScript backend) refuses a
+program that reaches `std::gfx`, saying so; `vilan check` accepts it.
+
+**What happens underneath.** The window system's loop (`winit`) owns the
+process's main thread, and the program runs ON THAT THREAD, inside it: the
+program's `main` runs, then the window system's loop turns the program's event
+loop whenever there is something for it — an input event (queued for the window
+and handed to the program inside a turn), a frame due, a timer reached, a socket
+ready (a helper thread waits on sockets, only while there are any), a wake from
+another thread — and sleeps in the operating system in between. A resize is
+handled in step: the new size is recorded, the program draws at it, and the
+frame is presented, before the next event. When there is no window system — no
+display — the program runs as it would without `std::gfx`, and `open` answers
+why. A program that reaches both `std::window` and `std::gfx` is refused by
+name: each needs the main thread for its own window system's loop.
+
+**What it links.** The renderer is the runtime crate `vilan-rt-gfx`: `wgpu`
+for the GPU (Vulkan, Metal, DirectX 12, or OpenGL where none of those is), a
+renderer of its own that draws every primitive as one quad shaped in the shader,
+`winit` for the window and its input, and `parley` and `swash` for text. A
+program links it only when it reaches `std::gfx`. Nothing is needed to build it
+beyond Rust (no development package; fontconfig is opened at run time on
+Linux); running it needs a GPU driver, or Mesa's software Vulkan (`lavapipe`,
+`mesa-vulkan-drivers` on Debian and Ubuntu). The first build fetches and
+compiles the stack, a minute or so.
+
+**Which versions, and the licences you ship.** `wgpu`, `winit`, `parley` and
+`swash` are pinned exactly, and the generated project starts from the lockfile
+the runtime crate was audited and licence-checked with; a lockfile you have
+moved yourself is kept. Every licence in the stack is one the compiler itself
+ships under; the list with their texts is
+`crates/vilan-rt-gfx/THIRD-PARTY-NOTICES.txt` in the vilan repository, the file
+to ship beside a binary that draws.
+
+**On a machine with no screen.** A window needs a display: `xvfb-run -a` gives
+it a virtual one, and Mesa's software Vulkan draws without a GPU. To draw with
+no display at all — a test, a thumbnail — `Offscreen::new(width,
+height).render(draw)` draws one frame into a `std::image` picture.
+
 ## Debug by default
 
 `vilan run --backend rust` builds in **debug**, and so does `vilan build
@@ -308,7 +432,7 @@ the point of emitting a language rather than machine code. `vilan build
 
 A desktop window shows a web page and nothing more yet: no menus, tray icon,
 notifications, deep links, secure token storage, or second window to manage,
-and no installer or package — each is its own slice. A **native UI**, drawn by
-the program rather than by a webview, is further off: how UI code should be
-written once and run on both native and the web is a design question being
-settled first.
+and no installer or package — each is its own slice. A GPU window is drawn by
+hand for now: the element tree, layout, styles and components that make a
+**native UI** of it (`std::ui`) come next, and paths, text editing, input
+methods and accessibility after them.

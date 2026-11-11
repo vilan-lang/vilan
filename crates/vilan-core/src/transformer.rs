@@ -1312,33 +1312,58 @@ fn image_codec_refusal(helpers: &BTreeSet<&'static str>) -> Option<Error> {
     })
 }
 
-/// F1 M2: the `__`-named free externs only the NATIVE backend implements, each
-/// with the std module that declares it — `std::window`'s desktop window,
-/// which is the operating system's webview and has no JavaScript twin. The
-/// interpreter refuses them as host capabilities too. Answers the canonical
-/// `'static` symbol and the module.
-pub(crate) fn native_only_extern(symbol: &str) -> Option<(&'static str, &'static str)> {
-    const NATIVE_ONLY: &[(&str, &str)] = &[
-        ("__window_open", "std::window"),
-        ("__window_close", "std::window"),
+/// A std module only the NATIVE backend implements (F1 M2, native-ui.md P1):
+/// its name, and why a JavaScript build has none of it — the clause the
+/// refusal ([`native_only_refusal`]) gives.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeOnly {
+    pub(crate) module: &'static str,
+    why: &'static str,
+}
+
+/// The `__`-named free externs only the NATIVE backend implements, by the std
+/// module that declares them: `std::window`'s desktop window (F1 M2), which is
+/// the operating system's webview, and `std::gfx`'s GPU window (native-ui.md
+/// P1), which is drawn by a renderer linked into the binary — neither has a
+/// JavaScript twin. Keyed by PREFIX: each module's externs share one, and only
+/// that module declares names with it. The interpreter refuses them as host
+/// capabilities too.
+pub(crate) fn native_only_extern(symbol: &str) -> Option<NativeOnly> {
+    const NATIVE_ONLY: &[(&str, NativeOnly)] = &[
+        (
+            "__window_",
+            NativeOnly {
+                module: "std::window",
+                why: "a desktop window is the operating system's webview, linked into a native \
+                      binary, and a JavaScript build has none",
+            },
+        ),
+        (
+            "__gfx_",
+            NativeOnly {
+                module: "std::gfx",
+                why: "a GPU window is drawn by a renderer linked into a native binary, and a \
+                      JavaScript build has none",
+            },
+        ),
     ];
     NATIVE_ONLY
         .iter()
-        .find(|(name, _)| *name == symbol)
-        .copied()
+        .find(|(prefix, _)| symbol.starts_with(prefix))
+        .map(|(_, native_only)| *native_only)
 }
 
 /// The JavaScript backend's refusal of a program that reaches a native-only
 /// module (F1 M2) — never a bundle that calls a helper it does not define.
-fn native_only_refusal(symbol: &str, module: &str) -> Error {
+fn native_only_refusal(symbol: &str, native_only: NativeOnly) -> Error {
+    let NativeOnly { module, why } = native_only;
     Error {
         trace: Vec::new(),
         note: None,
         span: Span::default(),
         msg: format!(
             "this program reaches `{module}` (its `{symbol}`), which only the native backend \
-             builds: a desktop window is the operating system's webview, linked into a native \
-             binary, and a JavaScript build has none. Build it with `vilan build --backend rust`"
+             builds: {why}. Build it with `vilan build --backend rust`"
         ),
     }
 }
@@ -4044,11 +4069,12 @@ struct Transformer<'src> {
     // the emitted text byte-identical.
     diagnose_only: bool,
     // F1 M2: the first NATIVE-ONLY host helper a call reached (a `std::window`
-    // `__window_*` extern), with the module that declares it. The JavaScript
-    // backend has no implementation to emit, so an emitting build refuses the
-    // program by the module's name ([`native_only_refusal`]); a check does
-    // not, because `vilan check` is the same for both backends.
-    native_only_reached: Option<(&'static str, &'static str)>,
+    // `__window_*` or a `std::gfx` `__gfx_*` extern), with the module that
+    // declares it. The JavaScript backend has no implementation to emit, so
+    // an emitting build refuses the program by the module's name
+    // ([`native_only_refusal`]); a check does not, because `vilan check` is
+    // the same for both backends.
+    native_only_reached: Option<(&'src str, NativeOnly)>,
     // E257 S5: leave source-map marks in the tree — a `Mark` before each
     // statement and tail, an `At` around each call. Set only by
     // [`transform_with_source_map`]; every other walk (a plain build, a
@@ -5168,9 +5194,9 @@ impl<'src> Transformer<'src> {
         }
         // F1 M2: a native-only module, refused by name — except by a check.
         if !self.diagnose_only
-            && let Some((symbol, module)) = self.native_only_reached
+            && let Some((symbol, native_only)) = self.native_only_reached
         {
-            return Err(native_only_refusal(symbol, module));
+            return Err(native_only_refusal(symbol, native_only));
         }
         let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
         close_helper_dependencies(&mut helpers);
@@ -11519,8 +11545,9 @@ impl<'src> Transformer<'src> {
                 // lives in the helper table (glue for shapes the extern binding
                 // forms can't express — option-object arguments, `??`
                 // flattening, global property reads).
-                if let Some(module) = native_only_extern(symbol) {
-                    self.native_only_reached.get_or_insert((module.0, module.1));
+                if let Some(native_only) = native_only_extern(symbol) {
+                    self.native_only_reached
+                        .get_or_insert((symbol, native_only));
                 }
                 if let Some(helper) = extern_helper(symbol) {
                     self.used_helpers.insert(helper);

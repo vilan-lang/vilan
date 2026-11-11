@@ -9,18 +9,19 @@
 # `swash` behind a small internal interface (R3, R15), into a glyph atlas this
 # crate owns.
 #
-# NOT YET LINKED BY ANYTHING. No `std::gfx` surface exists: the vilan surface,
-# and the emitted program that would name this crate in its generated cargo
-# project, follow in later slices (after the executor slice of native-ui.md
-# section 11.4). Until then the crate is proven on its own: unit tests, golden
-# images rendered offscreen, and a window example under xvfb.
+# LINKED BY USE: a program that reaches `std::gfx` (`vilan/std/src/gfx.vl`)
+# names this crate in its generated cargo project, which starts from THIS
+# crate's lockfile (the CLI seeds it), and its emitted `main` hands the main
+# thread to the host in `src/host/` (native-ui.md R8). A program that does not
+# reach `std::gfx` never builds it.
 #
 # OUTSIDE the compiler's workspace (R11), as `vilan-rt-webview` is: the root
 # `Cargo.toml` lists this directory under `exclude`, and the crate carries its
 # OWN `Cargo.lock`. Not for licences or advisories this time (every licence is
 # on the compiler's list and the audit passes) but for WEIGHT: the stack is
-# 304 packages in its lockfile against the compiler's 191, and nobody building the
-# compiler should compile a GPU stack. Its own CI job (`scripts/ci-local.sh
+# 306 packages in its lockfile (this crate, `vilan-rt` and `vilan-rt-poll`
+# among them) against the compiler's 191, and nobody building the compiler
+# should compile a GPU stack. Its own CI job (`scripts/ci-local.sh
 # gfx`, ci.yml's `gfx`) holds it to fmt, clippy, its tests (golden images and
 # the window proof REQUIRED there), `cargo audit --deny unsound` and its own
 # licence notices.
@@ -87,6 +88,14 @@ swash = { version = "=0.2.10" }
 bytemuck = { version = "=1.25.2", features = ["derive"] }
 # Blocks on the adapter and device requests (wgpu's are futures).
 pollster = { version = "=1.0.1" }
+# The vilan program's side (`src/host/`): the runtime the emitted program
+# links (its executor, which the window loop drives through the hosted turn,
+# R8), and the readiness wait whose helper thread watches the program's
+# sockets while the window loop owns the main thread. Path dependencies on
+# the compiler's own runtime crates, which a generated project materializes
+# beside this one.
+vilan-rt = { path = "../vilan-rt" }
+vilan-rt-poll = { path = "../vilan-rt-poll" }
 
 [dev-dependencies]
 # Golden images are PNG files.
@@ -94,9 +103,11 @@ png = { version = "=0.18.1" }
 
 # The window example closes ITSELF through the X server, with the same
 # WM_DELETE_WINDOW message a window manager sends, so the xvfb proof exercises
-# the real close path. `x11rb` is already in the tree (winit's X11 backend).
+# the real close path; and `examples/x11_input.rs` moves and clicks the pointer
+# through XTEST for the compiler's `std::gfx` end-to-end test. `x11rb` is
+# already in the tree (winit's X11 backend); `xtest` adds no package.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
-x11rb = { version = "=0.13.2" }
+x11rb = { version = "=0.13.2", features = ["xtest"] }
 
 # A workspace of its own: the compiler's root manifest EXCLUDES this
 # directory, and without this table cargo would keep walking up past it (to an

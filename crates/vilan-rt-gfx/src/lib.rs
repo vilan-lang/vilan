@@ -17,10 +17,11 @@
 //! | Transform | [`SceneBuilder::push_transform`]: translate and uniform scale |
 //! | Layer | [`SceneBuilder::push_layer`]: opacity |
 //!
-//! Nothing in this crate is reached by a vilan program yet: no `std::gfx`
-//! surface exists, and no generated project names the crate. The surface
-//! follows (after the executor slice of native-ui.md 11.4), and maps onto
-//! this API as described below.
+//! A vilan program reaches this crate through `std::gfx`
+//! (`vilan/std/src/gfx.vl`): [`host`] is its side of the seam, and the host
+//! that runs the program's event loop inside the window system's on the main
+//! thread (native-ui.md R8). The surface maps onto this API as described
+//! below.
 //!
 //! # How a frame is drawn
 //!
@@ -84,12 +85,15 @@
 //!
 //! # How `std::gfx` maps onto it
 //!
-//! A vilan `Scene` value is a [`SceneBuilder`] while it is filled and a
-//! [`Scene`] once finished; each primitive is a struct the emitted Rust builds
-//! and passes by value; `push_*`/`pop` are plain calls (no closures cross the
-//! boundary), and misuse is one error at [`SceneBuilder::finish`], not a check
-//! per call. A vilan program compiled to Rust calls this crate directly: no
-//! interpreter, no foreign-function boundary on the hot path.
+//! A frame callback fills a [`SceneBuilder`] the host holds for the frame;
+//! the vilan `Frame` it is handed is that frame's token, and each primitive
+//! crosses as the numbers it is made of (one call into [`host`] per
+//! primitive, nothing allocated per primitive), `push_*`/`pop` as plain calls.
+//! Misuse is one error at [`SceneBuilder::finish`], raised as the program's
+//! failure, not a check per call. A shaped [`TextLayout`] and an [`Image`]
+//! (`std::gfx`'s `Texture`) are host values the program holds. A vilan
+//! program compiled to Rust calls this crate directly: no interpreter, no
+//! foreign-function boundary on the hot path.
 //!
 //! # Known limits of the first version
 //!
@@ -108,6 +112,7 @@ mod color;
 mod encode;
 mod geometry;
 mod gpu;
+pub mod host;
 mod offscreen;
 mod order;
 mod renderer;

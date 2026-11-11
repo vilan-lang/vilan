@@ -1,0 +1,335 @@
+// A counter in a GPU-drawn window (`std::gfx`): a card with a shadow, a label
+// that shows the count, and a button that lights up under the pointer, darkens
+// while pressed and adds one on a click. The count is a `Signal`; the window
+// redraws only when something it shows changed — the count, the hover, the
+// press — and an idle window draws nothing.
+//
+// Hit testing is by hand (`Rect::contains`): the element tree that does it for
+// you is a later part (`std::ui`, native-ui.md P2 and P3).
+//
+// Modes, for the end-to-end test and the golden image:
+//
+//   --smoke                 print a line per frame and per event the test
+//                           drives; after the click, count the frames of an
+//                           idle second and print them
+//   --golden <png> --font <ttf>
+//                           draw the scene offscreen with a software adapter
+//                           and the given font, and compare it with the PNG
+//                           (one per channel of tolerance); with
+//                           VILAN_REGENERATE_GFX_GOLDENS set, write it instead
+
+import std::bytes::Bytes;
+import std::fs::{ read_bytes, write_bytes };
+import std::gfx::{
+	Border,
+	Color,
+	Corners,
+	Event,
+	FontFamily,
+	Frame,
+	LinearGradient,
+	Offscreen,
+	Point,
+	Rect,
+	Rectangle,
+	Shadow,
+	TextLayout,
+	TextStyle,
+	Underline,
+	Window,
+	dp,
+	register_font,
+};
+import std::image::{ Format, Image };
+import std::io::print;
+import std::process::{ args, env, exit };
+import std::range::Range;
+import std::reactive::{ Owner, Signal, SignalCell, run_with_owner };
+import std::shared::Shared;
+import std::time::sleep;
+
+/// What the frame shows, besides the count: the button's two pointer states.
+struct Pointer {
+	hover: bool,
+	pressed: bool,
+}
+
+/// The window's layout, in dp. Fixed: the window is drawn at its opening size.
+fun card(): Rect {
+	Rect::new(dp(24), dp(24), dp(312), dp(192))
+}
+
+fun button(): Rect {
+	Rect::new(dp(108), dp(140), dp(144), dp(48))
+}
+
+/// The scene: everything a frame draws, from the count's label, the button's
+/// label and the pointer state.
+fun draw(frame: Frame, label: TextLayout, caption: TextLayout, pointer: Pointer) {
+	let card = card();
+	frame.shadow(Shadow {
+		bounds = card.offset(dp(0), dp(4)),
+		radius = dp(16),
+		blur = dp(18),
+		color = Color::rgba(0, 0, 0, 0.25),
+	});
+	frame.rectangle(Rectangle::new(card, Color::white())
+		.radius(dp(16))
+		.border(Border::all(dp(1), Color::rgb(210, 210, 220))));
+	// A gradient bar across the card's top.
+	let bar = Rect::new(card.x + dp(20), card.y + dp(20), card.width - dp(40), dp(6));
+	frame.rectangle(Rectangle::new(bar, Color::black())
+		.radius(dp(3))
+		.gradient(LinearGradient {
+			start = Point::new(bar.x, bar.y),
+			end = Point::new(bar.right(), bar.y),
+			start_color = Color::rgb(255, 120, 0),
+			end_color = Color::rgb(40, 90, 255),
+		}));
+	// The count, centred above the button, underlined.
+	let size = label.size();
+	let origin = Point::new(card.x + (card.width - size.width) / 2.0, card.y + dp(56));
+	frame.text(label, origin, Color::rgb(30, 30, 40));
+	frame.underline(Underline {
+		origin = Point::new(origin.x, origin.y + size.height + dp(2)),
+		width = size.width,
+		thickness = dp(1),
+		color = Color::rgb(120, 120, 140),
+	});
+	// The button: lighter under the pointer, darker while pressed.
+	let button = button();
+	let fill = if pointer.pressed {
+		Color::rgb(28, 70, 190)
+	} else if pointer.hover {
+		Color::rgb(70, 120, 250)
+	} else {
+		Color::rgb(45, 95, 230)
+	};
+	frame.push_clip(button, Corners::all(dp(10)));
+	frame.rectangle(Rectangle::new(button, fill));
+	let caption_size = caption.size();
+	frame.text(
+		caption,
+		Point::new(
+			button.x + (button.width - caption_size.width) / 2.0,
+			button.y + (button.height - caption_size.height) / 2.0,
+		),
+		Color::white(),
+	);
+	frame.pop();
+}
+
+fun label_for(count: i32, style: TextStyle): TextLayout {
+	TextLayout::new(i"Count: {count}", style)
+}
+
+fun main() {
+	let arguments = args();
+	if arguments.contains("--golden") {
+		golden(arguments);
+		ret;
+	}
+	let smoke = arguments.contains("--smoke");
+	let window = match Window::builder()
+		.title("vilan gfx")
+		.size(dp(360), dp(240))
+		.background(Color::rgb(244, 244, 240))
+		.open() {
+		Ok(let window) => window,
+		// No display, no GPU: say why.
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let style = TextStyle::new().size(dp(22));
+	let count: SignalCell<i32> = Signal::new(0);
+	let label: Shared<TextLayout> = Shared::new(label_for(0, style));
+	let caption = TextLayout::new("Add one", TextStyle::new().size(dp(16)).weight(600));
+	let pointer: Shared<Pointer> = Shared::new(Pointer { hover = false, pressed = false });
+	let frames: Shared<i32> = Shared::new(0);
+	// Smoke mode: the frame that showed the last change (the count at 1, the
+	// pointer off the button), which an idle second is counted from.
+	let settled: Shared<Option<i32>> = Shared::new(None);
+
+	// The count changed: shape its label again (only then), and ask for a frame.
+	let owner = Owner::new();
+	run_with_owner(owner, || {
+		count.effect_on_change(|value: i32| {
+			label.write() = label_for(value, style);
+			window.request_redraw();
+		});
+	});
+
+	window.on_frame(|frame: Frame| {
+		let shown = pointer.read();
+		draw(frame, label.read(), caption, Pointer {
+			hover = shown.hover,
+			pressed = shown.pressed,
+		});
+		frames.write() = frames.read() + 1;
+		if smoke {
+			print(i"frame {frames.read()} count={count.get()} hover={shown.hover} pressed={shown.pressed}");
+			if count.get() == 1 && !shown.hover && settled.read().is_none() {
+				settled.write() = Some(frames.read());
+			}
+		}
+	});
+
+	window.on_event(|event: Event| {
+		match event {
+			Event::PointerMoved(let position) => {
+				let over = button().contains(position);
+				if over != pointer.read().hover {
+					pointer.write().hover = over;
+					if !over {
+						pointer.write().pressed = false;
+					}
+					window.request_redraw();
+				}
+				if smoke {
+					print(i"moved over={over}");
+				}
+				if smoke && !over && count.get() == 1 {
+					idle_second(frames, settled);
+				}
+			},
+			Event::PointerPressed(let press) => {
+				if button().contains(press.position) {
+					pointer.write().pressed = true;
+					window.request_redraw();
+				}
+			},
+			Event::PointerReleased(let release) => {
+				let was_pressed = pointer.read().pressed;
+				if was_pressed {
+					pointer.write().pressed = false;
+					window.request_redraw();
+					if button().contains(release.position) {
+						count.set_with(|value: i32| value + 1);
+					}
+				}
+			},
+			Event::PointerLeft => {
+				if pointer.read().hover {
+					pointer.write().hover = false;
+					pointer.write().pressed = false;
+					window.request_redraw();
+				}
+			},
+			Event::CloseRequested => {
+				if smoke {
+					print(i"close requested after {frames.read()} frames");
+				}
+			},
+			_ => {},
+		}
+	});
+}
+
+/// Smoke mode: once the count is 1 and the pointer has left the button, wait a
+/// second and count the frames drawn after the one that showed that (none,
+/// when nothing changed).
+fun idle_second(frames: Shared<i32>, settled: Shared<Option<i32>>) {
+	sleep(1000);
+	match settled.read() {
+		Some(let at) => print(i"idle frames={frames.read() - at}"),
+		None => print("idle: the last change was never drawn"),
+	}
+}
+
+/// Golden mode: the scene offscreen, at 100% and 150%, held to a PNG each.
+fun golden(arguments: List<str>) {
+	let golden = after(arguments, "--golden");
+	let font = after(arguments, "--font");
+	let families = match register_font(read_bytes(font)) {
+		Ok(let families) => families,
+		Err(let reason) => {
+			print(i"golden: {reason}");
+			exit(2);
+			ret;
+		},
+	};
+	let style = TextStyle::new().size(dp(22)).family(FontFamily::Named(families[0]));
+	let label = label_for(1, style);
+	let caption = TextLayout::new("Add one", TextStyle::new()
+		.size(dp(16))
+		.weight(600)
+		.family(FontFamily::Named(families[0])));
+	for scale in [1.0, 1.5] {
+		let path = i"{golden}-{(scale * 100.0).round()}.png";
+		let drawn = Offscreen::new(dp(360), dp(240))
+			.scale_factor(scale)
+			.software(true)
+			.background(Color::rgb(244, 244, 240))
+			.render(|frame: Frame| draw(frame, label, caption, Pointer {
+				hover = true,
+				pressed = false,
+			}));
+		match drawn {
+			Ok(let image) => compare(path, image),
+			Err(let reason) => {
+				print(i"golden: {reason}");
+				exit(2);
+			},
+		}
+	}
+}
+
+/// Writes `image` to `path` (regenerating), or compares it with the PNG there.
+fun compare(path: str, image: Image) {
+	if env("VILAN_REGENERATE_GFX_GOLDENS").is_some() {
+		match image.encode(Format::Png, 100) {
+			Ok(let png) => write_bytes(path, png),
+			Err(let reason) => print(i"golden: {reason}"),
+		}
+		print(i"golden: wrote {path}");
+		ret;
+	}
+	let expected = match Image::decode(read_bytes(path)) {
+		Ok(let expected) => expected,
+		Err(let reason) => {
+			print(i"golden: {path}: {reason}");
+			exit(1);
+			ret;
+		},
+	};
+	if expected.width() != image.width() || expected.height() != image.height() {
+		print(i"golden: {path} is {expected.width()} x {expected.height()}, the frame {image.width()} x {image.height()}");
+		exit(1);
+		ret;
+	}
+	let differing = differing_channels(expected.rgba(), image.rgba());
+	if differing == 0 {
+		print(i"golden: {path} matches");
+	} else {
+		print(i"golden: {path}: {differing} channels differ by more than 1");
+		exit(1);
+	}
+}
+
+/// Channels that differ by more than one: software Vulkan and software GL
+/// differ by one in a handful.
+fun differing_channels(expected: Bytes, drawn: Bytes): i32 {
+	mut differing = 0;
+	for index in Range::new(0, drawn.len().as_i32()) {
+		let difference = expected.get(index.as_usize()) - drawn.get(index.as_usize());
+		if difference > 1 || difference < -1 {
+			differing += 1;
+		}
+	}
+	differing
+}
+
+fun after(arguments: List<str>, flag: str): str {
+	for index in Range::new(1, arguments.len().as_i32()) {
+		if arguments[(index - 1).as_usize()] == flag {
+			ret arguments[index.as_usize()];
+		}
+	}
+	print(i"{flag} needs a value");
+	exit(2);
+	""
+}
+
+main();

@@ -1,0 +1,16 @@
+# A counter in a GPU-drawn window (native-ui.md P1): `std::gfx` draws the
+# scene — rounded rectangles, a shadow, a gradient, text — and hands the
+# program pointer input; a click on the button adds one to a `Signal`, and
+# the window redraws only when what it shows changed. NATIVE ONLY — the
+# JavaScript build refuses `std::gfx` by name — so it is built with the Rust
+# backend:
+#
+#   vilan run --backend rust .              the window
+#   vilan run --backend rust . -- --smoke   the end-to-end test's mode
+#
+# It needs a GPU adapter (any Vulkan, Metal, DirectX 12 or OpenGL driver, or
+# Mesa's software Vulkan) and, on Linux, an X11 or Wayland session. See the
+# native guide's "A GPU-drawn window" section.
+[package]
+name = "gfx"
+root = "."

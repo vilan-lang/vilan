@@ -2174,6 +2174,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vilan-rt"
+version = "0.55.1"
+
+[[package]]
 name = "vilan-rt-gfx"
 version = "0.55.1"
 dependencies = [
@@ -2183,9 +2187,20 @@ dependencies = [
  "png",
  "pollster",
  "swash",
+ "vilan-rt",
+ "vilan-rt-poll",
  "wgpu",
  "winit",
  "x11rb",
+]
+
+[[package]]
+name = "vilan-rt-poll"
+version = "0.55.1"
+dependencies = [
+ "libc",
+ "vilan-rt",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
