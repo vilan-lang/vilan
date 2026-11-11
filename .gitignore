@@ -2,6 +2,8 @@
 # F1 M2: the webview crate is its own workspace (outside the compiler's), so its
 # builds land in a target directory of its own.
 /crates/vilan-rt-webview/target
+# native-ui.md P1: so is the GPU crate.
+/crates/vilan-rt-gfx/target
 .vscode
 .claude
 *.out

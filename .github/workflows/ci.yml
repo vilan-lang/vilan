@@ -508,6 +508,50 @@ jobs:
       - name: The webview crate holds its gates, and a desktop window opens
         run: scripts/ci-local.sh webview
 
+  # native-ui.md P1 (R11): `std::gfx`'s runtime crate, `crates/vilan-rt-gfx`
+  # (`wgpu` + `winit` + `parley`), lives OUTSIDE the compiler's workspace with
+  # its own lockfile, so `fmt`, `clippy`, `test` and `audit` above never reach
+  # it; this leg does — its own fmt, clippy, tests, audit and licence notices,
+  # with the golden images rendered on Mesa's software Vulkan (lavapipe) and
+  # the window example run in a real X window under xvfb, both REQUIRED here
+  # (`VILAN_REQUIRE_GFX=1` in the leg) so neither can pass by skipping.
+  #
+  # GitHub-hosted, never the self-hosted runner: it installs system packages —
+  # the software Vulkan driver and its loader, xvfb, the X libraries winit
+  # opens at run time, fontconfig (opened at run time too) and one font for the
+  # window example. No development package: nothing here links a C library at
+  # build time. Its own cache entry: a `target/` of the GPU stack only.
+  gfx:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # NO `RUSTUP_TOOLCHAIN`, as `fmt` and `clippy` carry none: the crate's fmt
+    # and clippy are pinned gates too, so this resolves through
+    # rust-toolchain.toml (rustfmt and clippy included).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gfx
+          workspaces: |
+            crates/vilan-rt-gfx -> target
+          save-if: ${{ github.ref == 'refs/heads/next' || github.ref == 'refs/heads/main' }}
+      - name: Software Vulkan, a virtual display, and what winit opens at run time
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          mesa-vulkan-drivers libvulkan1 xvfb
+          libx11-xcb1 libxcursor1 libxrandr2 libxi6 libxkbcommon-x11-0
+          libfontconfig1 fonts-dejavu-core
+      # The licence notices are regenerated and compared, so the generator is
+      # pinned to the version that wrote the committed file.
+      - name: cargo-about, at the version the notices were written with
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+      - name: The GPU crate holds its gates, its goldens match and a window opens
+        run: scripts/ci-local.sh gfx
+
   # **This is the job to make a required status check** (process.md §2.5, where
   # it is called `ci`; the context reads `ci / check`). Everything above it can
   # legitimately not run; this cannot, which is the entire point — a required
@@ -522,13 +566,13 @@ jobs:
   #   cancelled-> FAIL    the result is unknown, and unknown is not green
   #
   # So a docs-only or root-prose-only push takes the cheap path — `changes`
-  # runs, `test`, `wasm`, `fmt`, `vilan-fmt`, `clippy`, `audit`, `perf` and `webview` skip, `check`
+  # runs, `test`, `wasm`, `fmt`, `vilan-fmt`, `clippy`, `audit`, `perf`, `webview` and `gfx` skip, `check`
   # is green —
   # and any red leg turns `check` red. `changes` is in `needs` on purpose: if
   # the filter itself fails, the expensive legs skip, and without this the
   # aggregate would call that a pass.
   check:
-    needs: [changes, test, wasm, fmt, vilan-fmt, clippy, audit, perf, webview]
+    needs: [changes, test, wasm, fmt, vilan-fmt, clippy, audit, perf, webview, gfx]
     if: always()
     runs-on: ubuntu-latest
     steps:
