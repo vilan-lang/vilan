@@ -24,9 +24,17 @@
 //!   draws edges from THAT caller to only the impl members the concrete type
 //!   selects; a binding leading to another generic parameter recurses to the
 //!   entry's own enclosing function, so a forwarding wrapper resolves per
-//!   call site; anything unresolvable — an opaque binding, a value-taken or
-//!   dispatch-reachable level whose entries cannot be enumerated — falls
-//!   back to every candidate, charged at the site itself.
+//!   call site; anything unresolvable — an opaque binding, a level whose
+//!   entries cannot be enumerated — falls back to every candidate, charged
+//!   at the site itself.
+//!
+//! An ENTRY of a function is any call that can run it with bindings on
+//! record: a direct call, and equally a DISPATCH site that can select it — a
+//! trait default method reached through `row.gap(..)` is entered at that
+//! site, whose recorded substitution binds the default's own parameters just
+//! as a direct call's does ([`DispatchEntries`]). A level's entries cannot be
+//! enumerated when the function is taken as a value, or when a dispatch the
+//! consumer did NOT list as a site can select it.
 //!
 //! Every fallback is toward MORE edges, never fewer: a consumer that treats
 //! an edge as a demand (coverage) or a refusal (the const-only check) can
@@ -39,6 +47,7 @@ use crate::call_graph::{CallGraph, CallTarget};
 use crate::fx::{FxHashMap as HashMap, FxHashSet as HashSet};
 use crate::id::Id;
 use crate::type_::{SubstitutionContext, Type, TypeId};
+use std::rc::Rc;
 
 /// Who makes the call a [`RefinedEdge`] charges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +80,19 @@ pub struct RefinedEdge {
     /// site itself for `OnType` narrowing and every conservative fallback.
     pub anchor: Id,
     pub callee: Id,
+    /// The nodes the dispatched value is handed THROUGH between `caller` and
+    /// the dispatch site, site outward: the site's owner and its lexical
+    /// parents up to the function owning the constraint, then the same for
+    /// each forwarding level an entry recursed through. Empty for an edge
+    /// charged at the site itself (`caller` is then the site's owner).
+    ///
+    /// A per-entry edge says "this caller's instantiation selects `callee`",
+    /// and for most readers that is the whole fact. A reader that follows a
+    /// value the caller HANDS DOWN (the context pass's coverage) needs the
+    /// path too: a node on it that receives the value from somewhere else —
+    /// a `run` body, a function declaring the context — is where `callee`
+    /// gets it, whatever `caller` holds.
+    pub via: Rc<[Id]>,
 }
 
 thread_local! {
@@ -702,6 +724,9 @@ struct RefineIndex {
     incoming_calls: HashMap<Id, Vec<(Id, Id)>>,
     /// Incoming calls per function from code no graph node owns.
     top_level_incoming: HashMap<Id, Vec<Id>>,
+    /// Every call some graph node makes — what tells a top-level call from a
+    /// node's.
+    node_owned_calls: HashSet<Id>,
 }
 
 impl RefineIndex {
@@ -724,11 +749,11 @@ impl RefineIndex {
                 _ => None,
             })
             .collect();
-        let mut owned_call_ids: HashSet<Id> = HashSet::default();
+        let mut node_owned_calls: HashSet<Id> = HashSet::default();
         let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
-                owned_call_ids.insert(call.call_id);
+                node_owned_calls.insert(call.call_id);
                 if let CallTarget::Function(target) = call.target {
                     incoming_calls
                         .entry(target)
@@ -739,7 +764,7 @@ impl RefineIndex {
         }
         let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::default();
         for (call_id, call) in &program.function_calls {
-            if owned_call_ids.contains(call_id) {
+            if node_owned_calls.contains(call_id) {
                 continue;
             }
             if let Some(Expr::Local(target)) = program.entity_map.get(&call.subject_id) {
@@ -753,6 +778,123 @@ impl RefineIndex {
             value_taken,
             incoming_calls,
             top_level_incoming,
+            node_owned_calls,
+        }
+    }
+}
+
+/// How dispatch can enter each function: the other half of a level's entries,
+/// beside the direct calls [`RefineIndex`] holds.
+///
+/// A dispatch site that can select a function is an ENTRY of it exactly as a
+/// direct call is — `Row { .. }.gap(Dp { .. })` runs `Attrs::gap`'s default
+/// body with `V = Dp`, and `method_call_substitution` records that binding at
+/// the site under the default's own parameter, the same channel a direct call
+/// records into. So an `OnConstraint` site inside a trait default resolves
+/// per call site too, where it used to charge every candidate to every call
+/// ("dispatch-reachable, entries cannot be enumerated") — which refused a
+/// static `MaybeSignal` argument for the owner only its reactive arm reads.
+///
+/// Built from the consumer's sites, because the consumer owns which calls
+/// count: a dispatch it did not list (the const-only check drops const
+/// subtrees; the context pass lists no `for` loop's `next` and no top-level
+/// statement) is not an entry this module may charge an edge at. Such a
+/// dispatch still RUNS what it selects, so everything it can select is
+/// [`Self::unenumerable`] and keeps the whole-candidate fallback — with one
+/// exception that is not a guess: a top-level call is already an entry of the
+/// function its subject names (`RefineIndex::top_level_incoming`).
+struct DispatchEntries {
+    /// Per function, the listed sites that can select it, as indexes into
+    /// the site list.
+    enumerated: HashMap<Id, Vec<usize>>,
+    /// The functions a dispatch outside the listed sites can select.
+    unenumerable: HashSet<Id>,
+}
+
+impl DispatchEntries {
+    fn build(program: &Program, sites: &[DispatchSite], index: &RefineIndex) -> Self {
+        let mut enumerated: HashMap<Id, Vec<usize>> = HashMap::default();
+        // The dispatch-record keys the listed sites answer for: a record is
+        // keyed by the call or by its subject (`dispatch_at`).
+        let mut accounted: HashSet<Id> = HashSet::default();
+        for (site_index, site) in sites.iter().enumerate() {
+            accounted.insert(site.call);
+            if let Some(call) = program.function_calls.get(&site.call) {
+                accounted.insert(call.subject_id);
+            }
+            // A known receiver's head selects among the candidates, so a site
+            // it narrows enters only what it selects; any other site may
+            // enter every candidate it lists.
+            let selected = known_receiver_candidates(program, site.call);
+            for &candidate in selected.as_deref().unwrap_or(&site.candidates) {
+                enumerated.entry(candidate).or_default().push(site_index);
+            }
+        }
+
+        let call_of_subject: HashMap<Id, Id> = program
+            .function_calls
+            .iter()
+            .map(|(call_id, call)| (call.subject_id, *call_id))
+            .collect();
+        // `candidates_of` is O(traits x implementations) and a function of
+        // (the asking file's scope, the name) alone.
+        let mut name_candidates: HashMap<(Option<SourceId>, &str), Vec<Id>> = HashMap::default();
+        let mut unenumerable: HashSet<Id> = HashSet::default();
+        let record_keys = program
+            .generic_dispatch
+            .keys()
+            .chain(program.dyn_method_calls.keys())
+            .chain(program.concat_render_dispatch.keys());
+        for &key in record_keys {
+            // The call the record belongs to: itself (a method call, a `for`
+            // loop's `next`, an operator) or the call its subject heads.
+            let call = if program.function_calls.contains_key(&key) {
+                key
+            } else {
+                call_of_subject.get(&key).copied().unwrap_or(key)
+            };
+            if accounted.contains(&key) || accounted.contains(&call) {
+                continue;
+            }
+            let name = match program.dyn_method_calls.get(&call) {
+                Some(name) => *name,
+                None => match crate::async_infer::dispatch_at(program, call) {
+                    Some(
+                        GenericDispatch::OnConstraint(_, name) | GenericDispatch::OnType(_, name),
+                    ) => name,
+                    None => continue,
+                },
+            };
+            let selected = known_receiver_candidates(program, call)
+                .or_else(|| bound_candidates(program, call))
+                .unwrap_or_else(|| {
+                    let scope = program
+                        .admitting_file(call)
+                        .filter(|file| program.impl_admission.restricts(*file));
+                    name_candidates
+                        .entry((scope, name))
+                        .or_insert_with(|| candidates_of(program, scope, name))
+                        .clone()
+                });
+            // A top-level call is an entry of the function its subject names
+            // already; it is unenumerable only for what else it can select.
+            let entered_directly = program
+                .function_calls
+                .get(&call)
+                .filter(|_| !index.node_owned_calls.contains(&call))
+                .and_then(|call| match program.entity_map.get(&call.subject_id) {
+                    Some(Expr::Local(target)) => Some(*target),
+                    _ => None,
+                });
+            unenumerable.extend(
+                selected
+                    .into_iter()
+                    .filter(|candidate| Some(*candidate) != entered_directly),
+            );
+        }
+        Self {
+            enumerated,
+            unenumerable,
         }
     }
 }
@@ -788,29 +930,12 @@ fn refined_edges_timed(
     if sites.is_empty() {
         return Vec::new();
     }
-    let RefineIndex {
-        value_taken,
-        incoming_calls,
-        top_level_incoming,
-    } = RefineIndex::build(program, graph);
-    let dispatch_reachable: HashSet<Id> = sites
-        .iter()
-        .flat_map(|site| site.candidates.iter().copied())
-        .collect();
-
-    // The nearest enclosing function of a graph node (identity for a
-    // function; a closure hops its lexical parents).
-    let enclosing_function = |node: Id| -> Option<Id> {
-        let mut current = node;
-        loop {
-            if program.functions.contains_key(&current) {
-                return Some(current);
-            }
-            current = graph.closure_parent_of(current)?;
-        }
-    };
+    let index = RefineIndex::build(program, graph);
+    let dispatch_entries = DispatchEntries::build(program, sites, &index);
+    let mut bound_site_selections: HashMap<usize, Option<HashSet<Id>>> = HashMap::default();
 
     let mut edges: Vec<RefinedEdge> = Vec::new();
+    let site_level: Rc<[Id]> = Rc::from([]);
     for site in sites {
         // B355: the fence's non-diagnostic face. Every path below that hands
         // back `site.candidates` INSTEAD of a resolution is a fallback, and
@@ -834,6 +959,7 @@ fn refined_edges_timed(
                     caller: site.owner,
                     anchor: site.call,
                     callee: candidate,
+                    via: site_level.clone(),
                 });
             }
         };
@@ -855,6 +981,7 @@ fn refined_edges_timed(
                                 caller: site.owner,
                                 anchor: site.call,
                                 callee: candidate,
+                                via: site_level.clone(),
                             });
                         }
                     }
@@ -919,67 +1046,264 @@ fn refined_edges_timed(
             selection_memo.insert(key.clone(), selected.clone());
             selected
         };
+        // The walk's first level: the function owning the constraint, with
+        // the hand-off path from the site's owner up to it. A top-level
+        // `OnConstraint` site has no enclosing generic function to enumerate
+        // entries of (and should not exist — top-level code binds no
+        // constraints).
+        let mut path: Vec<Id> = Vec::new();
         let root = match site.owner {
-            RefinedCaller::Node(owner) => enclosing_function(owner),
-            // A top-level `OnConstraint` site has no enclosing generic
-            // function to enumerate entries of (and should not exist —
-            // top-level code binds no constraints).
+            RefinedCaller::Node(owner) => extend_hand_off_path(program, graph, &mut path, owner),
             RefinedCaller::TopLevel => None,
         };
         let Some(root) = root else {
             union_fallback(&mut edges);
             continue;
         };
-        let mut visited: HashSet<(Id, TypeId)> = HashSet::default();
-        let mut walk: Vec<(Id, TypeId)> = vec![(root, constraint)];
-        while let Some((function, constraint)) = walk.pop() {
-            if !visited.insert((function, constraint)) {
-                // A revisit re-derives identical edges — skipping is exact.
+        // A level is (function, constraint) REACHED BY a hand-off path: two
+        // forwarding routes into one function are two levels when the value
+        // crosses different nodes on the way, because a reader of
+        // [`RefinedEdge::via`] may answer them differently. A revisit of the
+        // same triple re-derives identical edges — skipping is exact. The
+        // path is a set in first-seen order (a recursive generic adds no node
+        // twice), so the walk is finite; `MAX_LEVELS` bounds the one shape
+        // that could still make it long, a deep diamond of forwarders each
+        // crossing its own closure.
+        let mut visited: HashSet<(Id, TypeId, Rc<[Id]>)> = HashSet::default();
+        let mut walk: Vec<(Id, TypeId, Rc<[Id]>)> = vec![(root, constraint, Rc::from(path))];
+        let mut fell_back_at_site = false;
+        let mut site_fallback = |edges: &mut Vec<RefinedEdge>| {
+            if !std::mem::replace(&mut fell_back_at_site, true) {
+                union_fallback(edges);
+            }
+        };
+        while let Some((function, constraint, via)) = walk.pop() {
+            if visited.contains(&(function, constraint, via.clone())) {
                 continue;
             }
-            if value_taken.contains(&function) || dispatch_reachable.contains(&function) {
+            if visited.len() >= MAX_LEVELS {
+                site_fallback(&mut edges);
+                break;
+            }
+            visited.insert((function, constraint, via.clone()));
+            if index.value_taken.contains(&function)
+                || dispatch_entries.unenumerable.contains(&function)
+            {
                 // This level's entries cannot be enumerated.
-                union_fallback(&mut edges);
+                site_fallback(&mut edges);
                 continue;
             }
-            for (caller, incoming_call) in incoming_calls.get(&function).into_iter().flatten() {
-                let bindings = program.method_call_substitution.get(incoming_call);
+            // Every entry of this level: the direct calls from graph nodes
+            // and from top-level code, and the listed dispatch sites that can
+            // select it. A consumer may list a top-level dispatch call that
+            // is also a top-level incoming call; it is one entry.
+            let direct = index
+                .incoming_calls
+                .get(&function)
+                .into_iter()
+                .flatten()
+                .map(|(caller, call)| (RefinedCaller::Node(*caller), *call, false));
+            let top_level = index
+                .top_level_incoming
+                .get(&function)
+                .into_iter()
+                .flatten()
+                .map(|call| (RefinedCaller::TopLevel, *call, false));
+            let dispatched: Vec<(RefinedCaller, Id, bool)> = dispatch_entries
+                .enumerated
+                .get(&function)
+                .into_iter()
+                .flatten()
+                .filter(|site_index| {
+                    bound_site_selections
+                        .entry(**site_index)
+                        .or_insert_with(|| {
+                            bound_site_selection(
+                                program,
+                                graph,
+                                &index,
+                                &dispatch_entries,
+                                sites,
+                                **site_index,
+                            )
+                        })
+                        .as_ref()
+                        .is_none_or(|selection| selection.contains(&function))
+                })
+                .map(|site_index| (sites[*site_index].owner, sites[*site_index].call, true))
+                .collect();
+            let mut entered_at: HashSet<Id> = HashSet::default();
+            for (caller, entry_call, through_dispatch) in direct.chain(top_level).chain(dispatched)
+            {
+                if !entered_at.insert(entry_call) {
+                    continue;
+                }
+                let bindings = program.method_call_substitution.get(&entry_call);
                 let selected = match resolve_through(program, bindings, constraint) {
                     Resolution::Concrete(resolved) => selected_for(resolved),
-                    Resolution::Parameter(parameter) => match enclosing_function(*caller) {
-                        Some(outer) => {
-                            walk.push((outer, parameter));
-                            continue;
+                    // A binding that is the caller's own parameter recurses to
+                    // the caller's entries — a forwarding wrapper, or one
+                    // trait default calling another. Top-level code has no
+                    // parameters to recurse into.
+                    Resolution::Parameter(parameter) => {
+                        let mut outer_path: Vec<Id> = via.to_vec();
+                        let outer = match caller {
+                            RefinedCaller::Node(node) => {
+                                extend_hand_off_path(program, graph, &mut outer_path, node)
+                            }
+                            RefinedCaller::TopLevel => None,
+                        };
+                        match outer {
+                            Some(outer) => {
+                                walk.push((outer, parameter, Rc::from(outer_path)));
+                                continue;
+                            }
+                            None => widened(),
                         }
-                        None => widened(),
-                    },
+                    }
+                    // A dispatch entry is a site that MAY select this
+                    // function, and its record binds the member it names —
+                    // which is this function's own parameter only when this
+                    // function is that declaration. With nothing on record
+                    // the entry says nothing about this caller, so the site
+                    // itself keeps every candidate, as an unenumerable level
+                    // does; a direct call with an opaque binding does run
+                    // this function, and is charged where it is made.
+                    Resolution::Opaque if through_dispatch => {
+                        site_fallback(&mut edges);
+                        continue;
+                    }
                     Resolution::Opaque => widened(),
                 };
                 for candidate in selected {
                     edges.push(RefinedEdge {
-                        caller: RefinedCaller::Node(*caller),
-                        anchor: *incoming_call,
+                        caller,
+                        anchor: entry_call,
                         callee: candidate,
-                    });
-                }
-            }
-            for incoming_call in top_level_incoming.get(&function).into_iter().flatten() {
-                let bindings = program.method_call_substitution.get(incoming_call);
-                let selected = match resolve_through(program, bindings, constraint) {
-                    Resolution::Concrete(resolved) => selected_for(resolved),
-                    // Top-level code has no generic parameters to recurse
-                    // into — an unresolved binding marks every candidate.
-                    _ => widened(),
-                };
-                for candidate in selected {
-                    edges.push(RefinedEdge {
-                        caller: RefinedCaller::TopLevel,
-                        anchor: *incoming_call,
-                        callee: candidate,
+                        via: via.clone(),
                     });
                 }
             }
         }
     }
     edges
+}
+
+/// The most levels one site's entry walk visits before the site keeps every
+/// candidate instead ([`refined_edges`]). Far above any real forwarding
+/// depth; it exists so that a pathological diamond costs a fallback rather
+/// than a hang.
+const MAX_LEVELS: usize = 4096;
+
+/// Appends the nodes a value handed down to `node` crosses on its way from
+/// the nearest enclosing function — `node` and its lexical parents, the
+/// function included — to `path`, skipping any already on it, and answers
+/// that function. `None` (a closure no function encloses) leaves `path`
+/// holding what was crossed.
+fn extend_hand_off_path(
+    program: &Program,
+    graph: &CallGraph,
+    path: &mut Vec<Id>,
+    node: Id,
+) -> Option<Id> {
+    let mut current = node;
+    loop {
+        if !path.contains(&current) {
+            path.push(current);
+        }
+        if program.functions.contains_key(&current) {
+            return Some(current);
+        }
+        current = graph.closure_parent_of(current)?;
+    }
+}
+
+/// What a listed `OnConstraint` site can select under ANY of its enclosing
+/// function's entries, or `None` when nothing narrows it — the test that
+/// keeps a bounded site from being counted as an entry of a member no
+/// instantiation of it reaches.
+///
+/// `t.gap(cell)` under `T: Attrs` lists `Attrs::gap`'s default among its
+/// candidates by name, and whether it runs that default is a fact about the
+/// types `T` is instantiated with: if every one of them overrides `gap`, the
+/// default is not entered here and its body's dispatch must not be charged to
+/// this caller. The answer is the union over the same entry walk
+/// [`refined_edges`] makes, taken toward MORE: an unenumerable level, an
+/// opaque binding, an empty selection, or any site that is not a bounded one
+/// all answer `None`, and the dispatch entries it recurses through are not
+/// themselves narrowed (which also keeps a recursive bound from asking for
+/// its own answer).
+fn bound_site_selection(
+    program: &Program,
+    graph: &CallGraph,
+    index: &RefineIndex,
+    dispatch_entries: &DispatchEntries,
+    sites: &[DispatchSite],
+    site_index: usize,
+) -> Option<HashSet<Id>> {
+    let site = &sites[site_index];
+    let Some(GenericDispatch::OnConstraint(constraint, member)) =
+        crate::async_infer::dispatch_at(program, site.call)
+    else {
+        return None;
+    };
+    let RefinedCaller::Node(owner) = site.owner else {
+        return None;
+    };
+    let root = extend_hand_off_path(program, graph, &mut Vec::new(), owner)?;
+    let constraint_traits = bound_traits(program, constraint);
+    let file = program.admitting_file(site.call);
+    let mut selection: HashSet<Id> = HashSet::default();
+    let mut visited: HashSet<(Id, TypeId)> = HashSet::default();
+    let mut walk: Vec<(Id, TypeId)> = vec![(root, constraint)];
+    while let Some((function, constraint)) = walk.pop() {
+        if !visited.insert((function, constraint)) {
+            continue;
+        }
+        if index.value_taken.contains(&function)
+            || dispatch_entries.unenumerable.contains(&function)
+        {
+            return None;
+        }
+        let direct = index
+            .incoming_calls
+            .get(&function)
+            .into_iter()
+            .flatten()
+            .map(|(caller, call)| (RefinedCaller::Node(*caller), *call));
+        let top_level = index
+            .top_level_incoming
+            .get(&function)
+            .into_iter()
+            .flatten()
+            .map(|call| (RefinedCaller::TopLevel, *call));
+        let dispatched = dispatch_entries
+            .enumerated
+            .get(&function)
+            .into_iter()
+            .flatten()
+            .map(|entry| (sites[*entry].owner, sites[*entry].call));
+        for (caller, entry_call) in direct.chain(top_level).chain(dispatched) {
+            let bindings = program.method_call_substitution.get(&entry_call);
+            match resolve_through(program, bindings, constraint) {
+                Resolution::Concrete(resolved) => {
+                    let selected =
+                        impl_members_for_bound(program, file, resolved, member, &constraint_traits);
+                    if selected.is_empty() {
+                        return None;
+                    }
+                    selection.extend(selected);
+                }
+                Resolution::Parameter(parameter) => {
+                    let RefinedCaller::Node(node) = caller else {
+                        return None;
+                    };
+                    let outer = extend_hand_off_path(program, graph, &mut Vec::new(), node)?;
+                    walk.push((outer, parameter));
+                }
+                Resolution::Opaque => return None,
+            }
+        }
+    }
+    Some(selection)
 }

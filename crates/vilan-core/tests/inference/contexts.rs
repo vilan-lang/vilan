@@ -1,7 +1,9 @@
 //! The context-threading pass (`context.rs`): what the rewrite leaves in the
 //! tree the emitters read. The diagnostics the pass reports are pinned where
 //! their subject lives (`callable.rs`, `bounds.rs`, `macros.rs`); these pins
-//! own the SHAPE of the rewrite.
+//! own the SHAPE of the rewrite, and the coverage answer where it turns on
+//! the pass's own dispatch refinement (a generic body's bound dispatch,
+//! resolved per entry).
 
 use super::support::*;
 
@@ -471,5 +473,379 @@ main();
     assert_fails_with(
         "import std::web::ui::{ View, view };\n\nfun keep(body: || View): i32 {\n    let n: i32 = body;\n    n\n}\n\nfun main() {\n    print(keep(|| view(\"div\")));\n}\nmain();\n",
         "Expected i32, but got (|| View) context owner_scope instead.",
+    );
+}
+
+// --- Coverage through a trait DEFAULT method's own dispatch sites. ---
+//
+// `Attrs::gap` is a generic default whose body dispatches on its parameter
+// (`gap.bind(..)` under `V: MaybeSignal<Dp>`): the blanket (static) arm reads
+// no owner, the reactive arm reads `owner_scope`. Which arm a call runs is a
+// fact about that CALL's `V`, and coverage follows it per entry — for a
+// default reached through trait dispatch exactly as for an inherent method
+// reached by a direct call. The refinement used to stop at "the default is
+// dispatch-reachable, so its entries cannot be enumerated" and charge the
+// reactive arm's owner to every call, the static ones included.
+
+/// The fixture: a trait with the generic default (`gap`), a default that
+/// forwards to it (`padded`), a default that establishes its own owner
+/// (`owned_gap`) and one that clears it (`cleared_gap`); `Row` inherits them
+/// all, `Loud` overrides `gap` with a body that reads nothing; an inherent
+/// twin of the cleared shape; a generic wrapper (`spaced`) and a bounded one
+/// (`apply`). `body` is `main`'s.
+fn default_method_program(body: &str) -> String {
+    format!(
+        r#"
+import std::io::print;
+import std::reactive::{{ MaybeSignal, Signal, SignalCell, Owner, run_with_owner, owner_scope }};
+
+struct Dp {{ value: f64 }}
+struct Row {{ id: i32 }}
+struct Loud {{ id: i32 }}
+
+trait Attrs {{
+    fun id(self): i32;
+    fun gap<V: MaybeSignal<Dp>>(self, own gap: V): Self {{
+        let id = self.id();
+        gap.bind(|value: Dp| print(i"gap {{id}} {{value.value}}"));
+        self
+    }}
+    fun padded<V: MaybeSignal<Dp>>(self, own padding: V): Self {{
+        self.gap(padding)
+    }}
+    fun owned_gap<V: MaybeSignal<Dp>>(self, own gap: V): Self {{
+        let id = self.id();
+        owner_scope.run(Owner::new(), || {{
+            gap.bind(|value: Dp| print(i"owned {{id}} {{value.value}}"));
+        }});
+        self
+    }}
+    fun cleared_gap<V: MaybeSignal<Dp>>(self, own gap: V): Self {{
+        let id = self.id();
+        owner_scope.clear(|| {{
+            gap.bind(|value: Dp| print(i"cleared {{id}} {{value.value}}"));
+        }});
+        self
+    }}
+}}
+
+impl Row with Attrs {{
+    fun id(self): i32 {{ self.id }}
+}}
+
+impl Row {{
+    fun inherent_cleared<V: MaybeSignal<Dp>>(self, own gap: V): Self {{
+        let id = self.id;
+        owner_scope.clear(|| {{
+            gap.bind(|value: Dp| print(i"cleared {{id}} {{value.value}}"));
+        }});
+        self
+    }}
+    fun inherent_owned<V: MaybeSignal<Dp>>(self, own gap: V): Self {{
+        let id = self.id;
+        owner_scope.run(Owner::new(), || {{
+            gap.bind(|value: Dp| print(i"owned {{id}} {{value.value}}"));
+        }});
+        self
+    }}
+}}
+
+impl Loud with Attrs {{
+    fun id(self): i32 {{ self.id }}
+    fun gap<V: MaybeSignal<Dp>>(self, own gap: V): Self {{
+        print(i"loud {{self.id}}");
+        self
+    }}
+}}
+
+fun spaced<V: MaybeSignal<Dp>>(own row: Row, own gap: V): Row {{
+    row.gap(gap)
+}}
+
+fun apply<T: Attrs>(own target: T, own cell: SignalCell<Dp>): T {{
+    target.gap(cell)
+}}
+
+fun cell(): SignalCell<Dp> {{
+    Signal::new(Dp {{ value = 1.0 }})
+}}
+
+fun main() {{
+{body}
+}}
+main();
+"#
+    )
+}
+
+const UNCOVERED_OWNER: &str =
+    "context `owner_scope` is read here, but this code can be reached without an enclosing `run`";
+
+#[test]
+fn a_default_methods_bound_dispatch_resolves_per_call_site() {
+    // The report: the static call needs no owner, the reactive one has one.
+    assert_compiles_and_runs(
+        &default_method_program(
+            "    let row = Row { id = 1 }.gap(Dp { value = 4.0 });
+    run_with_owner(Owner::new(), || { row.gap(cell()); });",
+        ),
+        "gap 1 4\ngap 1 1\n",
+    );
+}
+
+#[test]
+fn a_default_method_called_with_a_reactive_argument_still_needs_an_owner() {
+    // The other direction: per-site resolution must not lose the reactive
+    // arm's read. One ownerless reactive call is refused, alone or beside a
+    // static one.
+    assert_fails_with(
+        &default_method_program("    let row = Row { id = 1 }.gap(cell());"),
+        UNCOVERED_OWNER,
+    );
+    assert_fails_with(
+        &default_method_program(
+            "    let row = Row { id = 1 }.gap(Dp { value = 4.0 });
+    row.gap(cell());",
+        ),
+        UNCOVERED_OWNER,
+    );
+}
+
+#[test]
+fn a_wrapper_forwarding_into_a_default_method_resolves_at_the_wrappers_call() {
+    // `spaced` hands its own `V` to `row.gap(..)`: the binding at that
+    // dispatch site is `spaced`'s parameter, so the answer is each call of
+    // `spaced`.
+    assert_compiles_and_runs(
+        &default_method_program("    let row = spaced(Row { id = 1 }, Dp { value = 4.0 });"),
+        "gap 1 4\n",
+    );
+    assert_compiles_and_runs(
+        &default_method_program(
+            "    run_with_owner(Owner::new(), || { spaced(Row { id = 1 }, cell()); });",
+        ),
+        "gap 1 1\n",
+    );
+    assert_fails_with(
+        &default_method_program("    let row = spaced(Row { id = 1 }, cell());"),
+        UNCOVERED_OWNER,
+    );
+}
+
+#[test]
+fn a_default_calling_a_default_resolves_at_the_outer_call() {
+    // `padded` calls `self.gap(padding)` — a receiver-less dispatch, entered
+    // with `padded`'s own parameter — so the answer is each call of `padded`.
+    assert_compiles_and_runs(
+        &default_method_program(
+            "    let row = Row { id = 1 }.padded(Dp { value = 4.0 });
+    run_with_owner(Owner::new(), || { row.padded(cell()); });",
+        ),
+        "gap 1 4\ngap 1 1\n",
+    );
+    assert_fails_with(
+        &default_method_program("    let row = Row { id = 1 }.padded(cell());"),
+        UNCOVERED_OWNER,
+    );
+}
+
+#[test]
+fn a_receiverless_dispatch_keeps_every_member_it_may_select() {
+    // The conservative side. `Loud` overrides `gap` with a body that reads
+    // nothing, but `Loud { .. }.padded(cell())` reaches `gap` through
+    // `self.gap(..)` inside the shared default body, where the receiver is
+    // not on record: the site may select the DEFAULT, whose reactive arm
+    // reads the owner, and the call is refused for it. The same receiver
+    // calling `gap` itself is known to select the override, and compiles.
+    assert_fails_with(
+        &default_method_program("    let loud = Loud { id = 2 }.padded(cell());"),
+        UNCOVERED_OWNER,
+    );
+    assert_compiles_and_runs(
+        &default_method_program("    let loud = Loud { id = 2 }.gap(cell());"),
+        "loud 2\n",
+    );
+}
+
+#[test]
+fn a_bounded_site_enters_only_the_members_its_instantiations_select() {
+    // `apply<T: Attrs>` lists `Attrs::gap`'s default among `target.gap(..)`'s
+    // candidates by name. Instantiated only with `Loud`, which overrides it,
+    // the default is not entered there and its reactive arm is not charged
+    // to `apply`; instantiated with `Row`, which inherits it, it is.
+    assert_compiles_and_runs(
+        &default_method_program("    let loud = apply(Loud { id = 2 }, cell());"),
+        "loud 2\n",
+    );
+    assert_fails_with(
+        &default_method_program("    let row = apply(Row { id = 2 }, cell());"),
+        UNCOVERED_OWNER,
+    );
+    assert_fails_with(
+        &default_method_program(
+            "    let loud = apply(Loud { id = 2 }, cell());
+    let row = apply(Row { id = 2 }, cell());",
+        ),
+        UNCOVERED_OWNER,
+    );
+}
+
+#[test]
+fn a_top_level_call_of_a_default_method_is_an_entry_beside_a_functions() {
+    // A top-level statement owns no graph node; its call is an entry all the
+    // same, and resolves like the one inside `main`.
+    let program = default_method_program("    let other = Row { id = 2 }.gap(Dp { value = 5.0 });");
+    assert_compiles(&program.replace(
+        "\nfun main() {",
+        "\nlet row = Row { id = 1 }.gap(Dp { value = 4.0 });\n\nfun main() {",
+    ));
+    assert_fails_with(
+        &program.replace(
+            "\nfun main() {",
+            "\nlet row = Row { id = 1 }.gap(cell());\n\nfun main() {",
+        ),
+        UNCOVERED_OWNER,
+    );
+}
+
+#[test]
+fn a_generic_body_that_establishes_the_owner_covers_its_own_dispatch() {
+    // The dispatch sits inside `owner_scope.run(..)` in the generic body, so
+    // the reactive arm gets THAT owner whatever the caller holds. A per-entry
+    // edge charged to the caller regardless refused this for every ownerless
+    // caller — through a default and through an inherent method alike.
+    assert_compiles_and_runs(
+        &default_method_program("    let row = Row { id = 1 }.owned_gap(cell());"),
+        "owned 1 1\n",
+    );
+    assert_compiles_and_runs(
+        &default_method_program("    let row = Row { id = 1 }.inherent_owned(cell());"),
+        "owned 1 1\n",
+    );
+}
+
+#[test]
+fn a_generic_body_that_clears_the_owner_uncovers_its_own_dispatch() {
+    // And the mirror: inside `owner_scope.clear(..)` the reactive arm has no
+    // owner even when the caller does. Charged to the (covered) caller, the
+    // inherent form compiled and read an owner that was not there.
+    let owned_call = |call: &str| {
+        default_method_program(&format!(
+            "    owner_scope.run(Owner::new(), || {{ Row {{ id = 1 }}.{call}; }});"
+        ))
+    };
+    assert_fails_with(&owned_call("cleared_gap(cell())"), UNCOVERED_OWNER);
+    assert_fails_with(&owned_call("inherent_cleared(cell())"), UNCOVERED_OWNER);
+    // The static arm reads nothing, cleared or not.
+    assert_compiles_and_runs(
+        &owned_call("cleared_gap(Dp { value = 2.0 })"),
+        "cleared 1 2\n",
+    );
+    assert_compiles_and_runs(
+        &owned_call("inherent_cleared(Dp { value = 2.0 })"),
+        "cleared 1 2\n",
+    );
+}
+
+/// How many times the refinement fell back to the whole candidate list at
+/// the `bind` site inside `gap`, with the pass's dispatch sites enumerated as
+/// it enumerates them — minus, when `omit_entries` is set, the sites that
+/// dispatch `gap` itself.
+fn gap_bind_fallbacks(source: &str, omit_entries: bool) -> usize {
+    use vilan_core::call_graph::{CallGraph, CallTarget, IndirectReason};
+    use vilan_core::dispatch_refine::{
+        self, DispatchSite, RefinedCaller, candidates_of, member_name_at,
+    };
+
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                errors.is_empty(),
+                "expected a clean analysis, got: {:#?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            let program = program.expect("a program");
+            let graph = CallGraph::build(&program);
+            let mut sites: Vec<DispatchSite> = Vec::new();
+            let mut bind_sites = Vec::new();
+            for node in graph.nodes() {
+                for call in graph.calls_of(node.id()) {
+                    if !matches!(
+                        call.target,
+                        CallTarget::Indirect(
+                            IndirectReason::TraitDispatch | IndirectReason::GenericMember
+                        )
+                    ) {
+                        continue;
+                    }
+                    let Some(name) = member_name_at(&program, call.call_id) else {
+                        continue;
+                    };
+                    if omit_entries && name == "gap" {
+                        continue;
+                    }
+                    if name == "bind"
+                        && program
+                            .functions
+                            .get(&node.id())
+                            .is_some_and(|function| function.name == "gap")
+                    {
+                        bind_sites.push(call.call_id);
+                    }
+                    sites.push(DispatchSite {
+                        owner: RefinedCaller::Node(node.id()),
+                        call: call.call_id,
+                        candidates: candidates_of(
+                            &program,
+                            program.admitting_file(call.call_id),
+                            name,
+                        ),
+                    });
+                }
+            }
+            assert_eq!(bind_sites.len(), 1, "the fixture has one `bind` in `gap`");
+            dispatch_refine::reset_dispatch_fallbacks();
+            let _edges = dispatch_refine::refined_edges(&program, &graph, &sites);
+            dispatch_refine::dispatch_fallbacks()
+                .into_iter()
+                .filter(|(call, _)| bind_sites.contains(call))
+                .count()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked")
+}
+
+#[test]
+fn a_dispatch_the_consumer_did_not_list_keeps_the_fallback() {
+    // The refinement's consumers own which calls are sites (the const-only
+    // check drops const subtrees; this pass lists no `for` loop's `next`). A
+    // dispatch left out still RUNS what it selects, so a member it can select
+    // has an entry the refinement cannot charge: that level keeps every
+    // candidate, where resolving it from the listed entries alone would draw
+    // no edge for the unlisted one — an under-ask, in silence.
+    let program = default_method_program(
+        "    let row = Row { id = 1 }.gap(Dp { value = 4.0 });
+    run_with_owner(Owner::new(), || { row.gap(cell()); });",
+    );
+    assert_eq!(
+        gap_bind_fallbacks(&program, false),
+        0,
+        "every entry listed: the site resolves per entry, no fallback"
+    );
+    assert!(
+        gap_bind_fallbacks(&program, true) > 0,
+        "the `gap` dispatches unlisted: the site must keep every candidate"
     );
 }
