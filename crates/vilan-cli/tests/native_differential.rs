@@ -17289,6 +17289,63 @@ const GFX_PROBE: &str = concat!(
     "}\n",
 );
 
+/// native-ui.md P2: a program that only lays a `std::ui` tree out — no
+/// window — reaches the GPU crate's host as a `std::gfx` program does: the
+/// `__ui_*` helpers are calls into `vilan_rt_gfx::host::ui`, an element is the
+/// host's `Node` (taken by reference where a helper only reads it), and the
+/// synchronous `main` ends in the host's loop. Emitted with `--stdout`, so it
+/// runs wherever the suite does (the build, the boxes and the pictures are
+/// `ui_screen.rs`'s).
+#[test]
+fn ui_p2_a_ui_program_lowers_onto_the_gfx_hosts_element_tree() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_ui.vl"), UI_PROBE).expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_ui.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    assert!(
+        emitted.status.success(),
+        "the std::ui probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    assert!(
+        source.contains("fn main() {\n    vilan_rt_gfx::host::install();\n")
+            && source.contains("    vilan_rt_gfx::host::run_pending();\n"),
+        "a std::ui program does not end in the GPU host's loop:\n{source}"
+    );
+    for call in [
+        "vilan_rt_gfx::host::ui::node(",
+        "vilan_rt_gfx::host::ui::set(&",
+        "vilan_rt_gfx::host::ui::append_text(&",
+        "vilan_rt_gfx::host::ui::add_child(&",
+        "vilan_rt_gfx::host::ui::layout(&",
+        "vilan_rt_gfx::host::ui::node_number(&",
+        "vilan_rt_gfx::host::ui::Node",
+    ] {
+        assert!(source.contains(call), "no {call}:\n{source}");
+    }
+}
+
+const UI_PROBE: &str = concat!(
+    "import std::gfx::{ Size, dp };\n",
+    "import std::io::print;\n",
+    "import std::ui::{ column, layout, text };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet root = column().gap(dp(4)).child(text().child(\"hi\")).child(\"there\");\n",
+    "\tlayout(root, Size::new(dp(100), dp(50)), 1.0);\n",
+    "\tprint(root.element().bounds().width.value());\n",
+    "}\n",
+);
+
 const GFX_SYNC_PROBE: &str = concat!(
     "import std::gfx::{ TextLayout, TextStyle };\n",
     "import std::io::print;\n",

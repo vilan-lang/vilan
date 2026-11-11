@@ -31,17 +31,29 @@
 //!    it explains best.
 //!
 //! A doc example that happens to DECLARE its own enum sharing a std name would
-//! be compared against std's arms and would be wrong to be. There is no such
-//! example today; [`NOT_THE_STD_ENUM`] is where one would be excused, one entry
-//! with its reason, which is a decision visible in a diff.
+//! be compared against std's arms and would be wrong to be; [`NOT_THE_STD_ENUM`]
+//! is where one is excused, one entry with its reason, which is a decision
+//! visible in a diff.
+//!
+//! Two std modules may declare enums of one name (`std::image::Fit` and
+//! `std::ui::Fit`): a listing of that name is a copy of ONE of them, so it holds
+//! when it matches any declaration of the name, and is reported against all of
+//! them when it matches none.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Listings the gate must NOT read as a std enum's, each with its reason — a
-/// doc example that declares its own type sharing a std name. Empty: every
-/// listing in the book today is genuinely a mirror of std's declaration.
-const NOT_THE_STD_ENUM: &[(&str, &str)] = &[];
+/// doc example that declares its own type sharing a std name. `std::ui`'s
+/// `Align` (native-ui.md P2) arrived after these examples, each of which
+/// declares an `Align` of its own to teach enums and matching with; none of
+/// them is a listing of `std::ui`'s.
+const NOT_THE_STD_ENUM: &[(&str, &str)] = &[
+    ("vilan/docs/appendix/cli.md", "Align"),
+    ("vilan/docs/spec/types.md", "Align"),
+    ("vilan/docs/std/collections.md", "Align"),
+    ("vilan/docs/tour/data-and-traits.md", "Align"),
+];
 
 /// The number words a prose listing counts with, `one` at index 1.
 const NUMBER_WORDS: &[&str] = &[
@@ -218,13 +230,20 @@ fn push_arm(entry: &str, arms: &mut Vec<String>) {
     }
 }
 
-/// Every std enum by name, with the file it is declared in.
-fn std_enums() -> BTreeMap<String, (String, Vec<String>)> {
-    let mut declared = BTreeMap::new();
+/// One declaration of a std enum: the file it is in, and its arms.
+type Declaration = (String, Vec<String>);
+
+/// Every std enum by name, with the file each declaration of the name is in
+/// (two modules may each declare an enum of one name).
+fn std_enums() -> BTreeMap<String, Vec<Declaration>> {
+    let mut declared: BTreeMap<String, Vec<Declaration>> = BTreeMap::new();
     for path in vilan_sources() {
         let text = std::fs::read_to_string(&path).expect("read a std source");
         for (name, arms) in enum_declarations(&text) {
-            declared.insert(name, (relative(&path), arms));
+            declared
+                .entry(name)
+                .or_default()
+                .push((relative(&path), arms));
         }
     }
     assert!(
@@ -256,6 +275,19 @@ fn without_fences(text: &str) -> String {
     out
 }
 
+/// Whether `shown` is one of the declarations' arm lists, and if not, what the
+/// report says std declares.
+fn matches_one(shown: &[String], declarations: &[Declaration]) -> Result<(), String> {
+    if declarations.iter().any(|(_, arms)| arms == shown) {
+        return Ok(());
+    }
+    Err(declarations
+        .iter()
+        .map(|(source, arms)| format!("{source} declares {arms:?}"))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
 fn excused(page: &str, name: &str) -> bool {
     NOT_THE_STD_ENUM
         .iter()
@@ -278,17 +310,16 @@ fn every_doc_fence_of_a_std_enum_lists_every_arm() {
             if line.trim_start().starts_with("```") {
                 if inside {
                     for (name, arms) in enum_declarations(&fence) {
-                        let Some((source, std_arms)) = declared.get(&name) else {
+                        let Some(declarations) = declared.get(&name) else {
                             continue;
                         };
                         if excused(&page, &name) {
                             continue;
                         }
                         seen += 1;
-                        if &arms != std_arms {
+                        if let Err(std_declares) = matches_one(&arms, declarations) {
                             stale.push(format!(
-                                "  {page}: `enum {name}` shows {arms:?}, {source} declares \
-                                 {std_arms:?}"
+                                "  {page}: `enum {name}` shows {arms:?}, {std_declares}"
                             ));
                         }
                     }
@@ -332,7 +363,7 @@ fn every_doc_table_of_a_std_enum_lists_every_arm() {
             let Some(name) = table_head_enum(line) else {
                 continue;
             };
-            let Some((source, std_arms)) = declared.get(&name) else {
+            let Some(declarations) = declared.get(&name) else {
                 continue;
             };
             if excused(&page, &name) {
@@ -348,10 +379,9 @@ fn every_doc_table_of_a_std_enum_lists_every_arm() {
                 .take_while(|row| row.starts_with('|'))
                 .filter_map(|row| first_cell_name(row))
                 .collect();
-            if &shown != std_arms {
+            if let Err(std_declares) = matches_one(&shown, declarations) {
                 stale.push(format!(
-                    "  {page}:{}: the `{name}` table shows {shown:?}, {source} declares \
-                     {std_arms:?}",
+                    "  {page}:{}: the `{name}` table shows {shown:?}, {std_declares}",
                     index + 1
                 ));
             }
@@ -428,11 +458,17 @@ fn every_prose_count_of_a_std_enums_arms_is_the_declared_count() {
             else {
                 continue;
             };
-            let (source, arms) = &declared[name];
             if excused(&page, name) {
                 continue;
             }
             seen += 1;
+            // The declaration of the name whose arm count the sentence gives;
+            // with none, the first is the one reported.
+            let declarations = &declared[name];
+            let (source, arms) = declarations
+                .iter()
+                .find(|(_, arms)| arms.len() == counted)
+                .unwrap_or(&declarations[0]);
             if counted != arms.len() {
                 stale.push(format!(
                     "  {page}:{line_number}: counts {counted} arm(s) of `{name}`, {source} \
@@ -566,9 +602,13 @@ fn the_rpc_error_and_reject_listings_are_reached_by_the_gate() {
             vec!["Unauthorized", "Forbidden", "TooMany", "Unavailable"],
         ),
     ] {
-        let (source, declared_arms) = declared
+        let [(source, declared_arms)] = declared
             .get(name)
-            .unwrap_or_else(|| panic!("std no longer declares `{name}`"));
+            .unwrap_or_else(|| panic!("std no longer declares `{name}`"))
+            .as_slice()
+        else {
+            panic!("std declares more than one `{name}`: the exhibit wants re-reading");
+        };
         assert_eq!(
             declared_arms, &arms,
             "`{name}`'s arms moved in {source}; the exhibit list here is what E159 \

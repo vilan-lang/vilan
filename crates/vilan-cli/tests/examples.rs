@@ -187,6 +187,12 @@ fn post_build(directory: &str) -> PostBuild {
         // native-ui.md P1: the GPU window's counter; its native build and its
         // run are `gfx_window.rs`'s.
         "gfx" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P2: a screen laid out by `std::ui`; its native build,
+        // its recorded rectangles and its goldens are `ui_screen.rs`'s. It
+        // reaches `std::gfx` too (its window, its test font), and the refusal
+        // names the first native-only module the build reaches, which is
+        // that one; `std::ui`'s own refusal is pinned in `std_surface.rs`.
+        "ui" => PostBuild::NativeOnly { module: "std::gfx" },
         _ => PostBuild::BuildOnly,
     }
 }

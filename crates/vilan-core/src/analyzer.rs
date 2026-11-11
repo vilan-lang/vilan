@@ -64371,9 +64371,16 @@ impl<'src> Analyzer<'src> {
     /// path: only a failed resolution asks). Empty when the file is unreadable —
     /// a steer degrades, it never fails.
     fn web_prelude_names(&self) -> Vec<String> {
-        let module = crate::manifest::WEB_PRELUDE
-            .strip_prefix("std::")
-            .unwrap_or_default();
+        self.std_module_names(
+            crate::manifest::WEB_PRELUDE
+                .strip_prefix("std::")
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The importable names std module `module` (a path below `std::`, as
+    /// `web::ui`) declares; empty when there is no such module.
+    fn std_module_names(&self, module: &str) -> Vec<String> {
         let Some(path) = self
             .std_module_files
             .iter()
@@ -64398,7 +64405,9 @@ impl<'src> Analyzer<'src> {
     /// AT `dom`; `std::web` resolves (it is the namespace now), so the old web
     /// prelude path shows only as a miss one segment deeper, and only for a
     /// name the prelude exports (`std::web::Signal`) — a typo under the
-    /// namespace (`std::web::dmo`) is an ordinary miss.
+    /// namespace (`std::web::dmo`) is an ordinary miss. A reclaimed path
+    /// ([`crate::parsing::RECLAIMED_STD_MODULES`], `std::ui`) is the same
+    /// shape: a miss under it for a name the module it moved to declares.
     fn moved_std_segment(
         &self,
         root: &str,
@@ -64417,10 +64426,24 @@ impl<'src> Analyzer<'src> {
                 .map(|(module, _)| (*module, part_span));
         }
         let (previous, previous_span, previous_at_root) = previous?;
-        (previous == "web"
-            && previous_at_root
-            && self.web_prelude_names().iter().any(|name| name == part))
-        .then_some(("web", previous_span))
+        if !previous_at_root {
+            return None;
+        }
+        if previous == "web" {
+            return self
+                .web_prelude_names()
+                .iter()
+                .any(|name| name == part)
+                .then_some(("web", previous_span));
+        }
+        let reclaimed = crate::parsing::RECLAIMED_STD_MODULES
+            .iter()
+            .find(|module| **module == previous)?;
+        let new = crate::parsing::moved_std_module(reclaimed)?;
+        self.std_module_names(new)
+            .iter()
+            .any(|name| name == part)
+            .then_some((*reclaimed, previous_span))
     }
 
     /// The B4 import steer for a PATH whose resolution missed in scope (E103) —

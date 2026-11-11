@@ -407,11 +407,33 @@ fn a154_every_moved_module_is_refused_at_its_old_path_and_resolves_at_its_new_on
         if *old == "null" {
             continue;
         }
-        if *old != "web" {
+        // A reclaimed path is a live module again: its old meaning is pinned
+        // by name below.
+        if *old != "web" && !vilan_core::parsing::RECLAIMED_STD_MODULES.contains(old) {
             assert_fails_once_with(&format!("import std::{old};\n\nfun main() {{}}\n"), &steer);
         }
         assert_compiles(&format!("import std::{new};\n\nfun main() {{}}\n"));
     }
+}
+
+/// native-ui.md P2 reclaimed `std::ui` (the web UI's old path) for the native
+/// UI framework: the web UI's names under it still steer to `std::web::ui`,
+/// alone or in a brace list, while `std::ui`'s own names resolve and a name
+/// neither declares is an ordinary miss.
+#[test]
+fn a154_the_reclaimed_ui_path_steers_the_web_uis_names_and_resolves_its_own() {
+    let steer = vilan_core::parsing::moved_std_module_message("ui", "web::ui");
+    for import in ["import std::ui::view;", "import std::ui::{ Slot };"] {
+        assert_fails_once_with(&format!("{import}\n\nfun main() {{}}\n"), &steer);
+    }
+    // One refusal per name reached, as `std::web::{ Signal, SignalCell }` has.
+    assert_fails_with("import std::ui::{ View, view };\n\nfun main() {}\n", &steer);
+    assert_compiles("import std::ui::{ column, row, style, text };\n\nfun main() {}\n");
+    assert_compiles("import std::ui;\n\nfun main() {}\n");
+    assert_fails_with(
+        "import std::ui::no_such_name;\n\nfun main() {}\n",
+        "cannot find 'no_such_name' in the imported path",
+    );
 }
 
 #[test]
@@ -9497,5 +9519,166 @@ fn gfx_p1_lengths_geometry_and_colour_are_plain_values() {
             "#,
         ),
         "20\ntrue\ntrue\n7\ntrue\nfalse\ntrue\n30\n140\n0.2\n0.5\n4\n8\n1\nbuilt, never opened\n",
+    );
+}
+
+// --- native-ui.md P2: `std::ui` ------------------------------------------------
+//
+// Elements are laid out and drawn by `vilan-rt-gfx`, linked only into a native
+// binary: an EMITTING JavaScript build refuses a program that makes one, by the
+// module's name; `vilan check` does not; a browser build refuses it at the
+// platform fence. A `Style` and its `+`, a `fraction`, the enums are plain
+// vilan and run anywhere. The element tree's layout is pinned by
+// `vilan-rt-gfx`'s own unit tests, the native lowering by `native_differential`'s
+// `ui_p2_*`, the example screen by `ui_screen.rs`.
+
+fn ui_p2_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::result::Result::{{ Err, Ok }};
+        import std::gfx::{{ Border, Color, Corners, FontFamily, Frame, Size, Window, dp }};
+        import std::ui::{{
+            Align, Anchor, DropShadow, Element, Fit, Justify, Length, Role, Style, column, draw,
+            fraction, image, layout, mount, row, stack, style, text,
+        }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+const UI_P2_SCREEN: &str = r#"
+    let screen = column()
+        .padding(dp(16))
+        .gap(dp(8))
+        .style(style().background(Color::white()).radius(dp(8)))
+        .child(text().child("Title").style(style().text_size(dp(20)).weight(700)).role(Role::Heading))
+        .child(row().gap(dp(4)).align(Align::Center).justify(Justify::SpaceBetween).wrap().child("a").child("b"))
+        .child(stack().child(text().child("badge").anchor(Anchor::TopRight)).label("card"));
+    layout(screen, Size::new(dp(320), dp(200)), 1.5);
+    print(screen.element().bounds().width.value());
+"#;
+
+#[test]
+fn ui_p2_the_javascript_build_refuses_ui_by_the_modules_name() {
+    assert_fails_with(
+        &ui_p2_program(UI_P2_SCREEN),
+        "this program reaches `std::ui` (its `__ui_",
+    );
+    assert_fails_with(
+        &ui_p2_program(UI_P2_SCREEN),
+        "which only the native backend builds: its elements are laid out and drawn by the GPU \
+         renderer linked into a native binary, and a JavaScript build has none",
+    );
+}
+
+/// Making one element is a host call: reaching it alone is refused.
+#[test]
+fn ui_p2_making_one_element_alone_reaches_the_ui_host() {
+    assert_fails_with(
+        &ui_p2_program(r#"let element: Element = text().child("hi").element();"#),
+        "this program reaches `std::ui` (its `__ui_",
+    );
+}
+
+#[test]
+fn ui_p2_a_ui_program_checks_clean() {
+    if let Err(errors) = f1_m2_check(&ui_p2_program(UI_P2_SCREEN)) {
+        panic!("`vilan check` must accept a std::ui program: {errors:#?}");
+    }
+}
+
+/// The window entry points check too: `mount` and `draw` in a frame callback.
+#[test]
+fn ui_p2_mount_and_draw_check_clean() {
+    let body = r#"
+        match Window::builder().title("app").size(dp(320), dp(200)).open() {
+            Ok(let window) => {
+                let root = column().child("hello");
+                mount(window, root);
+                window.on_frame(|frame: Frame| draw(frame, root));
+            },
+            Err(let reason) => print(reason),
+        }
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_p2_program(body)) {
+        panic!("`vilan check` must accept mount and draw: {errors:#?}");
+    }
+}
+
+/// A browser entry is refused at the platform fence, before any backend.
+#[test]
+fn ui_p2_a_browser_build_cannot_reach_ui() {
+    assert_fails_browser_with(&ui_p2_program(UI_P2_SCREEN), "@process");
+}
+
+/// An attribute a kind does not have is an unknown method on its builder, as
+/// the element contract (native-ui.md section 12) says it must be: a text has
+/// no `gap`, an image no `child`, a stack no `wrap`.
+#[test]
+fn ui_p2_an_attribute_the_kind_lacks_is_an_unknown_method() {
+    for (body, method) in [
+        ("text().gap(dp(4));", "gap"),
+        ("image().child(\"x\");", "child"),
+        ("stack().wrap();", "wrap"),
+    ] {
+        let errors = f1_m2_check(&ui_p2_program(body))
+            .expect_err("an attribute the kind lacks must be refused");
+        assert!(
+            errors.iter().any(|error| error.contains(method)),
+            "{body}: {errors:#?}"
+        );
+    }
+}
+
+/// `+` composes styles field by field, the right side winning where it sets a
+/// field; a field neither sets stays unset. Plain vilan: it runs on the
+/// JavaScript backend.
+#[test]
+fn ui_p2_style_plus_takes_the_right_sides_fields() {
+    assert_compiles_and_runs(
+        &ui_p2_program(
+            r#"
+            let card = style().background(Color::white()).radius(dp(8)).text_size(dp(14)).weight(400);
+            let warning = style().background(Color::rgb(255, 0, 0)).weight(700);
+            let both = card + warning;
+            print(both.background.unwrap().green);
+            print(both.radius.unwrap().top_left.value());
+            print(both.text_size.unwrap().value());
+            print(both.weight.unwrap());
+            print(both.opacity.is_none());
+            let reversed = warning + card;
+            print(reversed.background.unwrap().green);
+            print(reversed.weight.unwrap());
+            let empty = style() + style();
+            print(empty.background.is_none() && empty.font.is_none());
+            let font = style().font(FontFamily::Monospace) + style().italic(true);
+            print(font.font.is_some() && font.italic.unwrap());
+            "#,
+        ),
+        "0\n8\n14\n700\ntrue\n1\n400\ntrue\ntrue\n",
+    );
+}
+
+/// The other plain values: a fraction, a shadow's builder, the lengths a size
+/// attribute takes.
+#[test]
+fn ui_p2_lengths_and_shadows_are_plain_values() {
+    assert_compiles_and_runs(
+        &ui_p2_program(
+            r#"
+            match fraction(1.0, 4.0) {
+                Length::Fraction(let value) => print(value),
+                _ => print("not a fraction"),
+            }
+            let shadow = DropShadow::new(dp(0), dp(2), dp(10), Color::black()).spread(dp(3));
+            print(shadow.y.value() + shadow.spread.value());
+            let look: Style = style().shadow(shadow).opacity(0.5);
+            print(look.opacity.unwrap());
+            "#,
+        ),
+        "0.25\n5\n0.5\n",
     );
 }
