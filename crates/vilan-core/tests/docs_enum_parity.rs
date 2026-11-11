@@ -118,10 +118,13 @@ fn collect(directory: &Path, extension: &str, found: &mut Vec<PathBuf>) {
 /// A path as the failure messages spell it — repo-relative, so a message can be
 /// pasted into an editor.
 fn relative(path: &Path) -> String {
+    // `/` on every platform: [`NOT_THE_STD_ENUM`] names pages this way, and a
+    // report reads the same wherever it was made.
     path.strip_prefix(repo_root())
         .unwrap_or(path)
         .display()
         .to_string()
+        .replace('\\', "/")
 }
 
 // --- The reader, used on BOTH sides ------------------------------------------
