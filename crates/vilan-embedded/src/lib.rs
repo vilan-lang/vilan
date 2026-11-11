@@ -127,6 +127,11 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
         staging.join("vilan-rt-webview").join("Cargo.toml"),
         RT_WEBVIEW_MANIFEST,
     ));
+    // native-ui.md P1: `std::gfx`'s GPU window.
+    written.push((
+        staging.join("vilan-rt-gfx").join("Cargo.toml"),
+        RT_GFX_MANIFEST,
+    ));
     for (path, contents) in written {
         let parent = path.parent().expect("every embedded file has a parent");
         fs::create_dir_all(parent)

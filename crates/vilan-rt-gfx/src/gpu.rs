@@ -40,6 +40,10 @@ pub struct AdapterSummary {
 
 /// An adapter, its device and its queue. Every renderer needs one; a window's
 /// comes with its surface ([`WindowRenderer`](crate::WindowRenderer)).
+///
+/// A clone is the same device (wgpu's handles are counted), so renderers made
+/// one after another can share one instead of each paying for a new device.
+#[derive(Clone)]
 pub struct GpuContext {
     pub(crate) instance: wgpu::Instance,
     pub(crate) adapter: wgpu::Adapter,

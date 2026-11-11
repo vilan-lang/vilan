@@ -127,12 +127,25 @@ Rust workspace, seventeen crates, plus the language's own tree:
   signed distance in the shader, paint order by an overlap test, R14) into a `winit` window or
   an offscreen texture read back as RGBA; text shaped by `parley` and rasterised by `swash`
   behind a crate-private interface (R15) into a glyph atlas with mask and colour pages that
-  evicts. NOT a workspace member (R11: weight, 304 packages in its lockfile; every licence is on the
+  evicts. NOT a workspace member (R11: weight, 306 packages in its lockfile; every licence is on the
   compiler's list and the audit is clean), so it keeps its own `Cargo.lock`, `about.toml` and
   `THIRD-PARTY-NOTICES.txt`, and `scripts/ci-local.sh gfx` (ci.yml's `gfx` job) runs its fmt,
-  clippy, tests, audit and notices; the `windows` leg cross-lints it. NOT YET LINKED BY
-  ANYTHING: no `std::gfx` surface exists and no generated project names it; the vilan surface
-  and the window loop's meeting with the executor (Q8) follow. Its golden images
+  clippy, tests, audit and notices; the `windows` leg cross-lints it. LINKED BY USE: a program
+  that reaches `std::gfx` (`vilan/std/src/gfx.vl`, every extern `__gfx_*`) names it in its
+  generated project, seeded with its `Cargo.lock` (`RT_GFX_LOCK`); the embed carries its
+  `.wgsl` shader with its `.rs` files. Its `src/host/` is the program's side: the extern
+  functions (a window crosses as its id, a frame as a token, a primitive as numbers, an event
+  as a kind code and numbers read one at a time) and the HOST (R8): the emitted `main` calls
+  `vilan_rt_gfx::host::install()` first and the host's `run_pending` / `block_on` in place of
+  the executor's, so `winit`'s loop owns the main thread and turns the program inside its
+  handlers — program code only inside a turn, a window event queued on the window's
+  `IoSource` first, frames only on demand, a failure out of a turn raised again after the
+  loop. Never keep a `wgpu` object in a `thread_local!` that drops: wgpu reads thread-local
+  storage of its own while dropping, and at thread exit the process aborted. A program
+  reaching both `std::window` and `std::gfx` is refused by name. The end-to-end proof is
+  `crates/vilan-cli/tests/gfx_window.rs` (the example under xvfb with pointer input injected
+  through XTEST by `examples/x11_input.rs`, and its offscreen goldens in
+  `crates/vilan-cli/tests/gfx/`), run by the `gfx` leg, which builds the compiler. Its golden images
   (`tests/golden/`, tolerance one per channel) and the window example's xvfb proof skip with a
   printed reason where there is no software adapter (Mesa's `mesa-vulkan-drivers`) or no
   `xvfb`, and are REQUIRED under `VILAN_REQUIRE_GFX=1`; regenerate the goldens with

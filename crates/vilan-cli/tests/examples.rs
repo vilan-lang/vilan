@@ -128,7 +128,8 @@ enum PostBuild {
     /// F1 M2: a NATIVE-ONLY example (it reaches `module`, which only the Rust
     /// backend builds). Here it must CHECK clean and its JavaScript build must
     /// refuse it by the module's name; the native build and run are
-    /// `desktop_shell.rs`'s, which needs a window system this gate does not.
+    /// `desktop_shell.rs`'s and `gfx_window.rs`'s, which need a window system
+    /// this gate does not.
     NativeOnly {
         module: &'static str,
     },
@@ -183,6 +184,9 @@ fn post_build(directory: &str) -> PostBuild {
         "desktop" => PostBuild::NativeOnly {
             module: "std::window",
         },
+        // native-ui.md P1: the GPU window's counter; its native build and its
+        // run are `gfx_window.rs`'s.
+        "gfx" => PostBuild::NativeOnly { module: "std::gfx" },
         _ => PostBuild::BuildOnly,
     }
 }

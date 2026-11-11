@@ -9396,3 +9396,106 @@ fn f1_m2_a_builder_never_opened_reaches_no_window() {
 fn f1_m2_a_browser_build_cannot_reach_a_window() {
     assert_fails_browser_with(&f1_m2_program(F1_M2_OPEN), "@process");
 }
+
+// --- native-ui.md P1: `std::gfx` -----------------------------------------------
+//
+// A GPU window is drawn by `vilan-rt-gfx`, linked only into a native binary.
+// The JavaScript backend has no twin, so an EMITTING build refuses a program
+// that reaches a `__gfx_*` extern, by the module's name; `vilan check` does
+// not; a browser build refuses it at the platform fence. What is plain vilan —
+// lengths, geometry, colour, the builders — runs on either backend, and its
+// semantics are pinned here by running it. The native lowering is pinned by
+// `native_differential`'s `gfx_p1_*`, the real window by `gfx_window.rs`.
+
+fn gfx_p1_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::result::Result::{{ Err, Ok }};
+        import std::gfx::{{
+            Border, Color, Corners, Frame, Point, Rect, Rectangle, TextLayout, TextStyle, Window,
+            WindowBuilder, dp,
+        }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+const GFX_P1_OPEN: &str = r#"
+    match Window::builder().title("app").size(dp(320), dp(200)).open() {
+        Ok(let window) => window.on_frame(|frame: Frame| {
+            frame.rectangle(Rectangle::new(Rect::new(dp(0), dp(0), dp(8), dp(8)), Color::white()));
+        }),
+        Err(let reason) => print(reason),
+    }
+"#;
+
+#[test]
+fn gfx_p1_the_javascript_build_refuses_gfx_by_the_modules_name() {
+    assert_fails_with(
+        &gfx_p1_program(GFX_P1_OPEN),
+        "this program reaches `std::gfx` (its `__gfx_",
+    );
+    assert_fails_with(
+        &gfx_p1_program(GFX_P1_OPEN),
+        "which only the native backend builds: a GPU window is drawn by a renderer linked into \
+         a native binary, and a JavaScript build has none",
+    );
+}
+
+/// Shaping text is a `std::gfx` host call too: reaching it alone is refused.
+#[test]
+fn gfx_p1_shaping_text_alone_reaches_the_gfx_host() {
+    assert_fails_with(
+        &gfx_p1_program(r#"print(TextLayout::new("hi", TextStyle::new()).line_count());"#),
+        "this program reaches `std::gfx` (its `__gfx_text_layout`)",
+    );
+}
+
+#[test]
+fn gfx_p1_a_gfx_program_checks_clean() {
+    if let Err(errors) = f1_m2_check(&gfx_p1_program(GFX_P1_OPEN)) {
+        panic!("`vilan check` must accept a GPU window program: {errors:#?}");
+    }
+}
+
+/// A browser entry is refused at the platform fence, before any backend.
+#[test]
+fn gfx_p1_a_browser_build_cannot_reach_gfx() {
+    assert_fails_browser_with(&gfx_p1_program(GFX_P1_OPEN), "@process");
+}
+
+/// The refusal is by REACH: lengths, geometry, colours and a builder never
+/// opened are plain vilan, and run on the JavaScript backend.
+#[test]
+fn gfx_p1_lengths_geometry_and_colour_are_plain_values() {
+    assert_compiles_and_runs(
+        &gfx_p1_program(
+            r#"
+            let a = dp(10) + dp(6) * 2.0 - dp(4) / 2.0;
+            print(a.value());
+            print(dp(3) < dp(4));
+            print(dp(5) == dp(5));
+            print(dp(2).max(dp(7)).value());
+            let button = Rect::new(dp(100), dp(50), dp(40), dp(20));
+            print(button.contains(Point::new(dp(100), dp(50))));
+            print(button.contains(Point::new(dp(140), dp(60))));
+            print(button.contains(Point::new(dp(139), dp(69))));
+            print(button.inset(dp(5)).width.value());
+            print(button.right().value());
+            let color = Color::rgb(255, 0, 51);
+            print(color.blue);
+            print(color.faded(0.5).alpha);
+            print(Corners::all(dp(4)).bottom_left.value());
+            let card = Rectangle::new(button, Color::white()).radius(dp(8)).border(Border::all(dp(1), color));
+            print(card.corners.top_right.value());
+            print(card.border.widths.left.value());
+            let builder: WindowBuilder = Window::builder().title("never opened").size(dp(1), dp(1));
+            print("built, never opened");
+            "#,
+        ),
+        "20\ntrue\ntrue\n7\ntrue\nfalse\ntrue\n30\n140\n0.2\n0.5\n4\n8\n1\nbuilt, never opened\n",
+    );
+}

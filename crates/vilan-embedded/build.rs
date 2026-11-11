@@ -114,6 +114,24 @@ fn main() {
         webview_lock.canonicalize().unwrap()
     ));
 
+    // native-ui.md P1 (R11): the GPU crate keeps a lockfile of its own too,
+    // outside the compiler's, and seeds a `std::gfx` program's generated
+    // project the same way (`vilan-cli`'s `native.rs` writes it).
+    let gfx_lock = manifest_dir.join("../vilan-rt-gfx/Cargo.lock");
+    println!("cargo:rerun-if-changed={}", gfx_lock.display());
+    assert!(
+        gfx_lock.is_file(),
+        "embedded-std build: {} is missing — is this a complete checkout?",
+        gfx_lock.display()
+    );
+    generated.push_str(&format!(
+        "/// `vilan-rt-gfx`'s own `Cargo.lock` (native-ui.md R11): the versions\n\
+         /// its audit and licence gates read, which a `std::gfx` program's\n\
+         /// generated project starts from.\n\
+         pub static RT_GFX_LOCK: &str = include_str!({:?});\n",
+        gfx_lock.canonicalize().unwrap()
+    ));
+
     let mut out = fs::File::create(&out_path).unwrap();
     out.write_all(generated.as_bytes()).unwrap();
 }
@@ -216,6 +234,13 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         directory: "vilan-rt-webview",
         manifest_static: "RT_WEBVIEW_MANIFEST",
         item: "F1 M2",
+    },
+    // native-ui.md P1: `std::gfx`'s GPU window (`wgpu` + `winit`). Outside
+    // the compiler's workspace (R11), embedded like the webview.
+    OptionalCrate {
+        directory: "vilan-rt-gfx",
+        manifest_static: "RT_GFX_MANIFEST",
+        item: "native-ui.md P1",
     },
 ];
 
@@ -325,7 +350,8 @@ fn collect(directory: &Path, prefix: &Path, files: &mut Vec<(String, PathBuf)>) 
 /// key relative to the materialization root, absolute path) — [`collect`]'s
 /// twin for the runtime crate, whose sources are Rust rather than vilan. Its
 /// `Cargo.toml` is deliberately NOT collected: [`runtime_manifest`] generates
-/// the one the cache carries.
+/// the one the cache carries. A `.wgsl` file is source too (native-ui.md P1:
+/// `vilan-rt-gfx`'s shader, which its renderer `include_str!`s).
 fn collect_rust(directory: &Path, prefix: &Path, files: &mut Vec<(String, PathBuf)>) {
     println!("cargo:rerun-if-changed={}", directory.display());
     for entry in fs::read_dir(directory).unwrap() {
@@ -340,7 +366,10 @@ fn collect_rust(directory: &Path, prefix: &Path, files: &mut Vec<(String, PathBu
                 continue;
             }
             collect_rust(&path, &relative, files);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "rs" || extension == "wgsl")
+        {
             files.push((key_of(&relative), path));
         }
     }

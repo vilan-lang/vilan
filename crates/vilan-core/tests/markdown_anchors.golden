@@ -80,6 +80,7 @@ guide/dev-loop.md h2 cleaning-up-strays
 guide/native.md h1 native-binaries
 guide/native.md h2 what-it-reaches-and-what-it-refuses-by-name
 guide/native.md h2 a-desktop-window
+guide/native.md h2 a-gpu-drawn-window
 guide/native.md h2 debug-by-default
 guide/native.md h2 numbers
 guide/native.md h2 where-the-emitted-rust-goes
@@ -457,6 +458,17 @@ std/encoding.md h2 bytes
 std/encoding.md h2 binary-codec-stdbinary
 std/encoding.md h2 base64-stdbase64
 std/encoding.md h2 percent-encoding-stdurl
+std/gfx.md h1 gpu-graphics
+std/gfx.md h2 lengths-dp
+std/gfx.md h2 geometry-colour-paint
+std/gfx.md h2 primitives-and-frames
+std/gfx.md h2 text
+std/gfx.md h2 textures
+std/gfx.md h2 windows
+std/gfx.md h2 events
+std/gfx.md h2 how-a-gpu-program-ends
+std/gfx.md h2 offscreen
+std/gfx.md h2 not-here-yet
 std/image.md h1 images
 std/image.md h2 avatars-one-upload-three-sizes
 std/image.md h2 what-decode-does-for-you

@@ -17133,3 +17133,217 @@ const WINDOW_PROBE: &str = concat!(
     "\t}\n",
     "}\n",
 );
+
+/// native-ui.md P1 (R8): a program that reaches `std::gfx` hands its loop to
+/// the GPU crate's host — `install` first, then the host's `block_on` in place
+/// of the executor's (opening a window is async, so this `main` is) — and links
+/// the termination signals and the readiness wait, which a GPU window stops on
+/// and waits through. A `main` that stays synchronous (it only shapes text)
+/// gets the host's `run_pending` instead. A program that reaches no GPU window
+/// keeps its `main` as it was. Emitted with `--stdout`: no cargo build, so this
+/// runs wherever the suite does (the build and the window are `gfx_window.rs`'s).
+#[test]
+fn gfx_p1_a_gfx_program_hands_its_loop_to_the_host() {
+    let staged = stage();
+    let emit = |program: &str, source: &str| {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("emit the probe");
+        assert!(
+            emitted.status.success(),
+            "{program} was refused:\n{}",
+            String::from_utf8_lossy(&emitted.stderr)
+        );
+        String::from_utf8_lossy(&emitted.stdout).into_owned()
+    };
+    let source = emit("native_probe_gfx.vl", GFX_PROBE);
+    assert!(
+        source.contains(
+            "fn main() {\n    vilan_rt_gfx::host::install();\n    vilan_rt_poll::install();\n    vilan_rt_signal::install();\n    vilan_rt::main_guard(|| vilan_rt_gfx::host::block_on(vilan_async_main()));\n}"
+        ),
+        "`main` does not hand an async program to the host:\n{source}"
+    );
+    assert!(
+        !source.contains("vilan_rt::executor::block_on("),
+        "{source}"
+    );
+    for call in [
+        "vilan_rt_gfx::host::open(",
+        "vilan_rt_gfx::host::on_frame(",
+        "vilan_rt_gfx::host::rectangle(",
+        "vilan_rt_gfx::host::text_layout(",
+    ] {
+        assert!(source.contains(call), "no {call}:\n{source}");
+    }
+
+    let synchronous = emit("native_probe_gfx_sync.vl", GFX_SYNC_PROBE);
+    assert!(
+        synchronous.contains("fn main() {\n    vilan_rt_gfx::host::install();\n")
+            && synchronous.contains("    vilan_rt_gfx::host::run_pending();\n")
+            && !synchronous.contains("vilan_rt::executor::run_pending();"),
+        "a synchronous `main` does not end in the host's loop:\n{synchronous}"
+    );
+
+    let plain = emit("native_probe_no_gfx.vl", "fun main() {\n\tprint(1);\n}\n");
+    assert!(
+        !plain.contains("vilan_rt_gfx"),
+        "a program with no GPU window reached the host:\n{plain}"
+    );
+}
+
+/// native-ui.md P1 (R11): the generated manifest names `vilan-rt-gfx` beside
+/// the runtime only for a program that reaches `std::gfx` — the crate is not
+/// in the compiler's workspace, and a program without a GPU window must not
+/// compile a GPU stack.
+#[test]
+fn gfx_p1_only_a_gfx_program_names_the_gfx_crate() {
+    let runtime = "/cache/vilan-rt";
+    let drawn = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            gfx: true,
+            poll: true,
+            signal: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        drawn.contains("vilan-rt-gfx = { path = \"/cache/vilan-rt-gfx\" }"),
+        "{drawn}"
+    );
+    let plain = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            poll: true,
+            window: true,
+            ..Default::default()
+        },
+    );
+    assert!(!plain.contains("vilan-rt-gfx"), "{plain}");
+}
+
+/// native-ui.md P1: a program that reaches BOTH `std::window` and `std::gfx`
+/// is refused by name — each wants the main thread for its own window
+/// system's loop — and so is a `main` answering an exit code, under which no
+/// window loop would ever run.
+#[test]
+fn gfx_p1_two_kinds_of_window_and_an_exiting_main_are_refused_by_name() {
+    let staged = stage();
+    let refusal = |program: &str, source: &str| {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("emit the probe");
+        assert!(!emitted.status.success(), "{program} was not refused");
+        String::from_utf8_lossy(&emitted.stderr).into_owned()
+    };
+    let both = refusal("native_probe_both_windows.vl", BOTH_WINDOWS_PROBE);
+    assert!(
+        both.contains("this program reaches both `std::window` and `std::gfx`"),
+        "{both}"
+    );
+    let exiting = refusal("native_probe_gfx_exit.vl", GFX_EXIT_CODE_PROBE);
+    assert!(
+        exiting.contains("this program reaches `std::gfx`, and its `main` answers an exit code"),
+        "{exiting}"
+    );
+}
+
+/// A `match` on a `str` whose last leg BINDS the subject (`let other =>`)
+/// built the `&str` the subject is matched as into a value that must be a
+/// `str` — rustc refused the emitted Rust (met by `std::gfx`'s key names).
+/// Both backends print the bound text.
+#[test]
+fn a_str_match_that_binds_its_subject_reads_a_str_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_str_binding.vl"),
+        STR_BINDING_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_str_binding.vl"),
+        Verdict::Identical,
+        "a binding leg of a str match must read the same text on both backends"
+    );
+}
+
+const GFX_PROBE: &str = concat!(
+    "import std::gfx::{ Color, Frame, Point, Rect, Rectangle, TextLayout, TextStyle, Window, dp };\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet label = TextLayout::new(\"hi\", TextStyle::new());\n",
+    "\tmatch Window::builder().title(\"t\").size(dp(200), dp(100)).open() {\n",
+    "\t\tOk(let window) => window.on_frame(|frame: Frame| {\n",
+    "\t\t\tframe.rectangle(Rectangle::new(Rect::new(dp(0), dp(0), dp(10), dp(10)), Color::white()));\n",
+    "\t\t\tframe.text(label, Point::new(dp(0), dp(0)), Color::black());\n",
+    "\t\t}),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
+const GFX_SYNC_PROBE: &str = concat!(
+    "import std::gfx::{ TextLayout, TextStyle };\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(TextLayout::new(\"hi\", TextStyle::new()).line_count());\n",
+    "}\n",
+);
+
+const BOTH_WINDOWS_PROBE: &str = concat!(
+    "import std::gfx::{ Window, dp };\n",
+    "import std::io::print;\n",
+    "import std::window;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmatch window::Window::builder(\"about:blank\").open() {\n",
+    "\t\tOk(let page) => page.close(),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "\tmatch Window::builder().size(dp(10), dp(10)).open() {\n",
+    "\t\tOk(let window) => window.close(),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
+const GFX_EXIT_CODE_PROBE: &str = concat!(
+    "import std::gfx::{ TextLayout, TextStyle };\n",
+    "\n",
+    "fun main(): i32 {\n",
+    "\tTextLayout::new(\"hi\", TextStyle::new()).line_count().as_i32()\n",
+    "}\n",
+);
+
+const STR_BINDING_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Named {\n",
+    "\tEnter,\n",
+    "\tOther(str),\n",
+    "}\n",
+    "\n",
+    "fun named(name: str): Named {\n",
+    "\tmatch name {\n",
+    "\t\t\"Enter\" => Named::Enter,\n",
+    "\t\tlet other => Named::Other(other),\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tfor name in [\"Enter\", \"CapsLock\"] {\n",
+    "\t\tmatch named(name) {\n",
+    "\t\t\tNamed::Enter => print(\"enter\"),\n",
+    "\t\t\tNamed::Other(let text) => print(i\"other {text} {text.len()}\"),\n",
+    "\t\t}\n",
+    "\t}\n",
+    "}\n",
+);
