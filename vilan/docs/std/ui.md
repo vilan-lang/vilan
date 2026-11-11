@@ -1,44 +1,61 @@
 # Elements and layout
 
-`std::ui` builds a window's contents from five element kinds — `row`,
-`column`, `stack`, `text`, `image` — and lays them out for you: every box comes
-from the elements' gap, padding, size, grow, shrink, align, justify and anchor,
-and a paragraph wraps to the width it is given. None of the kinds has a look of
-its own; a look is a `Style` value. It stands on [`std::gfx`](gfx.md), which
-draws the result (native-ui.md, part P2). The
+`std::ui` builds a window's contents from six element kinds — `row`,
+`column`, `stack`, `text`, `image`, `scroll` — lays them out for you, and makes
+them interactive: every box comes from the elements' gap, padding, size, grow,
+shrink, align, justify and anchor; a paragraph wraps to the width it is given;
+the element under the pointer or holding the focus hears the events it listens
+for; and any attribute can follow a signal. None of the kinds has a look of its
+own; a look is a `Style` value, and its conditions (`hovered()`, `pressed()`,
+`focused()`, the window's width) are typed. It stands on [`std::gfx`](gfx.md),
+which draws the result (native-ui.md, parts P2 and P3). The
 [native guide](../guide/native.md#elements-and-layout) walks through a whole
-screen.
+screen and a counter.
 
 **Native only**, as `std::gfx` is. The JavaScript build refuses a program that
 reaches this module, naming it; `vilan check` accepts one. What is plain vilan —
-a `Style` and its `+`, the enums — runs anywhere; the refusal is by reach, at the
-first element made.
+a `Style` and its `+`, its conditions, the enums — runs anywhere; the refusal is
+by reach, at the first element made.
 
-Not here yet: hit testing, events, focus, `scroll`, style conditions
-(`hovered()`, `pressed()`) and properties bound to signals are part P3; grid
-layout is a later slice.
+Not here yet: keyed lists and conditional children for this tree (`each`,
+`when`), grid layout, text editing, and publishing roles and labels to the
+system's accessibility API. Components (a button with behaviour, a text input, a
+virtual list) are `std::ui::kit`, a later part.
 
 ## Elements
 
 ```vilan,fragment
-fun row(): Row             // children left to right
-fun column(): Column       // children top to bottom
-fun stack(): Stack         // children on top of one another
-fun text(): Text           // a paragraph
-fun image(): ImageElement  // a texture in a box
+[element] fun row(): Row             // children left to right
+[element] fun column(): Column       // children top to bottom
+[element] fun stack(): Stack         // children on top of one another
+[element] fun text(): Text           // a paragraph
+[element] fun image(): ImageElement  // a texture in a box
+[element] fun scroll(): ScrollElement  // a clipped viewport over one child
 
 struct Element;            // an element of any kind
 impl Element {
 	fun bounds(self): Rect                    // its box from the last layout, in dp
 	fun outline(self): List<OutlineEntry>     // every element in its tree, in paint order
+	fun focus(self)                           // gives it the focus
+	fun interaction(self): Interaction        // hovered, pressed, focused now
 }
 struct OutlineEntry { depth: usize, kind: str, label: str, bounds: Rect }
+struct Interaction { hovered: bool, pressed: bool, focused: bool }
 
 trait Child { fun into_element(self): Element; }   // every kind, an Element, a str
 ```
 
-Each kind is a function with no parameters that answers a builder, every
-attribute is a method on it, and children arrive one at a time through `child`:
+Each kind is an `[element]` function with no parameters that answers a builder,
+every attribute is a method on it, and children arrive one at a time through
+`child`. So a kind is written as a TAG — `<row gap(dp(12))>"Name"{value}</row>`
+lowers to `row().gap(dp(12)).child("Name").child(value)` — or as those calls,
+and either spelling builds the same element. Tags read better wherever the shape
+of the tree is fixed when you write it; the calls suit a tree built in a loop
+(`rows.child(..)` per item) or extended as a value. A bare attribute is a call
+with no arguments (`<row wrap focusable>`), static text is a quoted child, and a
+value is a hole (`{count}`); the [element syntax](../guide/ui.md#markup-or-chain)
+is the web UI's, and a file that imports none of these six functions keeps the
+web meaning of `<text>` and `<image>`.
 
 ```vilan,native
 import std::gfx::{ Size, dp };
@@ -46,12 +63,18 @@ import std::io::print;
 import std::ui::{ Align, column, layout, row, text };
 
 fun main() {
-	let screen = column()
+	let screen = <column padding(dp(16)) gap(dp(8))>
+		<text>"Settings"</text>
+		<row gap(dp(12)) align(Align::Center)>"Name" "Ada"</row>
+	</column>;
+	// The same screen as the calls the tags lower to:
+	let again = column()
 		.padding(dp(16))
 		.gap(dp(8))
 		.child(text().child("Settings"))
 		.child(row().gap(dp(12)).align(Align::Center).child("Name").child("Ada"));
 	layout(screen, Size::new(dp(320), dp(200)), 1.0);
+	layout(again, Size::new(dp(320), dp(200)), 1.0);
 	for entry in screen.element().outline() {
 		print(i"{entry.kind} at {entry.bounds.x.value()}, {entry.bounds.y.value()}");
 	}
@@ -60,34 +83,60 @@ main();
 ```
 
 `child` takes anything `Child`: an element of any kind, or a `str`, which
-becomes a `text` holding it. A `text`'s own `child` takes a `str` and appends it
-to the paragraph. Elements are RETAINED: an element is built once and kept, a
-copy of one is the same element, and an element is in one place — giving it a
-second parent, or making it a child of itself or of an element inside it, fails
-the program with the reason. Build a second element for a second place (a
-function that answers one is the usual way). An element no longer held by the
+becomes a `text` holding it. A `text`'s own `child` takes a `str` (or a signal of
+one) and appends it to the paragraph. Elements are RETAINED: an element is built
+once and kept, a copy of one is the same element, and an element is in one place —
+giving it a second parent, or making it a child of itself or of an element inside
+it, fails the program with the reason. Build a second element for a second place
+(a function that answers one is the usual way). An element no longer held by the
 program or by a parent is freed.
+
+## Values and signals
+
+```vilan,fragment
+trait Bindable<T> { fun bind(own self, apply: |T| void); }
+impl type T with Bindable<T>                       // a value: set once
+impl type F: Flow<type T> with Bindable<T>         // a signal: set now and at every write
+```
+
+Every attribute that takes a value also takes a SIGNAL of it — a `SignalCell`, a
+memo, a pipe (`count.derive(|n: i32| i"Count: {n}")`): the attribute follows it.
+A write sets that one attribute again, which marks that one element for layout
+(a size, a padding, a text) or for paint (a style, a texture's fit), and asks the
+window the tree is mounted in for a frame. The frame lays out only what the
+solver must — a text that changed is measured again, alone, and its parent
+places its children from the solver's cache — and repaints only the elements
+that changed and the chain of scenes above them. Nothing else runs.
+
+`Bindable` is `std::reactive`'s `MaybeSignal` with one difference: a binding
+belongs to the ambient owner when there is one (`mount_root`, `run_with_owner`)
+and dies with it, and to its source otherwise, so a tree can be built and bound
+at the top of `main`.
 
 ## Attributes every element has
 
 ```vilan,fragment
 trait Attributes {
-	fun width<L: IntoLength>(self, width: L): Self       // dp(240), fraction(1, 2), Length::Auto
-	fun height<L: IntoLength>(self, height: L): Self
-	fun min_width<L: IntoLength>(self, width: L): Self
-	fun max_width<L: IntoLength>(self, width: L): Self
-	fun min_height<L: IntoLength>(self, height: L): Self
-	fun max_height<L: IntoLength>(self, height: L): Self
-	fun grow(self, grow: f64): Self                      // 0 until set
-	fun shrink(self, shrink: f64): Self                  // 1 until set
-	fun padding(self, padding: Dp): Self                 // every side
-	fun padding_x(self, padding: Dp): Self               // left and right
-	fun padding_y(self, padding: Dp): Self               // top and bottom
-	fun padding_top(self, padding: Dp): Self             // and _right, _bottom, _left
-	fun anchor(self, anchor: Anchor): Self               // its place in a stack
-	fun style(self, style: Style): Self
-	fun role(self, role: Role): Self                     // for assistive technology
-	fun label(self, label: str): Self
+	fun width<L: IntoLength, V: Bindable<L>>(self, width: V): Self   // dp(240), fraction(1, 2), Length::Auto
+	fun height<L: IntoLength, V: Bindable<L>>(self, height: V): Self
+	fun min_width<L: IntoLength, V: Bindable<L>>(self, width: V): Self
+	fun max_width<L: IntoLength, V: Bindable<L>>(self, width: V): Self
+	fun min_height<L: IntoLength, V: Bindable<L>>(self, height: V): Self
+	fun max_height<L: IntoLength, V: Bindable<L>>(self, height: V): Self
+	fun grow<V: Bindable<f64>>(self, grow: V): Self                   // 0 until set
+	fun shrink<V: Bindable<f64>>(self, shrink: V): Self               // 1 until set
+	fun padding<V: Bindable<Dp>>(self, padding: V): Self              // every side
+	fun padding_x<V: Bindable<Dp>>(self, padding: V): Self            // left and right
+	fun padding_y<V: Bindable<Dp>>(self, padding: V): Self            // top and bottom
+	fun padding_top<V: Bindable<Dp>>(self, padding: V): Self          // and _right, _bottom, _left
+	fun anchor<V: Bindable<Anchor>>(self, anchor: V): Self            // its place in a stack
+	fun style<V: Bindable<Style>>(self, style: V): Self
+	fun clip(self): Self                                              // children inside its box only
+	fun role(self, role: Role): Self                                  // for assistive technology
+	fun label<V: Bindable<str>>(self, label: V): Self
+	fun focusable(self): Self                                         // see Focus
+	fun tab_index(self, index: i32): Self
+	// and the events: see Events
 }
 enum Length { Auto, Fixed(Dp), Fraction(f64) }
 fun fraction(numerator: f64, denominator: f64): Length
@@ -106,6 +155,10 @@ size, so an element that must keep its width — a sidebar beside a long
 paragraph — says `shrink(0.0)`. No element shrinks below its content's smallest
 width (a paragraph's longest word).
 
+`clip()` paints its children, and lets them be hit, inside its padding box only
+(its border and rounded corners included); without it a child larger than its
+parent draws outside it. A `scroll` always clips.
+
 `role` and `label` are carried from this version for assistive technology
 (`Role::Heading`, `Button`, `Link`, `List`, `ListItem`, `Image` and the rest),
 and published to the system by a later one; `outline` lists the label too.
@@ -117,10 +170,10 @@ trait Parent with Attributes {
 	fun child<C: Child>(self, content: C): Self
 }
 trait Flex with Parent {                      // rows and columns
-	fun gap(self, gap: Dp): Self
-	fun align(self, align: Align): Self       // across the axis
-	fun justify(self, justify: Justify): Self // along the axis
-	fun wrap(self): Self                      // overflow starts a new line
+	fun gap<V: Bindable<Dp>>(self, gap: V): Self
+	fun align<V: Bindable<Align>>(self, align: V): Self       // across the axis
+	fun justify<V: Bindable<Justify>>(self, justify: V): Self // along the axis
+	fun wrap(self): Self                                      // overflow starts a new line
 }
 enum Align { Start, Center, End, Stretch, Baseline }
 enum Justify { Start, Center, End, SpaceBetween, SpaceAround, SpaceEvenly }
@@ -186,8 +239,8 @@ longest word. Text is shaped once per width and style, as `std::gfx`'s
 
 ```vilan,fragment
 impl ImageElement {
-	fun texture(self, texture: Texture): ImageElement
-	fun fit(self, fit: Fit): ImageElement
+	fun texture<V: Bindable<Texture>>(self, texture: V): ImageElement
+	fun fit<V: Bindable<Fit>>(self, fit: V): ImageElement
 }
 enum Fit { Contain, Cover, Fill, None }
 ```
@@ -213,6 +266,7 @@ struct Style {
 	line_height: Option<f64>,
 	weight: Option<i32>,
 	italic: Option<bool>,
+	conditions: List<Conditional>,   // the `when` styles
 }
 fun style(): Style                   // sets nothing
 impl Style {
@@ -228,8 +282,9 @@ impl Style {
 	fun line_height(own self, line_height: f64): Style
 	fun weight(own self, weight: i32): Style
 	fun italic(own self, italic: bool): Style
+	fun when(own self, condition: Condition, build: |Style| Style): Style
 }
-// Style + Style: the right side's fields where it sets them
+// Style + Style: the right side's fields where it sets them, both's conditions
 struct DropShadow { x: Dp, y: Dp, blur: Dp, spread: Dp, color: Color }   // DropShadow::new(x, y, blur, color)
 ```
 
@@ -261,30 +316,155 @@ own, field by field. Everything else belongs to the one element it is set on. A
 text colour change repaints; a change to any other text field lays the texts
 under it out again.
 
+## Conditions
+
+```vilan,fragment
+enum Condition { Hovered, Pressed, Focused, WindowAtLeast(Dp), WindowBelow(Dp) }
+fun hovered(): Condition                    // the pointer over it, or over an element inside it
+fun pressed(): Condition                    // the primary button went down on it and is still down
+fun focused(): Condition                    // it holds the focus
+fun window_at_least(width: Dp): Condition
+fun window_below(width: Dp): Condition
+```
+
+`when(condition, |s| ..)` adds fields to a style that apply only while the
+condition holds; the framework decides that from hit testing, the focus and the
+window. The conditions are typed and closed — these five — and a `when` inside a
+`when` applies while both hold. A condition's fields win over the unconditional
+fields whatever order the two were composed in; among conditions that hold, the
+later wins.
+
+```vilan
+import std::gfx::{ Border, Color, dp };
+import std::io::print;
+import std::ui::{ Style, focused, hovered, pressed, style, window_below };
+
+fun main() {
+	let button = style()
+		.background(Color::rgb(45, 95, 230))
+		.radius(dp(6))
+		.when(hovered(), |look: Style| look.background(Color::rgb(70, 120, 250)))
+		.when(pressed(), |look: Style| look.background(Color::rgb(28, 70, 190)))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), Color::rgb(255, 196, 60))))
+		.when(window_below(dp(400)), |look: Style| look.radius(dp(0)));
+	print(button.conditions.len());   // four conditional styles
+}
+main();
+```
+
+A condition change repaints the one element, and nothing else — unless its
+fields shape text (a font, a size, a line height, a weight, italic), which the
+solver then lays out again, as any change to those fields does. A text colour in
+a condition reaches the texts inside the element, as an unconditional one does.
+
+## Events
+
+```vilan,fragment
+trait Attributes {
+	fun on_press(self, handler: || void): Self                // the primary button went down on it
+	fun on_release(self, handler: || void): Self              // ... came up over it
+	fun on_click(self, handler: || void): Self                // a press and its release, both on it
+	fun on_pointer_enter(self, handler: || void): Self        // does not bubble
+	fun on_pointer_leave(self, handler: || void): Self        // does not bubble
+	fun on_pointer_move(self, handler: |Point| void): Self
+	fun on_scroll(self, handler: |Scroll| void): Self
+	fun on_key(self, handler: |KeyPress| void): Self          // to the focused element
+	fun on_key_release(self, handler: |KeyPress| void): Self
+	fun on_text(self, handler: |str| void): Self
+	fun on_focus(self, handler: || void): Self                // does not bubble
+	fun on_blur(self, handler: || void): Self                 // does not bubble
+}
+fun stop_event()                                              // inside a handler
+```
+
+Events are attributes like any other (`<row on_click(|| count.set(0))>`). A
+pointer event goes to the element under the pointer — hit testing walks the
+last layout back to front, a later sibling above an earlier one and a child
+above its parent, with rounded corners and clipping elements honoured — and a
+key or text event to the element holding the focus (the root, when nothing
+does). From there it BUBBLES: each ancestor that listens hears it, inner first.
+`stop_event()` inside a handler ends that, and also keeps the framework's own
+response from happening: Tab moving the focus, a `scroll` moving. A click goes
+to the innermost element holding both where the press and the release landed.
+Press, release and click are the primary button's; positions are dp from the
+window's top-left corner. Each handler runs as one turn, as a web event does: its
+signal writes settle as one wave.
+
+## Focus
+
+An element is focusable when it says so: `focusable()` puts it in the tab order
+in tree order, and `tab_index(n)` at a place of its own — every positive index
+before the elements in tree order, lowest first; a negative one is focusable by a
+press or by `focus()` but never reached by Tab. Tab moves the focus to the next
+element of the tab order and Shift+Tab to the previous one, wrapping at the ends;
+a press focuses the innermost focusable element at or above where it landed, and
+takes the focus away when there is none. Key and text events go to the focused
+element first. The `focused()` condition, `on_focus` and `on_blur` follow it.
+
+## Scrolling
+
+```vilan,fragment
+impl ScrollElement {
+	fun axis(self, axis: ScrollAxis): ScrollElement
+	fun offset(self, cell: SignalCell<Point>): ScrollElement   // bound both ways
+	fun scrolled(self): Point                                  // the offset now
+	fun range(self): Size                                      // the largest offset
+}
+enum ScrollAxis { Vertical, Horizontal, Both }
+```
+
+A `scroll` is a viewport over its one child. The child keeps its own size along
+the axis — a column of a thousand rows is as tall as its rows — and the scroll
+asks for that size but takes what its parent gives it: its content never holds
+it open, so in a column it shrinks to the room left (give it a size, or `grow`
+it into the room, to fill it). The wheel moves the child, clamped to how far it reaches past the
+viewport; a wheel turned over a scroll that is already at its end bubbles on to
+the next one out. The child is clipped to the scroll's padding box, and hit where
+it is drawn. `offset(cell)` binds the offset to a signal both ways: a write
+scrolls it, and the wheel writes the cell.
+
+A scroll MOVING lays nothing out and repaints nothing inside it: only the
+scroll's own scene changes, and when the frame is drawn the rows outside the
+viewport are skipped whole. Every row is still a real element, laid out once —
+virtualising a list (laying out only the rows in view) is a `std::ui::kit`
+component, not this.
+
 ## Showing it
 
 ```vilan,fragment
-fun mount<C: Child>(window: Window, root: C)            // the window shows it
-fun draw<C: Child>(frame: Frame, root: C)               // in a frame of your own
-fun layout<C: Child>(root: C, size: Size, scale_factor: f64)   // boxes only
+fun mount<C: Child>(window: Window, root: C)                     // the window shows it
+fun mount_root<C: Child>(window: Window, body: || C): Owner      // built under an owner, then mounted
+fun draw<C: Child>(frame: Frame, root: C)                        // in a frame of your own
+fun layout<C: Child>(root: C, size: Size, scale_factor: f64)     // boxes only
+fun deliver<C: Child>(root: C, event: Event)                     // an event, with no window
+fun last_frame(window: Window): FrameTimes
+struct FrameTimes { layout: f64, paint: f64, draw: f64, solved: bool, measured: i32, moved: i32, rebuilt: i32 }
 ```
 
-`mount` makes the tree the window's frame callback: every frame lays it out at
-the window's size and scale and draws it. The window draws a frame when it
-opens, resizes or changes scale, so the layout follows the window. Layout and
-painting are separate passes over the kept tree: the layout solver runs only when
-something that moves a box changed, or the size did; a scale change alone snaps
-the boxes again; and a frame with nothing changed draws the scene it painted
-last.
+`mount` makes the tree the window's contents: its frames lay the tree out at the
+window's size and scale and draw it; its events go to the tree's elements before
+the window's own event callback, if it has one, hears them; and a change to the
+tree asks for a frame. The window also draws when it opens, resizes or changes
+scale, so the layout follows the window — and nothing is drawn while nothing
+changes. `mount_root` builds the tree under a new owner first, as one turn, so
+its bindings die with that owner when it is disposed. A counter:
 
 ```vilan,native
 import std::gfx::{ Window, dp };
 import std::io::print;
-import std::ui::{ column, mount, text };
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ Style, column, hovered, mount_root, row, style, text };
 
 fun main() {
-	match Window::builder().title("Hello").size(dp(320), dp(160)).open() {
-		Ok(let window) => mount(window, column().padding(dp(24)).child(text().child("Hello from std::ui"))),
+	match Window::builder().title("Counter").size(dp(320), dp(160)).open() {
+		Ok(let window) => {
+			let count: SignalCell<i32> = Signal::new(0);
+			let look = style().when(hovered(), |look: Style| look.text_size(dp(16)));
+			let _owner = mount_root(window, || <column padding(dp(24)) gap(dp(8))>
+				<text>{count.derive(|value: i32| i"Count: {value}")}</text>
+				<row style(look) focusable on_click(|| count.set_with(|value: i32| value + 1))>"Add one"</row>
+			</column>);
+		},
 		Err(let reason) => print(i"no window: {reason}"),
 	}
 }
@@ -295,9 +475,15 @@ main();
 for a frame callback that draws more around it, or for an
 [`Offscreen`](gfx.md#offscreen) picture: a golden image of a screen is
 `Offscreen::new(..).software(true).render(|frame: Frame| draw(frame, root))`.
-`layout` only lays out, for reading boxes back with `bounds` and `outline`.
+`layout` only lays out, for reading boxes back with `bounds` and `outline`, and
+`deliver` routes a `std::gfx` `Event` into a laid-out tree as a window would —
+hit testing, conditions, focus, handlers, scrolling — for a test, or a program
+that drives its tree itself. `last_frame` answers what the last layout and paint
+took (in microseconds) and did: whether the solver ran, the texts and images it
+measured, the boxes that moved, the element scenes rebuilt.
 
 Every box is SNAPPED to the device pixel grid by the renderer's own rule, each
 edge on its own: boxes that share an edge in dp share it on the screen, and a
 1 dp line is one device pixel at 100%, 125% and 150%. `bounds` answers the
-snapped box in dp.
+snapped box in dp (an element inside a `scroll` is where it is laid out, before
+the scroll's offset).

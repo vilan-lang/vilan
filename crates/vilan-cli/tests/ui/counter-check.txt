@@ -1,0 +1,20 @@
+spellings agree=true elements=7
+column counter 0 0 360 240
+  text count 113 76 134 35
+  row buttons 88 127 184 37
+    row Add one 88 127 94 37
+      text  106 137 58 17
+    row Reset 194 127 78 37
+      text  212 137 42 17
+over add: count=0 add=h reset=- handlers=[]
+pressed add: count=0 add=hpf reset=- handlers=[]
+released add: count=1 add=hf reset=- handlers=[click Add one, click counter]
+pressed add, released outside: count=1 add=f reset=- handlers=[click counter]
+enter: count=2 add=f reset=- handlers=[key Add one]
+x: count=2 add=f reset=- handlers=[key counter]
+tab: count=2 add=- reset=f handlers=[key counter]
+space: count=0 add=- reset=f handlers=[key Reset]
+tab again: count=0 add=f reset=- handlers=[key counter]
+shift tab: count=0 add=- reset=f handlers=[key counter]
+left: count=0 add=- reset=f handlers=[]
+count height wide=35 narrow=23

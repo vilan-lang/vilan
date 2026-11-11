@@ -211,8 +211,13 @@ impl Shell<'_> {
             };
             let units = Units::new(scale_factor as f32, TEXT_SCALE as f32)
                 .map_err(|error| error.to_string())?;
-            match with_text(|text| renderer.render(&scene, units, text, background)) {
-                Ok(FrameOutcome::Presented(_)) => {}
+            let started = Instant::now();
+            let rendered = with_text(|text| renderer.render(&scene, units, text, background));
+            let took = started.elapsed().as_secs_f64() * 1.0e6;
+            match rendered {
+                Ok(FrameOutcome::Presented(_)) => {
+                    super::with_window(id, |slot| slot.last_draw_us = took);
+                }
                 // A minimised or covered window, or a surface that had to be
                 // reconfigured: the system asks for a frame again when the
                 // window changes.

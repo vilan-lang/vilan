@@ -114,6 +114,8 @@ pub(crate) struct EncodedFrame {
     pub(crate) images: Vec<Image>,
     pub(crate) primitives: u32,
     pub(crate) culled_primitives: u32,
+    /// Nested scenes skipped whole, their primitives counted as culled.
+    pub(crate) culled_scenes: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -170,6 +172,7 @@ impl Encoder {
         frame.images.clear();
         frame.primitives = 0;
         frame.culled_primitives = 0;
+        frame.culled_scenes = 0;
         self.assigner.reset(width, height);
         self.staged_quads.clear();
         self.staged_sprites.clear();
@@ -340,6 +343,15 @@ impl Walk<'_> {
                     self.state = self.encoder.stack.pop().expect("a built scene is balanced");
                 }
                 Command::Scene(nested) => {
+                    // A nested scene wholly outside the clip draws nothing:
+                    // skipped without walking it (a row scrolled out of view
+                    // in a long list).
+                    if self.outside_clip(nested) {
+                        self.frame.primitives += nested.primitive_count() as u32;
+                        self.frame.culled_primitives += nested.primitive_count() as u32;
+                        self.frame.culled_scenes += 1;
+                        continue;
+                    }
                     // A nested scene's own pushes and pops are balanced, so it
                     // leaves the state as it found it.
                     let depth = self.encoder.stack.len();
@@ -426,6 +438,24 @@ impl Walk<'_> {
             }
         }
         Clip { bounds, radii }
+    }
+
+    /// Whether every pixel `scene` can draw is outside the clip in force,
+    /// by its conservative bounds (one device pixel more on every side, for
+    /// rounding).
+    fn outside_clip(&self, scene: &Scene) -> bool {
+        let Some(bounds) = scene.bounds() else {
+            return true;
+        };
+        let transformed = self.state.transform.apply_rect(bounds);
+        let scale = self.content_scale();
+        let device = [
+            transformed.left() * scale - 1.0,
+            transformed.top() * scale - 1.0,
+            transformed.right() * scale + 1.0,
+            transformed.bottom() * scale + 1.0,
+        ];
+        is_empty(&intersection(&device, &self.state.clip.bounds))
     }
 
     /// The visible part of a quad: its bounds within the clip, or `None`.
@@ -830,6 +860,56 @@ mod tests {
                 BatchKind::Sprites(TextureKey::ColorPage(0))
             ]
         );
+    }
+
+    /// A row scrolled out of a clipped viewport is skipped WHOLE: its nested
+    /// scene is not walked, its primitives count as culled, and a row inside
+    /// the clip (or straddling its edge) is drawn. The transform in force is
+    /// applied to the nested scene's bounds first (the scroll's offset).
+    #[test]
+    fn a_nested_scene_wholly_outside_the_clip_is_skipped_whole() {
+        let row = |y: f32| {
+            let mut row = SceneBuilder::new();
+            row.rectangle(solid(0.0, y, 100.0, 20.0));
+            row.text(&layout(&[1, 2]), Point::new(4.0, y + 4.0), Color::BLACK);
+            row.finish().expect("balanced")
+        };
+        let mut builder = SceneBuilder::new();
+        builder.push_clip(Rect::new(0.0, 0.0, 100.0, 100.0), Corners::ZERO);
+        builder.push_transform(Transform::translate(0.0, -200.0));
+        for index in 0..20 {
+            builder.scene(&row(index as f32 * 20.0));
+        }
+        builder.pop();
+        builder.pop();
+        let frame = encode(&builder.finish().expect("balanced"), 1.0);
+        // Rows 10 to 14 are inside (y 200 to 300 moved to 0 to 100); the text
+        // of row 9 reaches within its conservative bounds, so it is walked
+        // (its primitives culled one by one) and so is row 15.
+        assert_eq!(frame.culled_scenes, 13, "rows 0-8 and 16-19");
+        assert_eq!(frame.primitives, 40);
+        assert_eq!(frame.quads.len(), 5, "the five visible rows' rectangles");
+    }
+
+    #[test]
+    fn a_scenes_bounds_hold_every_primitive_under_its_transforms() {
+        let mut builder = SceneBuilder::new();
+        builder.rectangle(solid(10.0, 10.0, 10.0, 10.0));
+        builder.push_transform(Transform::translate(100.0, 0.0));
+        builder.rectangle(solid(0.0, 50.0, 10.0, 10.0));
+        builder.pop();
+        builder.rectangle(solid(0.0, 0.0, 5.0, 5.0));
+        let scene = builder.finish().expect("balanced");
+        assert_eq!(scene.bounds(), Some(Rect::new(0.0, 0.0, 110.0, 60.0)));
+        let mut outer = SceneBuilder::new();
+        outer.push_transform(Transform::translate(0.0, 10.0));
+        outer.scene(&scene);
+        outer.pop();
+        assert_eq!(
+            outer.finish().expect("balanced").bounds(),
+            Some(Rect::new(0.0, 10.0, 110.0, 60.0))
+        );
+        assert_eq!(Scene::empty().bounds(), None);
     }
 
     #[test]

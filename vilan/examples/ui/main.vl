@@ -2,10 +2,15 @@
 // row, a sidebar column, and a content column with wrapped paragraphs, a picture
 // card whose badge is anchored to its corner, and a caption beside it. Nothing
 // here is positioned by hand — every box comes from the elements' gap, padding,
-// grow, align and anchor — and nothing reacts to input (that is part P3).
+// grow, align and anchor — and nothing reacts to input (`ui-counter` and
+// `ui-list` do).
 //
 // Resize the window: the header and the body follow its width, the paragraphs
 // wrap again, and the sidebar keeps its 200 dp.
+//
+// Built from element tags (`<row gap(dp(20))>..</row>`), which lower to the
+// builder calls (`row().gap(dp(20)).child(..)`) — `paragraph` is written that
+// way, and either spelling builds the same element.
 //
 // Modes, for the end-to-end test:
 //
@@ -99,24 +104,23 @@ fun picture(): Texture {
 
 fun header(): Element {
 	let link = style().text_color(Color::rgb(200, 210, 255));
-	row()
-		.padding_x(dp(24))
-		.padding_y(dp(14))
-		.gap(dp(20))
-		.align(Align::Center)
-		.style(style().background(ink()).text_color(Color::white()))
-		.label("header")
-		.child(text()
-			.child("vilan")
-			.style(style().text_size(dp(20)).weight(700))
-			.role(Role::Heading)
-			.label("brand"))
-		// An empty row that grows: the links sit at the right end.
-		.child(row().grow(1.0).label("spacer"))
-		.child(text().child("Guide").style(link).role(Role::Link).label("guide"))
-		.child(text().child("Library").style(link).role(Role::Link).label("library"))
-		.child(text().child("Examples").style(link).role(Role::Link).label("examples"))
-		.element()
+	// An empty row that grows: the links sit at the right end.
+	<row
+		padding_x(dp(24))
+		padding_y(dp(14))
+		gap(dp(20))
+		align(Align::Center)
+		style(style().background(ink()).text_color(Color::white()))
+		label("header")
+	>
+		<text style(style().text_size(dp(20)).weight(700)) role(Role::Heading) label("brand")>
+			"vilan"
+		</text>
+		<row grow(1.0) label("spacer") />
+		<text style(link) role(Role::Link) label("guide")>"Guide"</text>
+		<text style(link) role(Role::Link) label("library")>"Library"</text>
+		<text style(link) role(Role::Link) label("examples")>"Examples"</text>
+	</row>.element()
 }
 
 fun sidebar(): Element {
@@ -126,96 +130,86 @@ fun sidebar(): Element {
 		} else {
 			style()
 		};
-		text().child(name).padding_x(dp(10)).padding_y(dp(6)).style(look).role(Role::ListItem)
+		<text padding_x(dp(10)) padding_y(dp(6)) style(look) role(Role::ListItem)>{name}</text>
+	};
+	let edge = Border {
+		widths = Edges { top = dp(0), right = dp(1), bottom = dp(0), left = dp(0) },
+		color = Color::rgb(220, 220, 228),
 	};
 	// `shrink(0.0)`: the content beside it wants more than the window has, and
 	// a row takes the shortfall from every child that may shrink.
-	column()
-		.width(dp(200))
-		.shrink(0.0)
-		.padding(dp(16))
-		.gap(dp(4))
-		.style(style()
-			.background(Color::rgb(246, 246, 250))
-			.border(Border {
-				widths = Edges { top = dp(0), right = dp(1), bottom = dp(0), left = dp(0) },
-				color = Color::rgb(220, 220, 228),
-			}))
-		.role(Role::List)
-		.label("sidebar")
-		.child(entry("Overview", false))
-		.child(entry("Elements", true))
-		.child(entry("Layout", false))
-		.child(entry("Style", false))
-		.child(entry("Drawing", false))
-		.element()
+	<column
+		width(dp(200))
+		shrink(0.0)
+		padding(dp(16))
+		gap(dp(4))
+		style(style().background(Color::rgb(246, 246, 250)).border(edge))
+		role(Role::List)
+		label("sidebar")
+	>
+		{entry("Overview", false)}
+		{entry("Elements", true)}
+		{entry("Layout", false)}
+		{entry("Style", false)}
+		{entry("Drawing", false)}
+	</column>.element()
 }
 
 /// The picture with a badge anchored to its top-right corner.
 fun card(picture: Texture): Element {
-	let badge = text()
-		.child("NEW")
-		.padding_x(dp(8))
-		.padding_y(dp(3))
-		.anchor(Anchor::TopRight)
-		.style(style()
-			.background(Color::rgb(230, 60, 70))
-			.text_color(Color::white())
-			.text_size(dp(11))
-			.weight(700)
-			.radius(dp(9)))
-		.label("badge");
-	stack()
-		.padding(dp(8))
-		.style(style()
-			.background(Color::white())
-			.radius(dp(10))
-			.shadow(DropShadow::new(dp(0), dp(2), dp(10), Color::rgba(0, 0, 0, 0.2))))
-		.label("card")
-		.child(image()
-			.texture(picture)
-			.fit(Fit::Cover)
-			.width(dp(240))
-			.height(dp(120))
-			.style(style().radius(dp(6)))
-			.role(Role::Image)
-			.label("picture"))
-		.child(badge)
-		.element()
+	let badge_look = style()
+		.background(Color::rgb(230, 60, 70))
+		.text_color(Color::white())
+		.text_size(dp(11))
+		.weight(700)
+		.radius(dp(9));
+	let card_look = style()
+		.background(Color::white())
+		.radius(dp(10))
+		.shadow(DropShadow::new(dp(0), dp(2), dp(10), Color::rgba(0, 0, 0, 0.2)));
+	<stack padding(dp(8)) style(card_look) label("card")>
+		<image
+			texture(picture)
+			fit(Fit::Cover)
+			width(dp(240))
+			height(dp(120))
+			style(style().radius(dp(6)))
+			role(Role::Image)
+			label("picture")
+		/>
+		<text
+			padding_x(dp(8))
+			padding_y(dp(3))
+			anchor(Anchor::TopRight)
+			style(badge_look)
+			label("badge")
+		>
+			"NEW"
+		</text>
+	</stack>.element()
 }
 
+/// A paragraph — written as the builder calls a tag lowers to, which is the same
+/// element (the recorded rectangles hold both spellings to one layout).
 fun paragraph(words: str): Element {
 	text().child(words).role(Role::Paragraph).element()
 }
 
 fun content(picture: Texture): Element {
-	column()
-		.grow(1.0)
-		.padding(dp(28))
-		.gap(dp(16))
-		.label("content")
-		.child(text()
-			.child("Layout without a style sheet")
-			.style(style().text_size(dp(26)).weight(700))
-			.role(Role::Heading)
-			.label("title"))
-		.child(paragraph("Rows and columns place their children in a line, a gap apart; a stack puts them on top of one another, each anchored to an edge or a corner. A paragraph wraps to the width its column gives it, and nothing here was positioned by hand."))
-		.child(row()
-			.gap(dp(20))
-			.align(Align::Start)
-			.label("feature")
-			.child(card(picture))
-			.child(column()
-				.grow(1.0)
-				.shrink(1.0)
-				.gap(dp(8))
-				.label("caption")
-				.child(text()
-					.child("A picture, cropped to cover its box")
-					.style(style().weight(600)))
-				.child(paragraph("The badge sits in the card's top-right corner because the card is a stack and the badge asks for that anchor. Make the window narrower and this column gives up its width first."))))
-		.child(paragraph("Style is a value: a background, a border, a radius, a shadow, a text style. Text style alone is inherited, so the header's white reaches every word inside it."))
-		.element()
+	<column grow(1.0) padding(dp(28)) gap(dp(16)) label("content")>
+		<text style(style().text_size(dp(26)).weight(700)) role(Role::Heading) label("title")>
+			"Layout without a style sheet"
+		</text>
+		{paragraph("Rows and columns place their children in a line, a gap apart; a stack puts them on top of one another, each anchored to an edge or a corner. A paragraph wraps to the width its column gives it, and nothing here was positioned by hand.")}
+		<row gap(dp(20)) align(Align::Start) label("feature")>
+			{card(picture)}
+			<column grow(1.0) shrink(1.0) gap(dp(8)) label("caption")>
+				<text style(style().weight(600))>"A picture, cropped to cover its box"</text>
+				{paragraph("The badge sits in the card's top-right corner because the card is a stack and the badge asks for that anchor. Make the window narrower and this column gives up its width first.")}
+			</column>
+		</row>
+		{paragraph("Style is a value: a background, a border, a radius, a shadow, a text style. Text style alone is inherited, so the header's white reaches every word inside it.")}
+	</column>.element()
 }
 
 /// The whole screen. `font`, when given, is set at the root and inherited by
@@ -225,22 +219,18 @@ fun screen(font: Option<str>, picture: Texture): Element {
 		Some(let family) => style().font(FontFamily::Named(family)),
 		None => style(),
 	};
-	column()
-		.style(base
-			.background(Color::rgb(252, 252, 253))
-			.text_color(ink())
-			.text_size(dp(15))
-			.line_height(1.4))
-		.label("screen")
-		.child(header())
-		.child(row()
-			.grow(1.0)
-			.align(Align::Stretch)
-			.justify(Justify::Start)
-			.label("body")
-			.child(sidebar())
-			.child(content(picture)))
-		.element()
+	let look = base
+		.background(Color::rgb(252, 252, 253))
+		.text_color(ink())
+		.text_size(dp(15))
+		.line_height(1.4);
+	<column style(look) label("screen")>
+		{header()}
+		<row grow(1.0) align(Align::Stretch) justify(Justify::Start) label("body")>
+			{sidebar()}
+			{content(picture)}
+		</row>
+	</column>.element()
 }
 
 fun main() {

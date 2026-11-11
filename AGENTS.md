@@ -155,10 +155,21 @@ Rust workspace, seventeen crates, plus the language's own tree:
   one `taffy` tree per program with the solver (flexbox for rows and columns, a one-cell grid for
   stacks), and a vilan element is a handle on it (`host::ui`'s `Node`, freed when it has neither
   a handle nor a parent); text measures itself through the text system during layout, layout and
-  paint are separate passes keyed by two generations, and every box is snapped with `Units`'
-  rule, the renderer's. `vilan/std/src/ui.vl`'s `__ui_*` externs ride `std::gfx`'s host table and
-  reach; its end-to-end proof is `crates/vilan-cli/tests/ui_screen.rs` (recorded rectangles,
-  goldens, a window), in the same `gfx` leg.
+  paint are separate passes, and every box is snapped with `Units`' rule, the renderer's. Part P3
+  made it incremental and interactive: every element keeps its subtree's nested `Scene` and a
+  change invalidates the one element and the chain above it; the solver re-runs only taffy's dirty
+  chains and the snap visits only those (pinned against a full snap); the root's viewport cell is
+  a FIXED grid track — an `auto` one made every re-solve ask the root's content sizes, which taffy
+  keys by the parent's size, so the first re-solve after a resize re-measured every leaf. Style
+  is LAYERS per `style(..)` call (`ui/style.rs`, conditions resolved host-side), and hit testing,
+  routing with bubbling, focus and scrolling are `ui/input.rs`; the tree answers a `Route` and the
+  HOST calls the vilan handlers with nothing borrowed (`host::ui::run_route`, `stop`). A change to
+  a mounted tree asks its window for a frame (`host::ui`'s `change`). `vilan/std/src/ui.vl`'s
+  `__ui_*` externs ride `std::gfx`'s host table and reach; its end-to-end proofs are
+  `crates/vilan-cli/tests/ui_screen.rs` (recorded rectangles, goldens, a window) and
+  `ui_interaction.rs` (the counter with no window against a recorded listing, then by XTEST
+  pointer and keyboard; the 10,000-row list scrolled and clicked), in the same `gfx` leg.
+  `crates/vilan-rt-gfx/examples/ui_measure.rs` prints the layout and paint costs (release).
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

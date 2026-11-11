@@ -267,6 +267,11 @@ leg_webview() {
 #   offscreen and held to golden images, and shown in a window under xvfb;
 #   REQUIRED here too. The crate's own `cargo test` above runs the element
 #   tree's unit pins (`src/ui/tests.rs`).
+# - The `std::ui` interaction proof (`crates/vilan-cli/tests/ui_interaction.rs`,
+#   native-ui.md P3's exit test): `vilan/examples/ui-counter` driven with no
+#   window and held to a recorded listing, then in a window under xvfb by
+#   pointer AND keyboard through XTEST; `vilan/examples/ui-list` (10,000 rows
+#   in a scroll) scrolled by the wheel and clicked. REQUIRED here too.
 leg_gfx() {
     status=0
     (
@@ -280,7 +285,8 @@ leg_gfx() {
         tr -d '\r' <"$notices" | cmp - THIRD-PARTY-NOTICES.txt || exit 1
         rm -f "$notices"
     ) || status=$?
-    VILAN_REQUIRE_GFX=1 cargo nextest run -p vilan-cli --test gfx_window --test ui_screen ||
+    VILAN_REQUIRE_GFX=1 cargo nextest run -p vilan-cli --test gfx_window --test ui_screen \
+        --test ui_interaction ||
         status=$?
     return "$status"
 }

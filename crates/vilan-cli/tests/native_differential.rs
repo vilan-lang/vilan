@@ -17416,6 +17416,74 @@ const UI_PROBE: &str = concat!(
     "}\n",
 );
 
+/// native-ui.md P3: an interactive `std::ui` program — a style condition, an
+/// event attribute, a signal-bound text, a scroll, a mounted window — lowers
+/// onto the host's style layers, its handler table (a `|| void` callback per
+/// event, crossing as an `Rc<dyn Fn()>`), its text runs, its scroll and its
+/// mount. Emitted with `--stdout`, as P2's probe is (the run is
+/// `ui_interaction.rs`'s).
+#[test]
+fn ui_p3_an_interactive_ui_program_lowers_onto_the_hosts_layers_handlers_and_mount() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_ui_p3.vl"), UI_P3_PROBE)
+        .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_ui_p3.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    assert!(
+        emitted.status.success(),
+        "the std::ui P3 probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    for call in [
+        "vilan_rt_gfx::host::ui::style_group(&",
+        "vilan_rt_gfx::host::ui::style_layer(&",
+        "vilan_rt_gfx::host::ui::style_color(&",
+        "vilan_rt_gfx::host::ui::style_end(&",
+        "vilan_rt_gfx::host::ui::on(&",
+        "vilan_rt_gfx::host::ui::append_text(&",
+        "vilan_rt_gfx::host::ui::set_run(&",
+        "vilan_rt_gfx::host::ui::set_offset(&",
+        "vilan_rt_gfx::host::ui::on_offset(&",
+        "vilan_rt_gfx::host::ui::set_focusable(&",
+        "vilan_rt_gfx::host::ui::mount(",
+        "vilan_rt_gfx::host::event_current(",
+    ] {
+        assert!(source.contains(call), "no {call}:\n{source}");
+    }
+}
+
+const UI_P3_PROBE: &str = concat!(
+    "import std::gfx::{ Color, Point, Scroll, Window, dp };\n",
+    "import std::io::print;\n",
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "import std::ui::{ Style, column, hovered, mount, row, scroll, style, text };\n",
+    "\n",
+    "fun main() {\n",
+    "\tmatch Window::builder().title(\"probe\").open() {\n",
+    "\t\tOk(let window) => {\n",
+    "\t\t\tlet count: SignalCell<i32> = Signal::new(0);\n",
+    "\t\t\tlet offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));\n",
+    "\t\t\tlet look = style().when(hovered(), |look: Style| look.background(Color::white()));\n",
+    "\t\t\tmount(window, <column>\n",
+    "\t\t\t\t<text>{count.derive(|value: i32| i\"{value}\")}</text>\n",
+    "\t\t\t\t<row style(look) focusable on_click(|| count.set(count.get() + 1))>\"Add\"</row>\n",
+    "\t\t\t\t<scroll offset(offset) on_scroll(|wheel: Scroll| print(wheel.y.value()))><column /></scroll>\n",
+    "\t\t\t</column>);\n",
+    "\t\t},\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
 const GFX_SYNC_PROBE: &str = concat!(
     "import std::gfx::{ TextLayout, TextStyle };\n",
     "import std::io::print;\n",

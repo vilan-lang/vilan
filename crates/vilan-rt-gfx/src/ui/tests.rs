@@ -532,15 +532,16 @@ fn a_measured_width_is_reused_for_the_final_width_without_reshaping() {
         Content::Text(content) => content.shapings,
         _ => panic!("a text element"),
     };
-    // Its min-content width (a word a line) and its one line, which answers
-    // the max-content width, the definite width offered, and the final one.
-    assert_eq!(shapings(&fixture), 2);
+    // Its one line, which answers the max-content width, the definite width
+    // offered, and the final one. (No min-content width: the root's cell is
+    // the viewport's fixed size, so nothing asks the root's smallest size.)
+    assert_eq!(shapings(&fixture), 1);
     let mut builder = SceneBuilder::new();
     fixture
         .tree
         .paint(column, &mut builder, &mut fixture.text)
         .unwrap();
-    assert_eq!(shapings(&fixture), 2, "painting reshapes nothing");
+    assert_eq!(shapings(&fixture), 1, "painting reshapes nothing");
 }
 
 #[test]
@@ -1020,5 +1021,834 @@ fn the_outline_lists_every_element_in_paint_order_with_its_depth() {
             (2, "text", None),
             (1, "image", Some("logo".to_string())),
         ]
+    );
+}
+
+// ================================================================ part P3 ===
+
+/// The commands a root paints, flattened, as text: two paints compare equal
+/// exactly when they draw the same thing.
+fn painted(fixture: &mut Fixture, root: NodeId) -> String {
+    let mut builder = SceneBuilder::new();
+    fixture
+        .tree
+        .paint(root, &mut builder, &mut fixture.text)
+        .unwrap();
+    let text = format!("{:?}", flatten(&builder.finish().unwrap()));
+    // Which text system shaped a run is not what it draws.
+    let mut kept = String::new();
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("system: ") {
+        kept.push_str(&rest[..at]);
+        rest = rest[at..].trim_start_matches("system: ");
+        rest = rest.trim_start_matches(|character: char| character.is_ascii_digit());
+    }
+    kept.push_str(rest);
+    kept
+}
+
+/// A small screen with boxes at fractional dp positions, which snap
+/// differently at every scale.
+fn fractional_screen(fixture: &mut Fixture) -> NodeId {
+    let root = fixture.element(ElementKind::Column);
+    fixture.tree.set_gap(root, 3.3).unwrap();
+    fixture.tree.set_padding(root, Edges::all(5.5)).unwrap();
+    for (index, words) in ["first line", "second", "third and last"]
+        .iter()
+        .enumerate()
+    {
+        let row = fixture.element(ElementKind::Row);
+        fixture.tree.set_gap(row, 7.7).unwrap();
+        let label = fixture.paragraph(words, 11.0 + index as f32);
+        let mark = fixture.block(9.4, 6.2);
+        fixture
+            .tree
+            .set_background(mark, Color::new(1.0, 0.0, 0.0, 1.0));
+        fixture.add(row, &[label, mark]);
+        fixture.add(root, &[row]);
+    }
+    root
+}
+
+#[test]
+fn a_kept_scene_after_a_rescale_draws_what_a_fresh_paint_draws() {
+    let mut kept = Fixture::new();
+    let root = fractional_screen(&mut kept);
+    kept.layout_at(root, 200.0, 120.0, 1.0);
+    painted(&mut kept, root);
+    kept.layout_at(root, 200.0, 120.0, 1.5);
+    let after_rescale = painted(&mut kept, root);
+    let mut fresh = Fixture::new();
+    let fresh_root = fractional_screen(&mut fresh);
+    fresh.layout_at(fresh_root, 200.0, 120.0, 1.5);
+    assert_eq!(after_rescale, painted(&mut fresh, fresh_root));
+}
+
+// ------------------------------------------------- dirty marking scope ---
+
+/// A column of `count` rows, each a row of a label and a value text: the
+/// list's shape. Answers the column and each row's value text.
+fn list(fixture: &mut Fixture, count: usize) -> (NodeId, Vec<NodeId>) {
+    let column = fixture.element(ElementKind::Column);
+    let mut values = Vec::new();
+    for index in 0..count {
+        let row = fixture.element(ElementKind::Row);
+        fixture.tree.set_gap(row, 8.0).unwrap();
+        let label = fixture.paragraph(&format!("Row {index}"), 10.0);
+        fixture.tree.set_grow(label, 1.0).unwrap();
+        let value = fixture.paragraph("000", 10.0);
+        fixture.add(row, &[label, value]);
+        fixture.add(column, &[row]);
+        values.push(value);
+    }
+    (column, values)
+}
+
+fn paint_stats(fixture: &mut Fixture, root: NodeId) -> PassStats {
+    let mut builder = SceneBuilder::new();
+    fixture
+        .tree
+        .paint(root, &mut builder, &mut fixture.text)
+        .unwrap();
+    fixture.tree.last_pass()
+}
+
+#[test]
+fn a_text_change_measures_that_text_alone_and_repaints_its_chain() {
+    let mut fixture = Fixture::new();
+    let (column, values) = list(&mut fixture, 50);
+    fixture.layout(column, 300.0, 2000.0);
+    paint_stats(&mut fixture, column);
+    fixture.tree.set_run(values[20], 0, "999").unwrap();
+    assert!(fixture.layout(column, 300.0, 2000.0), "the solver ran");
+    let stats = paint_stats(&mut fixture, column);
+    // The changed text (at the several widths its row asks), and nothing
+    // else: none of the other 99 texts is measured again.
+    assert_eq!(fixture.tree.last_measured(), [values[20]], "{stats:?}");
+    assert_eq!(stats.moved, 0, "the same width: no box moved");
+    // The text's scene, its row's, the column's: three of 151 elements.
+    assert_eq!(stats.rebuilt, 3, "{stats:?}");
+}
+
+#[test]
+fn a_paint_only_change_repaints_without_a_solve_and_only_its_chain() {
+    let mut fixture = Fixture::new();
+    let (column, values) = list(&mut fixture, 20);
+    fixture.layout(column, 300.0, 1000.0);
+    paint_stats(&mut fixture, column);
+    let row = fixture.tree.children(column)[7];
+    fixture
+        .tree
+        .set_background(row, Color::new(1.0, 0.0, 0.0, 1.0));
+    assert!(!fixture.layout(column, 300.0, 1000.0), "no solve");
+    assert_eq!(
+        paint_stats(&mut fixture, column).rebuilt,
+        2,
+        "the row and the column"
+    );
+    // Nothing changed: the kept root scene, nothing rebuilt.
+    assert!(!fixture.layout(column, 300.0, 1000.0));
+    assert_eq!(paint_stats(&mut fixture, column).rebuilt, 0);
+    // The same text again is no change at all.
+    fixture.tree.set_run(values[3], 0, "000").unwrap();
+    assert!(!fixture.layout(column, 300.0, 1000.0));
+    assert_eq!(paint_stats(&mut fixture, column).rebuilt, 0);
+}
+
+#[test]
+fn a_re_solve_after_a_resize_measures_only_what_changed() {
+    let mut fixture = Fixture::new();
+    let (column, values) = list(&mut fixture, 40);
+    fixture.layout(column, 300.0, 1000.0);
+    fixture.layout(column, 240.0, 1000.0);
+    fixture.tree.set_run(values[10], 0, "998").unwrap();
+    fixture.layout(column, 240.0, 1000.0);
+    let stats = fixture.tree.last_pass();
+    // The root's cell is the viewport's fixed size: nothing asks the root for
+    // its content's smallest or largest size, so the resize leaves no
+    // question unanswered for this pass (with an `auto` cell it measured all
+    // 80 texts again): the changed row's two texts at most.
+    let row = fixture.tree.children(column)[10];
+    let measured = fixture.tree.last_measured();
+    assert!(
+        !measured.is_empty()
+            && measured
+                .iter()
+                .all(|node| fixture.tree.children(row).contains(node)),
+        "{measured:?} {stats:?}"
+    );
+}
+
+/// Snapping after a solve visits only the solver's dirty chains, the
+/// children they placed, and what moved: the boxes are those of a full snap
+/// after every kind of change.
+#[test]
+fn snapping_only_what_the_solver_re_ran_gives_every_box_a_full_snap_gives() {
+    let mut fixture = Fixture::new();
+    let (column, values) = list(&mut fixture, 12);
+    let boxes = |fixture: &Fixture| {
+        fixture
+            .tree
+            .outline(column)
+            .into_iter()
+            .map(|entry| entry.bounds)
+            .collect::<Vec<_>>()
+    };
+    fixture.layout_at(column, 300.0, 600.0, 1.25);
+    let rows = fixture.tree.children(column);
+    type Step<'step> = Box<dyn Fn(&mut Fixture) + 'step>;
+    let steps: Vec<Step> = vec![
+        Box::new(|fixture| {
+            fixture
+                .tree
+                .set_run(values[2], 0, "a much longer value")
+                .unwrap();
+        }),
+        Box::new(|fixture| {
+            fixture.tree.set_padding(rows[5], Edges::all(9.5)).unwrap();
+        }),
+        Box::new(|fixture| {
+            fixture.tree.set_gap(column, 3.3).unwrap();
+        }),
+        Box::new(|fixture| {
+            fixture.tree.set_grow(values[8], 1.0).unwrap();
+        }),
+        Box::new(|fixture| {
+            let added = fixture.paragraph("late", 13.0);
+            fixture.add(rows[0], &[added]);
+        }),
+    ];
+    for step in steps {
+        step(&mut fixture);
+        fixture.layout_at(column, 300.0, 600.0, 1.25);
+        let incremental = boxes(&fixture);
+        // A full snap: a new scale and back again snaps every box.
+        fixture.layout_at(column, 300.0, 600.0, 2.0);
+        fixture.layout_at(column, 300.0, 600.0, 1.25);
+        assert_eq!(incremental, boxes(&fixture));
+    }
+}
+
+// ------------------------------------------------------- hit testing ---
+
+#[test]
+fn hit_testing_is_back_to_front_and_honours_rounded_corners_and_clips() {
+    let mut fixture = Fixture::new();
+    let stack = fixture.element(ElementKind::Stack);
+    let under = fixture.block(100.0, 100.0);
+    let over = fixture.block(50.0, 50.0);
+    let inner = fixture.block(20.0, 20.0);
+    fixture.add(over, &[inner]);
+    fixture.add(stack, &[under, over]);
+    fixture.layout(stack, 200.0, 200.0);
+    let hit = |fixture: &Fixture, x: f32, y: f32| fixture.tree.hit(stack, Point::new(x, y));
+    assert_eq!(
+        hit(&fixture, 10.0, 10.0),
+        Some(inner),
+        "the innermost, topmost"
+    );
+    assert_eq!(
+        hit(&fixture, 40.0, 40.0),
+        Some(over),
+        "a later sibling is above"
+    );
+    assert_eq!(hit(&fixture, 80.0, 80.0), Some(under));
+    assert_eq!(
+        hit(&fixture, 150.0, 150.0),
+        Some(stack),
+        "the stack's own box"
+    );
+    assert_eq!(hit(&fixture, 250.0, 10.0), None);
+    // A rounded corner is outside the element.
+    fixture.tree.set_corners(under, Corners::all(30.0));
+    assert_eq!(hit(&fixture, 98.0, 98.0), Some(stack));
+    assert_eq!(hit(&fixture, 90.0, 60.0), Some(under));
+    // A child overflowing its parent is hit outside it, unless the parent
+    // clips.
+    let wide = fixture.block(80.0, 10.0);
+    let small = fixture.block(20.0, 20.0);
+    fixture.add(small, &[wide]);
+    let column = fixture.element(ElementKind::Column);
+    fixture.tree.set_align(column, Align::Start).unwrap();
+    fixture.add(column, &[small]);
+    fixture.layout(column, 200.0, 200.0);
+    assert_eq!(fixture.tree.hit(column, Point::new(60.0, 5.0)), Some(wide));
+    fixture.tree.set_clip(small, true);
+    fixture.layout(column, 200.0, 200.0);
+    assert_eq!(
+        fixture.tree.hit(column, Point::new(60.0, 5.0)),
+        Some(column)
+    );
+    assert_eq!(fixture.tree.hit(column, Point::new(10.0, 5.0)), Some(wide));
+}
+
+// ------------------------------------------------------- routing ---
+
+/// A log of the handlers called, and a way to add one that writes it.
+struct Recorder {
+    log: Rc<std::cell::RefCell<Vec<String>>>,
+}
+
+impl Recorder {
+    fn new() -> Recorder {
+        Recorder {
+            log: Rc::new(std::cell::RefCell::new(Vec::new())),
+        }
+    }
+
+    fn listen(&self, fixture: &mut Fixture, node: NodeId, kind: EventKind, name: &str) {
+        let log = Rc::clone(&self.log);
+        let line = format!("{kind:?} {name}");
+        fixture.tree.add_handler(
+            node,
+            kind,
+            Handler::new(move || log.borrow_mut().push(line.clone())),
+        );
+    }
+
+    /// Routes `input` and calls every handler, as the host does when nothing
+    /// stops the event; answers the log and empties it.
+    fn route(&self, fixture: &mut Fixture, root: NodeId, input: Input) -> Vec<String> {
+        let route = fixture.tree.route(root, &input);
+        self.run(fixture, root, route);
+        std::mem::take(&mut *self.log.borrow_mut())
+    }
+
+    fn run(&self, fixture: &mut Fixture, root: NodeId, route: Route) {
+        for step in route.steps {
+            for delivery in &step.deliveries {
+                delivery.handler.call();
+            }
+            if let Some(action) = step.default {
+                let more = fixture.tree.perform(root, action);
+                self.run(fixture, root, more);
+            }
+        }
+    }
+}
+
+/// A root column holding a card holding a button, side by side with a
+/// second button: `(root, card, first, second)`.
+fn buttons(fixture: &mut Fixture) -> (NodeId, NodeId, NodeId, NodeId) {
+    let root = fixture.element(ElementKind::Row);
+    fixture.tree.set_align(root, Align::Start).unwrap();
+    let card = fixture.element(ElementKind::Column);
+    fixture.tree.set_padding(card, Edges::all(10.0)).unwrap();
+    let first = fixture.block(40.0, 20.0);
+    let second = fixture.block(40.0, 20.0);
+    fixture.add(card, &[first]);
+    fixture.add(root, &[card, second]);
+    fixture.layout(root, 300.0, 100.0);
+    (root, card, first, second)
+}
+
+#[test]
+fn an_event_reaches_its_target_first_then_each_listening_ancestor() {
+    let mut fixture = Fixture::new();
+    let (root, card, first, second) = buttons(&mut fixture);
+    let recorder = Recorder::new();
+    for (node, name) in [(root, "root"), (card, "card"), (first, "first")] {
+        recorder.listen(&mut fixture, node, EventKind::Press, name);
+        recorder.listen(&mut fixture, node, EventKind::Click, name);
+    }
+    recorder.listen(&mut fixture, second, EventKind::Click, "second");
+    // `first` is at (10, 10) in the card at (0, 0).
+    let at = Point::new(20.0, 20.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Pressed(at)),
+        ["Press first", "Press card", "Press root"]
+    );
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(at)),
+        ["Click first", "Click card", "Click root"]
+    );
+    // Pressed on `first`, released on `second`: the click goes to the
+    // innermost element holding both, the root.
+    recorder.route(&mut fixture, root, Input::Pressed(at));
+    let second_at = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(second_at)),
+        ["Click root"]
+    );
+}
+
+#[test]
+fn a_stopped_event_goes_no_further_and_its_default_does_not_happen() {
+    let mut fixture = Fixture::new();
+    let (root, card, first, _) = buttons(&mut fixture);
+    fixture.tree.set_tab_index(first, Some(0));
+    let route = fixture.tree.route(
+        root,
+        &Input::Key {
+            name: "Tab".to_string(),
+            shift: false,
+        },
+    );
+    // Nothing is focused: the root is the target, and the default moves the
+    // focus. A stop is the host's (`host::ui`'s `run_route`), which skips
+    // the rest of a stoppable step and its default.
+    assert_eq!(route.steps.len(), 1);
+    assert!(route.steps[0].stoppable);
+    assert_eq!(
+        route.steps[0].default,
+        Some(DefaultAction::MoveFocus { backward: false })
+    );
+    let _ = card;
+}
+
+#[test]
+fn the_pointer_entering_and_leaving_is_told_to_each_element_once() {
+    let mut fixture = Fixture::new();
+    let (root, card, first, second) = buttons(&mut fixture);
+    let recorder = Recorder::new();
+    for (node, name) in [
+        (root, "root"),
+        (card, "card"),
+        (first, "first"),
+        (second, "second"),
+    ] {
+        recorder.listen(&mut fixture, node, EventKind::PointerEnter, name);
+        recorder.listen(&mut fixture, node, EventKind::PointerLeave, name);
+    }
+    let on_first = Point::new(20.0, 20.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerMoved(on_first)),
+        [
+            "PointerEnter root",
+            "PointerEnter card",
+            "PointerEnter first"
+        ],
+        "outermost first"
+    );
+    assert_eq!(
+        recorder.route(
+            &mut fixture,
+            root,
+            Input::PointerMoved(Point::new(21.0, 20.0))
+        ),
+        Vec::<String>::new(),
+        "a move inside tells nobody"
+    );
+    let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerMoved(on_second)),
+        [
+            "PointerLeave first",
+            "PointerLeave card",
+            "PointerEnter second"
+        ],
+        "deepest left first; the root is still under the pointer"
+    );
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerLeft),
+        ["PointerLeave second", "PointerLeave root"]
+    );
+}
+
+// ------------------------------------------------------- conditions ---
+
+fn red() -> Color {
+    Color::new(1.0, 0.0, 0.0, 1.0)
+}
+
+fn blue() -> Color {
+    Color::new(0.0, 0.0, 1.0, 1.0)
+}
+
+/// A conditional layer on `node` setting the background to `color`.
+fn when(fixture: &mut Fixture, node: NodeId, condition: Condition, color: Color) {
+    let group = fixture.tree.style_group(node, None);
+    let layer = fixture
+        .tree
+        .style_layer(node, group, Some(condition))
+        .unwrap();
+    fixture
+        .tree
+        .set_style_fields(node, layer, |fields| fields.background = Some(color));
+    fixture.tree.restyle(node);
+}
+
+#[test]
+fn each_condition_applies_while_it_holds_and_repaints_its_element_alone() {
+    let mut fixture = Fixture::new();
+    let (root, card, first, second) = buttons(&mut fixture);
+    fixture.tree.set_tab_index(first, Some(0));
+    fixture.tree.set_background(first, blue());
+    let hovered = Condition {
+        hovered: true,
+        ..Condition::default()
+    };
+    let pressed = Condition {
+        pressed: true,
+        ..Condition::default()
+    };
+    let focused = Condition {
+        focused: true,
+        ..Condition::default()
+    };
+    when(&mut fixture, first, hovered, red());
+    when(&mut fixture, second, pressed, red());
+    when(&mut fixture, card, focused, red());
+    fixture.layout(root, 300.0, 100.0);
+    paint_stats(&mut fixture, root);
+    let background = |fixture: &Fixture, node| fixture.tree.paint_of(node).background;
+
+    // Hovered: the pointer over `first`.
+    fixture
+        .tree
+        .route(root, &Input::PointerMoved(Point::new(20.0, 20.0)));
+    assert_eq!(background(&fixture, first), Some(red()));
+    assert!(!fixture.layout(root, 300.0, 100.0), "a look: no solve");
+    assert_eq!(
+        paint_stats(&mut fixture, root).rebuilt,
+        3,
+        "first, card, root"
+    );
+    fixture
+        .tree
+        .route(root, &Input::PointerMoved(Point::new(200.0, 90.0)));
+    assert_eq!(background(&fixture, first), Some(blue()), "the base again");
+
+    // Pressed: held while the button is down, wherever the pointer goes.
+    let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    fixture.tree.route(root, &Input::Pressed(on_second));
+    assert_eq!(background(&fixture, second), Some(red()));
+    fixture
+        .tree
+        .route(root, &Input::PointerMoved(Point::new(200.0, 90.0)));
+    assert_eq!(background(&fixture, second), Some(red()), "still down");
+    fixture
+        .tree
+        .route(root, &Input::Released(Point::new(200.0, 90.0)));
+    assert_eq!(background(&fixture, second), None);
+
+    // Focused: on the element that holds the focus only — not its parent.
+    fixture.tree.focus(Some(first));
+    assert_eq!(background(&fixture, card), None, "the card is not focused");
+    fixture.tree.focus(Some(card));
+    assert_eq!(background(&fixture, card), Some(red()));
+}
+
+#[test]
+fn a_window_width_condition_follows_the_layout_width() {
+    let mut fixture = Fixture::new();
+    let root = fixture.element(ElementKind::Column);
+    fixture.tree.set_align(root, Align::Start).unwrap();
+    let text = fixture.paragraph("abc", 10.0);
+    fixture.add(root, &[text]);
+    let group = fixture.tree.style_group(text, None);
+    let narrow = fixture
+        .tree
+        .style_layer(
+            text,
+            group,
+            Some(Condition {
+                window_below: Some(200.0),
+                ..Condition::default()
+            }),
+        )
+        .unwrap();
+    fixture
+        .tree
+        .set_style_fields(text, narrow, |fields| fields.text.size = Some(20.0));
+    fixture.tree.restyle(text);
+    fixture.layout(root, 300.0, 100.0);
+    assert_eq!(fixture.rect(text).2.round(), 18.0, "three 6 dp advances");
+    // A text size is a shaping field: the narrow window lays it out again.
+    assert!(fixture.layout(root, 150.0, 100.0));
+    assert_eq!(fixture.rect(text).2.round(), 36.0);
+    assert!(fixture.layout(root, 300.0, 100.0));
+    assert_eq!(fixture.rect(text).2.round(), 18.0);
+}
+
+#[test]
+fn a_conditions_fields_win_over_the_unconditional_ones_in_any_order() {
+    let mut fixture = Fixture::new();
+    let node = fixture.block(10.0, 10.0);
+    let hovered = Condition {
+        hovered: true,
+        ..Condition::default()
+    };
+    // The condition is written first, an unconditional background after it
+    // (a later `style` call: a later group).
+    when(&mut fixture, node, hovered, red());
+    let later = fixture.tree.style_group(node, None);
+    let layer = fixture.tree.style_layer(node, later, None).unwrap();
+    fixture
+        .tree
+        .set_style_fields(node, layer, |fields| fields.background = Some(blue()));
+    fixture.tree.restyle(node);
+    fixture.layout(node, 50.0, 50.0);
+    fixture
+        .tree
+        .route(node, &Input::PointerMoved(Point::new(5.0, 5.0)));
+    assert_eq!(fixture.tree.paint_of(node).background, Some(red()));
+}
+
+#[test]
+fn a_style_group_written_again_replaces_only_its_own_layers() {
+    let mut fixture = Fixture::new();
+    let node = fixture.block(10.0, 10.0);
+    let kept = fixture.tree.style_group(node, None);
+    let layer = fixture.tree.style_layer(node, kept, None).unwrap();
+    fixture.tree.set_style_fields(node, layer, |fields| {
+        fields.corners = Some(Corners::all(3.0))
+    });
+    let bound = fixture.tree.style_group(node, None);
+    let layer = fixture.tree.style_layer(node, bound, None).unwrap();
+    fixture
+        .tree
+        .set_style_fields(node, layer, |fields| fields.background = Some(red()));
+    fixture.tree.restyle(node);
+    // The bound style writes a value without a background.
+    fixture.tree.style_group(node, Some(bound));
+    let layer = fixture.tree.style_layer(node, bound, None).unwrap();
+    fixture
+        .tree
+        .set_style_fields(node, layer, |fields| fields.opacity = Some(0.5));
+    fixture.tree.restyle(node);
+    let paint = fixture.tree.paint_of(node);
+    assert_eq!(paint.background, None, "the old value's background went");
+    assert_eq!(paint.opacity, 0.5);
+    assert_eq!(paint.corners, Corners::all(3.0), "the other group stays");
+}
+
+// ------------------------------------------------------------ focus ---
+
+#[test]
+fn the_tab_order_is_positive_indices_first_then_tree_order_and_wraps() {
+    let mut fixture = Fixture::new();
+    let root = fixture.element(ElementKind::Column);
+    let nodes: Vec<NodeId> = (0..5).map(|_| fixture.block(10.0, 10.0)).collect();
+    fixture.add(root, &nodes);
+    fixture.tree.set_tab_index(nodes[0], Some(0));
+    fixture.tree.set_tab_index(nodes[1], Some(2));
+    fixture.tree.set_tab_index(nodes[2], Some(-1));
+    fixture.tree.set_tab_index(nodes[3], Some(1));
+    fixture.tree.set_tab_index(nodes[4], Some(0));
+    assert_eq!(
+        fixture.tree.tab_order(root),
+        [nodes[3], nodes[1], nodes[0], nodes[4]],
+        "1, 2, then the zeros in tree order; -1 is not reached"
+    );
+    fixture.layout(root, 100.0, 100.0);
+    let recorder = Recorder::new();
+    let tab = |shift| Input::Key {
+        name: "Tab".to_string(),
+        shift,
+    };
+    recorder.route(&mut fixture, root, tab(false));
+    assert_eq!(fixture.tree.focused(), Some(nodes[3]), "the first");
+    recorder.route(&mut fixture, root, tab(true));
+    assert_eq!(
+        fixture.tree.focused(),
+        Some(nodes[4]),
+        "back wraps to the last"
+    );
+    recorder.route(&mut fixture, root, tab(false));
+    assert_eq!(fixture.tree.focused(), Some(nodes[3]), "forward wraps");
+    // A focused element with -1 is outside the order: Tab starts again.
+    fixture.tree.focus(Some(nodes[2]));
+    recorder.route(&mut fixture, root, tab(false));
+    assert_eq!(fixture.tree.focused(), Some(nodes[3]));
+}
+
+#[test]
+fn a_press_focuses_the_nearest_focusable_and_keys_go_to_the_focus() {
+    let mut fixture = Fixture::new();
+    let (root, card, first, second) = buttons(&mut fixture);
+    fixture.tree.set_tab_index(card, Some(0));
+    let recorder = Recorder::new();
+    recorder.listen(&mut fixture, card, EventKind::Focus, "card");
+    recorder.listen(&mut fixture, card, EventKind::Blur, "card");
+    recorder.listen(&mut fixture, card, EventKind::Key, "card");
+    recorder.listen(&mut fixture, root, EventKind::Key, "root");
+    // `first` is not focusable; its parent the card is.
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Pressed(Point::new(20.0, 20.0))),
+        ["Focus card"]
+    );
+    assert_eq!(fixture.tree.focused(), Some(card));
+    assert!(fixture.tree.interaction(card).focused);
+    assert_eq!(
+        recorder.route(
+            &mut fixture,
+            root,
+            Input::Key {
+                name: "a".to_string(),
+                shift: false
+            }
+        ),
+        ["Key card", "Key root"],
+        "to the focus, then up"
+    );
+    // A press on nothing focusable takes the focus away.
+    let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Pressed(on_second)),
+        ["Blur card"]
+    );
+    assert_eq!(fixture.tree.focused(), None);
+    assert_eq!(
+        recorder.route(
+            &mut fixture,
+            root,
+            Input::Key {
+                name: "a".to_string(),
+                shift: false
+            }
+        ),
+        ["Key root"],
+        "no focus: the root"
+    );
+    let _ = first;
+}
+
+// ------------------------------------------------------------ scroll ---
+
+/// A 100 x 100 scroll over a column of ten 50 dp rows: `(scroll, rows)`.
+fn scrolled_list(fixture: &mut Fixture) -> (NodeId, Vec<NodeId>) {
+    let scroll = fixture.element(ElementKind::Scroll);
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Width, Length::Dp(100.0))
+        .unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Height, Length::Dp(100.0))
+        .unwrap();
+    let column = fixture.element(ElementKind::Column);
+    let rows: Vec<NodeId> = (0..10).map(|_| fixture.block(100.0, 50.0)).collect();
+    fixture.add(column, &rows);
+    fixture.add(scroll, &[column]);
+    let root = fixture.element(ElementKind::Stack);
+    fixture.add(root, &[scroll]);
+    fixture.layout(root, 300.0, 300.0);
+    (scroll, rows)
+}
+
+#[test]
+fn a_scroll_clips_its_child_and_moves_it_by_its_offset_without_a_layout() {
+    let mut fixture = Fixture::new();
+    let (scroll, rows) = scrolled_list(&mut fixture);
+    let root = fixture.tree.root_of(scroll);
+    assert_eq!(
+        fixture.rect(rows[9]),
+        (0.0, 450.0, 100.0, 50.0),
+        "laid out whole"
+    );
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(0.0, 400.0))
+    );
+    paint_stats(&mut fixture, root);
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 120.0))
+        .unwrap();
+    assert!(!fixture.layout(root, 300.0, 300.0), "no solve");
+    assert_eq!(
+        paint_stats(&mut fixture, root).rebuilt,
+        2,
+        "the scroll and the root"
+    );
+    let mut builder = SceneBuilder::new();
+    fixture
+        .tree
+        .paint(root, &mut builder, &mut fixture.text)
+        .unwrap();
+    let commands = flatten(&builder.finish().unwrap());
+    let clip = commands.iter().position(|command| {
+        matches!(command, Command::PushClip { bounds, .. } if *bounds == Rect::new(0.0, 0.0, 100.0, 100.0))
+    });
+    let moved = commands.iter().position(|command| {
+        matches!(command, Command::PushTransform(transform) if *transform == Transform::translate(0.0, -120.0))
+    });
+    assert!(
+        clip.is_some() && moved > clip,
+        "clipped, then moved: {commands:?}"
+    );
+    // Clamped to the range.
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(30.0, 900.0))
+        .unwrap();
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(0.0, 400.0)),
+        "a vertical scroll does not move across, and stops at its range"
+    );
+}
+
+#[test]
+fn hits_inside_a_scroll_follow_its_offset_and_stop_at_its_edge() {
+    let mut fixture = Fixture::new();
+    let (scroll, rows) = scrolled_list(&mut fixture);
+    let root = fixture.tree.root_of(scroll);
+    assert_eq!(
+        fixture.tree.hit(root, Point::new(10.0, 60.0)),
+        Some(rows[1])
+    );
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 120.0))
+        .unwrap();
+    // Content y 180: the fourth row.
+    assert_eq!(
+        fixture.tree.hit(root, Point::new(10.0, 60.0)),
+        Some(rows[3])
+    );
+    // Below the viewport, the rows laid out there are clipped away.
+    assert_eq!(fixture.tree.hit(root, Point::new(10.0, 130.0)), Some(root));
+}
+
+#[test]
+fn the_wheel_scrolls_the_innermost_scroll_that_can_move() {
+    let mut fixture = Fixture::new();
+    let (scroll, _) = scrolled_list(&mut fixture);
+    let root = fixture.tree.root_of(scroll);
+    let recorder = Recorder::new();
+    recorder.listen(&mut fixture, scroll, EventKind::Scroll, "scroll");
+    recorder.listen(&mut fixture, root, EventKind::Scroll, "root");
+    let down = |amount: f32| Input::Scrolled {
+        position: Point::new(10.0, 10.0),
+        delta: Point::new(0.0, -amount),
+    };
+    // It moves: the scroll takes the wheel, the root never hears it.
+    assert_eq!(
+        recorder.route(&mut fixture, root, down(64.0)),
+        ["Scroll scroll"]
+    );
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(0.0, 64.0))
+    );
+    // At the end it cannot move: the wheel bubbles on.
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 400.0))
+        .unwrap();
+    assert_eq!(
+        recorder.route(&mut fixture, root, down(64.0)),
+        ["Scroll scroll", "Scroll root"]
+    );
+    // A wheel move tells the program, once.
+    assert_eq!(
+        fixture.tree.take_offset_notices().len(),
+        0,
+        "a set is not told"
+    );
+    recorder.route(
+        &mut fixture,
+        root,
+        Input::Scrolled {
+            position: Point::new(10.0, 10.0),
+            delta: Point::new(0.0, 32.0),
+        },
+    );
+    assert_eq!(
+        fixture.tree.take_offset_notices().len(),
+        0,
+        "no handler set"
     );
 }
