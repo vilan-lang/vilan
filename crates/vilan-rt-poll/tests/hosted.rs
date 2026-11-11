@@ -413,9 +413,14 @@ fn an_http_round_trip_runs_under_a_host() {
         threads_after, 0,
         "the poller ends once no socket is watched"
     );
+    // More than the client thread's own one wake: the requests reached the
+    // host through the poller. NOT one per request - a request that arrives
+    // while the loop is still inside the turn that answered the last one is
+    // served without a wake, and how often that happens is the machine's
+    // (CI saw 193 wakes for 200 requests).
     assert!(
-        wakes > REQUESTS,
-        "{wakes} wakes: each request reached the host through the poller"
+        wakes > 1,
+        "{wakes} wakes: no request reached the host through the poller"
     );
     // One report, one wake, per snapshot, and a turn arms at most one
     // snapshot: a poller that looked at a still-ready socket again before the

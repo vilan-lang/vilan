@@ -62,7 +62,9 @@ fn no_tracked_file_contains_an_absolute_home_path() {
     );
 }
 
-/// Files that legitimately carry a consumer-mailbox address.
+/// Files that legitimately carry a consumer-mailbox address, by FILE NAME: a
+/// runtime crate outside the workspace (`vilan-rt-webview`, `vilan-rt-gfx`)
+/// carries generated notices of its own under the same name.
 const PERSONAL_MAILBOX_ALLOWLIST: &[(&str, &str)] = &[(
     "THIRD-PARTY-NOTICES.txt",
     "generated from upstream license headers — those addresses are the \
@@ -93,7 +95,7 @@ fn no_tracked_file_publishes_a_personal_mailbox() {
     for (name, text) in tracked_text_files() {
         if PERSONAL_MAILBOX_ALLOWLIST
             .iter()
-            .any(|(allowed, _reason)| *allowed == name.as_str())
+            .any(|(allowed, _reason)| name.rsplit('/').next() == Some(*allowed))
         {
             continue;
         }
@@ -149,7 +151,7 @@ fn no_tracked_file_contains_a_pre_migration_owner_string() {
     for (name, text) in tracked_text_files() {
         if OWNER_STRING_ALLOWLIST
             .iter()
-            .any(|(allowed, _reason)| *allowed == name.as_str())
+            .any(|(allowed, _reason)| name.rsplit('/').next() == Some(*allowed))
         {
             continue;
         }
