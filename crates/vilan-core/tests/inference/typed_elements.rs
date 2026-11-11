@@ -404,6 +404,83 @@ fn a_binding_declared_after_the_element_does_not_shadow_it() {
 }
 
 #[test]
+fn a_guard_capture_shadows_an_element_function() {
+    // B222: the capture of a guard whose blocked path diverges is a binding
+    // from the end of the `if` on, and a tag resolves the way a name written
+    // there would — the capture, a value, hides the `[element]` function, so
+    // `<row>` is a web element. The tag waits for the guard verdict, as the
+    // held-back names do.
+    assert_compiles_and_runs(
+        &with_row(
+            r#"
+            import std::web::ui::{ view, View, render };
+
+            fun show(maybe: Option<i32>) {
+                if !(maybe is Some(let row)) {
+                    ret;
+                }
+                print(render(<row gap("1") />));
+                print(row);
+            }
+
+            fun main() {
+                show(Some(4));
+            }
+            "#,
+        ),
+        "<row gap=\"1\"></row>\n4\n",
+    );
+}
+
+#[test]
+fn a_guard_capture_does_not_shadow_an_element_function_before_the_guard() {
+    // The capture is visible only past the `if`: a tag ahead of it is still
+    // the `[element]` function's, decided with the held-back names all the
+    // same.
+    assert_compiles_and_runs(
+        &with_row(
+            r#"
+            fun show(maybe: Option<i32>) {
+                print(<row wrap />.log);
+                if !(maybe is Some(let row)) {
+                    ret;
+                }
+                print(row);
+            }
+
+            fun main() {
+                show(Some(4));
+            }
+            "#,
+        ),
+        "row wrap\n4\n",
+    );
+}
+
+#[test]
+fn a_capture_of_a_guard_that_does_not_diverge_does_not_shadow_an_element_function() {
+    // The blocked path falls through, so nothing is published: the tag is
+    // the function's.
+    assert_compiles_and_runs(
+        &with_row(
+            r#"
+            fun show(maybe: Option<i32>) {
+                if !(maybe is Some(let row)) {
+                    print("none");
+                }
+                print(<row wrap />.log);
+            }
+
+            fun main() {
+                show(Some(4));
+            }
+            "#,
+        ),
+        "row wrap\n",
+    );
+}
+
+#[test]
 fn a_local_element_function_makes_its_tag_typed() {
     assert_compiles_and_runs(
         r#"

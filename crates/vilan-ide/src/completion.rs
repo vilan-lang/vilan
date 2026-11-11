@@ -2008,10 +2008,10 @@ impl<'a, 'src> Analysis<'a, 'src> {
     fn typed_element_builder(&self, tag: &str, offset: usize) -> Option<Id> {
         let program = self.program;
         let function_id = self.binding_in_scope(tag, self.to_analyzed_offset(offset))?;
-        let function = program.functions.get(&function_id)?;
-        if !function.element {
+        if !program.element_functions.contains(&function_id) {
             return None;
         }
+        let function = program.functions.get(&function_id)?;
         nominal_type_id(program, function.return_type_id?)
     }
 

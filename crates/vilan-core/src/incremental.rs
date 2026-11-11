@@ -951,7 +951,7 @@ pub fn fingerprints(program: &Program) -> Fingerprints {
         let rendered = format!(
             "{signature}|track_caller={}|element={}|async={}|contexts={}|declared={:?}|borrows={:?}|bumps={:?}|{}",
             function.track_caller,
-            function.element,
+            program.element_functions.contains(id),
             function.is_async || program.async_functions.contains(id),
             program.context_dependent_functions.contains(id),
             context_names(program.declared_function_contexts.get(id)),

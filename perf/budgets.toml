@@ -325,33 +325,33 @@ item = "M199"
 subject = "example:browser"
 class = "ci"
 ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0051 of the ceiling at next c1d58aaa where the limit stood at x1.0050"
+reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0006 at next 85ce6095, x1.0011 with M202's fix; a build with the element recording taken out entirely read the same, so the residual is not the per-head work (most likely code layout under one codegen unit, M116)"
 item = "M202"
 
 [[bump]]
 subject = "genapp:46"
 class = "ci"
 ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0080 of the ceiling at next c1d58aaa where the limit stood at x1.0050"
+reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0054 at next 85ce6095, x1.0008 with M202's fix (no tag resolved in a world with no [element] function, heads recorded by a push, Function back to 264 bytes); about x1.0034 of the ceiling, under the limit, but more than +0.05% over the pre-merge count"
 item = "M202"
 
 [[bump]]
 subject = "example:reactive-ui"
 class = "ci"
 ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0048 of the ceiling at next c1d58aaa where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0008 at next 85ce6095, x1.0012 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
 item = "M202"
 
 [[bump]]
 subject = "example:router"
 class = "ci"
 ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0044 of the ceiling at next c1d58aaa where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0012 at next 85ce6095, x1.0012 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
 item = "M202"
 
 [[bump]]
 subject = "example:rpc"
 class = "ci"
 ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12: the analyzer records every element head and resolves its tag as a name, x1.0006 to x1.0015 on the examples and x1.0054 on genapp:46 against next e15985d2, on top of the order's earlier std growth): CI read x1.0044 of the ceiling at next c1d58aaa where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
+reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0013 at next 85ce6095, x1.0011 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
 item = "M202"
