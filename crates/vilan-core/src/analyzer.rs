@@ -1512,6 +1512,10 @@ pub struct Function<'src> {
     /// reachable only through a trait bound, never on a concrete type's own
     /// surface (`proposal/transport-rpc.md` §3.2).
     pub trait_only: bool,
+    /// Declared `[element]` (native-ui.md §12): an element constructor. A tag
+    /// whose name resolves to this function is a TYPED element, lowered onto
+    /// what it returns ([`Analyzer::lower_typed_element`]).
+    pub element: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -4312,6 +4316,41 @@ type ExposeFieldCheck<'src> = (
     Exposure<'src>,
 );
 
+/// native-ui.md §12: one named element's head as the walk saw it — the web
+/// chain `elements.rs` built, `view("tag")` and its links — recorded so the
+/// element can be lowered onto an `[element]` function once its tag resolves
+/// ([`Analyzer::lower_typed_element`]).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+struct ElementHead<'src> {
+    /// The `view("tag")` call's entity.
+    call: Id,
+    tag: &'src str,
+    /// The `"tag"` argument's entity, which a typed head does not pass.
+    tag_argument: Id,
+    /// Where the call's `CallSubject` constraint and its
+    /// `written_call_arguments` row sit, to take the argument out of both.
+    call_constraint: Option<usize>,
+    call_written_arguments: Option<usize>,
+    /// The head's links, in source order.
+    links: Vec<ElementChainLink<'src>>,
+}
+
+/// One link of a named element's chain ([`ElementHead`]).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+struct ElementChainLink<'src> {
+    id: Id,
+    /// What `elements.rs` generated it from, or `None` for a `.method(..)`
+    /// link the head wrote (B620's), spanned by `written`.
+    generated: Option<crate::elements::GeneratedLink<'src>>,
+    written: Span,
+    /// Where its member constraint (`MethodCall`, or a `FieldAccessor` for a
+    /// written bare `.name`) and its `written_call_arguments` row sit.
+    constraint: Option<usize>,
+    written_arguments: Option<usize>,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct Analyzer<'src> {
@@ -6096,6 +6135,19 @@ pub struct Analyzer<'src> {
     // element back (`resolve_method_call`'s `Found` arm reads it); the same
     // call written after the element is not in here and takes any method.
     element_head_links: HashMap<Id, (&'src str, Span)>,
+    // native-ui.md §12: every NAMED element head the walk met, keyed by its
+    // `view` callee's entity — what `lower_typed_element` needs to rewrite the
+    // element's web chain into the typed one once its tag resolves.
+    element_heads: HashMap<Id, ElementHead<'src>>,
+    // native-ui.md §12: the head an entity of an element's chain belongs to —
+    // the head CALL and each link `elements.rs` generated or the head wrote —
+    // valued by the head's callee. A link finds its head through its subject.
+    element_chain_heads: HashMap<Id, Id>,
+    // native-ui.md §12: the links of a TYPED element that are web-only forms,
+    // refused by name when the element lowered. Each resolves to an
+    // `Expr::Error` without a second diagnostic, which keeps the rest of the
+    // chain quiet as B620's refused links do.
+    refused_element_links: HashSet<Id>,
     // E309: every `L <M>(args)` the walk met — E291 reads a spaced `<` after
     // a name as a comparison, so the shape is `(L < M) > (args)` — keyed by
     // the outer `>` binary. Decided after solving: when `L` names a generic
@@ -8517,6 +8569,9 @@ impl<'src> Analyzer<'src> {
             tuple_element_types: HashMap::default(),
             entry_labels: HashMap::default(),
             element_head_links: HashMap::default(),
+            element_heads: HashMap::default(),
+            element_chain_heads: HashMap::default(),
+            refused_element_links: HashSet::default(),
             spaced_generic_calls: HashMap::default(),
             spaced_generic_operands: HashSet::default(),
             deferred_not_a_value: HashMap::default(),
@@ -42553,7 +42608,57 @@ impl<'src> Analyzer<'src> {
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
             }
         }
+        if !self.element_chain_heads.is_empty() {
+            self.record_element_link(id, subject_id, member, head_tag.is_some());
+        }
         None
+    }
+
+    /// native-ui.md §12: when the link `id` belongs to a named element's
+    /// chain — a link `elements.rs` generated, or one the head wrote — its
+    /// record for the typed lowering. Out of the walk's recursion: the member
+    /// and its arguments are already walked.
+    fn record_element_link(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        member: &'src Spanned<Node<'src>>,
+        head_written: bool,
+    ) {
+        let Some(&head) = self.element_chain_heads.get(&subject_id) else {
+            return;
+        };
+        let generated = crate::elements::generated_link(member);
+        if generated.is_none() && !head_written {
+            // Written AFTER the element (`<div />.f()`): the element's value,
+            // whichever lowering, is this call's receiver like any other.
+            return;
+        }
+        // The member's constraint is the last one its arm pushed.
+        let constraint =
+            self.constraints
+                .len()
+                .checked_sub(1)
+                .filter(|&index| match &self.constraints[index] {
+                    Constraint::MethodCall { id: call, .. } => *call == id,
+                    Constraint::FieldAccessor(accessor) => accessor.id == id,
+                    _ => false,
+                });
+        let written_arguments = self
+            .written_call_arguments
+            .len()
+            .checked_sub(1)
+            .filter(|&index| self.written_call_arguments[index].0 == id);
+        self.element_chain_heads.insert(id, head);
+        if let Some(record) = self.element_heads.get_mut(&head) {
+            record.links.push(ElementChainLink {
+                id,
+                generated,
+                written: member.1,
+                constraint,
+                written_arguments,
+            });
+        }
     }
 
     /// `walk_expr_node_inner`'s `Node::Let` arm, out of line (N169): its
@@ -43353,6 +43458,26 @@ impl<'src> Analyzer<'src> {
         // lexical parent.
         self.written_call_arguments
             .push((id, subject_id, argument_ids.clone()));
+        // native-ui.md §12: a named element's head, recorded for the typed
+        // lowering — the web walk itself is untouched.
+        if let Node::StdItem(module, item) = subject.0
+            && crate::elements::is_view_head(module, item)
+            && let ([(Node::String(tag), _)], [tag_argument]) =
+                (arguments.0.as_slice(), argument_ids.as_slice())
+        {
+            self.element_heads.insert(
+                subject_id,
+                ElementHead {
+                    call: id,
+                    tag,
+                    tag_argument: *tag_argument,
+                    call_constraint: Some(self.constraints.len()),
+                    call_written_arguments: Some(self.written_call_arguments.len() - 1),
+                    links: Vec::new(),
+                },
+            );
+            self.element_chain_heads.insert(id, subject_id);
+        }
         // Defer call type-checking to constraint solving.
         self.constraints
             .push(Constraint::CallSubject(CallSubjectConstraint::from_walk(
@@ -44559,6 +44684,7 @@ impl<'src> Analyzer<'src> {
                         .collect(),
                     rpc: function.rpc,
                     trait_only: function.trait_only,
+                    element: function.element,
                 },
             );
             Some(Expr::Function(id))
@@ -60178,6 +60304,12 @@ impl<'src> Analyzer<'src> {
             // instantiates them with. No call spelling names which.
             AmbiguousDefaultHomes(Vec<String>),
         }
+        // native-ui.md §12: a web-only form on a typed element, refused by
+        // name when the element lowered.
+        if self.refused_element_links.contains(&id) {
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        }
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         // A method on a `List::new()` whose element slot is still unknown but has a
         // pending `push`/`run` to fill it must wait: resolving now would type a
@@ -69356,6 +69488,12 @@ impl<'src> Analyzer<'src> {
         let id = constraint.id;
         let subject_id = constraint.subject_id;
         let member_name = constraint.member_name;
+        // native-ui.md §12: a `.name` link written in a typed element's head,
+        // refused by name when the element lowered.
+        if self.refused_element_links.contains(&id) {
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        }
         if !self.expr_id_to_expr_map.contains_key(&subject_id) {
             return Resolution::Deferred;
         }
@@ -70087,6 +70225,163 @@ impl<'src> Analyzer<'src> {
         self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
     }
 
+    /// native-ui.md §12: lower the named element whose head calls `callee`
+    /// onto the `[element]` function its tag names, when it names one —
+    /// `true` if it did, and `false` (nothing touched) for a web element.
+    ///
+    /// The tag resolves as a name written at the tag would, in the element's
+    /// scope at the tag's offset, so a local binding shadows an outer
+    /// `[element]` function and an import or a renamed import reaches one.
+    /// Only a function declared `[element]` makes the element typed: a
+    /// `fun button()` without the marker leaves `<button>` the web element
+    /// it has always been.
+    ///
+    /// The element was walked as its web chain (`elements.rs`); lowering
+    /// rewrites that chain in place into the typed one, before any of it has
+    /// resolved:
+    ///
+    /// - the head `view("row")` becomes `row()` — the callee resolves to the
+    ///   function, spanned by the tag, and the `"row"` argument is dropped;
+    /// - an attribute `.attr("gap", value)` becomes `.gap(value)`, and a bare
+    ///   one `.attr("wrap", "")` becomes `.wrap()`, its method spanned by the
+    ///   written name so an unknown attribute is reported there;
+    /// - a `.child(value)` is already the typed form;
+    /// - an `on:event(..)` item, a `.method(..)` link written in the head and
+    ///   a hyphenated attribute name are web-only forms, each refused by name.
+    fn lower_typed_element(&mut self, callee: Id) -> bool {
+        let Some(head) = self.element_heads.get(&callee) else {
+            return false;
+        };
+        let tag = head.tag;
+        let tag_argument = head.tag_argument;
+        let scope_id = self.get_scope_id_for_entity(callee);
+        let Some(tag_span) = self.span_map.get(&tag_argument).copied() else {
+            return false;
+        };
+        let Some(function_id) = self.resolve_value_name_at(tag, scope_id, tag_span.start) else {
+            return false;
+        };
+        if !self
+            .functions
+            .get(&function_id)
+            .is_some_and(|function| function.element)
+        {
+            return false;
+        }
+        let Some(head) = self.element_heads.remove(&callee) else {
+            return false;
+        };
+        // The callee: the function, spanned by the tag the author wrote.
+        let reference_count = self.reference_count.entry(function_id).or_insert(0);
+        *reference_count += 1;
+        self.expr_id_to_expr_map
+            .insert(callee, Expr::Local(function_id));
+        self.span_map.insert(callee, tag_span);
+        // The call passes no arguments.
+        if let Some(index) = head.call_constraint
+            && let Some(Constraint::CallSubject(constraint)) = self.constraints.get_mut(index)
+            && constraint.call_id == head.call
+        {
+            constraint.argument_ids.clear();
+        }
+        if let Some(index) = head.call_written_arguments
+            && let Some(row) = self.written_call_arguments.get_mut(index)
+        {
+            row.2.clear();
+        }
+        let source = self.source_of_id(callee);
+        for link in head.links {
+            let diagnostics_before = self.diagnostics.len();
+            match link.generated {
+                Some(crate::elements::GeneratedLink::Child) => continue,
+                Some(crate::elements::GeneratedLink::Attribute {
+                    name,
+                    name_span,
+                    bare,
+                }) => {
+                    if !name.contains('-') {
+                        self.retarget_element_attribute(&link, name, name_span, bare);
+                        continue;
+                    }
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: name_span,
+                        msg: format!(
+                            "`{name}` is a hyphenated attribute, which only a web element \
+                             takes: on `<{tag}>`, an attribute is a method of what \
+                             `{tag}()` returns, and no method is named `{name}`"
+                        ),
+                    });
+                }
+                Some(crate::elements::GeneratedLink::Event { span }) => {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "`on:` is the web element's event form: on `<{tag}>`, an event is \
+                             a method of what `{tag}()` returns, written as an attribute \
+                             (`on_press(|| …)`)"
+                        ),
+                    });
+                }
+                None => {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: link.written,
+                        msg: format!(
+                            "a `.method(…)` link is the web element's head form: on \
+                             `<{tag}>`, every head item is an attribute, a method of what \
+                             `{tag}()` returns, written without the dot"
+                        ),
+                    });
+                }
+            }
+            if let Some(source) = source {
+                self.attribute_new_diagnostics(diagnostics_before, source);
+            }
+            self.refused_element_links.insert(link.id);
+        }
+        true
+    }
+
+    /// One attribute of a typed element: `.attr("name", value)` becomes
+    /// `.name(value)`, or `.name()` for a bare attribute (native-ui.md §12).
+    fn retarget_element_attribute(
+        &mut self,
+        link: &ElementChainLink<'src>,
+        name: &'src str,
+        name_span: Span,
+        bare: bool,
+    ) {
+        if let Some(index) = link.constraint
+            && let Some(Constraint::MethodCall {
+                id,
+                member_name,
+                argument_ids,
+                ..
+            }) = self.constraints.get_mut(index)
+            && *id == link.id
+        {
+            *member_name = name;
+            argument_ids.remove(0);
+            if bare {
+                argument_ids.clear();
+            }
+        }
+        if let Some(index) = link.written_arguments
+            && let Some(row) = self.written_call_arguments.get_mut(index)
+        {
+            row.2.remove(0);
+            if bare {
+                row.2.clear();
+            }
+        }
+        self.member_name_spans.insert(link.id, name_span);
+    }
+
     /// `std::<module…>::<item>`'s entity, or `None` when std does not have it.
     /// The modules are walked in order, so `["style", "prelude"]` descends
     /// `std::web::style` and then its `style/prelude.vl` child — the same walk
@@ -70775,6 +71070,13 @@ impl<'src> Analyzer<'src> {
         for (id, module, item) in std::mem::take(&mut self.prepped_std_items) {
             // M110 S6: what the drain mints for a row belongs to the row's item.
             self.id_windows.set_drain_anchor(id);
+            // native-ui.md §12: an element head whose tag names an `[element]`
+            // function is that function's call, not std's `view`. Decided
+            // here, where every import has bound and no local has resolved
+            // yet — the head's callee is about to become one or the other.
+            if self.element_heads.contains_key(&id) && self.lower_typed_element(id) {
+                continue;
+            }
             self.resolve_prepped_std_item(id, module, item);
         }
         let mut guarded_locals = Vec::new();

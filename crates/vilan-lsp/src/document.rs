@@ -20504,6 +20504,60 @@ pub(crate) mod tests {
         }
     }
 
+    // --- native-ui.md §12: a TYPED element's tag -----------------------------
+
+    /// A typed element's builder and constructor, shared by the pins below.
+    const TYPED_ELEMENT_PRELUDE: &str = "struct Row {\n\tlog: str,\n}\n\nimpl Row {\n\tfun gap(self, value: i32): Row {\n\t\tself\n\t}\n\tfun wrap(self): Row {\n\t\tself\n\t}\n}\n\n[element]\nfun row(): Row {\n\tRow { log = \"row\" }\n}\n\n";
+
+    // A typed element's head items are its builder's methods, so they are the
+    // whole vocabulary — undotted, and no HTML attribute, no `on:`.
+    #[test]
+    fn a_typed_element_head_offers_the_builders_methods() {
+        let labels = completions_at_marker(
+            &format!("{TYPED_ELEMENT_PRELUDE}fun main() {{\n\tlet built = <row ~ />;\n}}\n"),
+            '~',
+        );
+        for method in ["gap", "wrap"] {
+            assert!(
+                labels.contains(&method.to_string()),
+                "`{method}` is a Row method: {labels:?}"
+            );
+        }
+        for wrong in ["on:", "class", ".gap", "log", "built"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` is no attribute of a typed element: {labels:?}"
+            );
+        }
+        // The control: the same position on a web tag offers the web forms.
+        let web = completions_at_marker(
+            &format!(
+                "{TYPED_ELEMENT_PRELUDE}{ELEMENT_HEAD_PRELUDE}fun main() {{\n\tlet built = <div ~ />;\n}}\n"
+            ),
+            '~',
+        );
+        assert!(web.contains(&"on:".to_string()), "{web:?}");
+    }
+
+    // The tag IS the constructor's reference: go-to-definition lands on the
+    // `[element]` function and hover shows its signature.
+    #[test]
+    fn definition_and_hover_on_a_typed_tag_reach_its_element_function() {
+        let source =
+            format!("{TYPED_ELEMENT_PRELUDE}fun main() {{\n\tlet built = <row gap(1) />;\n}}\n");
+        let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
+        let offset = source.find("<row").unwrap() + 2;
+        let (_, span) = document
+            .definition(offset)
+            .expect("go-to-definition on the tag should answer");
+        let declared = source.find("fun row").unwrap() + "fun ".len();
+        assert_eq!(span.into_range(), declared..declared + "row".len());
+        let hover = document
+            .hover(offset)
+            .expect("hovering the tag should answer");
+        assert!(hover.contains("fun row(): Row"), "{hover}");
+    }
+
     // E67: a NESTED tag under construction. The unfinished chain link used to
     // flatten its own tag to an error atom and, nested, took the whole
     // statement with it; the head-item recovery keeps both elements alive.

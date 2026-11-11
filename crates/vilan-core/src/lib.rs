@@ -1030,6 +1030,7 @@ fn analyze_source_unfenced(
                     platform_fence: Vec::new(),
                     rpc: false,
                     trait_only: false,
+                    element: false,
                     generic_parameters: None,
                     parameters: (Vec::new(), head),
                     return_type: Some(Box::new((Node::Accessor("Source"), head))),

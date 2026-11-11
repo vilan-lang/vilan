@@ -2600,6 +2600,8 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     // A142 S7: a struct field's store knobs, `[reactive(coarse)]` and
     // `[reactive(name = "..")]` — a field-position attribute, like `expose`.
     "reactive",
+    // native-ui.md §12: an element constructor, `[element] fun row(): Row`.
+    "element",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -2621,7 +2623,7 @@ fn is_known_attribute_marker(name: &str) -> bool {
 ///   `[trait_only]` (8), and the retired `[doc(hidden)]` (9), refused where a
 ///   function's prefix reads it;
 /// - fence: `[platform]` (10);
-/// - class: `[resource]` (11).
+/// - class: `[resource]` and `[element]` (11).
 ///
 /// Ties keep the order they were written in (a `[service]` and a
 /// `[client_service]`, two `[hint]`s). The parser sorts a run into this
@@ -2639,7 +2641,9 @@ pub fn attribute_rank(name: &str) -> u8 {
         "trait_only" => 8,
         "doc" => 9,
         "platform" => 10,
-        "resource" => 11,
+        // Both are the declaration's CLASS, and no declaration takes both:
+        // `[resource]` labels a type, `[element]` a function.
+        "resource" | "element" => 11,
         _ => 0,
     }
 }
@@ -2733,6 +2737,24 @@ impl MarkerUnitKind<'_> {
     }
 }
 
+/// native-ui.md §12: `[element]` on a method (see
+/// [`Parser::check_element_constructor`]).
+const ELEMENT_ON_A_METHOD: &str = "`[element]` marks the function a tag calls by name: it may \
+     label only a free `fun`, and a method is reached through a receiver";
+
+/// `[element]` on an `external fun`.
+const ELEMENT_ON_AN_EXTERNAL: &str = "`[element]` marks the function a tag calls by name: it may \
+     label only a `fun` with a body, and an `external fun` binds a host function";
+
+/// `[element]` on a function that declares parameters.
+const ELEMENT_WITH_PARAMETERS: &str = "an `[element]` function is called by its tag with no \
+     arguments (`<row>` is `row()`): it may declare no parameters; what varies is set through \
+     the methods of what it returns, written as the tag's attributes";
+
+/// `[element]` where no function is declared.
+const ELEMENT_NOT_ON_A_FUNCTION: &str = "`[element]` marks the function a tag calls by name: it \
+     may label only a free `fun`";
+
 /// The declaration word a marker run may end at, as the steer spells it, or
 /// `None` for any other token — where the run is not a declaration's.
 fn declaration_word(token: Option<&Token<'_>>) -> Option<&'static str> {
@@ -2811,7 +2833,7 @@ fn attribute_order_rule(canonical: &str) -> String {
     format!(
         "a declaration's attributes are written in one order — `[derive]` and the other \
          generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, \
-         `[trait_only]`, `[platform]`, `[resource]`: write `{canonical}`"
+         `[trait_only]`, `[platform]`, `[resource]` or `[element]`: write `{canonical}`"
     )
 }
 
@@ -4627,6 +4649,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_misplaced_resource) {
+            return Some(item);
+        }
+        if let Some(item) = self.attempt(Self::parse_misplaced_element) {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_impl) {
@@ -9754,6 +9779,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         let trait_only = self.eat_marker_attribute("trait_only");
         self.refuse_doc_hidden_attribute();
         let platform_fence = self.parse_platform_attribute().unwrap_or_default();
+        let element_start = self.position;
+        let element = self.eat_marker_attribute("element");
+        let element_span = self.span_from(element_start);
         let is_async = self.eat(&Token::Async);
         let external = self.eat(&Token::External);
         self.expect(&Token::Fun)?;
@@ -9808,6 +9836,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             );
         }
         self.reject_misplaced_spread(&parameters.0);
+        if element {
+            self.check_element_constructor(element_span, external, &parameters);
+        }
         // B520: `fun f() -> T` reads as `fun f(): T`, refused at the arrow.
         let mut return_type = if self.eat_op(":") || self.eat_foreign_arrow(ForeignSpelling::Arrow)
         {
@@ -9962,6 +9993,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 track_caller,
                 rpc,
                 trait_only,
+                element,
                 platform_fence,
                 generic_parameters,
                 parameters,
@@ -9973,6 +10005,39 @@ impl<'a, 'src> Parser<'a, 'src> {
             })),
             self.span_from(start),
         ))
+    }
+
+    /// native-ui.md §12: what an `[element]` function must be for a tag to
+    /// call it. The tag `<row>` lowers to `row()`, so the function is reached
+    /// by its NAME with NO arguments: a method is reached through a receiver
+    /// and an `external fun` is a host binding, and neither is a name a tag
+    /// resolves to; a parameter would be an argument no tag can write. Each
+    /// refusal is reported and the declaration still parses, so nothing after
+    /// it cascades.
+    fn check_element_constructor(
+        &mut self,
+        attribute: Span,
+        external: bool,
+        parameters: &Spanned<Vec<Parameter<'src>>>,
+    ) {
+        let (span, reason) = if self.in_member_body {
+            (attribute, ParseErrorReason::Rule(ELEMENT_ON_A_METHOD))
+        } else if external {
+            (attribute, ParseErrorReason::Rule(ELEMENT_ON_AN_EXTERNAL))
+        } else if !parameters.0.is_empty() {
+            (
+                parameters.1,
+                ParseErrorReason::Rule(ELEMENT_WITH_PARAMETERS),
+            )
+        } else {
+            return;
+        };
+        self.errors.push(ParseError {
+            span,
+            reason,
+            context: Vec::new(),
+            hint: None,
+        });
     }
 
     /// `(param, ...)` — a function parameter list (allow-trailing), carrying the
@@ -12238,6 +12303,26 @@ impl<'a, 'src> Parser<'a, 'src> {
         }
         let span = self.span_from(start);
         self.push_misplaced_resource(span);
+        Some((Node::Error, span))
+    }
+
+    /// native-ui.md §12: `[element]` NOT followed by a function — the
+    /// misplaced-attribute steer, read after `fun`/`struct`/`enum` have
+    /// declined (so a valid `[element] fun` is never shadowed), recovering to
+    /// a `Node::Error` spanning the attribute and leaving the item after it
+    /// unconsumed, as [`Parser::parse_misplaced_resource`] does.
+    fn parse_misplaced_element(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        if !self.eat_marker_attribute("element") {
+            return None;
+        }
+        let span = self.span_from(start);
+        self.errors.push(ParseError {
+            span,
+            reason: ParseErrorReason::Rule(ELEMENT_NOT_ON_A_FUNCTION),
+            context: Vec::new(),
+            hint: None,
+        });
         Some((Node::Error, span))
     }
 
@@ -14785,6 +14870,36 @@ mod tests {
             only_item("[internal(\"r\")] [resource] external struct Db;"),
             Node::Struct(_, _, true, true, _, Some(_))
         ));
+    }
+
+    #[test]
+    fn the_element_attribute_marks_a_free_function() {
+        // native-ui.md §12: a marker of the class band, read after `[platform]`.
+        match only_item("[platform(\"browser\")] [element] fun row(): Row { Row {} }") {
+            Node::Func(function) => {
+                assert!(function.element);
+                assert_eq!(function.platform_fence.len(), 1);
+            }
+            other => panic!("expected a function, got {other:?}"),
+        }
+        match only_item("fun row(): Row { Row {} }") {
+            Node::Func(function) => assert!(!function.element),
+            other => panic!("expected a function, got {other:?}"),
+        }
+        // Refused, and the declaration still parses: one error, no cascade.
+        for source in [
+            "[element] fun row(gap: i32): i32 { gap }\n",
+            "impl T {\n\t[element] fun make(): T { T {} }\n}\n",
+            "[element] struct Row {}\n",
+        ] {
+            let (_, errors) = parse(source);
+            assert_eq!(
+                errors.len(),
+                1,
+                "{source:?}: {:?}",
+                errors.iter().map(render).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]
