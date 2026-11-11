@@ -672,6 +672,15 @@ fn call_target(program: &Program, call_id: Id) -> Option<Id> {
     }
 }
 
+/// The per-entry dispatch edges that share one hand-off path
+/// (`dispatch_refine::RefinedEdge::via`): `(caller, callee)` each, the caller
+/// `None` for top-level code. Kept apart from the site-level edges because
+/// who a callee's value comes from along the path is a per-context answer.
+struct EntryCoverageEdges {
+    via: std::rc::Rc<[Id]>,
+    edges: Vec<(Option<Id>, Id)>,
+}
+
 /// The binding an entity resolves to, if it is a direct `Expr::Local`.
 fn local_target(program: &Program, entity_id: Id) -> Option<Id> {
     match program.entity_map.get(&entity_id)? {
@@ -1930,19 +1939,42 @@ fn analyze(
             },
         )
         .collect();
+    // An edge charged at the SITE is the same for every context. A per-ENTRY
+    // edge is not: it charges the caller whose instantiation selects the
+    // callee, on the reading that the value is handed caller → generic body →
+    // callee — and a node on that path (`RefinedEdge::via`) may get its value
+    // from somewhere else in one context and not in another. Those wait for
+    // the per-context loop (`entry_coverage_edges`), grouped by path.
     let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
     let mut coverage_outside: HashSet<Id> = HashSet::default();
+    let mut entry_coverage_edges: Vec<EntryCoverageEdges> = Vec::new();
     for edge in crate::dispatch_refine::refined_edges(program, graph, &refinement_sites) {
-        match edge.caller {
-            crate::dispatch_refine::RefinedCaller::Node(caller) => {
-                coverage_dispatch_callers
-                    .entry(edge.callee)
-                    .or_default()
-                    .push(caller);
+        if edge.via.is_empty() {
+            match edge.caller {
+                crate::dispatch_refine::RefinedCaller::Node(caller) => {
+                    coverage_dispatch_callers
+                        .entry(edge.callee)
+                        .or_default()
+                        .push(caller);
+                }
+                crate::dispatch_refine::RefinedCaller::TopLevel => {
+                    coverage_outside.insert(edge.callee);
+                }
             }
-            crate::dispatch_refine::RefinedCaller::TopLevel => {
-                coverage_outside.insert(edge.callee);
+            continue;
+        }
+        let caller = match edge.caller {
+            crate::dispatch_refine::RefinedCaller::Node(caller) => Some(caller),
+            crate::dispatch_refine::RefinedCaller::TopLevel => None,
+        };
+        match entry_coverage_edges.last_mut() {
+            Some(group) if std::rc::Rc::ptr_eq(&group.via, &edge.via) => {
+                group.edges.push((caller, edge.callee));
             }
+            _ => entry_coverage_edges.push(EntryCoverageEdges {
+                via: edge.via,
+                edges: vec![(caller, edge.callee)],
+            }),
         }
     }
 
@@ -3018,6 +3050,38 @@ fn analyze(
         if let Some(main) = entry_main {
             bound.remove(&main);
         }
+        // The per-entry dispatch edges, settled for THIS context. An entry
+        // edge charges the caller that instantiates a generic body with the
+        // callee, because that caller's value is what the body hands on — up
+        // to the first node on the hand-off path that takes its value from
+        // elsewhere: a `run` body (handed it by `run`), a function declaring
+        // the context (handed it by its own callers, and checked at its
+        // boundary — B242), a `clear` body (handed nothing). From there
+        // inward the callee has whatever THAT node has, so it is the edge's
+        // caller here. Charging the entry regardless refused
+        // `owner_scope.run(owner, || gap.bind(..))` inside a generic for
+        // every caller without an owner of its own, when the body had just
+        // established one.
+        let mut entry_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
+        let mut entry_outside: HashSet<Id> = HashSet::default();
+        for group in &entry_coverage_edges {
+            let establishing = group.via.iter().copied().find(|node| {
+                run_closure_ids.contains(node)
+                    || declared_here.contains(node)
+                    || cleared_here(*node).is_some()
+            });
+            for &(caller, callee) in &group.edges {
+                match establishing.or(caller) {
+                    Some(caller) => entry_dispatch_callers
+                        .entry(callee)
+                        .or_default()
+                        .push(caller),
+                    None => {
+                        entry_outside.insert(callee);
+                    }
+                }
+            }
+        }
         loop {
             let mut removed = false;
             for &id in &strict {
@@ -3040,10 +3104,16 @@ fn analyze(
                     // run); one selected from a top-level call is entered
                     // from outside the graph — uncovered.
                     let callers = graph.callers_of(id);
-                    let through_dispatch = coverage_dispatch_callers.get(&id);
-                    let no_edges =
-                        callers.is_empty() && through_dispatch.is_none_or(|list| list.is_empty());
+                    let through_dispatch = || {
+                        coverage_dispatch_callers
+                            .get(&id)
+                            .into_iter()
+                            .chain(entry_dispatch_callers.get(&id))
+                            .flatten()
+                    };
+                    let no_edges = callers.is_empty() && through_dispatch().next().is_none();
                     if coverage_outside.contains(&id)
+                        || entry_outside.contains(&id)
                         || top_level_targets.contains(&id)
                         || value_taken.contains(&id)
                     {
@@ -3058,10 +3128,7 @@ fn analyze(
                         true
                     } else {
                         callers.iter().all(|caller| bound.contains(&caller.id()))
-                            && through_dispatch
-                                .into_iter()
-                                .flatten()
-                                .all(|caller| bound.contains(caller))
+                            && through_dispatch().all(|caller| bound.contains(caller))
                     }
                 } else if cleared_here(id).is_some() {
                     // B458: a `clear` body runs with the value absent — an
@@ -3107,8 +3174,9 @@ fn analyze(
         // What makes it sound is ONE property of `refined_edges`, stated in its
         // own documentation and load-bearing here: **every fallback widens to
         // the whole candidate list**. A site the refinement cannot resolve —
-        // an opaque binding, a value-taken or dispatch-reachable level whose
-        // entries cannot be enumerated, a receiver-less `OnType` — draws an
+        // an opaque binding, a level whose entries cannot be enumerated (a
+        // function taken as a value, or one a dispatch outside the listed
+        // sites can select), a receiver-less `OnType` — draws an
         // edge to EVERY candidate, so no candidate of an unresolved site is
         // ever mistaken for dead. A node with no refined edge was therefore
         // excluded by a RESOLUTION at every site that lists it, which is a real
