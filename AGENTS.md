@@ -97,6 +97,14 @@ Rust workspace, seventeen crates, plus the language's own tree:
   (`IoSource::interest`, `LoopWaker`); a generated cargo project names this crate only when
   the program starts a server, dials a WebSocket or reads stdin — without it the loop keeps
   its 1 ms tick. Its `unsafe` is the one FFI call per platform, with its reason.
+  The loop can also be HOSTED (native-ui.md R8): `vilan_rt::executor::turn` /
+  `Program::turn` run everything runnable and return what to wait for instead of
+  blocking, the host's wake (`install_host`) is called by every `LoopWaker`, a
+  termination and the socket helper, and `vilan_rt_poll::install_hosted` adds
+  that helper (`Poller`), a thread that exists only while sockets are watched and
+  waits only BETWEEN turns — so program code (window events included) runs only
+  inside a turn. The owned loop (`block_on`, `run_pending`) is the same `drive`
+  in the mode that blocks; `vilan-rt-poll/tests/support` is the reference host.
 - `crates/vilan-rt-webview` — `std::window` for emitted Rust (F1 M2, native-objective.md
   D2/D2a): a desktop window showing a web page in the OS webview, through `wry` + `tao`. NOT a
   workspace member — the root manifest EXCLUDES it, and it keeps its own `Cargo.lock`,
