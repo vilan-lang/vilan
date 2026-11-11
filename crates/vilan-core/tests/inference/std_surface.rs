@@ -9682,3 +9682,108 @@ fn ui_p2_lengths_and_shadows_are_plain_values() {
         "0.25\n5\n0.5\n",
     );
 }
+
+// ------------------------------------------------- native-ui.md part P3 ---
+
+fn ui_p3_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::gfx::{{ Border, Color, KeyPress, Point, Scroll, Size, Window, dp }};
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{
+            Align, Element, Length, ScrollAxis, Style, column, deliver, focused, hovered,
+            layout, mount, mount_root, pressed, row, scroll, stop_event, style, text,
+            window_at_least, window_below,
+        }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+/// The six constructors are `[element]` functions: their tags lower onto
+/// std::ui's builders — a bare attribute, an event, a signal hole, a scroll —
+/// and the program checks.
+#[test]
+fn ui_p3_std_uis_tags_lower_onto_its_builders_and_check_clean() {
+    let body = r#"
+        let count: SignalCell<i32> = Signal::new(0);
+        let offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
+        let gap: SignalCell<Length> = Signal::new(Length::Auto);
+        let screen = <column padding(dp(16)) gap(dp(8)) align(Align::Center)>
+            <text style(style().when(hovered(), |look: Style| look.weight(700)))>{count.derive(|value: i32| i"{value}")}</text>
+            <row width(gap) focusable tab_index(2) on_click(|| count.set(count.get() + 1)) on_key(|key: KeyPress| stop_event())>
+                "Add one"
+            </row>
+            <scroll axis(ScrollAxis::Vertical) offset(offset) on_scroll(|wheel: Scroll| print(wheel.y.value()))>
+                <column wrap>"a" "b"</column>
+            </scroll>
+        </column>;
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+        print(screen.element().interaction().hovered);
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_p3_program(body)) {
+        panic!("std::ui's tags must check: {errors:#?}");
+    }
+}
+
+/// A handler of the wrong shape is the attribute method's ordinary mismatch:
+/// `on_key` hands its handler the key.
+#[test]
+fn ui_p3_an_event_attribute_takes_a_handler_of_its_shape() {
+    let errors = f1_m2_check(&ui_p3_program(
+        r#"let button = <row on_key(|| print("key"))>"x"</row>;"#,
+    ))
+    .expect_err("a key handler must take the key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("on_key") || error.contains("KeyPress")),
+        "{errors:#?}"
+    );
+}
+
+/// A tag in a file that imports none of std::ui's constructors keeps the web
+/// lowering, byte for byte: `<text>` and `<image>` are the web UI's there.
+#[test]
+fn ui_p3_a_file_that_imports_no_ui_constructor_keeps_text_and_image_web() {
+    let web =
+        "fun main() {\n\tlet a = <text>\"hi\"</text>;\n\tlet b = <image src(\"x.png\") />;\n}\n";
+    assert_compiles(web);
+    // The same `<text>` with std::ui's `text` imported is the typed element:
+    // a native program, refused by the JavaScript build by name.
+    assert_fails_with(
+        "import std::ui::text;\n\nfun main() {\n\tlet a = <text>\"hi\"</text>;\n}\n",
+        "this program reaches `std::ui` (its `__ui_",
+    );
+}
+
+/// `when` adds a conditional style; a `when` inside a `when` applies while
+/// both hold; `+` keeps both sides' conditions in order. Plain vilan: it runs
+/// on the JavaScript backend.
+#[test]
+fn ui_p3_style_conditions_are_plain_values_and_compose() {
+    assert_compiles_and_runs(
+        &ui_p3_program(
+            r#"
+            let look = style()
+                .background(Color::white())
+                .when(hovered(), |look: Style| look
+                    .background(Color::rgb(0, 0, 255))
+                    .when(pressed(), |inner: Style| inner.weight(700)))
+                .when(window_below(dp(400)), |look: Style| look.radius(dp(0)));
+            print(look.conditions.len());
+            print(look.conditions[1].conditions.len());
+            print(look.conditions[1].style.weight.unwrap());
+            print(look.conditions[0].style.conditions.len());
+            let both = look + style().when(focused(), |look: Style| look.border(Border::all(dp(2), Color::black())));
+            print(both.conditions.len());
+            print(both.conditions[3].style.border.is_some());
+            print(style().when(window_at_least(dp(600)), |look: Style| look).unconditional().conditions.len());
+            "#,
+        ),
+        "3\n2\n700\n0\n4\ntrue\n0\n",
+    );
+}

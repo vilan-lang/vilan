@@ -5,8 +5,9 @@
 //! chain. Every other tag keeps the web lowering (`view("tag")` and its
 //! string-keyed links), which the corpus goldens hold byte for byte.
 //!
-//! Each fixture declares its own small builder: std declares no `[element]`
-//! function yet.
+//! Each fixture declares its own small builder, so a pin does not move with
+//! `std::ui`'s (whose six constructors are `[element]` since native-ui.md P3;
+//! its tags are proven by `crates/vilan-cli/tests/ui_interaction.rs`).
 
 use super::support::*;
 

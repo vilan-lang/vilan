@@ -108,6 +108,10 @@ external fun gfx_event_integer(index: i32): i32;
 [extern("__gfx_event_text")]
 external fun gfx_event_text(): str;
 
+/// The kind of the event being delivered right now, or -1 when none is.
+[extern("__gfx_event_current")]
+external fun gfx_event_current(): i32;
+
 [extern("__gfx_frame_token")]
 external fun gfx_frame_token(): u32;
 
@@ -1138,6 +1142,19 @@ fun read_event(kind: i32): Event {
 		}),
 		9 => Event::ScaleChanged(gfx_event_number(0)),
 		_ => Event::CloseRequested,
+	}
+}
+
+/// The event being delivered right now: inside a window's event callback, the one
+/// it was handed; inside a `std::ui` element's handler, the window event that
+/// reached the element (`on_scroll` and the other handlers that take a value read
+/// theirs from it). `None` anywhere else.
+export fun current_event(): Option<Event> {
+	let kind = gfx_event_current();
+	if kind < 0 {
+		None
+	} else {
+		Some(read_event(kind))
 	}
 }
 

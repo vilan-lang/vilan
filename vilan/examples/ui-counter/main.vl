@@ -1,0 +1,417 @@
+// The counter of native-ui.md section 4.1, built on `std::ui` (part P3): a count
+// bound to a `Signal`, and two buttons — "Add one" and "Reset" — whose looks the
+// app supplies as style conditions: lighter under the pointer, darker while
+// pressed, ringed while focused. A click, or Enter or Space on the focused
+// button, runs it; Tab and Shift+Tab move the focus between the two.
+//
+// Nothing here redraws by hand: the count's text, the buttons' looks and the
+// focus ring are bound, and each change asks the window for one frame that lays
+// out and paints only what changed. An idle window draws nothing.
+//
+// Modes, for the end-to-end test:
+//
+//   --smoke         print the buttons' boxes after the first frame, a line per
+//                   frame (what it shows, and what it took), and a line per
+//                   handler; once the count is 1 and the pointer has moved to the
+//                   window's top-left corner, count the frames of an idle second
+//   --check --font <ttf>
+//                   no window: build the screen in both spellings (tags, and the
+//                   builder calls they lower to) and compare their boxes, then
+//                   drive the tree with `deliver` and print what each event did
+
+import std::display::Display;
+import std::fs::read_bytes;
+import std::gfx::{
+	Border,
+	Button,
+	Color,
+	Event,
+	FontFamily,
+	Frame,
+	KeyName,
+	KeyPress,
+	Modifiers,
+	Point,
+	Pointer,
+	Size,
+	Window,
+	dp,
+	register_font,
+};
+import std::io::print;
+import std::process::{ args, exit };
+import std::range::Range;
+import std::reactive::{ Signal, SignalCell };
+import std::shared::Shared;
+import std::time::sleep;
+import std::ui::{
+	Align,
+	Element,
+	Interaction,
+	Justify,
+	OutlineEntry,
+	Role,
+	Style,
+	column,
+	deliver,
+	draw,
+	focused,
+	hovered,
+	last_frame,
+	layout,
+	mount,
+	pressed,
+	row,
+	stop_event,
+	style,
+	text,
+	window_below,
+};
+
+/// The app's button look — `std::ui` has none of its own: blue, lighter under the
+/// pointer, darker while pressed, and ringed in amber while it has the focus. The
+/// ring is a border, drawn inside the box, so it moves nothing.
+fun button_look(): Style {
+	let blue = Color::rgb(45, 95, 230);
+	style()
+		.background(blue)
+		.radius(dp(8))
+		.text_color(Color::white())
+		.border(Border::all(dp(2), blue))
+		.when(hovered(), |look: Style| look.background(Color::rgb(70, 120, 250)))
+		.when(pressed(), |look: Style| look.background(Color::rgb(28, 70, 190)))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), Color::rgb(255, 196, 60))))
+}
+
+/// Enter and Space press a focused button, as a platform button does.
+fun activates(key: KeyPress): bool {
+	match key.key {
+		KeyName::Enter => true,
+		KeyName::Char(let typed) => typed == " ",
+		_ => false,
+	}
+}
+
+/// A button: a focusable row with the app's look, running `action` on a click or
+/// on Enter or Space while it has the focus. `log` hears what it did.
+fun button(name: str, log: |str| void, action: || void): Element {
+	<row
+		padding_x(dp(18))
+		padding_y(dp(10))
+		justify(Justify::Center)
+		style(button_look())
+		role(Role::Button)
+		label(name)
+		focusable
+		on_click(|| {
+			log(i"click {name}");
+			action();
+		})
+		on_key(|key: KeyPress| {
+			if activates(key) {
+				log(i"key {name}");
+				action();
+				// Handled here: the screen's own key handler does not hear it.
+				stop_event();
+			}
+		})
+	>
+		{name}
+	</row>.element()
+}
+
+/// The count's look: smaller in a narrow window.
+fun count_look(): Style {
+	style()
+		.text_size(dp(28))
+		.weight(700)
+		.when(window_below(dp(300)), |look: Style| look.text_size(dp(18)))
+}
+
+fun screen_look(font: str): Style {
+	let base = if font == "" { style() } else { style().font(FontFamily::Named(font)) };
+	base.background(Color::rgb(244, 244, 240)).text_color(Color::rgb(30, 30, 40))
+}
+
+/// The screen, in tags: the count above the two buttons, centred. The screen
+/// itself listens for clicks and keys too, which is how a click on a button is
+/// seen to bubble up to it.
+fun counter(
+	count: SignalCell<i32>,
+	add: Element,
+	reset: Element,
+	font: str,
+	log: |str| void,
+): Element {
+	<column
+		padding(dp(24))
+		gap(dp(16))
+		align(Align::Center)
+		justify(Justify::Center)
+		style(screen_look(font))
+		label("counter")
+		on_click(|| log("click counter"))
+		on_key(|key: KeyPress| log("key counter"))
+	>
+		<text style(count_look()) label("count")>
+			{count.derive(|value: i32| i"Count: {value}")}
+		</text>
+		<row gap(dp(12)) label("buttons")>
+			{add}
+			{reset}
+		</row>
+	</column>.element()
+}
+
+/// The same screen in the builder calls the tags lower to (no handlers: only the
+/// boxes are compared).
+fun counter_in_calls(count: SignalCell<i32>, add: Element, reset: Element, font: str): Element {
+	column()
+		.padding(dp(24))
+		.gap(dp(16))
+		.align(Align::Center)
+		.justify(Justify::Center)
+		.style(screen_look(font))
+		.label("counter")
+		.child(text()
+			.style(count_look())
+			.label("count")
+			.child(count.derive(|value: i32| i"Count: {value}")))
+		.child(row().gap(dp(12)).label("buttons").child(add).child(reset))
+		.element()
+}
+
+fun button_in_calls(name: str): Element {
+	row()
+		.padding_x(dp(18))
+		.padding_y(dp(10))
+		.justify(Justify::Center)
+		.style(button_look())
+		.role(Role::Button)
+		.label(name)
+		.focusable()
+		.child(name)
+		.element()
+}
+
+fun state(element: Element): str {
+	let now: Interaction = element.interaction();
+	mut letters = "";
+	if now.hovered {
+		letters = letters + "h";
+	}
+	if now.pressed {
+		letters = letters + "p";
+	}
+	if now.focused {
+		letters = letters + "f";
+	}
+	if letters == "" {
+		"-"
+	} else {
+		letters
+	}
+}
+
+fun main() {
+	let arguments = args();
+	if arguments.contains("--check") {
+		check(arguments);
+		ret;
+	}
+	let smoke = arguments.contains("--smoke");
+	let window = match Window::builder().title("vilan ui counter").size(dp(360), dp(240)).open() {
+		Ok(let window) => window,
+		// No display, no GPU: say why.
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let log = |line: str| {
+		if smoke {
+			print(line);
+		}
+	};
+	let count: SignalCell<i32> = Signal::new(0);
+	let add = button("Add one", log, || count.set_with(|value: i32| value + 1));
+	let reset = button("Reset", log, || count.set(0));
+	let root = counter(count, add, reset, "", log);
+	mount(window, root);
+	if !smoke {
+		ret;
+	}
+	// Smoke mode: the same frames, drawn through a frame callback of the
+	// program's own so each can be reported. Events still go to the tree, and a
+	// change still asks for a frame.
+	let frames: Shared<i32> = Shared::new(0);
+	let settled: Shared<Option<i32>> = Shared::new(None);
+	let armed: Shared<bool> = Shared::new(false);
+	window.on_frame(|frame: Frame| {
+		draw(frame, root);
+		frames.write() = frames.read() + 1;
+		let times = last_frame(window);
+		print(i"frame {frames.read()} count={count.get()} add={state(add)} reset={state(reset)} solved={times.solved} measured={times.measured} rebuilt={times.rebuilt} layout_us={times.layout.round()} paint_us={times.paint.round()} draw_us={times.draw.round()}");
+		if frames.read() == 1 {
+			for (name, element) in [("add", add), ("reset", reset)] {
+				let bounds = element.bounds();
+				print(i"box {name} {bounds.x.value()} {bounds.y.value()} {bounds.width.value()} {bounds.height.value()}");
+			}
+		}
+		if armed.read() && settled.read().is_none() {
+			settled.write() = Some(frames.read());
+		}
+	});
+	window.on_event(|event: Event| {
+		match event {
+			Event::PointerMoved(let point) => {
+				print(i"moved {point.x.value()} {point.y.value()}");
+				if point.x.value() < 20.0
+					&& point.y.value() < 20.0
+					&& count.get() == 1
+					&& !armed.read() {
+					armed.write() = true;
+					idle_second(frames, settled);
+				}
+			},
+			Event::CloseRequested => print(i"close requested after {frames.read()} frames"),
+			_ => {},
+		}
+	});
+}
+
+/// Smoke mode: once the pointer has moved off the buttons with the count at 1,
+/// wait a second and count the frames drawn after the one that showed it (none,
+/// when nothing changed).
+fun idle_second(frames: Shared<i32>, settled: Shared<Option<i32>>) {
+	sleep(1000);
+	match settled.read() {
+		Some(let at) => print(i"idle frames={frames.read() - at}"),
+		None => print("idle: the last change was never drawn"),
+	}
+}
+
+/// Check mode: the tree, with no window.
+fun check(arguments: List<str>) {
+	let font = match register_font(read_bytes(after(arguments, "--font"))) {
+		Ok(let families) => families[0],
+		Err(let reason) => {
+			print(i"font: {reason}");
+			exit(2);
+			""
+		},
+	};
+	let size = Size::new(dp(360), dp(240));
+	let lines: Shared<List<str>> = Shared::new([]);
+	let log = |line: str| lines.write().push(line);
+	let count: SignalCell<i32> = Signal::new(0);
+	let add = button("Add one", log, || count.set_with(|value: i32| value + 1));
+	let reset = button("Reset", log, || count.set(0));
+	let root = counter(count, add, reset, font, log);
+	layout(root, size, 1.0);
+
+	// 1. Both spellings, one layout.
+	let in_calls = counter_in_calls(
+		count,
+		button_in_calls("Add one"),
+		button_in_calls("Reset"),
+		font,
+	);
+	layout(in_calls, size, 1.0);
+	let tags = root.outline();
+	let calls = in_calls.outline();
+	mut agree = tags.len() == calls.len();
+	for index in Range::new(0, tags.len().as_i32()) {
+		let (left, right) = (tags[index.as_usize()], calls[index.as_usize()]);
+		if left.kind != right.kind
+			|| left.label != right.label
+			|| left.bounds.x.value() != right.bounds.x.value()
+			|| left.bounds.y.value() != right.bounds.y.value()
+			|| left.bounds.width.value() != right.bounds.width.value()
+			|| left.bounds.height.value() != right.bounds.height.value() {
+			agree = false;
+			print(i"spellings differ at {left.kind} {left.label}");
+		}
+	}
+	print(i"spellings agree={agree} elements={tags.len()}");
+	for entry in tags {
+		print(i"{"  ".repeat(entry.depth)}{entry.kind} {entry.label} {entry.bounds.x.value()} {entry.bounds.y.value()} {entry.bounds.width.value()} {entry.bounds.height.value()}");
+	}
+
+	let report = |what: str| {
+		print(i"{what}: count={count.get()} add={state(add)} reset={state(reset)} handlers=[{lines.read().join(", ")}]");
+		lines.write() = [];
+	};
+	let centre = |element: Element| {
+		let bounds = element.bounds();
+		Point::new(bounds.x + bounds.width / 2.0, bounds.y + bounds.height / 2.0)
+	};
+	let none = Modifiers { shift = false, control = false, alt = false, meta = false };
+	let primary = |at: Point| Pointer { position = at, button = Button::Left, modifiers = none };
+	let key = |name: KeyName, shift: bool| KeyPress {
+		key = name,
+		repeat = false,
+		modifiers = Modifiers { shift, control = false, alt = false, meta = false },
+	};
+
+	// 2. Hover, press, release: the conditions follow, the click bubbles from the
+	// button to the screen, and the press focused the button.
+	deliver(root, Event::PointerMoved(centre(add)));
+	report("over add");
+	deliver(root, Event::PointerPressed(primary(centre(add))));
+	report("pressed add");
+	deliver(root, Event::PointerReleased(primary(centre(add))));
+	report("released add");
+	// A press on the button and a release off it: no click on the button; the
+	// click goes to the innermost element holding both, the screen.
+	deliver(root, Event::PointerPressed(primary(centre(add))));
+	deliver(root, Event::PointerReleased(primary(Point::new(dp(4), dp(4)))));
+	report("pressed add, released outside");
+
+	// 3. Keys go to the focused element: Enter on "Add one" adds and stops there,
+	// so the screen's key handler never hears it; any other key bubbles.
+	deliver(root, Event::KeyPressed(key(KeyName::Enter, false)));
+	report("enter");
+	deliver(root, Event::KeyPressed(key(KeyName::Char("x"), false)));
+	report("x");
+
+	// 4. Tab and Shift+Tab move the focus through the tab order, wrapping.
+	deliver(root, Event::KeyPressed(key(KeyName::Tab, false)));
+	report("tab");
+	deliver(root, Event::KeyPressed(key(KeyName::Char(" "), false)));
+	report("space");
+	deliver(root, Event::KeyPressed(key(KeyName::Tab, false)));
+	report("tab again");
+	deliver(root, Event::KeyPressed(key(KeyName::Tab, true)));
+	report("shift tab");
+	deliver(root, Event::PointerLeft);
+	report("left");
+
+	// 5. A window width condition: the count's text is smaller below 300 dp.
+	let count_text = |entries: List<OutlineEntry>| {
+		mut height = 0.0;
+		for entry in entries {
+			if entry.label == "count" {
+				height = entry.bounds.height.value();
+			}
+		}
+		height
+	};
+	let wide = count_text(root.outline());
+	layout(root, Size::new(dp(280), dp(240)), 1.0);
+	let narrow = count_text(root.outline());
+	print(i"count height wide={wide} narrow={narrow}");
+}
+
+fun after(arguments: List<str>, flag: str): str {
+	for index in Range::new(1, arguments.len().as_i32()) {
+		if arguments[(index - 1).as_usize()] == flag {
+			ret arguments[index.as_usize()];
+		}
+	}
+	print(i"{flag} needs a value");
+	exit(2);
+	""
+}
+
+main();

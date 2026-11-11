@@ -9,15 +9,20 @@
 //!
 //! - `screen`: `vilan/examples/ui`'s documentation page, its structure
 //!   (25 elements), at 960 x 640 dp;
-//! - `rows`: a column of 10,000 rows, each a row of a label and a value text,
-//!   at 960 x 640 dp (no virtualisation: every row is laid out).
+//! - `rows`: a heading above a `scroll` over a column of 10,000 rows, each a
+//!   row of a label and a value text, at 960 x 640 dp (no virtualisation:
+//!   every row is laid out) — `vilan/examples/ui-list`'s structure.
 //!
-//! For each: `first_us` (the first layout: every paragraph shaped, the solver
-//! cold), `resize_us` (a new width: re-solved, paragraphs re-wrapped from
-//! their kept shapings where they can be), `unchanged_us` (nothing changed:
-//! no solve), `rescale_us` (a new scale only: re-snapped), `one_change_us`
-//! (the first row's minimum height changed: its dirty chain re-solved, and
-//! the column places every sibling again), `paint_us` (the scene rebuilt).
+//! For each: `first_us` and `first_paint_us` (the first layout and paint:
+//! every paragraph shaped, the solver cold, every scene built),
+//! `unchanged_us` (a frame with nothing changed: no solve, the kept scene),
+//! `resize_us` (a new width), `rescale_us` (a new scale only: re-snapped).
+//! For the list: `one_text_*` (one row's value text replaced by one of the
+//! same width: the layout pass, the leaves it measured, the boxes that moved,
+//! the paint pass and the scenes it rebuilt), `scroll_step_*` (the offset
+//! moved by 96 dp, laid out and painted), and `one_text_after_resize_*` (the
+//! same change in the first solve after a resize) against
+//! `one_text_settled_us` (the solve after that).
 //! Times are wall time on this thread, medians over runs: the passes are
 //! CPU-bound and single-threaded, so on an unloaded core wall time is CPU
 //! time, and on a loaded machine they are upper bounds. Text is shaped with
@@ -137,29 +142,74 @@ fn screen(builder: &mut Builder) -> NodeId {
     root
 }
 
-/// A column of `count` rows, each a label and a value.
+/// A column of a heading and a `scroll` (growing into the rest) over a
+/// column of `count` rows, each a label and a value centred across the row:
+/// the exit test's list (`vilan/examples/ui-list`), its structure.
 fn rows(builder: &mut Builder, count: usize) -> NodeId {
+    let root = builder.node(ElementKind::Column);
+    let heading = builder.text("10000 rows: scroll, and click one");
+    builder.padding(heading, 12.0);
+    let scroll = builder.node(ElementKind::Scroll);
+    builder.tree.set_grow(scroll, 1.0).unwrap();
+    builder.add(root, &[heading, scroll]);
     let column = builder.node(ElementKind::Column);
+    builder.add(scroll, &[column]);
     for index in 0..count {
         let row = builder.node(ElementKind::Row);
         builder.tree.set_gap(row, 8.0).unwrap();
-        builder.padding(row, 4.0);
+        builder.tree.set_align(row, Align::Center).unwrap();
+        builder
+            .tree
+            .set_padding(
+                row,
+                Edges {
+                    top: 6.0,
+                    right: 12.0,
+                    bottom: 6.0,
+                    left: 12.0,
+                },
+            )
+            .unwrap();
         let label = builder.text(&format!("Row {index}"));
         builder.tree.set_grow(label, 1.0).unwrap();
-        let value = builder.text(&format!("{}", index * 37 % 1000));
+        let value = builder.text("0 clicks");
         builder.add(row, &[label, value]);
         builder.add(column, &[row]);
     }
-    column
+    root
+}
+
+/// The scroll of `rows`'s list.
+fn scroll_of(tree: &UiTree, root: NodeId) -> Option<NodeId> {
+    let children = tree.children(root);
+    let scroll = *children.get(1)?;
+    (tree.kind(scroll) == ElementKind::Scroll).then_some(scroll)
+}
+
+/// The value text of row `index` of `rows`'s list.
+fn value_of(tree: &UiTree, root: NodeId, index: usize) -> Option<NodeId> {
+    let scroll = scroll_of(tree, root)?;
+    let column = tree.children(scroll)[0];
+    let row = tree.children(column)[index];
+    Some(tree.children(row)[1])
+}
+
+#[derive(Default)]
+struct Samples {
+    rows: Vec<(&'static str, Vec<u128>)>,
+}
+
+impl Samples {
+    fn push(&mut self, key: &'static str, value: u128) {
+        match self.rows.iter_mut().find(|(name, _)| *name == key) {
+            Some((_, values)) => values.push(value),
+            None => self.rows.push((key, vec![value])),
+        }
+    }
 }
 
 fn measure(name: &str, build: impl Fn(&mut Builder) -> NodeId, runs: usize) {
-    let mut firsts = Vec::new();
-    let mut resizes = Vec::new();
-    let mut unchanged = Vec::new();
-    let mut rescales = Vec::new();
-    let mut one_changes = Vec::new();
-    let mut paints = Vec::new();
+    let mut samples = Samples::default();
     let mut elements = 0;
     let at_100 = Units::new(1.0, 1.0).unwrap();
     let at_150 = Units::new(1.5, 1.0).unwrap();
@@ -177,41 +227,104 @@ fn measure(name: &str, build: impl Fn(&mut Builder) -> NodeId, runs: usize) {
         let root = build(&mut builder);
         elements = builder.tree.element_count();
         let tree = &mut builder.tree;
-        firsts.push(timed(|| {
-            tree.layout(root, Size::new(960.0, 640.0), at_100, &mut text)
-                .unwrap();
-        }));
-        resizes.push(timed(|| {
-            tree.layout(root, Size::new(720.0, 640.0), at_100, &mut text)
-                .unwrap();
-        }));
-        unchanged.push(timed(|| {
-            tree.layout(root, Size::new(720.0, 640.0), at_100, &mut text)
-                .unwrap();
-        }));
-        rescales.push(timed(|| {
-            tree.layout(root, Size::new(720.0, 640.0), at_150, &mut text)
-                .unwrap();
-        }));
-        let first_child = tree.children(root)[0];
-        tree.set_size(first_child, SizeProperty::MinHeight, Length::Dp(30.0))
-            .unwrap();
-        one_changes.push(timed(|| {
-            tree.layout(root, Size::new(720.0, 640.0), at_150, &mut text)
-                .unwrap();
-        }));
-        paints.push(timed(|| {
+        let paint = |tree: &mut UiTree, text: &mut TextSystem| {
             let mut scene = SceneBuilder::new();
-            tree.paint(root, &mut scene, &mut text).unwrap();
-        }));
+            tree.paint(root, &mut scene, text).unwrap();
+        };
+        samples.push(
+            "first_us",
+            timed(|| {
+                tree.layout(root, Size::new(960.0, 640.0), at_100, &mut text)
+                    .unwrap();
+            }),
+        );
+        samples.push("first_measured", tree.last_pass().measured as u128);
+        samples.push("first_paint_us", timed(|| paint(tree, &mut text)));
+        samples.push(
+            "unchanged_us",
+            timed(|| {
+                tree.layout(root, Size::new(960.0, 640.0), at_100, &mut text)
+                    .unwrap();
+                paint(tree, &mut text);
+            }),
+        );
+        if let Some(value) = value_of(tree, root, 5_000) {
+            // One row's text changes, its width the same: the solver
+            // measures that text again and places the column's rows; one
+            // row's scene and the chain above it are rebuilt.
+            tree.set_run(value, 0, "1 clicks").unwrap();
+            samples.push(
+                "one_text_layout_us",
+                timed(|| {
+                    tree.layout(root, Size::new(960.0, 640.0), at_100, &mut text)
+                        .unwrap();
+                }),
+            );
+            samples.push("one_text_measured", tree.last_pass().measured as u128);
+            samples.push("one_text_moved", tree.last_pass().moved as u128);
+            samples.push("one_text_paint_us", timed(|| paint(tree, &mut text)));
+            samples.push("one_text_rebuilt", tree.last_pass().rebuilt as u128);
+            // A scroll: the offset moves; nothing is laid out, and only the
+            // scroll's own scene is rebuilt.
+            let mut offset = 0.0;
+            samples.push(
+                "scroll_step_us",
+                timed(|| {
+                    offset += 96.0;
+                    let scroll = scroll_of(tree, root).expect("the list's scroll");
+                    tree.set_scroll_offset(scroll, vilan_rt_gfx::Point::new(0.0, offset))
+                        .unwrap();
+                    tree.layout(root, Size::new(960.0, 640.0), at_100, &mut text)
+                        .unwrap();
+                    paint(tree, &mut text);
+                }),
+            );
+            samples.push("scroll_step_rebuilt", tree.last_pass().rebuilt as u128);
+        }
+        samples.push(
+            "resize_us",
+            timed(|| {
+                tree.layout(root, Size::new(720.0, 640.0), at_100, &mut text)
+                    .unwrap();
+            }),
+        );
+        samples.push(
+            "rescale_us",
+            timed(|| {
+                tree.layout(root, Size::new(720.0, 640.0), at_150, &mut text)
+                    .unwrap();
+            }),
+        );
+        if let Some(value) = value_of(tree, root, 5_000) {
+            // The same change in the first solve after a resize: `taffy`'s
+            // per-node caches kept entries the resize pass did not ask for
+            // again, and this pass misses them (see the report).
+            tree.set_run(value, 0, "2 clicks").unwrap();
+            samples.push(
+                "one_text_after_resize_us",
+                timed(|| {
+                    tree.layout(root, Size::new(720.0, 640.0), at_150, &mut text)
+                        .unwrap();
+                }),
+            );
+            samples.push(
+                "one_text_after_resize_measured",
+                tree.last_pass().measured as u128,
+            );
+            tree.set_run(value, 0, "3 clicks").unwrap();
+            samples.push(
+                "one_text_settled_us",
+                timed(|| {
+                    tree.layout(root, Size::new(720.0, 640.0), at_150, &mut text)
+                        .unwrap();
+                }),
+            );
+        }
     }
     println!("{name}_elements={elements}");
-    println!("{name}_first_us={}", median(firsts));
-    println!("{name}_resize_us={}", median(resizes));
-    println!("{name}_unchanged_us={}", median(unchanged));
-    println!("{name}_rescale_us={}", median(rescales));
-    println!("{name}_one_change_us={}", median(one_changes));
-    println!("{name}_paint_us={}", median(paints));
+    for (key, values) in samples.rows {
+        println!("{name}_{key}={}", median(values));
+    }
 }
 
 fn main() {

@@ -226,6 +226,7 @@ enum KeyName {
 	Char(str), Enter, Tab, Backspace, Delete, Insert, Escape,
 	Up, Down, Left, Right, Home, End, PageUp, PageDown, F(i32), Other(str),
 }
+fun current_event(): Option<Event>   // the event being delivered now
 ```
 
 Events arrive in order, through the window's event callback; a window with no
@@ -240,6 +241,13 @@ line, and positive `x` and `y` mean the content should move right and down.
 
 `Resized` is followed in the same turn by a frame at the new size, so a window
 being dragged larger redraws in step with the drag.
+
+`current_event()` answers the event being delivered right now: inside the
+event callback, the one it was handed; inside a [`std::ui`](ui.md#events)
+element's handler, the window event that reached the element (which is how
+`on_scroll` and `on_key` read theirs); `None` anywhere else. A window with a
+`std::ui` tree mounted routes each event into the tree first, then hands it to
+its own event callback, if it has one.
 
 ## How a GPU program ends
 

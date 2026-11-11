@@ -28,6 +28,9 @@ fn insert_window(id: u32) {
                 modifiers: ModifiersState::empty(),
                 on_frame: None,
                 on_event: None,
+                ui_root: None,
+                last_draw_us: 0.0,
+                redraw_requests: 0,
                 events: VecDeque::new(),
                 frame_due: false,
                 scene: None,
@@ -210,4 +213,124 @@ fn a_window_reports_the_size_it_asked_for_until_it_exists() {
 fn opening_without_the_window_system_answers_why() {
     let task = open(&str_new("t"), 100.0, 100.0, 1.0, 1.0, 1.0, 1.0);
     assert!(task.is_settled(), "the refusal is immediate");
+}
+
+// ------------------------------------------------------------- std::ui ---
+
+fn redraws(id: u32) -> u64 {
+    with_window(id, |slot| slot.redraw_requests).expect("the window")
+}
+
+/// native-ui.md R9: a change to an element of a MOUNTED tree asks its window
+/// for a frame; a change to an element in no mounted tree, and a write that
+/// changes nothing, do not.
+#[test]
+fn a_change_to_a_mounted_tree_asks_its_window_for_a_frame_and_nothing_else_does() {
+    insert_window(11);
+    let root = ui::node(1);
+    let label = ui::node(3);
+    let run = ui::append_text(&label, &str_new("0"));
+    ui::add_child(&root, &label);
+    ui::mount(11, &root);
+    let mounted = redraws(11);
+    ui::set_run(&label, run, &str_new("1"));
+    assert_eq!(redraws(11), mounted + 1, "a run of a mounted text");
+    ui::set_run(&label, run, &str_new("1"));
+    assert_eq!(redraws(11), mounted + 1, "the same text: no change");
+    let elsewhere = ui::node(0);
+    ui::set(&elsewhere, 2, 8.0);
+    assert_eq!(redraws(11), mounted + 1, "an element in no mounted tree");
+    let group = ui::style_group(&root, -1);
+    let layer = ui::style_layer(&root, group, false, 0, -1.0, -1.0);
+    ui::style_color(&root, layer, 0, 1.0, 0.0, 0.0, 1.0);
+    ui::style_end(&root);
+    assert_eq!(redraws(11), mounted + 2, "a look");
+}
+
+/// A key handler that stops its event: the ancestor listening never hears
+/// it, and Tab does not move the focus.
+#[test]
+fn a_stopped_event_bubbles_no_further_and_its_default_does_not_happen() {
+    let root = ui::node(1);
+    let first = ui::node(0);
+    let second = ui::node(0);
+    ui::add_child(&root, &first);
+    ui::add_child(&root, &second);
+    ui::set_focusable(&first, true);
+    ui::set_focusable(&second, true);
+    ui::layout(&root, 100.0, 100.0, 1.0);
+    let heard = Rc::new(RefCell::new(Vec::new()));
+    let stopping = Rc::new(std::cell::Cell::new(true));
+    {
+        let heard = Rc::clone(&heard);
+        let stopping = Rc::clone(&stopping);
+        ui::on(
+            &first,
+            7,
+            Rc::new(move || {
+                heard.borrow_mut().push("first");
+                if stopping.get() {
+                    ui::stop();
+                }
+            }),
+        );
+    }
+    {
+        let heard = Rc::clone(&heard);
+        ui::on(&root, 7, Rc::new(move || heard.borrow_mut().push("root")));
+    }
+    ui::focus(&first);
+    let tab = |shift: f64| {
+        ui::deliver(
+            &root,
+            input::KEY_PRESSED,
+            0.0,
+            shift,
+            1.0,
+            0.0,
+            0.0,
+            &str_new("Tab"),
+        )
+    };
+    tab(0.0);
+    assert_eq!(*heard.borrow(), ["first"], "stopped at the focus");
+    assert_eq!(ui::interaction(&first) & 4, 4, "Tab did not move the focus");
+    stopping.set(false);
+    heard.borrow_mut().clear();
+    tab(0.0);
+    assert_eq!(*heard.borrow(), ["first", "root"], "bubbled to the root");
+    assert_eq!(ui::interaction(&second) & 4, 4, "and Tab moved the focus");
+}
+
+/// A handler reads its event through `std::gfx`'s current event: the window
+/// event being routed while it runs, and none after.
+#[test]
+fn a_handler_runs_with_the_routed_event_as_the_current_one() {
+    let root = ui::node(1);
+    ui::set_length(&root, 0, 1, 50.0);
+    ui::set_length(&root, 1, 1, 50.0);
+    ui::layout(&root, 100.0, 100.0, 1.0);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    {
+        let seen = Rc::clone(&seen);
+        ui::on(
+            &root,
+            6,
+            Rc::new(move || {
+                seen.borrow_mut().push((event_current(), event_number(3)));
+            }),
+        );
+    }
+    ui::deliver(
+        &root,
+        input::SCROLLED,
+        10.0,
+        10.0,
+        0.0,
+        -32.0,
+        0.0,
+        &str_new(""),
+    );
+    assert_eq!(*seen.borrow(), [(input::SCROLLED, -32.0)]);
+    assert_eq!(event_current(), -1, "none after");
 }

@@ -190,6 +190,14 @@ pub(crate) enum Command {
 pub struct Scene {
     pub(crate) commands: Arc<[Command]>,
     primitive_count: usize,
+    /// A rectangle, in the scene's own dp, that every pixel it can draw lies
+    /// inside (`None`: it draws nothing). CONSERVATIVE, never tight: a text
+    /// run counts its layout box grown by its height on every side (glyph ink
+    /// may leave the line box), a shadow its blur's whole reach. The encoder
+    /// skips a nested scene whose bounds miss the clip in force, which is
+    /// what keeps a long list in a scrolled viewport from costing its whole
+    /// length every frame.
+    pub(crate) bounds: Option<Rect>,
 }
 
 impl Default for Scene {
@@ -203,6 +211,7 @@ impl Scene {
         Scene {
             commands: Arc::from(Vec::new()),
             primitive_count: 0,
+            bounds: None,
         }
     }
 
@@ -210,6 +219,12 @@ impl Scene {
     /// counts once, whatever its glyph count).
     pub fn primitive_count(&self) -> usize {
         self.primitive_count
+    }
+
+    /// The rectangle every pixel of the scene lies inside, in its own dp (see
+    /// the field); `None` for a scene that draws nothing.
+    pub fn bounds(&self) -> Option<Rect> {
+        self.bounds
     }
 
     /// Whether `self` and `other` are the same built scene (not merely equal
@@ -266,6 +281,37 @@ pub struct SceneBuilder {
     open_groups: usize,
     primitive_count: usize,
     error: Option<SceneError>,
+    /// The transform in force for the bounds (the identity when `None`), and
+    /// the one each open group restores at its `pop`.
+    transform: Option<Transform>,
+    transforms: Vec<Option<Transform>>,
+    bounds: Option<Rect>,
+}
+
+/// The smallest rectangle holding both.
+pub(crate) fn union(first: Option<Rect>, second: Rect) -> Option<Rect> {
+    if !(second.size.width >= 0.0 && second.size.height >= 0.0) {
+        return first;
+    }
+    Some(match first {
+        None => second,
+        Some(first) => {
+            let left = first.left().min(second.left());
+            let top = first.top().min(second.top());
+            let right = first.right().max(second.right());
+            let bottom = first.bottom().max(second.bottom());
+            Rect::new(left, top, right - left, bottom - top)
+        }
+    })
+}
+
+fn grown(rect: Rect, by: f32) -> Rect {
+    Rect::new(
+        rect.left() - by,
+        rect.top() - by,
+        rect.size.width + 2.0 * by,
+        rect.size.height + 2.0 * by,
+    )
 }
 
 impl SceneBuilder {
@@ -279,45 +325,89 @@ impl SceneBuilder {
         }
     }
 
-    fn primitive(&mut self, command: Command) {
+    fn primitive(&mut self, command: Command, extent: Rect) {
         self.primitive_count += 1;
         self.commands.push(command);
+        self.include(extent);
+    }
+
+    /// Grows the bounds by `extent`, in the coordinates of the groups open.
+    fn include(&mut self, extent: Rect) {
+        let extent = match self.transform {
+            Some(transform) => transform.apply_rect(extent),
+            None => extent,
+        };
+        self.bounds = union(self.bounds, extent);
     }
 
     pub fn rectangle(&mut self, rectangle: Rectangle) {
-        self.primitive(Command::Rectangle(rectangle));
+        let extent = rectangle.bounds;
+        self.primitive(Command::Rectangle(rectangle), extent);
     }
 
     pub fn shadow(&mut self, shadow: Shadow) {
-        self.primitive(Command::Shadow(shadow));
+        // The Gaussian's standard deviation is half the blur; three of them
+        // is where it has faded out.
+        let extent = grown(shadow.bounds, 1.5 * shadow.blur.max(0.0) + 1.0);
+        self.primitive(Command::Shadow(shadow), extent);
     }
 
     /// Draws a shaped paragraph with its top-left corner at `origin`.
     pub fn text(&mut self, layout: &TextLayout, origin: Point, color: Color) {
-        self.primitive(Command::Text {
-            layout: layout.clone(),
-            origin,
-            color,
-        });
+        let size = layout.size();
+        // Glyph ink may leave the line box (an italic overhang, a tall
+        // accent): its whole height again on every side covers it.
+        let extent = grown(
+            Rect::new(origin.x, origin.y, size.width, size.height),
+            size.height.max(1.0),
+        );
+        self.primitive(
+            Command::Text {
+                layout: layout.clone(),
+                origin,
+                color,
+            },
+            extent,
+        );
     }
 
     pub fn underline(&mut self, underline: Underline) {
-        self.primitive(Command::Underline(underline));
+        let extent = grown(
+            Rect::new(
+                underline.origin.x,
+                underline.origin.y,
+                underline.width,
+                underline.thickness,
+            ),
+            1.0,
+        );
+        self.primitive(Command::Underline(underline), extent);
     }
 
     /// Draws `image` stretched over `bounds`, clipped to `corner_radii`.
     pub fn image(&mut self, image: &Image, bounds: Rect, corner_radii: Corners) {
-        self.primitive(Command::Image {
-            image: image.clone(),
+        self.primitive(
+            Command::Image {
+                image: image.clone(),
+                bounds,
+                corner_radii,
+            },
             bounds,
-            corner_radii,
-        });
+        );
+    }
+
+    fn open_group(&mut self, transform: Option<Transform>) {
+        self.open_groups += 1;
+        self.transforms.push(self.transform);
+        if transform.is_some() {
+            self.transform = transform;
+        }
     }
 
     /// Clips what follows, until the matching `pop`, to a rounded rectangle.
     /// Nested clips intersect.
     pub fn push_clip(&mut self, bounds: Rect, corner_radii: Corners) {
-        self.open_groups += 1;
+        self.open_group(None);
         self.commands.push(Command::PushClip {
             bounds,
             corner_radii,
@@ -330,7 +420,11 @@ impl SceneBuilder {
         if !transform.is_valid() {
             self.record(SceneError::InvalidTransform(transform));
         }
-        self.open_groups += 1;
+        let combined = self
+            .transform
+            .unwrap_or(Transform::IDENTITY)
+            .then(transform);
+        self.open_group(Some(combined));
         self.commands.push(Command::PushTransform(transform));
     }
 
@@ -345,7 +439,7 @@ impl SceneBuilder {
         if opacity.is_nan() {
             self.record(SceneError::InvalidOpacity);
         }
-        self.open_groups += 1;
+        self.open_group(None);
         self.commands.push(Command::PushLayer {
             opacity: if opacity.is_nan() {
                 1.0
@@ -362,6 +456,7 @@ impl SceneBuilder {
             return;
         }
         self.open_groups -= 1;
+        self.transform = self.transforms.pop().flatten();
         self.commands.push(Command::Pop);
     }
 
@@ -372,6 +467,9 @@ impl SceneBuilder {
         }
         self.primitive_count += scene.primitive_count;
         self.commands.push(Command::Scene(scene.clone()));
+        if let Some(bounds) = scene.bounds {
+            self.include(bounds);
+        }
     }
 
     pub fn finish(self) -> Result<Scene, SceneError> {
@@ -384,6 +482,7 @@ impl SceneBuilder {
         Ok(Scene {
             commands: Arc::from(self.commands),
             primitive_count: self.primitive_count,
+            bounds: self.bounds,
         })
     }
 }

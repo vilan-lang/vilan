@@ -1,8 +1,8 @@
-// `std::ui` — elements, layout and style for a window `std::gfx` draws, for a
-// native program (native-ui.md part P2; its section 9 RULED 2026-11-10, its section
-// 12 the element contract).
+// `std::ui` — elements, layout, style and interaction for a window `std::gfx`
+// draws, for a native program (native-ui.md parts P2 and P3; its section 9 RULED
+// 2026-11-10, its section 12 the element contract).
 //
-// Five element kinds carry every layout, and none has a look of its own:
+// Six element kinds carry every layout, and none has a look of its own:
 //
 //   row, column   children in a line along x or y: gap, padding, grow, shrink,
 //                 align, justify, wrap (flexbox semantics, our vocabulary)
@@ -10,58 +10,109 @@
 //                 corner, the centre, or the whole stack
 //   text          a paragraph, wrapped to the width layout gives it
 //   image         a texture, drawn by its fit rule
+//   scroll        a clipped viewport over its one child, moved by the wheel
 //
 // Everything else (a button, a card, a sidebar) is a function that answers these.
 // No margins (R5): space between siblings is the parent's `gap`, space inside an
 // element its `padding`. `dp` is the only length unit; a fraction of the parent
 // (`fraction(1, 3)`) and `Length::Auto` are the other lengths.
 //
-// THE ELEMENT CONTRACT (section 12): each kind is a zero-parameter function that
-// answers a builder, every attribute is a builder method, and children arrive
-// through `child`, which takes anything `Child` — an element, or a `str` for a
-// text. Written as calls: `row().gap(dp(8)).child(text().child("hi"))`.
+// THE ELEMENT CONTRACT (section 12): each kind is an `[element]` function with no
+// parameters that answers a builder, every attribute is a builder method, and
+// children arrive through `child`, which takes anything `Child` — an element, or a
+// `str` for a text. So `<row gap(dp(8)) wrap>"a"{b}</row>` is
+// `row().gap(dp(8)).wrap().child("a").child(b)`, and either spelling builds the
+// same element.
 //
 // STYLE (R7) is a value: a `Style` of optional fields (background, border,
 // radius, shadow, opacity, text style), composed with `+` (the right side wins
 // field by field) and set with `.style(s)`. No selectors, no cascade. The TEXT
 // fields are the one inherited thing: a font, a size, a colour, a line height
 // set on an element flow down to every text under it that does not set its own.
+// CONDITIONS are typed and closed (section 4.3): `style().when(hovered(), |s|
+// s.background(c))` applies its fields while the condition holds — `hovered()`,
+// `pressed()`, `focused()`, `window_at_least(w)`, `window_below(w)` — resolved
+// by the framework from hit testing, the focus and the window.
 //
-// RETAINED (R9): an element is built once and kept. The tree lives in the GPU crate
-// (`vilan-rt-gfx`, its `ui` module) with the layout solver; an element here is a
-// handle on it, so a copy is the same element and an element is in one place in the
-// tree. `mount` lays the tree out at the window's size and scale and repaints it on
-// every frame the window draws — a resize or a scale change lays it out again; a
-// frame with nothing changed appends the scene painted last.
+// RETAINED, AND BOUND (R9): an element is built once and kept. The tree lives in
+// the GPU crate (`vilan-rt-gfx`, its `ui` module) with the layout solver; an
+// element here is a handle on it, so a copy is the same element and an element is
+// in one place in the tree. Every attribute takes a value or a signal (anything
+// `MaybeSignal`): a signal's write sets that one attribute again, which marks that
+// one element for layout or for paint and asks the mounted window for a frame —
+// nothing else is laid out or painted that the solver does not need.
+//
+// EVENTS are attributes too (`on_click(|| ..)`, `on_key(|key| ..)`), delivered to
+// the element under the pointer (or holding the focus) and bubbling to its
+// ancestors that listen; `stop_event()` inside a handler ends that. Focus moves
+// with Tab and Shift+Tab through the focusable elements in tree order.
 //
 // NATIVE ONLY, as `std::gfx` is: the JavaScript backend refuses a program that
 // reaches it, by name, when it builds; `vilan check` does not.
 //
-// Not here yet (native-ui.md section 8): hit testing, conditions (`hovered()`,
-// `pressed()`), focus, events and `scroll` are part P3, with properties bound to
-// signals; grid layout is a later slice. Accessibility roles and labels are
-// carried from this version and published by a later one (R10).
+// Not here yet: keyed lists and conditional children (`each`, `when` for this
+// tree), grid layout, text editing, publishing roles and labels to the system's
+// accessibility API (R10: carried from this version).
 
 [platform("@process")] mod self;
 
-import pkg::gfx::{ Border, Color, Corners, Dp, FontFamily, Frame, Rect, Size, Texture, Window, dp };
+import pkg::gfx::{
+	Border,
+	Button,
+	Color,
+	Corners,
+	Dp,
+	Event,
+	FontFamily,
+	Frame,
+	KeyName,
+	KeyPress,
+	Modifiers,
+	Point,
+	Rect,
+	Scroll,
+	Size,
+	Texture,
+	Window,
+	current_event,
+	dp,
+};
 import pkg::operators::Add;
 import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::{
+	Flow,
+	FlushPolicy,
+	Owner,
+	SignalCell,
+	comp,
+	owner_scope,
+	register_with_owner,
+	tracking,
+	turn,
+	turn_scope,
+};
 
 // --- The seam ------------------------------------------------------------------
 //
 // `vilan-rt-gfx`'s `host::ui` module, over the program's one element tree. An
-// element crosses as its `Node`; every attribute once, as numbers, when it is set.
-// The codes are kept by `crates/vilan-rt-gfx/src/host/ui.rs` too:
+// element crosses as its `Node`; every attribute once, as numbers, when it is set
+// (and again when a signal it is bound to writes). The codes are kept by
+// `crates/vilan-rt-gfx/src/host/ui.rs` too:
 //
 //   __ui_set property     0 grow, 1 shrink, 2 gap, 3 align, 4 justify, 5 wrap,
-//                         6 anchor, 7 role, 8 opacity, 9 text size, 10 line
-//                         height, 11 weight, 12 italic, 13 fit, 14..17 padding
-//                         top, right, bottom, left
+//                         6 anchor, 7 role, 13 fit, 14..17 padding top, right,
+//                         bottom, left, 18 clip, 19 tab index, 20 scroll axis
 //   __ui_set_length       0 width, 1 height, 2 min width, 3 max width, 4 min
 //                         height, 5 max height; unit 0 auto, 1 dp, 2 fraction
-//   __ui_set_color        0 background, 1 text colour
-//   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image
+//   __ui_style_number     0 opacity, 1 text size, 2 line height, 3 weight,
+//                         4 italic
+//   __ui_style_color      0 background, 1 text colour
+//   __ui_style_layer      condition bits 1 hovered, 2 pressed, 4 focused; window
+//                         widths at least / below, negative for none
+//   __ui_on               0 pointer enter, 1 pointer leave, 2 pointer move,
+//                         3 press, 4 release, 5 click, 6 scroll, 7 key, 8 key
+//                         release, 9 text, 10 focus, 11 blur
+//   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll
 //
 // The enums' codes are their declaration order.
 
@@ -78,18 +129,32 @@ external fun ui_set(node: Node, property: i32, value: f64): void;
 [extern("__ui_set_length")]
 external fun ui_set_length(node: Node, property: i32, unit: i32, value: f64): void;
 
-[extern("__ui_set_corners")]
-external fun ui_set_corners(
-	node: Node,
-	top_left: f64,
-	top_right: f64,
-	bottom_right: f64,
-	bottom_left: f64,
-): void;
+/// Starts a style group: a new one (-1), or `group` emptied to be written again.
+[extern("__ui_style_group")]
+external fun ui_style_group(node: Node, group: i32): i32;
 
-[extern("__ui_set_color")]
-external fun ui_set_color(
+/// A new layer of `group`, unconditional or under a condition; answers its id.
+[extern("__ui_style_layer")]
+external fun ui_style_layer(
 	node: Node,
+	group: i32,
+	conditional: bool,
+	bits: i32,
+	at_least: f64,
+	below: f64,
+): i32;
+
+/// Resolves the element's style from its layers.
+[extern("__ui_style_end")]
+external fun ui_style_end(node: Node): void;
+
+[extern("__ui_style_number")]
+external fun ui_style_number(node: Node, layer: i32, property: i32, value: f64): void;
+
+[extern("__ui_style_color")]
+external fun ui_style_color(
+	node: Node,
+	layer: i32,
 	property: i32,
 	red: f64,
 	green: f64,
@@ -97,9 +162,20 @@ external fun ui_set_color(
 	alpha: f64,
 ): void;
 
-[extern("__ui_set_border")]
-external fun ui_set_border(
+[extern("__ui_style_corners")]
+external fun ui_style_corners(
 	node: Node,
+	layer: i32,
+	top_left: f64,
+	top_right: f64,
+	bottom_right: f64,
+	bottom_left: f64,
+): void;
+
+[extern("__ui_style_border")]
+external fun ui_style_border(
+	node: Node,
+	layer: i32,
 	top: f64,
 	right: f64,
 	bottom: f64,
@@ -110,9 +186,10 @@ external fun ui_set_border(
 	alpha: f64,
 ): void;
 
-[extern("__ui_set_shadow")]
-external fun ui_set_shadow(
+[extern("__ui_style_shadow")]
+external fun ui_style_shadow(
 	node: Node,
+	layer: i32,
 	x: f64,
 	y: f64,
 	blur: f64,
@@ -123,11 +200,16 @@ external fun ui_set_shadow(
 	alpha: f64,
 ): void;
 
-[extern("__ui_set_font")]
-external fun ui_set_font(node: Node, family: i32, name: str): void;
+[extern("__ui_style_font")]
+external fun ui_style_font(node: Node, layer: i32, family: i32, name: str): void;
 
+/// Appends a run to a text's paragraph; answers its index.
 [extern("__ui_append_text")]
-external fun ui_append_text(node: Node, run: str): void;
+external fun ui_append_text(node: Node, run: str): i32;
+
+/// Replaces run `index` of a text's paragraph.
+[extern("__ui_set_run")]
+external fun ui_set_run(node: Node, index: i32, run: str): void;
 
 [extern("__ui_set_label")]
 external fun ui_set_label(node: Node, label: str): void;
@@ -138,11 +220,58 @@ external fun ui_set_texture(node: Node, texture: Texture): void;
 [extern("__ui_add_child")]
 external fun ui_add_child(parent: Node, child: Node): void;
 
+[extern("__ui_set_focusable")]
+external fun ui_set_focusable(node: Node, focusable: bool): void;
+
+[extern("__ui_on")]
+external fun ui_on(node: Node, kind: i32, handler: || void): void;
+
+[extern("__ui_stop")]
+external fun ui_stop(): void;
+
+[extern("__ui_focus")]
+external fun ui_focus(node: Node): void;
+
+/// Bits: 1 hovered, 2 pressed, 4 focused.
+[extern("__ui_interaction")]
+external fun ui_interaction(node: Node): i32;
+
+[extern("__ui_set_offset")]
+external fun ui_set_offset(node: Node, x: f64, y: f64): void;
+
+/// A scroll's offset x (0) and y (1), and its range x (2) and y (3), in dp.
+[extern("__ui_offset")]
+external fun ui_offset(node: Node, which: i32): f64;
+
+[extern("__ui_on_offset")]
+external fun ui_on_offset(node: Node, handler: || void): void;
+
 [extern("__ui_layout")]
 external fun ui_layout(root: Node, width: f64, height: f64, scale_factor: f64): void;
 
 [extern("__ui_paint")]
 external fun ui_paint(frame: u32, root: Node): void;
+
+[extern("__ui_mount")]
+external fun ui_mount(window: u32, root: Node): void;
+
+/// The last frame a mounted tree drew: layout (0), paint (1) and draw (2) times in
+/// microseconds; solved (3), measured (4), moved (5), rebuilt (6).
+[extern("__ui_frame_number")]
+external fun ui_frame_number(window: u32, which: i32): f64;
+
+/// Routes an event (`std::gfx`'s table: a kind, five numbers, a text) into a tree.
+[extern("__ui_deliver")]
+external fun ui_deliver(
+	root: Node,
+	kind: i32,
+	a: f64,
+	b: f64,
+	c: f64,
+	d: f64,
+	e: f64,
+	text: str,
+): void;
 
 /// The element's box from its last layout, in dp: x (0), y (1), width (2),
 /// height (3).
@@ -160,6 +289,38 @@ external fun ui_outline_number(index: i32, which: i32): f64;
 /// An outline entry's kind (0) and label (1).
 [extern("__ui_outline_text")]
 external fun ui_outline_text(index: i32, which: i32): str;
+
+// --- Values and signals --------------------------------------------------------
+
+/// What an attribute takes: a value, or a signal of one — any `Flow`: a
+/// `SignalCell`, a memo, a pipe (`count.derive(|n| i"{n}")`). `std::reactive`'s
+/// `MaybeSignal` for this tree, and the same two arms: the static one sets the
+/// attribute once, the reactive one sets it now and at every write.
+///
+/// One difference, deliberate: a reactive attribute belongs to the AMBIENT OWNER
+/// when there is one (`mount_root`, `run_with_owner`) and dies with it, and to its
+/// source otherwise — as a materialising node (`.cell()`) does — so a tree can be
+/// built and bound at the top of `main`. (`MaybeSignal`'s reactive arm requires an
+/// owner, and the context checker charges a requirement inside a trait's DEFAULT
+/// method to every call of it, the static ones included: every `.gap(dp(8))` would
+/// have needed an owner.)
+export trait Bindable<T> {
+	fun bind(own self, apply: |T| void);
+}
+
+/// The value: set once.
+export impl type T with Bindable<T> {
+	fun bind(own self, apply: |T| void) {
+		apply(self);
+	}
+}
+
+/// The signal: set now, and again at every write.
+export impl type F: Flow<type T> with Bindable<T> {
+	fun bind(own self, apply: |T| void) {
+		let _bound = register_with_owner(self.sub(|value: T| apply(value)));
+	}
+}
 
 // --- Lengths -------------------------------------------------------------------
 
@@ -336,6 +497,25 @@ fun role_code(role: Role): f64 {
 	}
 }
 
+/// The directions a `scroll` moves its child in. `Vertical` until `axis` says
+/// otherwise.
+export enum ScrollAxis {
+	/// Up and down: the child is as wide as the viewport, as tall as it wants.
+	Vertical,
+	/// Left and right: the child is as tall as the viewport, as wide as it wants.
+	Horizontal,
+	/// Both ways: the child is as large as it wants.
+	Both,
+}
+
+fun scroll_axis_code(axis: ScrollAxis): f64 {
+	match axis {
+		ScrollAxis::Vertical => 0.0,
+		ScrollAxis::Horizontal => 1.0,
+		ScrollAxis::Both => 2.0,
+	}
+}
+
 // --- Style ---------------------------------------------------------------------
 
 /// A shadow under an element's box: moved by `x`, `y`, blurred by `blur` (as CSS's
@@ -360,17 +540,70 @@ export impl DropShadow {
 	}
 }
 
+/// When a conditional style applies (section 4.3). Typed and closed: these five,
+/// resolved by the framework.
+export enum Condition {
+	/// The pointer is over the element, or over an element inside it.
+	Hovered,
+	/// The primary button went down on the element (or inside it) and has not come
+	/// up yet, wherever the pointer is now.
+	Pressed,
+	/// The element holds the focus.
+	Focused,
+	/// The window is at least this wide.
+	WindowAtLeast(Dp),
+	/// The window is narrower than this.
+	WindowBelow(Dp),
+}
+
+/// The pointer over the element, or over an element inside it.
+export fun hovered(): Condition {
+	Condition::Hovered
+}
+
+/// The primary button down on the element, or inside it.
+export fun pressed(): Condition {
+	Condition::Pressed
+}
+
+/// The element holding the focus.
+export fun focused(): Condition {
+	Condition::Focused
+}
+
+/// The window at least `width` wide.
+export fun window_at_least(width: Dp): Condition {
+	Condition::WindowAtLeast(width)
+}
+
+/// The window narrower than `width`.
+export fun window_below(width: Dp): Condition {
+	Condition::WindowBelow(width)
+}
+
+/// A style's fields that apply while every one of `conditions` holds.
+export struct Conditional {
+	conditions: List<Condition>,
+	style: Style,
+}
+
 /// How an element looks: every field optional, a field left `None` changes nothing.
 /// A value — build it once, keep it, combine it: `a + b` is `a` with every field
-/// `b` sets replaced by `b`'s. Setting it on an element (`.style(s)`) sets the
-/// fields it has; a second `.style` composes onto the first the same way.
+/// `b` sets replaced by `b`'s, and both's conditional styles. Setting it on an
+/// element (`.style(s)`) sets the fields it has; a second `.style` composes onto
+/// the first the same way.
 ///
 /// The text fields (`font` to `italic`) are INHERITED: set on a row, they reach
 /// every text inside it that does not set its own. The others belong to the one
 /// element.
 ///
-/// (Part P3 adds conditions here — `when(hovered(), |s| ..)` — as a list of
-/// conditional styles that `+` concatenates.)
+/// `when(condition, |s| ..)` adds fields that apply only while the condition holds
+/// (`hovered()`, `pressed()`, `focused()`, `window_at_least(w)`, `window_below(w)`).
+/// A condition's fields win over the unconditional ones whatever order they were
+/// composed in; among conditions that hold, the later wins; a `when` inside a
+/// `when` applies while both hold. A conditional field that shapes text (a font, a
+/// size, a line height, a weight, italic) lays the text out again when the
+/// condition changes; every other field only repaints the one element.
 export struct Style {
 	background: Option<Color>,
 	/// Drawn INSIDE the box: a border never moves the content or the layout.
@@ -387,6 +620,8 @@ export struct Style {
 	/// 100 (thin) to 900 (black); 400 is regular, 700 bold.
 	weight: Option<i32>,
 	italic: Option<bool>,
+	/// The conditional styles, in the order they were added.
+	conditions: List<Conditional>,
 }
 
 /// A style that sets nothing, to build on: `style().background(c).radius(dp(8))`.
@@ -403,6 +638,7 @@ export fun style(): Style {
 		line_height = None,
 		weight = None,
 		italic = None,
+		conditions = [],
 	}
 }
 
@@ -468,11 +704,55 @@ export impl Style {
 		self.italic = Some(italic);
 		self
 	}
+
+	/// Fields that apply only while `condition` holds: `build` is handed an empty
+	/// style and answers them (a `when` inside it applies while both hold).
+	fun when(own self, condition: Condition, build: |Style| Style): Style {
+		let built = build(style());
+		self.conditions.push(Conditional {
+			conditions = [condition],
+			style = built.unconditional(),
+		});
+		for nested in built.conditions {
+			mut conditions = [condition];
+			for inner in nested.conditions {
+				conditions.push(inner);
+			}
+			self.conditions.push(Conditional { conditions, style = nested.style });
+		}
+		self
+	}
+
+	/// The fields alone, without the conditional styles.
+	fun unconditional(self): Style {
+		Style {
+			background = self.background,
+			border = self.border,
+			radius = self.radius,
+			shadow = self.shadow,
+			opacity = self.opacity,
+			font = self.font,
+			text_size = self.text_size,
+			text_color = self.text_color,
+			line_height = self.line_height,
+			weight = self.weight,
+			italic = self.italic,
+			conditions = [],
+		}
+	}
 }
 
-/// `a + b`: `b`'s fields where it sets them, `a`'s elsewhere.
+/// `a + b`: `b`'s fields where it sets them, `a`'s elsewhere; `a`'s conditional
+/// styles, then `b`'s.
 export impl Style with Add {
 	fun add(self, b: Style): Style {
+		mut conditions: List<Conditional> = [];
+		for conditional in self.conditions {
+			conditions.push(conditional);
+		}
+		for conditional in b.conditions {
+			conditions.push(conditional);
+		}
 		Style {
 			background = b.background.or(self.background),
 			border = b.border.or(self.border),
@@ -485,23 +765,29 @@ export impl Style with Add {
 			line_height = b.line_height.or(self.line_height),
 			weight = b.weight.or(self.weight),
 			italic = b.italic.or(self.italic),
+			conditions,
 		}
 	}
 }
 
-fun set_color(node: Node, property: i32, color: Color) {
-	ui_set_color(node, property, color.red, color.green, color.blue, color.alpha);
-}
-
-/// Sets on `node` every field `style` has.
-fun apply_style(node: Node, style: Style) {
+/// Writes `style`'s fields (not its conditions) to layer `layer` of `node`.
+fun style_fields(node: Node, layer: i32, style: Style) {
 	match style.background {
-		Some(let color) => set_color(node, 0, color),
+		Some(let color) => ui_style_color(
+			node,
+			layer,
+			0,
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha,
+		),
 		None => {},
 	}
 	match style.border {
-		Some(let border) => ui_set_border(
+		Some(let border) => ui_style_border(
 			node,
+			layer,
 			border.widths.top.value(),
 			border.widths.right.value(),
 			border.widths.bottom.value(),
@@ -514,8 +800,9 @@ fun apply_style(node: Node, style: Style) {
 		None => {},
 	}
 	match style.radius {
-		Some(let corners) => ui_set_corners(
+		Some(let corners) => ui_style_corners(
 			node,
+			layer,
 			corners.top_left.value(),
 			corners.top_right.value(),
 			corners.bottom_right.value(),
@@ -524,8 +811,9 @@ fun apply_style(node: Node, style: Style) {
 		None => {},
 	}
 	match style.shadow {
-		Some(let shadow) => ui_set_shadow(
+		Some(let shadow) => ui_style_shadow(
 			node,
+			layer,
 			shadow.x.value(),
 			shadow.y.value(),
 			shadow.blur.value(),
@@ -538,41 +826,88 @@ fun apply_style(node: Node, style: Style) {
 		None => {},
 	}
 	match style.opacity {
-		Some(let opacity) => ui_set(node, 8, opacity),
+		Some(let opacity) => ui_style_number(node, layer, 0, opacity),
 		None => {},
 	}
 	match style.font {
 		Some(let font) => match font {
-			FontFamily::SansSerif => ui_set_font(node, 0, ""),
-			FontFamily::Serif => ui_set_font(node, 1, ""),
-			FontFamily::Monospace => ui_set_font(node, 2, ""),
-			FontFamily::Named(let name) => ui_set_font(node, 3, name),
+			FontFamily::SansSerif => ui_style_font(node, layer, 0, ""),
+			FontFamily::Serif => ui_style_font(node, layer, 1, ""),
+			FontFamily::Monospace => ui_style_font(node, layer, 2, ""),
+			FontFamily::Named(let name) => ui_style_font(node, layer, 3, name),
 		},
 		None => {},
 	}
 	match style.text_size {
-		Some(let size) => ui_set(node, 9, size.value()),
+		Some(let size) => ui_style_number(node, layer, 1, size.value()),
 		None => {},
 	}
 	match style.text_color {
-		Some(let color) => set_color(node, 1, color),
+		Some(let color) => ui_style_color(
+			node,
+			layer,
+			1,
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha,
+		),
 		None => {},
 	}
 	match style.line_height {
-		Some(let line_height) => ui_set(node, 10, line_height),
+		Some(let line_height) => ui_style_number(node, layer, 2, line_height),
 		None => {},
 	}
 	match style.weight {
-		Some(let weight) => ui_set(node, 11, weight.as_f64()),
+		Some(let weight) => ui_style_number(node, layer, 3, weight.as_f64()),
 		None => {},
 	}
 	match style.italic {
-		Some(let italic) => ui_set(node, 12, if italic { 1.0 } else { 0.0 }),
+		Some(let italic) => ui_style_number(node, layer, 4, if italic { 1.0 } else { 0.0 }),
 		None => {},
 	}
 }
 
+/// Writes `style` as style group `group` of `node`: one unconditional layer, one
+/// layer per conditional style; then resolves the element.
+fun apply_style(node: Node, group: i32, style: Style) {
+	let base = ui_style_layer(node, group, false, 0, -1.0, -1.0);
+	style_fields(node, base, style);
+	for conditional in style.conditions {
+		mut bits = 0;
+		mut at_least = -1.0;
+		mut below = -1.0;
+		for condition in conditional.conditions {
+			match condition {
+				Condition::Hovered => bits = bits | 1,
+				Condition::Pressed => bits = bits | 2,
+				Condition::Focused => bits = bits | 4,
+				Condition::WindowAtLeast(let width) => at_least = if at_least < 0.0 {
+					width.value()
+				} else {
+					at_least.max(width.value())
+				},
+				Condition::WindowBelow(let width) => below = if below < 0.0 {
+					width.value()
+				} else {
+					below.min(width.value())
+				},
+			}
+		}
+		let layer = ui_style_layer(node, group, true, bits, at_least, below);
+		style_fields(node, layer, conditional.style);
+	}
+	ui_style_end(node);
+}
+
 // --- Elements ------------------------------------------------------------------
+
+/// What the pointer and the focus do to an element now: what its conditions read.
+export struct Interaction {
+	hovered: bool,
+	pressed: bool,
+	focused: bool,
+}
 
 /// An element of any kind: what a builder converts to (`Child`), and what a
 /// function that answers "some element" answers. Retained: a copy is the same
@@ -583,7 +918,8 @@ export struct Element {
 
 export impl Element {
 	/// Its box from the last layout of its tree, in dp from the root's top-left
-	/// corner, snapped to the device pixel grid of that layout's scale.
+	/// corner, snapped to the device pixel grid of that layout's scale. (An element
+	/// inside a `scroll` is where it is laid out, before the scroll's offset.)
 	fun bounds(self): Rect {
 		Rect::new(
 			dp(ui_node_number(self.node, 0)),
@@ -612,6 +948,18 @@ export impl Element {
 			index += 1;
 		}
 		entries
+	}
+
+	/// Gives it the focus, whether or not it is `focusable` (its `on_blur` and the
+	/// previous holder's `on_focus` run first).
+	fun focus(self) {
+		ui_focus(self.node);
+	}
+
+	/// Whether it is hovered, pressed and focused now.
+	fun interaction(self): Interaction {
+		let bits = ui_interaction(self.node);
+		Interaction { hovered = bits & 1 != 0, pressed = bits & 2 != 0, focused = bits & 4 != 0 }
 	}
 }
 
@@ -643,113 +991,152 @@ export impl str with Child {
 	}
 }
 
-/// The attributes every element kind has: its size, how it grows and shrinks in a
-/// row or a column, its padding, its anchor in a stack, its style, and its
-/// accessibility role and label. Each sets the element and answers it, so they
-/// chain.
+/// The attributes every element has: its size, how it grows and shrinks in a row or
+/// a column, its padding, its anchor in a stack, its style, its accessibility role
+/// and label, its focus, and the events it listens for. Each sets the element and
+/// answers it, so they chain.
+///
+/// Every attribute that takes a value takes a SIGNAL of it too (anything
+/// `MaybeSignal`: a `SignalCell`, a memo, a pipe): the attribute follows it, and
+/// each write marks that one element for layout (a size, a padding) or for paint (a
+/// style) and asks the window it is mounted in for a frame. A signal needs an owner
+/// to belong to: build under `mount_root` (or `run_with_owner`).
 export trait Attributes {
 	/// The element these set.
 	fun element(self): Element;
 
 	/// `width(dp(240))`, `width(fraction(1, 2))`, `width(Length::Auto)`.
-	fun width<L: IntoLength>(self, width: L): Self {
-		set_length(self.element().node, 0, width.into_length());
+	fun width<L: IntoLength, V: Bindable<L>>(self, own width: V): Self {
+		let node = self.element().node;
+		width.bind(|value: L| set_length(node, 0, value.into_length()));
 		self
 	}
 
-	fun height<L: IntoLength>(self, height: L): Self {
-		set_length(self.element().node, 1, height.into_length());
+	fun height<L: IntoLength, V: Bindable<L>>(self, own height: V): Self {
+		let node = self.element().node;
+		height.bind(|value: L| set_length(node, 1, value.into_length()));
 		self
 	}
 
-	fun min_width<L: IntoLength>(self, width: L): Self {
-		set_length(self.element().node, 2, width.into_length());
+	fun min_width<L: IntoLength, V: Bindable<L>>(self, own width: V): Self {
+		let node = self.element().node;
+		width.bind(|value: L| set_length(node, 2, value.into_length()));
 		self
 	}
 
-	fun max_width<L: IntoLength>(self, width: L): Self {
-		set_length(self.element().node, 3, width.into_length());
+	fun max_width<L: IntoLength, V: Bindable<L>>(self, own width: V): Self {
+		let node = self.element().node;
+		width.bind(|value: L| set_length(node, 3, value.into_length()));
 		self
 	}
 
-	fun min_height<L: IntoLength>(self, height: L): Self {
-		set_length(self.element().node, 4, height.into_length());
+	fun min_height<L: IntoLength, V: Bindable<L>>(self, own height: V): Self {
+		let node = self.element().node;
+		height.bind(|value: L| set_length(node, 4, value.into_length()));
 		self
 	}
 
-	fun max_height<L: IntoLength>(self, height: L): Self {
-		set_length(self.element().node, 5, height.into_length());
+	fun max_height<L: IntoLength, V: Bindable<L>>(self, own height: V): Self {
+		let node = self.element().node;
+		height.bind(|value: L| set_length(node, 5, value.into_length()));
 		self
 	}
 
 	/// Its share of a row's or a column's leftover space along the axis, against
 	/// its siblings' shares. 0 (none) until set.
-	fun grow(self, grow: f64): Self {
-		ui_set(self.element().node, 0, grow);
+	fun grow<V: Bindable<f64>>(self, own grow: V): Self {
+		let node = self.element().node;
+		grow.bind(|value: f64| ui_set(node, 0, value));
 		self
 	}
 
 	/// Its share of a row's or a column's shortfall when the children do not fit. 1
 	/// until set; 0 keeps it at least as large as its content.
-	fun shrink(self, shrink: f64): Self {
-		ui_set(self.element().node, 1, shrink);
+	fun shrink<V: Bindable<f64>>(self, own shrink: V): Self {
+		let node = self.element().node;
+		shrink.bind(|value: f64| ui_set(node, 1, value));
 		self
 	}
 
 	/// The space inside it, between its edge and its content, on every side.
-	fun padding(self, padding: Dp): Self {
+	fun padding<V: Bindable<Dp>>(self, own padding: V): Self {
 		let node = self.element().node;
-		for side in [14, 15, 16, 17] {
-			ui_set(node, side, padding.value());
-		}
+		padding.bind(|value: Dp| {
+			for side in [14, 15, 16, 17] {
+				ui_set(node, side, value.value());
+			}
+		});
 		self
 	}
 
 	/// The padding on the left and the right.
-	fun padding_x(self, padding: Dp): Self {
+	fun padding_x<V: Bindable<Dp>>(self, own padding: V): Self {
 		let node = self.element().node;
-		ui_set(node, 15, padding.value());
-		ui_set(node, 17, padding.value());
+		padding.bind(|value: Dp| {
+			ui_set(node, 15, value.value());
+			ui_set(node, 17, value.value());
+		});
 		self
 	}
 
 	/// The padding at the top and the bottom.
-	fun padding_y(self, padding: Dp): Self {
+	fun padding_y<V: Bindable<Dp>>(self, own padding: V): Self {
 		let node = self.element().node;
-		ui_set(node, 14, padding.value());
-		ui_set(node, 16, padding.value());
+		padding.bind(|value: Dp| {
+			ui_set(node, 14, value.value());
+			ui_set(node, 16, value.value());
+		});
 		self
 	}
 
-	fun padding_top(self, padding: Dp): Self {
-		ui_set(self.element().node, 14, padding.value());
+	fun padding_top<V: Bindable<Dp>>(self, own padding: V): Self {
+		let node = self.element().node;
+		padding.bind(|value: Dp| ui_set(node, 14, value.value()));
 		self
 	}
 
-	fun padding_right(self, padding: Dp): Self {
-		ui_set(self.element().node, 15, padding.value());
+	fun padding_right<V: Bindable<Dp>>(self, own padding: V): Self {
+		let node = self.element().node;
+		padding.bind(|value: Dp| ui_set(node, 15, value.value()));
 		self
 	}
 
-	fun padding_bottom(self, padding: Dp): Self {
-		ui_set(self.element().node, 16, padding.value());
+	fun padding_bottom<V: Bindable<Dp>>(self, own padding: V): Self {
+		let node = self.element().node;
+		padding.bind(|value: Dp| ui_set(node, 16, value.value()));
 		self
 	}
 
-	fun padding_left(self, padding: Dp): Self {
-		ui_set(self.element().node, 17, padding.value());
+	fun padding_left<V: Bindable<Dp>>(self, own padding: V): Self {
+		let node = self.element().node;
+		padding.bind(|value: Dp| ui_set(node, 17, value.value()));
 		self
 	}
 
 	/// Where it sits in a `stack`.
-	fun anchor(self, anchor: Anchor): Self {
-		ui_set(self.element().node, 6, anchor_code(anchor));
+	fun anchor<V: Bindable<Anchor>>(self, own anchor: V): Self {
+		let node = self.element().node;
+		anchor.bind(|value: Anchor| ui_set(node, 6, anchor_code(value)));
 		self
 	}
 
-	/// Sets every field `style` has (a second `style` composes onto the first).
-	fun style(self, style: Style): Self {
-		apply_style(self.element().node, style);
+	/// Sets every field `style` has (a second `style` composes onto the first). A
+	/// signal of a style replaces what its last value set, and leaves what other
+	/// `style` calls set alone.
+	fun style<V: Bindable<Style>>(self, own style: V): Self {
+		let node = self.element().node;
+		let group = ui_style_group(node, -1);
+		style.bind(|value: Style| {
+			ui_style_group(node, group);
+			apply_style(node, group, value);
+		});
+		self
+	}
+
+	/// Its children painted, and hit, inside its padding box only (a `scroll`
+	/// always clips).
+	fun clip(self): Self {
+		ui_set(self.element().node, 18, 1.0);
 		self
 	}
 
@@ -760,16 +1147,146 @@ export trait Attributes {
 	}
 
 	/// What assistive technology reads for it, and the name `outline` lists it by.
-	fun label(self, label: str): Self {
-		ui_set_label(self.element().node, label);
+	fun label<V: Bindable<str>>(self, own label: V): Self {
+		let node = self.element().node;
+		label.bind(|value: str| ui_set_label(node, value));
+		self
+	}
+
+	/// It takes the focus when pressed, and Tab reaches it in tree order.
+	fun focusable(self): Self {
+		ui_set_focusable(self.element().node, true);
+		self
+	}
+
+	/// Focusable, at `index` in the tab order: every positive index comes before
+	/// the elements in tree order (0), lowest first; a negative one is focusable by
+	/// a press or by `focus()` but never reached by Tab.
+	fun tab_index(self, index: i32): Self {
+		ui_set(self.element().node, 19, index.as_f64());
+		self
+	}
+
+	// --- Events. Each handler runs the way a window delivers an event: as one
+	// turn (its signal writes settle as one wave), with tracking cleared (a
+	// handler is a callback, not a body) — the web UI's `on`, exactly. ---
+
+	/// The primary button went down on it (or inside it).
+	fun on_press(self, handler: (|| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 3, || turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler())));
+		self
+	}
+
+	/// The primary button came up over it (or inside it).
+	fun on_release(self, handler: (|| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 4, || turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler())));
+		self
+	}
+
+	/// A press and its release, both on it (or inside it).
+	fun on_click(self, handler: (|| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 5, || turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler())));
+		self
+	}
+
+	/// The pointer came over it. Does not bubble: each element the pointer comes
+	/// into hears its own.
+	fun on_pointer_enter(self, handler: (|| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 0, || turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler())));
+		self
+	}
+
+	/// The pointer left it. Does not bubble.
+	fun on_pointer_leave(self, handler: (|| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 1, || turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler())));
+		self
+	}
+
+	/// The pointer moved over it, to this point (dp from the window's top-left).
+	fun on_pointer_move(self, handler: (|Point| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 2, || {
+			if current_event() is Some(Event::PointerMoved(let point)) {
+				turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(point)));
+			}
+		});
+		self
+	}
+
+	/// The wheel (or a touchpad) scrolled over it. A `scroll` on the way up that
+	/// can move takes it from there.
+	fun on_scroll(self, handler: (|Scroll| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 6, || {
+			if current_event() is Some(Event::Scrolled(let scroll)) {
+				turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(scroll)));
+			}
+		});
+		self
+	}
+
+	/// A key went down while it (or an element inside it) has the focus — or,
+	/// when nothing has the focus, on the root. `stop_event()` keeps Tab from
+	/// moving the focus.
+	fun on_key(self, handler: (|KeyPress| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 7, || {
+			if current_event() is Some(Event::KeyPressed(let key)) {
+				turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(key)));
+			}
+		});
+		self
+	}
+
+	/// A key came up, delivered as `on_key` is.
+	fun on_key_release(self, handler: (|KeyPress| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 8, || {
+			if current_event() is Some(Event::KeyReleased(let key)) {
+				turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(key)));
+			}
+		});
+		self
+	}
+
+	/// Text typed, delivered as `on_key` is.
+	fun on_text(self, handler: (|str| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 9, || {
+			if current_event() is Some(Event::TextInput(let text)) {
+				turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(text)));
+			}
+		});
+		self
+	}
+
+	/// It took the focus. Does not bubble.
+	fun on_focus(self, handler: (|| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 10, || turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler())));
+		self
+	}
+
+	/// It lost the focus. Does not bubble.
+	fun on_blur(self, handler: (|| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 11, || turn(FlushPolicy::AtSuspension, || tracking
+			.clear(|| handler())));
 		self
 	}
 }
 
-/// The elements with children: rows, columns and stacks.
+/// Inside an event handler: the event goes no further up the tree, and the
+/// framework's own response to it does not happen (Tab moving the focus, a `scroll`
+/// moving). Enter, leave, focus and blur cannot be stopped.
+export fun stop_event() {
+	ui_stop();
+}
+
+/// The elements with children: rows, columns, stacks and scrolls.
 export trait Parent with Attributes {
 	/// Appends a child: an element of any kind, or a `str` (a `text` holding it).
-	/// An element is in one place: one already inside another is refused.
+	/// An element is in one place: one already inside another is refused, and a
+	/// `scroll` takes one child.
 	fun child<C: Child>(self, content: C): Self {
 		ui_add_child(self.element().node, content.into_element().node);
 		self
@@ -780,20 +1297,23 @@ export trait Parent with Attributes {
 export trait Flex with Parent {
 	/// The space between neighbouring children, along the axis (and between the
 	/// lines when it wraps).
-	fun gap(self, gap: Dp): Self {
-		ui_set(self.element().node, 2, gap.value());
+	fun gap<V: Bindable<Dp>>(self, own gap: V): Self {
+		let node = self.element().node;
+		gap.bind(|value: Dp| ui_set(node, 2, value.value()));
 		self
 	}
 
 	/// Where the children sit across the axis.
-	fun align(self, align: Align): Self {
-		ui_set(self.element().node, 3, align_code(align));
+	fun align<V: Bindable<Align>>(self, own align: V): Self {
+		let node = self.element().node;
+		align.bind(|value: Align| ui_set(node, 3, align_code(value)));
 		self
 	}
 
 	/// How the children share the space along the axis.
-	fun justify(self, justify: Justify): Self {
-		ui_set(self.element().node, 4, justify_code(justify));
+	fun justify<V: Bindable<Justify>>(self, own justify: V): Self {
+		let node = self.element().node;
+		justify.bind(|value: Justify| ui_set(node, 4, justify_code(value)));
 		self
 	}
 
@@ -835,23 +1355,29 @@ export struct ImageElement {
 	element: Element,
 }
 
-// NOTE(elem-58): each constructor below gains `[element]` when that attribute
-// lands, so `<row gap(dp(8))>..</row>` lowers onto exactly these calls.
+/// A clipped viewport over one child. See `scroll()`. (`std::gfx::Scroll` is a
+/// wheel's movement; this is the element that scrolls.)
+export struct ScrollElement {
+	element: Element,
+}
 
 /// Children left to right, `gap` apart, stretched to the row's height (`align`),
 /// packed at the start (`justify`).
+[element]
 export fun row(): Row {
 	Row { element = new_element(0) }
 }
 
 /// Children top to bottom, `gap` apart, stretched to the column's width (`align`),
 /// packed at the top (`justify`).
+[element]
 export fun column(): Column {
 	Column { element = new_element(1) }
 }
 
 /// Children on top of one another, later ones above, each at the top left until it
 /// says otherwise (`anchor`). As large as its largest child unless it sizes itself.
+[element]
 export fun stack(): Stack {
 	Stack { element = new_element(2) }
 }
@@ -859,14 +1385,26 @@ export fun stack(): Stack {
 /// A paragraph: its `child` runs, one after another, in the text style it
 /// inherits and sets. As wide as its one line unless its parent gives it less,
 /// then wrapped at that width — never narrower than its longest word.
+[element]
 export fun text(): Text {
 	Text { element = new_element(3) }
 }
 
 /// A texture, drawn by its fit rule (`Fit::Contain` until set). Its natural size is
 /// the texture's, a pixel a dp; given one side, it keeps the aspect.
+[element]
 export fun image(): ImageElement {
 	ImageElement { element = new_element(4) }
+}
+
+/// A viewport over its one child, clipped to its padding box, moved by the wheel
+/// along its `axis` (`ScrollAxis::Vertical` until set). The child keeps its own
+/// size along the axis — a column of a thousand rows is as tall as its rows — and
+/// the scroll asks for that size but takes what its parent gives it: its content
+/// never holds it open (give it a size, or `grow` it, to fill the room).
+[element]
+export fun scroll(): ScrollElement {
+	ScrollElement { element = new_element(5) }
 }
 
 export impl Row with Attributes {
@@ -928,9 +1466,13 @@ export impl Text with Child {
 }
 
 export impl Text {
-	/// Appends a run of text to the paragraph.
-	fun child(self, run: str): Text {
-		ui_append_text(self.element.node, run);
+	/// Appends a run of text to the paragraph: a `str`, or a signal of one, whose
+	/// writes replace the run in place (the text is laid out again, and nothing
+	/// else that does not have to move).
+	fun child<V: Bindable<str>>(self, own run: V): Text {
+		let node = self.element.node;
+		let index = ui_append_text(node, "");
+		run.bind(|value: str| ui_set_run(node, index, value));
 		self
 	}
 }
@@ -949,31 +1491,85 @@ export impl ImageElement with Child {
 
 export impl ImageElement {
 	/// The picture it shows.
-	fun texture(self, texture: Texture): ImageElement {
-		ui_set_texture(self.element.node, texture);
+	fun texture<V: Bindable<Texture>>(self, own texture: V): ImageElement {
+		let node = self.element.node;
+		texture.bind(|value: Texture| ui_set_texture(node, value));
 		self
 	}
 
 	/// How the picture fills the box.
-	fun fit(self, fit: Fit): ImageElement {
-		ui_set(self.element.node, 13, fit_code(fit));
+	fun fit<V: Bindable<Fit>>(self, own fit: V): ImageElement {
+		let node = self.element.node;
+		fit.bind(|value: Fit| ui_set(node, 13, fit_code(value)));
 		self
 	}
 }
 
-// --- Layout and drawing --------------------------------------------------------
+export impl ScrollElement with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl ScrollElement with Parent {}
+
+export impl ScrollElement with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl ScrollElement {
+	/// Which way it moves its child.
+	fun axis(self, axis: ScrollAxis): ScrollElement {
+		ui_set(self.element.node, 20, scroll_axis_code(axis));
+		self
+	}
+
+	/// Binds its offset — how far the child is moved up and left — to `cell`, both
+	/// ways: the cell's value (now and at every write) scrolls it, clamped to how
+	/// far the child reaches; the wheel, and a clamp, write the cell. A scroll
+	/// moving lays nothing out and repaints nothing inside it.
+	fun offset(self, cell: SignalCell<Point>): ScrollElement {
+		let node = self.element.node;
+		let _bound = register_with_owner(cell
+			.sub(|value: Point| ui_set_offset(node, value.x.value(), value.y.value())));
+		ui_on_offset(node, || {
+			let now = Point::new(dp(ui_offset(node, 0)), dp(ui_offset(node, 1)));
+			let held = cell.get();
+			if held.x.value() != now.x.value() || held.y.value() != now.y.value() {
+				turn(FlushPolicy::AtSuspension, || cell.set(now));
+			}
+		});
+		self
+	}
+
+	/// How far its child is moved up and left now.
+	fun scrolled(self): Point {
+		Point::new(dp(ui_offset(self.element.node, 0)), dp(ui_offset(self.element.node, 1)))
+	}
+
+	/// How far its child reaches past it, from the last layout: the largest offset.
+	fun range(self): Size {
+		Size::new(dp(ui_offset(self.element.node, 2)), dp(ui_offset(self.element.node, 3)))
+	}
+}
+
+// --- Layout, drawing and the window ---------------------------------------------
 
 /// Lays `root`'s tree out in a `size` viewport (the root fills it unless it sizes
 /// itself), snapped to the device pixel grid at `scale_factor` — what `mount`
 /// does for every frame, for a test or a measurement to read back with `bounds`
 /// and `outline`. The solver runs only when something that moves a box changed,
-/// or the size did; a new scale alone snaps again.
+/// or the size did, and measures only what its cache lost; a new scale alone
+/// snaps again.
 export fun layout<C: Child>(root: C, size: Size, scale_factor: f64) {
 	ui_layout(root.into_element().node, size.width.value(), size.height.value(), scale_factor);
 }
 
 /// Lays `root` out at `frame`'s size and scale and draws it into `frame`. For a
-/// frame callback of your own (drawing more around it), and for `Offscreen`.
+/// frame callback of your own (drawing more around it), and for `Offscreen`. Only
+/// the elements that changed since the last draw are painted again.
 export fun draw<C: Child>(frame: Frame, root: C) {
 	let element = root.into_element();
 	let size = frame.size();
@@ -981,14 +1577,180 @@ export fun draw<C: Child>(frame: Frame, root: C) {
 	ui_paint(frame.token, element.node);
 }
 
-/// Shows `root` in `window`: it becomes the window's frame callback, laying the
-/// tree out at the window's size and scale on every frame and drawing it. The
-/// window draws a frame when it opens, resizes or changes scale, so the tree
-/// follows the window; asking for a frame (`window.request_redraw()`) after a
-/// change shows it.
+/// Shows `root` in `window`: its frames lay the tree out at the window's size and
+/// scale and draw it; its events go to the tree's elements (hit testing, focus,
+/// conditions, scrolling) before the window's own event callback, if it has one,
+/// hears them; and a change to the tree — a signal-bound attribute's write, a
+/// condition, a scroll — asks for a frame. Nothing is drawn while nothing changes.
 export fun mount<C: Child>(window: Window, root: C) {
-	let element = root.into_element();
-	window.on_frame(|frame: Frame| {
-		draw(frame, element);
-	});
+	ui_mount(window.id, root.into_element().node);
+}
+
+/// Builds `root` under a new owner (the boundary every signal binding inside it
+/// belongs to), as one turn, and mounts it in `window`. Answers the owner: dispose
+/// it to release the bindings.
+export fun mount_root<C: Child>(window: Window, body: (sync || C) context owner_scope): Owner {
+	let (built, owner) = turn(FlushPolicy::AtSuspension, || comp(body));
+	mount(window, built);
+	owner
+}
+
+/// What the last layout and paint took and did — a mounted window's frame, or a
+/// `draw` of your own. Times are microseconds of this thread's wall clock (on a
+/// software GPU driver, `draw` is the driver's rasterising too, and says nothing
+/// about a real GPU).
+export struct FrameTimes {
+	/// The layout pass: resolving styles, the solver, snapping.
+	layout: f64,
+	/// The paint pass: rebuilding the scenes of what changed.
+	paint: f64,
+	/// Encoding, submitting and presenting the window's last PRESENTED frame (read
+	/// inside a frame callback, that is the frame before).
+	draw: f64,
+	/// The solver ran.
+	solved: bool,
+	/// Leaves (texts, images) the solver measured.
+	measured: i32,
+	/// Elements whose box moved.
+	moved: i32,
+	/// Elements whose scene was rebuilt.
+	rebuilt: i32,
+}
+
+/// The last layout and paint, and `window`'s last draw.
+export fun last_frame(window: Window): FrameTimes {
+	let id = window.id;
+	FrameTimes {
+		layout = ui_frame_number(id, 0),
+		paint = ui_frame_number(id, 1),
+		draw = ui_frame_number(id, 2),
+		solved = ui_frame_number(id, 3) != 0.0,
+		measured = ui_frame_number(id, 4).as_i32(),
+		moved = ui_frame_number(id, 5).as_i32(),
+		rebuilt = ui_frame_number(id, 6).as_i32(),
+	}
+}
+
+/// Delivers `event` to `root`'s tree as a mounted window does — hit testing on its
+/// last layout, conditions, focus, handlers, scrolling — with no window: for a
+/// test, or a program that drives a tree itself. Lay it out first.
+export fun deliver<C: Child>(root: C, event: Event) {
+	let node = root.into_element().node;
+	match event {
+		Event::PointerMoved(let point) => ui_deliver(
+			node,
+			0,
+			point.x.value(),
+			point.y.value(),
+			0.0,
+			0.0,
+			0.0,
+			"",
+		),
+		Event::PointerPressed(let pointer) => ui_deliver(
+			node,
+			1,
+			pointer.position.x.value(),
+			pointer.position.y.value(),
+			button_code(pointer.button),
+			modifier_bits(pointer.modifiers),
+			0.0,
+			"",
+		),
+		Event::PointerReleased(let pointer) => ui_deliver(
+			node,
+			2,
+			pointer.position.x.value(),
+			pointer.position.y.value(),
+			button_code(pointer.button),
+			modifier_bits(pointer.modifiers),
+			0.0,
+			"",
+		),
+		Event::PointerLeft => ui_deliver(node, 3, 0.0, 0.0, 0.0, 0.0, 0.0, ""),
+		Event::Scrolled(let scroll) => ui_deliver(
+			node,
+			4,
+			scroll.position.x.value(),
+			scroll.position.y.value(),
+			scroll.x.value(),
+			scroll.y.value(),
+			modifier_bits(scroll.modifiers),
+			"",
+		),
+		Event::KeyPressed(let key) => deliver_key(node, 5, key),
+		Event::KeyReleased(let key) => deliver_key(node, 6, key),
+		Event::TextInput(let text) => ui_deliver(node, 7, 0.0, 0.0, 0.0, 0.0, 0.0, text),
+		_ => {},
+	}
+}
+
+fun deliver_key(node: Node, kind: i32, key: KeyPress) {
+	let repeat = if key.repeat { 1.0 } else { 0.0 };
+	let (name, named) = key_name(key);
+	ui_deliver(
+		node,
+		kind,
+		repeat,
+		modifier_bits(key.modifiers),
+		if named {
+			1.0
+		} else {
+			0.0
+		},
+		0.0,
+		0.0,
+		name,
+	);
+}
+
+/// A key as `std::gfx`'s event table names it: the inverse of its decoder.
+fun key_name(key: KeyPress): (str, bool) {
+	match key.key {
+		KeyName::Char(let character) => (character, false),
+		KeyName::Enter => ("Enter", true),
+		KeyName::Tab => ("Tab", true),
+		KeyName::Backspace => ("Backspace", true),
+		KeyName::Delete => ("Delete", true),
+		KeyName::Insert => ("Insert", true),
+		KeyName::Escape => ("Escape", true),
+		KeyName::Up => ("ArrowUp", true),
+		KeyName::Down => ("ArrowDown", true),
+		KeyName::Left => ("ArrowLeft", true),
+		KeyName::Right => ("ArrowRight", true),
+		KeyName::Home => ("Home", true),
+		KeyName::End => ("End", true),
+		KeyName::PageUp => ("PageUp", true),
+		KeyName::PageDown => ("PageDown", true),
+		KeyName::F(let number) => (i"F{number}", true),
+		KeyName::Other(let name) => (name, true),
+	}
+}
+
+fun button_code(button: Button): f64 {
+	match button {
+		Button::Left => 0.0,
+		Button::Right => 1.0,
+		Button::Middle => 2.0,
+		Button::Back => 3.0,
+		Button::Forward => 4.0,
+		Button::Other(let code) => 5.0 + code.as_f64(),
+	}
+}
+
+fun modifier_bits(modifiers: Modifiers): f64 {
+	mut bits = 0;
+	if modifiers.shift {
+		bits = bits | 1;
+	}
+	if modifiers.control {
+		bits = bits | 2;
+	}
+	if modifiers.alt {
+		bits = bits | 4;
+	}
+	if modifiers.meta {
+		bits = bits | 8;
+	}
+	bits.as_f64()
 }

@@ -137,6 +137,15 @@ pub(crate) struct WindowSlot {
     pub(crate) modifiers: winit::keyboard::ModifiersState,
     pub(crate) on_frame: Option<Rc<dyn Fn()>>,
     pub(crate) on_event: Option<Rc<dyn Fn()>>,
+    /// The `std::ui` tree mounted in the window (`ui::mount`): its events
+    /// are routed into it before `on_event` hears them.
+    pub(crate) ui_root: Option<ui::Node>,
+    /// How long the last presented frame took to draw (encode, submit,
+    /// present), in microseconds.
+    pub(crate) last_draw_us: f64,
+    /// Frames asked for (`request_redraw`) since the window was asked for:
+    /// what the pins of "a change asks for a frame" read.
+    pub(crate) redraw_requests: u64,
     pub(crate) events: VecDeque<RawEvent>,
     /// A frame is due: the source builds it in the next turn.
     pub(crate) frame_due: bool,
@@ -336,6 +345,9 @@ pub fn open(
                 modifiers: winit::keyboard::ModifiersState::empty(),
                 on_frame: None,
                 on_event: None,
+                ui_root: None,
+                last_draw_us: 0.0,
+                redraw_requests: 0,
                 events: VecDeque::new(),
                 frame_due: false,
                 scene: None,
@@ -372,6 +384,7 @@ pub fn close(id: u32) {
 /// is drawn are one frame.
 pub fn request_redraw(id: u32) {
     with_window(id, |slot| {
+        slot.redraw_requests += 1;
         if let Some(window) = &slot.window {
             window.request_redraw();
         }
@@ -439,6 +452,18 @@ pub fn event_integer(index: i32) -> i32 {
     event_number(index) as i32
 }
 
+/// `__gfx_event_current()` — the kind of the event being delivered (the one
+/// `event_next` took last, or the one a `std::ui` handler runs for), or -1.
+pub fn event_current() -> i32 {
+    STATE.with(|state| {
+        state
+            .borrow()
+            .current_event
+            .as_ref()
+            .map_or(-1, |event| event.kind)
+    })
+}
+
 /// `__gfx_event_text()` — the string of the event `event_next` took (a key's
 /// name, typed text), or "" for an event that carries none.
 pub fn event_text() -> Str {
@@ -467,6 +492,9 @@ struct WindowSource {
 enum Work {
     Answer(Answer, Result<u32, Str>),
     Events(Rc<dyn Fn()>),
+    /// A mounted tree's events, then (if the program listens too) its
+    /// callback, which reads the same events again.
+    UiEvents(ui::Node, Vec<RawEvent>, Option<Rc<dyn Fn()>>),
     Frame(Option<Rc<dyn Fn()>>, (f64, f64), f64),
     Nothing,
 }
@@ -494,6 +522,15 @@ impl IoSource for WindowSource {
                     None => Work::Nothing,
                 };
             }
+            if !slot.events.is_empty()
+                && let Some(root) = &slot.ui_root
+            {
+                let events: Vec<RawEvent> = slot.events.iter().cloned().collect();
+                if slot.on_event.is_none() {
+                    slot.events.clear();
+                }
+                return Work::UiEvents(root.clone(), events, slot.on_event.clone());
+            }
             if !slot.events.is_empty() {
                 match &slot.on_event {
                     Some(callback) => return Work::Events(Rc::clone(callback)),
@@ -519,6 +556,15 @@ impl IoSource for WindowSource {
             }
             Work::Events(callback) => {
                 callback();
+                true
+            }
+            Work::UiEvents(root, events, callback) => {
+                for event in &events {
+                    ui::dispatch(&root, event);
+                }
+                if let Some(callback) = callback {
+                    callback();
+                }
                 true
             }
             Work::Frame(callback, size, scale_factor) => {

@@ -1,15 +1,17 @@
-//! `std::ui`'s element tree, layout and paint (native-ui.md part P2; rulings
-//! R4, R5, R7, R9, R10, R16).
+//! `std::ui`'s element tree, layout, paint and interaction (native-ui.md
+//! parts P2 and P3; rulings R4, R5, R7, R9, R10, R16).
 //!
 //! # What lives here, and why here
 //!
 //! The RETAINED element tree is this crate's: a [`UiTree`] holds every element
-//! of a program — its kind, its layout properties, its paint, its inherited
-//! text style, its accessibility role and label — in one `taffy` tree, and a
-//! vilan program holds HANDLES to its elements (`host::ui`'s `Node`, one
-//! `Rc` per element). The vilan surface (`vilan/std/src/ui.vl`) is the typed
-//! builder vocabulary over it; every attribute call crosses once, as numbers,
-//! at build time, and nothing crosses per frame but the root's handle.
+//! of a program — its kind, its layout properties, its style layers, its
+//! inherited text style, its accessibility role and label, its event handlers,
+//! its focus and scroll state — in one `taffy` tree, and a vilan program holds
+//! HANDLES to its elements (`host::ui`'s `Node`, one `Rc` per element). The
+//! vilan surface (`vilan/std/src/ui.vl`) is the typed builder vocabulary over
+//! it; every attribute call crosses once, as numbers, when it is set (again
+//! when a signal it is bound to writes), and nothing crosses per frame but the
+//! root's handle.
 //!
 //! The tree is here and not in vilan values because of what layout needs:
 //!
@@ -20,28 +22,40 @@
 //! - **The solver's per-node cache is the incremental layout.** `taffy` keeps
 //!   a cache per node and clears it up the ancestor chain when a node's style
 //!   changes; a tree rebuilt into the solver for every pass would throw that
-//!   away. Keeping the tree here keeps it, which is what P3's signal-bound
-//!   properties lean on (one write, one dirty chain, one re-solve).
+//!   away. Keeping the tree here keeps it: one write, one dirty chain, one
+//!   re-solve that measures only what changed.
 //! - **One Rust stack (R12, R14).** The browser target compiles this same
 //!   crate to wasm; a tree mirrored in vilan values would be a second
 //!   implementation of the same thing on the other side of the seam.
 //!
-//! # Passes
+//! # Passes, and what a change costs
 //!
 //! A frame of a mounted root is two passes, kept apart:
 //!
-//! 1. [`UiTree::layout`]: when the tree's LAYOUT generation moved (a layout
-//!    property, a child, a text run, a texture, an inherited text style) or
-//!    the size changed, the inherited text styles are resolved down the tree
-//!    and the solver runs from the root's viewport; then (and on a scale
-//!    change alone) every element's box is SNAPPED to the device pixel grid
-//!    by [`Units`]'s one rule, the renderer's (R16).
-//! 2. [`UiTree::paint`]: when the PAINT generation or the layout moved, the
-//!    root's scene is rebuilt from the snapped boxes; otherwise the scene
-//!    built last time is appended again, unchanged.
+//! 1. [`UiTree::layout`]: the inherited text styles of the subtrees whose
+//!    style changed are resolved again; then, when the LAYOUT generation
+//!    moved (a layout property, a child, a text run, a texture, a reshaping
+//!    text style) or the size changed, the solver runs from the root's
+//!    viewport — re-measuring only what its cache lost, the dirty chain —
+//!    and every element's box is SNAPPED to the device pixel grid by
+//!    [`Units`]' one rule, the renderer's (R16). A box that moved is marked
+//!    for repaint.
+//! 2. [`UiTree::paint`]: every element keeps the SCENE of its own subtree
+//!    (`std::gfx`'s nested [`Scene`]). A change marks the one element (and
+//!    the chain of scenes above it, which only recombine their children's
+//!    kept scenes) for rebuilding; everything else is appended as it was
+//!    built. A frame with nothing changed appends the root's kept scene.
 //!
-//! A property that changes paint only (a colour, a radius, an opacity) moves
-//! the paint generation alone, so it repaints without a layout pass.
+//! So a property that changes paint only (a colour, a radius, an opacity, a
+//! condition's look) repaints its element without a layout pass, and a
+//! scroll moves a viewport's offset without laying out or repainting what is
+//! inside it.
+//!
+//! # Interaction
+//!
+//! Hit testing, the hover / press / focus state the style conditions read,
+//! event routing with bubbling, the tab order and scrolling are `input.rs`'s;
+//! style layers and conditions are `style.rs`'s.
 //!
 //! # Element kinds
 //!
@@ -51,25 +65,33 @@
 //! | stack | every child in ONE grid cell, each placed by its own anchor |
 //! | text | a leaf measured by the text system, wrapped to the width it is given |
 //! | image | a leaf whose natural size is its texture's, in dp; painted by its fit |
+//! | scroll | a clipped viewport over its one child, which keeps its own size |
 //!
 //! No margins (R5): space between siblings is the parent's gap, space inside
 //! an element its padding.
+
+mod input;
+mod style;
 
 use std::rc::Rc;
 
 use taffy::{
     AlignContent, AlignItems, AvailableSpace, Dimension, Display, FlexDirection, FlexWrap,
-    LengthPercentage, LengthPercentageAuto, TaffyTree,
+    LengthPercentage, LengthPercentageAuto, Overflow, TaffyTree, TraversePartialTree,
 };
 
 /// An element's id in its [`UiTree`].
 pub use taffy::NodeId;
 
+pub use input::{DefaultAction, Delivery, EventKind, Handler, Input, Route, Step};
+pub use style::{Condition, Interaction, StyleFields};
+
 use crate::color::{Color, Fill};
-use crate::geometry::{Corners, Edges, Point, Rect, Size};
+use crate::geometry::{Corners, Edges, Point, Rect, Size, Transform};
 use crate::scene::{Border, Image, Rectangle, Scene, SceneBuilder, Shadow};
 use crate::text::{FontFamily, TextLayout, TextStyle, TextSystem};
 use crate::units::Units;
+use style::Layers;
 
 #[cfg(test)]
 mod tests;
@@ -83,6 +105,7 @@ pub enum ElementKind {
     Stack,
     Text,
     Image,
+    Scroll,
     Viewport,
 }
 
@@ -95,6 +118,7 @@ impl ElementKind {
             ElementKind::Stack => "stack",
             ElementKind::Text => "text",
             ElementKind::Image => "image",
+            ElementKind::Scroll => "scroll",
             ElementKind::Viewport => "viewport",
         }
     }
@@ -102,7 +126,11 @@ impl ElementKind {
     fn is_parent(self) -> bool {
         matches!(
             self,
-            ElementKind::Row | ElementKind::Column | ElementKind::Stack | ElementKind::Viewport
+            ElementKind::Row
+                | ElementKind::Column
+                | ElementKind::Stack
+                | ElementKind::Scroll
+                | ElementKind::Viewport
         )
     }
 }
@@ -177,6 +205,19 @@ pub enum Fit {
     None,
 }
 
+/// The directions a `scroll` moves its child in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScrollAxis {
+    /// Up and down: the child is as wide as the viewport and as tall as it
+    /// wants.
+    Vertical,
+    /// Left and right: the child is as tall as the viewport and as wide as it
+    /// wants.
+    Horizontal,
+    /// Both: the child is as large as it wants each way.
+    Both,
+}
+
 /// The accessibility role an element announces (R10). Carried, read by
 /// nothing yet: a later part publishes it through the platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -219,6 +260,15 @@ pub struct TextOverrides {
 impl TextOverrides {
     fn is_empty(&self) -> bool {
         *self == TextOverrides::default()
+    }
+
+    /// Whether `self` and `other` differ only in colour: a change between
+    /// them repaints and never reshapes.
+    fn differs_in_colour_only(&self, other: &TextOverrides) -> bool {
+        TextOverrides {
+            color: other.color,
+            ..self.clone()
+        } == *other
     }
 }
 
@@ -265,7 +315,8 @@ impl ResolvedText {
     }
 }
 
-/// What an element paints of its own, under its children.
+/// What an element paints of its own, under its children: its effective
+/// style's paint fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Paint {
     pub background: Option<Color>,
@@ -299,6 +350,10 @@ struct Shaped {
 
 #[derive(Clone, Debug, Default)]
 struct TextContent {
+    /// The paragraph's runs, one per `child`, in order: a run bound to a
+    /// signal is replaced in place when it writes.
+    runs: Vec<String>,
+    /// The runs, joined: what is shaped.
     text: String,
     resolved: Rc<ResolvedText>,
     shaped: Vec<Shaped>,
@@ -357,12 +412,34 @@ impl TextContent {
         self.shaped.truncate(SHAPED_KEPT);
         layout
     }
+
+    fn reshape(&mut self) {
+        self.shaped.clear();
+        self.shapings = 0;
+    }
 }
 
 #[derive(Clone, Debug)]
 struct ImageContent {
     image: Option<Image>,
     fit: Fit,
+}
+
+/// A `scroll`'s state: its axis, where its child is scrolled to, and how far
+/// it can go.
+#[derive(Clone, Debug)]
+struct ScrollState {
+    axis: ScrollAxis,
+    /// How far the child is moved up and left, in dp: within `0..=range`.
+    offset: Point,
+    /// How far the child reaches past the viewport, from the last layout.
+    range: Size,
+    /// Told when the offset moves other than by the program setting it (a
+    /// wheel, a clamp), so a bound signal follows.
+    on_offset: Option<Handler>,
+    /// The range has been measured by a layout: an offset set before then is
+    /// kept as asked until the first layout clamps it.
+    measured: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -376,22 +453,19 @@ enum Content {
 #[derive(Clone, Debug)]
 struct RootState {
     viewport: NodeId,
-    /// The style generation the inherited text styles were last resolved at.
-    resolved: u64,
     /// The size and layout generation the solver last ran at.
     solved: Option<(Size, u64)>,
-    /// The scale and solve count the boxes were last snapped at.
+    /// The scale the boxes were last snapped at, and the solve count then.
     snapped: Option<(Units, u64)>,
     solves: u64,
-    /// The scene painted last, with the paint generation and snap count it
-    /// was painted at.
-    scene: Option<(u64, u64, Scene)>,
 }
 
 /// One element, as the tree keeps it beside the solver's style.
 #[derive(Clone, Debug)]
 pub struct NodeData {
     kind: ElementKind,
+    /// The style's layers, and what they resolve to.
+    layers: Layers,
     paint: Paint,
     text: TextOverrides,
     /// The text style it inherits from its parent, then overrides: kept for
@@ -401,11 +475,21 @@ pub struct NodeData {
     role: Role,
     label: Option<String>,
     content: Content,
+    /// Children painted inside its padding box only.
+    clip: bool,
+    scroll: Option<ScrollState>,
+    /// Its place in the tab order: `None` not focusable, a negative number
+    /// focusable by a press or by the program only, 0 in tree order, a
+    /// positive number before every 0, lowest first.
+    tab_index: Option<i32>,
+    interaction: Interaction,
+    handlers: Vec<(EventKind, Handler)>,
     /// Whether a vilan handle to it is alive: an element is freed when it has
     /// neither a handle nor a parent.
     handle: bool,
     root: Option<RootState>,
-    /// The snapped box, in dp from the root's top-left corner.
+    /// The snapped box, in dp from the root's top-left corner (a scrolled
+    /// element's box is where it is laid out, before the scroll's offset).
     bounds: Rect,
     /// Where the content box (inside the padding) starts in the box.
     content_offset: Point,
@@ -413,6 +497,9 @@ pub struct NodeData {
     /// gave it, never at a snapped width that could break a line the solver
     /// did not.
     content_size: Size,
+    /// The scene of its subtree from the last paint, kept until something
+    /// in it changes. When it is `None`, so is every ancestor's.
+    scene: Option<Scene>,
 }
 
 impl NodeData {
@@ -427,6 +514,7 @@ impl NodeData {
         };
         NodeData {
             kind,
+            layers: Layers::default(),
             paint: Paint::default(),
             text: TextOverrides::default(),
             resolved: Rc::new(ResolvedText::default()),
@@ -434,11 +522,23 @@ impl NodeData {
             role: Role::None,
             label: None,
             content,
+            clip: kind == ElementKind::Scroll,
+            scroll: (kind == ElementKind::Scroll).then(|| ScrollState {
+                axis: ScrollAxis::Vertical,
+                offset: Point::ZERO,
+                range: Size::default(),
+                on_offset: None,
+                measured: false,
+            }),
+            tab_index: None,
+            interaction: Interaction::default(),
+            handlers: Vec::new(),
             handle: true,
             root: None,
             bounds: Rect::default(),
             content_offset: Point::default(),
             content_size: Size::default(),
+            scene: None,
         }
     }
 }
@@ -449,6 +549,8 @@ impl NodeData {
 pub enum UiError {
     /// `child` on a text or an image.
     NotAParent(ElementKind),
+    /// A second child for a `scroll`.
+    OneChild,
     /// An element given a second parent: an element is in one place.
     AlreadyPlaced,
     /// An element made a child of itself or of its own descendant.
@@ -462,6 +564,8 @@ pub enum UiError {
     },
     /// A number that is not finite where a length or a factor is wanted.
     NotFinite(&'static str),
+    /// A run index a text does not have.
+    NoSuchRun(usize),
 }
 
 impl std::fmt::Display for UiError {
@@ -469,8 +573,14 @@ impl std::fmt::Display for UiError {
         match self {
             UiError::NotAParent(kind) => write!(
                 formatter,
-                "a `{}` element has no children: only a row, a column or a stack takes `child`",
+                "a `{}` element has no children: only a row, a column, a stack or a scroll \
+                 takes `child`",
                 kind.name()
+            ),
+            UiError::OneChild => write!(
+                formatter,
+                "a `scroll` has one child, which it scrolls: put a column (or a row) of the \
+                 content inside it"
             ),
             UiError::AlreadyPlaced => write!(
                 formatter,
@@ -490,6 +600,7 @@ impl std::fmt::Display for UiError {
                 write!(formatter, "a `{}` element has no `{property}`", kind.name())
             }
             UiError::NotFinite(what) => write!(formatter, "{what} must be a finite number"),
+            UiError::NoSuchRun(index) => write!(formatter, "a text has no run {index}"),
         }
     }
 }
@@ -505,16 +616,49 @@ pub struct OutlineEntry {
     pub bounds: Rect,
 }
 
+/// What the last layout and paint passes did: what the "a change touches
+/// only what it must" pins read, and what the frame-time measurements print.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PassStats {
+    /// The last layout ran the solver.
+    pub solved: bool,
+    /// Leaves the solver measured in the last layout (a text or an image the
+    /// solver's cache could not answer).
+    pub measured: usize,
+    /// Elements whose snapped box changed in the last layout.
+    pub moved: usize,
+    /// Elements whose subtree scene the last paint rebuilt (every other one
+    /// was appended as kept).
+    pub rebuilt: usize,
+}
+
 /// Every element of a program: see the module documentation.
 pub struct UiTree {
     taffy: TaffyTree<NodeData>,
     /// Moves on every change that can move a box.
     layout_generation: u64,
-    /// Moves on every change at all.
+    /// Moves on every change that can change a pixel.
     paint_generation: u64,
-    /// Moves when an inherited text field, or the tree's shape, changes:
-    /// a root resolves its text styles again when it moved.
-    style_generation: u64,
+    /// Elements whose subtree's inherited text style must be resolved again
+    /// before the next layout (a text style set, a child added).
+    pending_text: Vec<NodeId>,
+    /// Elements with a layer that reads the window's width.
+    width_conditional: Vec<NodeId>,
+    /// The width of the window the last layout was at.
+    window_width: Option<f32>,
+    /// The interaction state (`input.rs`).
+    hovered: Option<NodeId>,
+    pressed: Option<NodeId>,
+    focused: Option<NodeId>,
+    pointer: Option<Point>,
+    /// Scrolls whose offset moved by the framework, to tell their programs.
+    offset_notices: Vec<NodeId>,
+    /// Elements the solver was told changed since it last ran: with their
+    /// ancestors, the only elements whose children it can have moved.
+    dirty: Vec<NodeId>,
+    stats: PassStats,
+    /// The leaves the last solve measured, once each.
+    measured: Vec<NodeId>,
 }
 
 impl Default for UiTree {
@@ -569,6 +713,46 @@ fn anchor_alignment(anchor: Anchor) -> (AlignItems, AlignItems) {
     }
 }
 
+/// A scroll's flex arrangement for its axis: the child keeps its own size
+/// along every axis that scrolls (it never shrinks to the viewport), and
+/// fills the viewport across the axis that does not.
+fn scroll_style(style: &mut taffy::Style, axis: ScrollAxis) {
+    style.display = Display::Flex;
+    let (direction, align, overflow) = match axis {
+        ScrollAxis::Vertical => (
+            FlexDirection::Column,
+            AlignItems::STRETCH,
+            taffy::Point {
+                x: Overflow::Visible,
+                y: Overflow::Hidden,
+            },
+        ),
+        ScrollAxis::Horizontal => (
+            FlexDirection::Row,
+            AlignItems::STRETCH,
+            taffy::Point {
+                x: Overflow::Hidden,
+                y: Overflow::Visible,
+            },
+        ),
+        ScrollAxis::Both => (
+            FlexDirection::Column,
+            AlignItems::START,
+            taffy::Point {
+                x: Overflow::Hidden,
+                y: Overflow::Hidden,
+            },
+        ),
+    };
+    style.flex_direction = direction;
+    style.align_items = align;
+
+    // `Hidden`: the scroll's own smallest size is not its content's, so a
+    // parent can make it smaller than what it shows; no scrollbar space.
+    style.overflow = overflow;
+    style.scrollbar_width = 0.0;
+}
+
 /// The solver's style a new element of `kind` starts from.
 fn initial_style(kind: ElementKind) -> taffy::Style {
     let mut style = taffy::Style::DEFAULT;
@@ -593,6 +777,7 @@ fn initial_style(kind: ElementKind) -> taffy::Style {
             style.justify_items = AlignItems::START;
             style.align_items = AlignItems::START;
         }
+        ElementKind::Scroll => scroll_style(&mut style, ScrollAxis::Vertical),
         ElementKind::Viewport => {
             style.display = Display::Grid;
             // The root fills the window unless it sizes itself.
@@ -610,6 +795,49 @@ fn initial_style(kind: ElementKind) -> taffy::Style {
     style
 }
 
+/// Whether `point` is inside `bounds` with its corners rounded by `corners`.
+fn inside_rounded(bounds: Rect, corners: Corners, point: Point) -> bool {
+    if point.x < bounds.left()
+        || point.y < bounds.top()
+        || point.x >= bounds.right()
+        || point.y >= bounds.bottom()
+    {
+        return false;
+    }
+    let half = bounds.size.width.min(bounds.size.height) / 2.0;
+    let corner_test = |radius: f32, center_x: f32, center_y: f32, beyond: bool| {
+        let radius = radius.clamp(0.0, half);
+        if radius <= 0.0 || !beyond {
+            return true;
+        }
+        let (dx, dy) = (point.x - center_x, point.y - center_y);
+        dx * dx + dy * dy <= radius * radius
+    };
+    let (left, top, right, bottom) = (bounds.left(), bounds.top(), bounds.right(), bounds.bottom());
+    let r = corners;
+    corner_test(
+        r.top_left,
+        left + r.top_left.min(half),
+        top + r.top_left.min(half),
+        point.x < left + r.top_left.min(half) && point.y < top + r.top_left.min(half),
+    ) && corner_test(
+        r.top_right,
+        right - r.top_right.min(half),
+        top + r.top_right.min(half),
+        point.x > right - r.top_right.min(half) && point.y < top + r.top_right.min(half),
+    ) && corner_test(
+        r.bottom_right,
+        right - r.bottom_right.min(half),
+        bottom - r.bottom_right.min(half),
+        point.x > right - r.bottom_right.min(half) && point.y > bottom - r.bottom_right.min(half),
+    ) && corner_test(
+        r.bottom_left,
+        left + r.bottom_left.min(half),
+        bottom - r.bottom_left.min(half),
+        point.x < left + r.bottom_left.min(half) && point.y > bottom - r.bottom_left.min(half),
+    )
+}
+
 impl UiTree {
     pub fn new() -> UiTree {
         let mut taffy = TaffyTree::new();
@@ -620,13 +848,44 @@ impl UiTree {
             taffy,
             layout_generation: 1,
             paint_generation: 1,
-            style_generation: 1,
+            pending_text: Vec::new(),
+            width_conditional: Vec::new(),
+            window_width: None,
+            hovered: None,
+            pressed: None,
+            focused: None,
+            pointer: None,
+            offset_notices: Vec::new(),
+            dirty: Vec::new(),
+            stats: PassStats::default(),
+            measured: Vec::new(),
         }
     }
 
     /// Elements alive in the tree, viewports included.
     pub fn element_count(&self) -> usize {
         self.taffy.total_node_count()
+    }
+
+    /// What the last layout and paint did.
+    pub fn last_pass(&self) -> PassStats {
+        self.stats
+    }
+
+    /// The leaves the last solve measured, each once.
+    pub fn last_measured(&self) -> &[NodeId] {
+        &self.measured
+    }
+
+    /// The layout and paint generations: when neither moved, nothing a frame
+    /// shows changed.
+    pub fn generations(&self) -> (u64, u64) {
+        (self.layout_generation, self.paint_generation)
+    }
+
+    /// Whether `node` is an element of this tree still.
+    pub fn is_alive(&self, node: NodeId) -> bool {
+        self.taffy.get_node_context(node).is_some()
     }
 
     fn data(&self, node: NodeId) -> &NodeData {
@@ -646,8 +905,22 @@ impl UiTree {
         self.paint_generation += 1;
     }
 
-    fn paint_changed(&mut self) {
+    /// `node`'s own look changed: its scene, and the chain of scenes above
+    /// it, are rebuilt at the next paint; every other scene is kept.
+    fn invalidate(&mut self, node: NodeId) {
         self.paint_generation += 1;
+        let mut current = Some(node);
+        while let Some(node) = current {
+            let Some(data) = self.taffy.get_node_context_mut(node) else {
+                return;
+            };
+            if data.scene.take().is_none() {
+                // Every ancestor of an element with no kept scene has none
+                // either (a scene is built after its children's).
+                return;
+            }
+            current = self.taffy.parent(node);
+        }
     }
 
     /// A new element of `kind`, with a live handle and no parent.
@@ -667,7 +940,21 @@ impl UiTree {
         self.taffy
             .set_style(node, style)
             .expect("an element's style");
+        self.dirty.push(node);
         self.layout_changed();
+    }
+
+    /// The element `node`'s tree hangs from: itself when it has no parent
+    /// (or only its viewport).
+    pub fn root_of(&self, node: NodeId) -> NodeId {
+        let mut current = node;
+        while let Some(parent) = self.taffy.parent(current) {
+            if self.kind(parent) == ElementKind::Viewport {
+                break;
+            }
+            current = parent;
+        }
+        current
     }
 
     // ------------------------------------------------------------ the tree ---
@@ -677,6 +964,9 @@ impl UiTree {
         let kind = self.kind(parent);
         if !kind.is_parent() || kind == ElementKind::Viewport {
             return Err(UiError::NotAParent(kind));
+        }
+        if kind == ElementKind::Scroll && self.taffy.child_count(parent) > 0 {
+            return Err(UiError::OneChild);
         }
         if parent == child || self.is_ancestor(child, parent) {
             return Err(UiError::Cycle);
@@ -692,7 +982,9 @@ impl UiTree {
         self.taffy
             .add_child(parent, child)
             .expect("a child appended");
-        self.style_generation += 1;
+        self.dirty.push(parent);
+        self.pending_text.push(child);
+        self.invalidate(parent);
         self.layout_changed();
         Ok(())
     }
@@ -740,12 +1032,15 @@ impl UiTree {
             for child in self.children(node) {
                 if !self.data(child).handle {
                     pending.push(child);
+                } else {
+                    // It stays, parentless: its subtree's text resolves
+                    // from the default when it is placed or laid out again.
+                    self.pending_text.push(child);
                 }
             }
             // Detaches the children that stay (they have handles).
             let _ = self.taffy.remove(node);
         }
-        self.style_generation += 1;
         self.layout_changed();
     }
 
@@ -909,37 +1204,123 @@ impl UiTree {
         self.data(node).label.as_deref()
     }
 
+    /// Children painted (and hit) inside the element's padding box only.
+    pub fn set_clip(&mut self, node: NodeId, clip: bool) {
+        if self.data(node).clip != clip {
+            self.data_mut(node).clip = clip || self.kind(node) == ElementKind::Scroll;
+            self.invalidate(node);
+        }
+    }
+
+    // --------------------------------------------------------------- style ---
+
+    /// Starts a style group on `node`: a new one after every other (`None`),
+    /// or `group` emptied to be written again (a bound style's new value).
+    /// Answers the group.
+    pub fn style_group(&mut self, node: NodeId, group: Option<u32>) -> u32 {
+        let layers = &mut self.data_mut(node).layers;
+        match group {
+            Some(group) => {
+                layers.clear_group(group);
+                group
+            }
+            None => layers.new_group(),
+        }
+    }
+
+    /// A new layer of `group` on `node`, unconditional or applying while
+    /// `condition` holds. Answers the layer's id, which the field setters
+    /// name.
+    pub fn style_layer(
+        &mut self,
+        node: NodeId,
+        group: u32,
+        condition: Option<Condition>,
+    ) -> Result<u32, UiError> {
+        if let Some(condition) = condition {
+            for limit in [condition.window_at_least, condition.window_below]
+                .into_iter()
+                .flatten()
+            {
+                finite(limit, "a window width")?;
+            }
+            if condition.reads_width() && !self.width_conditional.contains(&node) {
+                self.width_conditional.push(node);
+            }
+        }
+        Ok(self.data_mut(node).layers.add(group, condition))
+    }
+
+    /// Writes fields of layer `layer` of `node` (a layer that is gone is
+    /// ignored: its group was written again under the caller).
+    pub fn set_style_fields(
+        &mut self,
+        node: NodeId,
+        layer: u32,
+        change: impl FnOnce(&mut StyleFields),
+    ) {
+        if let Some(fields) = self.data_mut(node).layers.fields_mut(layer) {
+            change(fields);
+        }
+    }
+
+    /// Resolves `node`'s effective style from its layers, now: a change of a
+    /// text field that shapes (font, size, line height, weight, italic)
+    /// lays the text under it out again; any other change repaints the
+    /// element, and a text colour the texts under it.
+    pub fn restyle(&mut self, node: NodeId) {
+        let width = self.window_width;
+        let data = self.data(node);
+        let fields = data.layers.resolve(data.interaction, width);
+        let paint = fields.paint();
+        if paint != data.paint {
+            self.data_mut(node).paint = paint;
+            self.invalidate(node);
+        }
+        let before = self.data(node).text.clone();
+        if fields.text != before {
+            let colour_only = before.differs_in_colour_only(&fields.text);
+            self.data_mut(node).text = fields.text;
+            self.pending_text.push(node);
+            if colour_only {
+                self.paint_generation += 1;
+            } else {
+                self.layout_changed();
+            }
+        }
+    }
+
+    /// Writes the direct layer (see `style.rs`) and resolves.
+    fn set_direct(&mut self, node: NodeId, change: impl FnOnce(&mut StyleFields)) {
+        change(self.data_mut(node).layers.direct());
+        self.restyle(node);
+    }
+
     pub fn set_background(&mut self, node: NodeId, color: Color) {
-        self.data_mut(node).paint.background = Some(color);
-        self.paint_changed();
+        self.set_direct(node, |fields| fields.background = Some(color));
     }
 
     pub fn set_border(&mut self, node: NodeId, widths: Edges, color: Color) {
-        let paint = &mut self.data_mut(node).paint;
-        paint.border_widths = Edges {
+        let widths = Edges {
             top: widths.top.max(0.0),
             right: widths.right.max(0.0),
             bottom: widths.bottom.max(0.0),
             left: widths.left.max(0.0),
         };
-        paint.border_color = color;
-        self.paint_changed();
+        self.set_direct(node, |fields| fields.border = Some((widths, color)));
     }
 
     pub fn set_corners(&mut self, node: NodeId, corners: Corners) {
-        self.data_mut(node).paint.corners = corners;
-        self.paint_changed();
+        self.set_direct(node, |fields| fields.corners = Some(corners));
     }
 
     pub fn set_shadow(&mut self, node: NodeId, shadow: DropShadow) {
-        self.data_mut(node).paint.shadow = Some(shadow);
-        self.paint_changed();
+        self.set_direct(node, |fields| fields.shadow = Some(shadow));
     }
 
     pub fn set_opacity(&mut self, node: NodeId, opacity: f32) -> Result<(), UiError> {
         let opacity = finite(opacity, "an opacity")?.clamp(0.0, 1.0);
-        self.data_mut(node).paint.opacity = opacity;
-        self.paint_changed();
+        self.set_direct(node, |fields| fields.opacity = Some(opacity));
         Ok(())
     }
 
@@ -947,33 +1328,23 @@ impl UiTree {
         &self.data(node).paint
     }
 
-    /// Sets some of the element's text style; the rest stays inherited. A
-    /// colour alone changes paint only; every other field reshapes.
+    /// Sets some of the element's text style (its direct layer); the rest
+    /// stays inherited. A colour alone changes paint only; every other field
+    /// reshapes.
     pub fn set_text_style(&mut self, node: NodeId, change: impl FnOnce(&mut TextOverrides)) {
-        let before = self.data(node).text.clone();
-        change(&mut self.data_mut(node).text);
-        let after = self.data(node).text.clone();
-        if before == after {
-            return;
-        }
-        self.style_generation += 1;
-        let colour_only = TextOverrides {
-            color: before.color,
-            ..after.clone()
-        } == before;
-        if colour_only {
-            self.paint_changed();
-        } else {
-            self.layout_changed();
-        }
+        self.set_direct(node, |fields| change(&mut fields.text));
     }
 
+    /// The element's effective text overrides.
     pub fn text_overrides(&self, node: NodeId) -> &TextOverrides {
         &self.data(node).text
     }
 
-    /// Appends a run of text to a text element.
-    pub fn append_text(&mut self, node: NodeId, run: &str) -> Result<(), UiError> {
+    // ---------------------------------------------------------------- text ---
+
+    /// Appends a run of text to a text element; answers its index, by which
+    /// [`UiTree::set_run`] replaces it.
+    pub fn append_text(&mut self, node: NodeId, run: &str) -> Result<usize, UiError> {
         let kind = self.kind(node);
         let Content::Text(content) = &mut self.data_mut(node).content else {
             return Err(UiError::WrongKind {
@@ -981,12 +1352,46 @@ impl UiTree {
                 kind,
             });
         };
-        content.text.push_str(run);
-        content.shaped.clear();
-        content.shapings = 0;
-        self.taffy.mark_dirty(node).expect("an element");
-        self.layout_changed();
+        content.runs.push(run.to_string());
+        let index = content.runs.len() - 1;
+        if !run.is_empty() {
+            content.text.push_str(run);
+            content.reshape();
+            self.text_changed(node);
+        }
+        Ok(index)
+    }
+
+    /// Replaces run `index` of a text element (a run bound to a signal,
+    /// written). The same text again changes nothing.
+    pub fn set_run(&mut self, node: NodeId, index: usize, run: &str) -> Result<(), UiError> {
+        let kind = self.kind(node);
+        let Content::Text(content) = &mut self.data_mut(node).content else {
+            return Err(UiError::WrongKind {
+                property: "text",
+                kind,
+            });
+        };
+        let Some(slot) = content.runs.get_mut(index) else {
+            return Err(UiError::NoSuchRun(index));
+        };
+        if slot == run {
+            return Ok(());
+        }
+        run.clone_into(slot);
+        content.text = content.runs.concat();
+        content.reshape();
+        self.text_changed(node);
         Ok(())
+    }
+
+    /// A text's paragraph changed: the solver measures it again (and only
+    /// it, through the cache), and it repaints.
+    fn text_changed(&mut self, node: NodeId) {
+        self.taffy.mark_dirty(node).expect("an element");
+        self.dirty.push(node);
+        self.invalidate(node);
+        self.layout_changed();
     }
 
     pub fn text(&self, node: NodeId) -> Option<&str> {
@@ -1008,6 +1413,7 @@ impl UiTree {
         // set, a stretch, a grid cell), not only where it asks the measure.
         let aspect = image.width() as f32 / image.height() as f32;
         content.image = Some(image);
+        self.invalidate(node);
         self.update_style(node, |style| style.aspect_ratio = Some(aspect));
         Ok(())
     }
@@ -1021,7 +1427,7 @@ impl UiTree {
             });
         };
         content.fit = fit;
-        self.paint_changed();
+        self.invalidate(node);
         Ok(())
     }
 
@@ -1048,14 +1454,12 @@ impl UiTree {
             .expect("the root in its viewport");
         let state = RootState {
             viewport,
-            resolved: 0,
             solved: None,
             snapped: None,
             solves: 0,
-            scene: None,
         };
         self.data_mut(root).root = Some(state.clone());
-        self.style_generation += 1;
+        self.pending_text.push(root);
         Ok(state)
     }
 
@@ -1075,12 +1479,19 @@ impl UiTree {
         let height = finite(size.height, "a layout height")?.max(0.0);
         let size = Size::new(width, height);
         let mut state = self.root_state(root)?;
+        let mut chains = None;
+        self.stats.solved = false;
+        self.stats.measured = 0;
+        self.stats.moved = 0;
+        // A new window width first: a condition on it may change a style,
+        // and a style may change the layout.
+        if self.window_width != Some(width) {
+            self.window_width = Some(width);
+            self.restyle_width_conditional();
+        }
         // Before deciding whether to solve: a colour alone resolves without
         // a solve, and a reshaping style has moved the layout generation.
-        if state.resolved != self.style_generation {
-            self.resolve_text_styles(root);
-            state.resolved = self.style_generation;
-        }
+        self.resolve_pending_text();
         let solve = state.solved != Some((size, self.layout_generation));
         if solve {
             let viewport_style = self.taffy.style(state.viewport).expect("the viewport");
@@ -1092,10 +1503,47 @@ impl UiTree {
                     width: Dimension::length(width),
                     height: Dimension::length(height),
                 };
+                // The root's cell is exactly the viewport: FIXED tracks, so
+                // the grid never asks the root for its content's smallest or
+                // largest size. An `auto` track would, and `taffy` keys those
+                // answers by the parent's size: after a resize the first
+                // re-solve with the root dirty measured every leaf of the
+                // tree again (180,000 measures for a 10,000-row list) — the
+                // resize pass itself had answered those questions from
+                // entries made at the old size.
+                style.grid_template_columns = vec![taffy::style_helpers::length(width)];
+                style.grid_template_rows = vec![taffy::style_helpers::length(height)];
                 self.taffy
                     .set_style(state.viewport, style)
                     .expect("the viewport's size");
+                self.dirty.push(state.viewport);
             }
+            // The chains the solver re-runs: every other element keeps its
+            // cached layout unless its parent placed it elsewhere.
+            let mut changed = std::collections::HashSet::new();
+            let mut other_trees = Vec::new();
+            for node in std::mem::take(&mut self.dirty) {
+                if !self.is_alive(node) {
+                    continue;
+                }
+                if node != state.viewport && self.root_of(node) != root {
+                    // Another tree's change, for its own next solve.
+                    other_trees.push(node);
+                    continue;
+                }
+                let mut current = Some(node);
+                while let Some(node) = current {
+                    if !self.is_alive(node) || !changed.insert(node) {
+                        break;
+                    }
+                    current = self.taffy.parent(node);
+                }
+            }
+            self.dirty = other_trees;
+            chains = Some(changed);
+            let mut measured = 0;
+            let mut leaves = std::mem::take(&mut self.measured);
+            leaves.clear();
             self.taffy
                 .compute_layout_with_measure(
                     state.viewport,
@@ -1103,55 +1551,116 @@ impl UiTree {
                         width: AvailableSpace::Definite(width),
                         height: AvailableSpace::Definite(height),
                     },
-                    |inputs, _node, data, style| measure(inputs, data, style, text),
+                    |inputs, node, data, style| {
+                        measured += 1;
+                        if leaves.last() != Some(&node) && !leaves.contains(&node) {
+                            leaves.push(node);
+                        }
+                        measure(inputs, data, style, text)
+                    },
                 )
                 .expect("the layout");
+            self.measured = leaves;
+            self.stats.solved = true;
+            self.stats.measured = measured;
             state.solved = Some((size, self.layout_generation));
             state.solves += 1;
         }
-        if solve || state.snapped.map(|(snapped, _)| snapped) != Some(units) {
-            self.snap(root, units);
+        let rescaled = state.snapped.map(|(snapped, _)| snapped) != Some(units);
+        if solve || rescaled {
+            // A new scale moves every box; a solve, only what it re-ran.
+            self.snap(root, units, chains.as_ref().filter(|_| !rescaled));
             state.snapped = Some((units, state.solves));
         }
         self.data_mut(root).root = Some(state);
         Ok(solve)
     }
 
-    /// Resolves the inherited text style of every element under `root`, top
-    /// down from the default, and marks a text element whose shaping style
-    /// changed for the solver.
-    fn resolve_text_styles(&mut self, root: NodeId) {
-        let mut pending = vec![(root, Rc::new(ResolvedText::default()))];
-        while let Some((node, inherited)) = pending.pop() {
-            let data = self.data(node);
-            let resolved = if data.text.is_empty() {
-                inherited
-            } else {
-                Rc::new(inherited.with(&data.text))
-            };
-            let data = self.data_mut(node);
-            data.resolved = resolved.clone();
-            if let Content::Text(content) = &mut data.content {
-                let reshape = content.resolved.style != resolved.style;
-                content.resolved = resolved.clone();
-                if reshape {
-                    content.shaped.clear();
-                    content.shapings = 0;
-                    self.taffy.mark_dirty(node).expect("an element");
-                }
+    fn restyle_width_conditional(&mut self) {
+        let nodes = std::mem::take(&mut self.width_conditional);
+        let mut kept = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if self.is_alive(node) && self.data(node).layers.reads_width() {
+                self.restyle(node);
+                kept.push(node);
             }
-            for child in self.children(node) {
-                pending.push((child, resolved.clone()));
+        }
+        self.width_conditional = kept;
+    }
+
+    /// Resolves the inherited text style of every subtree a change named
+    /// (a style set, a child added, a root laid out first), top down from
+    /// its parent's, and marks a text element whose shaping style changed
+    /// for the solver and one whose colour changed for paint.
+    fn resolve_pending_text(&mut self) {
+        let pending = std::mem::take(&mut self.pending_text);
+        for start in pending {
+            if !self.is_alive(start) {
+                continue;
+            }
+            let inherited = match self.taffy.parent(start) {
+                Some(parent) if self.kind(parent) != ElementKind::Viewport => {
+                    self.data(parent).resolved.clone()
+                }
+                _ => Rc::new(ResolvedText::default()),
+            };
+            let mut walk = vec![(start, inherited)];
+            while let Some((node, inherited)) = walk.pop() {
+                let data = self.data(node);
+                let resolved = if data.text.is_empty() {
+                    inherited
+                } else {
+                    Rc::new(inherited.with(&data.text))
+                };
+                let data = self.data_mut(node);
+                data.resolved = resolved.clone();
+                let mut reshape = false;
+                let mut repaint = false;
+                if let Content::Text(content) = &mut data.content {
+                    reshape = content.resolved.style != resolved.style;
+                    repaint = content.resolved.color != resolved.color;
+                    content.resolved = resolved.clone();
+                    if reshape {
+                        content.reshape();
+                    }
+                }
+                if reshape {
+                    self.taffy.mark_dirty(node).expect("an element");
+                    self.dirty.push(node);
+                    self.layout_changed();
+                }
+                if reshape || repaint {
+                    self.invalidate(node);
+                }
+                for index in 0..self.taffy.child_count(node) {
+                    let child = self.taffy.get_child_id(node, index);
+                    walk.push((child, resolved.clone()));
+                }
             }
         }
     }
 
     /// Snaps every box under `root` to the device grid: each edge on its own,
     /// by [`Units`]' rule (the renderer's), so boxes that share an edge in dp
-    /// share it on the device and a hairline stays one pixel (R16).
-    fn snap(&mut self, root: NodeId, units: Units) {
+    /// share it on the device and a hairline stays one pixel (R16). A box
+    /// that moved is marked for repaint; a scroll's range follows its child,
+    /// and its offset is clamped into it.
+    ///
+    /// With `chains` (the elements the solver re-ran, and their ancestors),
+    /// only what can have moved is visited: the chains, the children the
+    /// chains placed, and everything under a box that moved. An element off
+    /// the chains whose box is where it was kept its cached layout — the
+    /// solver lays a node's children out from its own final size and style,
+    /// and neither changed — so nothing under it moved either.
+    fn snap(
+        &mut self,
+        root: NodeId,
+        units: Units,
+        chains: Option<&std::collections::HashSet<NodeId>>,
+    ) {
         let scale = units.content_scale();
         let mut pending = vec![(root, Point::new(0.0, 0.0))];
+        let mut scrolls = Vec::new();
         while let Some((node, parent_origin)) = pending.pop() {
             let layout = *self.taffy.layout(node).expect("a laid-out element");
             let origin = Point::new(
@@ -1162,18 +1671,68 @@ impl UiTree {
             let (y, height) = units.snap_span(origin.y, layout.size.height);
             let inset_left = layout.padding.left + layout.border.left;
             let inset_top = layout.padding.top + layout.border.top;
-            let data = self.data_mut(node);
-            data.bounds = Rect::new(x / scale, y / scale, width / scale, height / scale);
-            data.content_offset = Point::new(inset_left, inset_top);
-            data.content_size = Size::new(
+            let bounds = Rect::new(x / scale, y / scale, width / scale, height / scale);
+            let content_offset = Point::new(inset_left, inset_top);
+            let content_size = Size::new(
                 (layout.size.width - inset_left - layout.padding.right - layout.border.right)
                     .max(0.0),
                 (layout.size.height - inset_top - layout.padding.bottom - layout.border.bottom)
                     .max(0.0),
             );
-            for child in self.children(node) {
-                pending.push((child, origin));
+            let data = self.data_mut(node);
+            let moved = data.bounds != bounds
+                || data.content_offset != content_offset
+                || data.content_size != content_size;
+            data.bounds = bounds;
+            data.content_offset = content_offset;
+            data.content_size = content_size;
+            if data.scroll.is_some() {
+                scrolls.push(node);
             }
+            if moved {
+                self.stats.moved += 1;
+                self.invalidate(node);
+            }
+            let descend = moved || chains.is_none_or(|chains| chains.contains(&node));
+            if descend {
+                for index in 0..self.taffy.child_count(node) {
+                    pending.push((self.taffy.get_child_id(node, index), origin));
+                }
+            }
+        }
+        for scroll in scrolls {
+            self.measure_scroll_range(scroll);
+        }
+    }
+
+    /// A scroll's range from its child's laid-out box, and its offset
+    /// clamped into it.
+    fn measure_scroll_range(&mut self, node: NodeId) {
+        let data = self.data(node);
+        let content = Rect::new(
+            data.bounds.left() + data.content_offset.x,
+            data.bounds.top() + data.content_offset.y,
+            data.content_size.width,
+            data.content_size.height,
+        );
+        let mut reach = Size::new(0.0, 0.0);
+        for index in 0..self.taffy.child_count(node) {
+            let child = self.data(self.taffy.get_child_id(node, index)).bounds;
+            reach.width = reach.width.max(child.right() - content.left());
+            reach.height = reach.height.max(child.bottom() - content.top());
+        }
+        let range = Size::new(
+            (reach.width - content.size.width).max(0.0),
+            (reach.height - content.size.height).max(0.0),
+        );
+        let scroll = self.data_mut(node).scroll.as_mut().expect("a scroll");
+        scroll.range = range;
+        scroll.measured = true;
+        let clamped = clamp_offset(scroll.offset, range, scroll.axis);
+        if clamped != scroll.offset {
+            scroll.offset = clamped;
+            self.offset_notices.push(node);
+            self.invalidate(node);
         }
     }
 
@@ -1202,59 +1761,154 @@ impl UiTree {
         entries
     }
 
+    // -------------------------------------------------------------- scroll ---
+
+    /// Which way a scroll moves; its child is laid out again.
+    pub fn set_scroll_axis(&mut self, node: NodeId, axis: ScrollAxis) -> Result<(), UiError> {
+        let kind = self.kind(node);
+        let Some(scroll) = self.data_mut(node).scroll.as_mut() else {
+            return Err(UiError::WrongKind {
+                property: "axis",
+                kind,
+            });
+        };
+        scroll.axis = axis;
+        self.update_style(node, |style| scroll_style(style, axis));
+        Ok(())
+    }
+
+    /// Where a scroll's child is moved to, as the program sets it: clamped
+    /// into the range of the last layout (a later layout clamps again, and
+    /// tells the program when that moved it). A paint-only change of the
+    /// scroll: nothing inside it is laid out or repainted.
+    pub fn set_scroll_offset(&mut self, node: NodeId, offset: Point) -> Result<(), UiError> {
+        let kind = self.kind(node);
+        finite(offset.x, "a scroll offset")?;
+        finite(offset.y, "a scroll offset")?;
+        let Some(scroll) = self.data_mut(node).scroll.as_mut() else {
+            return Err(UiError::WrongKind {
+                property: "offset",
+                kind,
+            });
+        };
+        let clamped = if scroll.measured {
+            clamp_offset(offset, scroll.range, scroll.axis)
+        } else {
+            offset
+        };
+        if clamped != scroll.offset {
+            scroll.offset = clamped;
+            self.invalidate(node);
+        }
+        if clamped != offset {
+            self.offset_notices.push(node);
+        }
+        Ok(())
+    }
+
+    pub fn scroll_offset(&self, node: NodeId) -> Option<Point> {
+        self.data(node).scroll.as_ref().map(|scroll| scroll.offset)
+    }
+
+    /// How far a scroll's child reaches past its viewport, from the last
+    /// layout.
+    pub fn scroll_range(&self, node: NodeId) -> Option<Size> {
+        self.data(node).scroll.as_ref().map(|scroll| scroll.range)
+    }
+
+    /// Called when the offset moves other than by `set_scroll_offset`'s
+    /// value: a wheel, a clamp.
+    pub fn on_scroll_offset(&mut self, node: NodeId, handler: Handler) -> Result<(), UiError> {
+        let kind = self.kind(node);
+        let Some(scroll) = self.data_mut(node).scroll.as_mut() else {
+            return Err(UiError::WrongKind {
+                property: "offset",
+                kind,
+            });
+        };
+        scroll.on_offset = Some(handler);
+        Ok(())
+    }
+
+    /// The handlers of the scrolls whose offsets moved by the framework
+    /// since the last call, each once.
+    pub fn take_offset_notices(&mut self) -> Vec<Handler> {
+        let mut notices = std::mem::take(&mut self.offset_notices);
+        notices.sort_by_key(|node| u64::from(*node));
+        notices.dedup();
+        notices
+            .into_iter()
+            .filter(|node| self.is_alive(*node))
+            .filter_map(|node| self.data(node).scroll.as_ref()?.on_offset.clone())
+            .collect()
+    }
+
     // --------------------------------------------------------------- paint ---
 
-    /// Appends `root`'s scene to `builder`: rebuilt when anything was
-    /// painted or laid out differently since the last paint, the same
-    /// shared scene otherwise. Lay the root out first.
+    /// Appends `root`'s scene to `builder`: each element's scene rebuilt
+    /// where something in it changed since the last paint, kept otherwise.
+    /// Lay the root out first.
     pub fn paint(
         &mut self,
         root: NodeId,
         builder: &mut SceneBuilder,
         text: &mut TextSystem,
     ) -> Result<(), UiError> {
-        let mut state = self.root_state(root)?;
-        let snaps = state.snapped.map_or(0, |(_, solves)| solves);
-        let key = (self.paint_generation, snaps);
-        if let Some((generation, painted_at, scene)) = &state.scene
-            && (*generation, *painted_at) == key
-        {
-            builder.scene(scene);
-            return Ok(());
-        }
-        let mut own = SceneBuilder::new();
-        self.paint_subtree(root, &mut own, text);
-        let scene = own.finish().expect("a balanced element scene");
+        self.root_state(root)?;
+        self.stats.rebuilt = 0;
+        let scene = self.compose(root, text);
         builder.scene(&scene);
-        state.scene = Some((key.0, key.1, scene));
-        self.data_mut(root).root = Some(state);
         Ok(())
     }
 
-    fn paint_subtree(&mut self, root: NodeId, builder: &mut SceneBuilder, text: &mut TextSystem) {
-        enum Visit {
-            Enter(NodeId),
-            Exit,
+    /// `node`'s subtree scene: the kept one, or rebuilt from its own look
+    /// and its children's (kept or rebuilt) scenes.
+    fn compose(&mut self, node: NodeId, text: &mut TextSystem) -> Scene {
+        if let Some(scene) = &self.data(node).scene {
+            return scene.clone();
         }
-        let mut pending = vec![Visit::Enter(root)];
-        while let Some(visit) = pending.pop() {
-            let node = match visit {
-                Visit::Exit => {
-                    builder.pop();
-                    continue;
-                }
-                Visit::Enter(node) => node,
-            };
-            let layered = self.data(node).paint.opacity < 1.0;
-            if layered {
-                builder.push_layer(self.data(node).paint.opacity);
-                pending.push(Visit::Exit);
-            }
-            self.paint_element(node, builder, text);
-            for child in self.children(node).into_iter().rev() {
-                pending.push(Visit::Enter(child));
-            }
+        let count = self.taffy.child_count(node);
+        let mut children = Vec::with_capacity(count);
+        for index in 0..count {
+            let child = self.taffy.get_child_id(node, index);
+            children.push(self.compose(child, text));
         }
+        let mut builder = SceneBuilder::new();
+        let opacity = self.data(node).paint.opacity;
+        if opacity < 1.0 {
+            builder.push_layer(opacity);
+        }
+        self.paint_element(node, &mut builder, text);
+        let data = self.data(node);
+        let clipped = data.clip && !children.is_empty();
+        if clipped {
+            let (area, corners) = padding_box(data);
+            builder.push_clip(area, corners);
+        }
+        let shifted = data
+            .scroll
+            .as_ref()
+            .map(|scroll| scroll.offset)
+            .filter(|offset| *offset != Point::ZERO);
+        if let Some(offset) = shifted {
+            builder.push_transform(Transform::translate(-offset.x, -offset.y));
+        }
+        for child in &children {
+            builder.scene(child);
+        }
+        if shifted.is_some() {
+            builder.pop();
+        }
+        if clipped {
+            builder.pop();
+        }
+        if opacity < 1.0 {
+            builder.pop();
+        }
+        let scene = builder.finish().expect("a balanced element scene");
+        self.stats.rebuilt += 1;
+        self.data_mut(node).scene = Some(scene.clone());
+        scene
     }
 
     /// One element's own primitives: shadow, background and border, then its
@@ -1313,6 +1967,52 @@ impl UiTree {
             }
         }
     }
+}
+
+/// An offset kept within `0..=range` on the axes `axis` scrolls, and at 0 on
+/// the others.
+fn clamp_offset(offset: Point, range: Size, axis: ScrollAxis) -> Point {
+    let (horizontal, vertical) = match axis {
+        ScrollAxis::Vertical => (false, true),
+        ScrollAxis::Horizontal => (true, false),
+        ScrollAxis::Both => (true, true),
+    };
+    Point::new(
+        if horizontal {
+            offset.x.clamp(0.0, range.width)
+        } else {
+            0.0
+        },
+        if vertical {
+            offset.y.clamp(0.0, range.height)
+        } else {
+            0.0
+        },
+    )
+}
+
+/// An element's padding box — inside its border — with its corners reduced by
+/// the border: where a clipping element's children show.
+fn padding_box(data: &NodeData) -> (Rect, Corners) {
+    let bounds = data.bounds;
+    let widths = data.paint.border_widths;
+    let area = Rect::new(
+        bounds.left() + widths.left,
+        bounds.top() + widths.top,
+        (bounds.size.width - widths.left - widths.right).max(0.0),
+        (bounds.size.height - widths.top - widths.bottom).max(0.0),
+    );
+    let corners = data.paint.corners;
+    let inner = |radius: f32, first: f32, second: f32| (radius - first.max(second)).max(0.0);
+    (
+        area,
+        Corners {
+            top_left: inner(corners.top_left, widths.top, widths.left),
+            top_right: inner(corners.top_right, widths.top, widths.right),
+            bottom_right: inner(corners.bottom_right, widths.bottom, widths.right),
+            bottom_left: inner(corners.bottom_left, widths.bottom, widths.left),
+        },
+    )
 }
 
 /// Draws `image` in `area` by its fit rule.

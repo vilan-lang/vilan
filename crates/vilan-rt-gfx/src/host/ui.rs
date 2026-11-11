@@ -1,15 +1,33 @@
-//! The vilan program's side of `std::ui` (native-ui.md P2): the `__ui_*`
-//! externs `vilan/std/src/ui.vl` binds, over the program's one [`UiTree`].
+//! The vilan program's side of `std::ui` (native-ui.md P2 and P3): the
+//! `__ui_*` externs `vilan/std/src/ui.vl` binds, over the program's one
+//! [`UiTree`], and the dispatch of a mounted window's events into it.
 //!
 //! An element crosses as a [`Node`]: a host value holding the element's id,
 //! shared by every copy the program makes, and RELEASED when the last copy is
 //! gone — the tree frees an element once it has neither a handle nor a parent
 //! ([`UiTree::release`]). Every attribute crosses once, as numbers (or a
-//! string, or a texture), when the program sets it; a frame crosses only the
-//! root's handle and the frame's token.
+//! string, or a texture), when the program sets it, and again each time a
+//! signal it is bound to writes; a frame crosses only the root's handle.
 //!
-//! The codes below are `ui.vl`'s, kept in step with it by hand (each table is
-//! in both files):
+//! # Changes ask for frames
+//!
+//! A change to an element of a MOUNTED tree ([`mount`]) asks its window for a
+//! frame, once however many changes come before it is drawn: so a signal
+//! bound to a property shows its new value with no call of the program's.
+//! The frame lays out and paints only what changed (`ui/mod.rs`).
+//!
+//! # Events
+//!
+//! A mounted window's events are routed into its tree ([`dispatch`]) before
+//! the window's own event callback (if the program set one) sees them. The
+//! handlers a route names are called with nothing of the tree borrowed, in
+//! order; [`stop`] from inside one ends its event's bubbling. While a handler
+//! runs, `std::gfx`'s current event is the window event being routed, which
+//! is how a handler reads its position, key or scroll.
+//!
+//! # The codes
+//!
+//! `ui.vl`'s, kept in step with it by hand (each table is in both files):
 //!
 //! | `__ui_set` property | value |
 //! |---|---|
@@ -19,30 +37,46 @@
 //! | 5 wrap | 0 or 1 |
 //! | 6 anchor | 0 top left, 1 top, 2 top right, 3 left, 4 centre, 5 right, 6 bottom left, 7 bottom, 8 bottom right, 9 fill |
 //! | 7 role | the index of `ui.vl`'s `Role` variant |
-//! | 8 opacity | 0 to 1 |
-//! | 9 text size (dp), 10 line height, 11 weight, 12 italic (0 or 1) | a number |
 //! | 13 fit | 0 contain, 1 cover, 2 fill, 3 none |
 //! | 14 padding top, 15 right, 16 bottom, 17 left | dp |
+//! | 18 clip | 0 or 1 |
+//! | 19 tab index | a whole number; `__ui_set_focusable` takes it away |
+//! | 20 scroll axis | 0 vertical, 1 horizontal, 2 both |
 //!
 //! `__ui_set_length` properties: 0 width, 1 height, 2 min width, 3 max width,
 //! 4 min height, 5 max height; units 0 auto, 1 dp, 2 fraction of the parent.
-//! `__ui_set_corners`: the corner radii, clockwise from the top left. `__ui_set_color`: 0
-//! background, 1 text colour. Element kinds: 0 row, 1 column, 2 stack, 3
-//! text, 4 image.
+//! Element kinds: 0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll.
+//!
+//! Style fields go to a LAYER (`ui/style.rs`): `__ui_style_group` starts a
+//! group (-1 a new one, or the number of one to write again),
+//! `__ui_style_layer` adds a layer to it (unconditional, or under a condition:
+//! bits 1 hovered, 2 pressed, 4 focused, and a window width at least / below,
+//! negative for none), the `__ui_style_*` setters write it, and
+//! `__ui_style_end` resolves the element. `__ui_style_number`: 0 opacity, 1
+//! text size, 2 line height, 3 weight, 4 italic (0 or 1). `__ui_style_color`:
+//! 0 background, 1 text colour.
+//!
+//! Event kinds for `__ui_on`: 0 pointer enter, 1 pointer leave, 2 pointer
+//! move, 3 press, 4 release, 5 click, 6 scroll, 7 key, 8 key release, 9 text,
+//! 10 focus, 11 blur.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use taffy::NodeId;
 use vilan_rt::{Js, Json, Str, panic_with, str_new};
 
-use super::{TEXT_SCALE, color, with_frame, with_text};
+use super::input::{self as raw_input, RawEvent};
+use super::{STATE, TEXT_SCALE, color, with_frame, with_text, with_window};
 use crate::geometry::{Corners, Edges, Point, Size};
 use crate::scene::Image;
 use crate::text::FontFamily;
 use crate::ui::{
-    Align, Anchor, DropShadow, ElementKind, Fit, Justify, Length, OutlineEntry, Role, SizeProperty,
-    UiError, UiTree,
+    Align, Anchor, Condition, DropShadow, ElementKind, EventKind, Fit, Handler, Input, Justify,
+    Length, OutlineEntry, PassStats, Role, Route, ScrollAxis, SizeProperty, StyleFields, UiError,
+    UiTree,
 };
 use crate::units::Units;
 
@@ -53,21 +87,49 @@ thread_local! {
     /// The outline `__ui_outline` took last, read by its number and text
     /// externs.
     static OUTLINE: RefCell<Vec<OutlineEntry>> = const { RefCell::new(Vec::new()) };
+    /// Each mounted root, and the window it is mounted in.
+    static MOUNTS: RefCell<HashMap<NodeId, u32>> = RefCell::new(HashMap::new());
+    /// A handler called `stop` for the event being delivered.
+    static STOPPED: Cell<bool> = const { Cell::new(false) };
+    /// The last frame a mounted tree drew: its layout and paint times and
+    /// what they did.
+    static LAST_FRAME: Cell<FrameRecord> = const { Cell::new(FrameRecord::NONE) };
+}
+
+/// What the last frame of a mounted tree took and did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameRecord {
+    layout_us: f64,
+    paint_us: f64,
+    stats: PassStats,
+}
+
+impl FrameRecord {
+    const NONE: FrameRecord = FrameRecord {
+        layout_us: 0.0,
+        paint_us: 0.0,
+        stats: PassStats {
+            solved: false,
+            measured: 0,
+            moved: 0,
+            rebuilt: 0,
+        },
+    };
 }
 
 /// An element, as the program holds it: see the module documentation. A copy
 /// is the same element, and two are `==` only when they are one.
 #[derive(Clone, Debug)]
 pub struct Node {
-    handle: Rc<Handle>,
+    handle: Rc<NodeHandle>,
 }
 
 #[derive(Debug)]
-struct Handle {
+struct NodeHandle {
     id: NodeId,
 }
 
-impl Drop for Handle {
+impl Drop for NodeHandle {
     fn drop(&mut self) {
         // At thread exit the tree may already be gone, and with it every
         // element: nothing is left to release.
@@ -89,10 +151,33 @@ fn with_tree<R>(body: impl FnOnce(&mut UiTree) -> R) -> R {
     TREE.with(|tree| body(&mut tree.borrow_mut()))
 }
 
+/// A change to `node`: when it moved a generation of the tree, the window its
+/// tree is mounted in is asked for a frame.
+fn change<R>(node: &Node, body: impl FnOnce(&mut UiTree, NodeId) -> R) -> R {
+    let id = node.id();
+    let (result, root) = with_tree(|tree| {
+        let before = tree.generations();
+        let result = body(tree, id);
+        let root = (tree.generations() != before && tree.is_alive(id)).then(|| tree.root_of(id));
+        (result, root)
+    });
+    if let Some(root) = root {
+        request_frame(root);
+    }
+    result
+}
+
+fn request_frame(root: NodeId) {
+    if let Some(window) = MOUNTS.with(|mounts| mounts.borrow().get(&root).copied()) {
+        super::request_redraw(window);
+    }
+}
+
 /// A refused tree operation is the program's failure, with the reason.
-fn or_fail(result: Result<(), UiError>) {
-    if let Err(error) = result {
-        panic_with(&format!("`std::ui`: {error}"));
+fn or_fail<T>(result: Result<T, UiError>) -> T {
+    match result {
+        Ok(value) => value,
+        Err(error) => panic_with(&format!("`std::ui`: {error}")),
     }
 }
 
@@ -113,12 +198,13 @@ pub fn node(kind: i32) -> Node {
             ElementKind::Stack,
             ElementKind::Text,
             ElementKind::Image,
+            ElementKind::Scroll,
         ],
         f64::from(kind),
         "element kind",
     );
     Node {
-        handle: Rc::new(Handle {
+        handle: Rc::new(NodeHandle {
             id: with_tree(|tree| tree.create(kind)),
         }),
     }
@@ -126,9 +212,8 @@ pub fn node(kind: i32) -> Node {
 
 /// `__ui_set(node, property, value)` — a property that is one number.
 pub fn set(node: &Node, property: i32, value: f64) {
-    let id = node.id();
     let number = value as f32;
-    with_tree(|tree| match property {
+    change(node, |tree, id| match property {
         0 => or_fail(tree.set_grow(id, number)),
         1 => or_fail(tree.set_shrink(id, number)),
         2 => or_fail(tree.set_gap(id, number)),
@@ -200,11 +285,6 @@ pub fn set(node: &Node, property: i32, value: f64) {
             );
             tree.set_role(id, role)
         }
-        8 => or_fail(tree.set_opacity(id, number)),
-        9 => tree.set_text_style(id, |text| text.size = Some(number.max(0.0))),
-        10 => tree.set_text_style(id, |text| text.line_height = Some(number.max(0.0))),
-        11 => tree.set_text_style(id, |text| text.weight = Some(number.clamp(1.0, 1000.0))),
-        12 => tree.set_text_style(id, |text| text.italic = Some(value != 0.0)),
         13 => {
             let fit = code(
                 &[Fit::Contain, Fit::Cover, Fit::Fill, Fit::None],
@@ -214,6 +294,25 @@ pub fn set(node: &Node, property: i32, value: f64) {
             or_fail(tree.set_fit(id, fit))
         }
         14..=17 => or_fail(tree.set_padding_side(id, (property - 14) as usize, number)),
+        18 => tree.set_clip(id, value != 0.0),
+        19 => {
+            if !value.is_finite() {
+                panic_with("a tab index must be a whole number");
+            }
+            tree.set_tab_index(id, Some(value as i32))
+        }
+        20 => {
+            let axis = code(
+                &[
+                    ScrollAxis::Vertical,
+                    ScrollAxis::Horizontal,
+                    ScrollAxis::Both,
+                ],
+                value,
+                "scroll axis",
+            );
+            or_fail(tree.set_scroll_axis(id, axis))
+        }
         _ => panic_with(&format!("{property} is not a `std::ui` property code")),
     });
 }
@@ -238,49 +337,122 @@ pub fn set_length(node: &Node, property: i32, unit: i32, value: f64) {
         2 => Length::Fraction(value as f32),
         _ => panic_with(&format!("{unit} is not a `std::ui` length unit code")),
     };
-    let id = node.id();
-    with_tree(|tree| or_fail(tree.set_size(id, property, length)));
+    change(node, |tree, id| {
+        or_fail(tree.set_size(id, property, length))
+    });
 }
 
-/// `__ui_set_corners(node, top_left, top_right, bottom_right, bottom_left)`
-/// — the corner radii, in dp.
-pub fn set_corners(
+// ----------------------------------------------------------------- style ---
+
+/// `__ui_style_group(node, group)` — starts a style group: a new one (-1),
+/// or `group` emptied to be written again. Answers the group.
+pub fn style_group(node: &Node, group: i32) -> i32 {
+    let group = u32::try_from(group).ok();
+    with_tree(|tree| tree.style_group(node.id(), group)) as i32
+}
+
+/// `__ui_style_layer(node, group, conditional, bits, at_least, below)` — a
+/// new layer of `group`: unconditional, or under the condition the bits and
+/// the two widths (negative: none) name. Answers its id.
+pub fn style_layer(
     node: &Node,
+    group: i32,
+    conditional: bool,
+    bits: i32,
+    at_least: f64,
+    below: f64,
+) -> i32 {
+    let condition = conditional.then_some(Condition {
+        hovered: bits & 1 != 0,
+        pressed: bits & 2 != 0,
+        focused: bits & 4 != 0,
+        window_at_least: (at_least >= 0.0).then_some(at_least as f32),
+        window_below: (below >= 0.0).then_some(below as f32),
+    });
+    let group = u32::try_from(group).unwrap_or_else(|_| panic_with("a style group is positive"));
+    or_fail(with_tree(|tree| {
+        tree.style_layer(node.id(), group, condition)
+    })) as i32
+}
+
+fn layer_fields(node: &Node, layer: i32, change: impl FnOnce(&mut StyleFields)) {
+    let layer = u32::try_from(layer).unwrap_or_else(|_| panic_with("a style layer is positive"));
+    with_tree(|tree| tree.set_style_fields(node.id(), layer, change));
+}
+
+/// `__ui_style_end(node)` — resolves the element's style from its layers.
+pub fn style_end(node: &Node) {
+    change(node, |tree, id| tree.restyle(id));
+}
+
+/// `__ui_style_number(node, layer, property, value)` — 0 opacity, 1 text
+/// size, 2 line height, 3 weight, 4 italic.
+pub fn style_number(node: &Node, layer: i32, property: i32, value: f64) {
+    let number = value as f32;
+    if !number.is_finite() {
+        panic_with("a style number must be finite");
+    }
+    layer_fields(node, layer, |fields| match property {
+        0 => fields.opacity = Some(number.clamp(0.0, 1.0)),
+        1 => fields.text.size = Some(number.max(0.0)),
+        2 => fields.text.line_height = Some(number.max(0.0)),
+        3 => fields.text.weight = Some(number.clamp(1.0, 1000.0)),
+        4 => fields.text.italic = Some(value != 0.0),
+        _ => panic_with(&format!("{property} is not a `std::ui` style number code")),
+    });
+}
+
+/// `__ui_style_color(node, layer, property, colour)` — the background (0) or
+/// the text colour (1, inherited).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an extern's arguments are the vilan call's, one scalar each"
+)]
+pub fn style_color(
+    node: &Node,
+    layer: i32,
+    property: i32,
+    red: f64,
+    green: f64,
+    blue: f64,
+    alpha: f64,
+) {
+    let value = color(red, green, blue, alpha);
+    layer_fields(node, layer, |fields| match property {
+        0 => fields.background = Some(value),
+        1 => fields.text.color = Some(value),
+        _ => panic_with(&format!("{property} is not a `std::ui` colour code")),
+    });
+}
+
+/// `__ui_style_corners(node, layer, top_left, top_right, bottom_right,
+/// bottom_left)` — the corner radii, in dp.
+pub fn style_corners(
+    node: &Node,
+    layer: i32,
     top_left: f64,
     top_right: f64,
     bottom_right: f64,
     bottom_left: f64,
 ) {
-    let id = node.id();
     let corners = Corners {
         top_left: (top_left as f32).max(0.0),
         top_right: (top_right as f32).max(0.0),
         bottom_right: (bottom_right as f32).max(0.0),
         bottom_left: (bottom_left as f32).max(0.0),
     };
-    with_tree(|tree| tree.set_corners(id, corners));
+    layer_fields(node, layer, |fields| fields.corners = Some(corners));
 }
 
-/// `__ui_set_color(node, property, colour)` — the background (0) or the
-/// text colour (1, inherited).
-pub fn set_color(node: &Node, property: i32, red: f64, green: f64, blue: f64, alpha: f64) {
-    let id = node.id();
-    let value = color(red, green, blue, alpha);
-    with_tree(|tree| match property {
-        0 => tree.set_background(id, value),
-        1 => tree.set_text_style(id, |text| text.color = Some(value)),
-        _ => panic_with(&format!("{property} is not a `std::ui` colour code")),
-    });
-}
-
-/// `__ui_set_border(node, widths, colour)` — widths clockwise from the top,
-/// in dp, drawn inside the box.
+/// `__ui_style_border(node, layer, widths, colour)` — widths clockwise from
+/// the top, in dp, drawn inside the box.
 #[allow(
     clippy::too_many_arguments,
     reason = "an extern's arguments are the vilan call's, one scalar each"
 )]
-pub fn set_border(
+pub fn style_border(
     node: &Node,
+    layer: i32,
     top: f64,
     right: f64,
     bottom: f64,
@@ -290,23 +462,24 @@ pub fn set_border(
     blue: f64,
     alpha: f64,
 ) {
-    let id = node.id();
     let widths = Edges {
-        top: top as f32,
-        right: right as f32,
-        bottom: bottom as f32,
-        left: left as f32,
+        top: (top as f32).max(0.0),
+        right: (right as f32).max(0.0),
+        bottom: (bottom as f32).max(0.0),
+        left: (left as f32).max(0.0),
     };
-    with_tree(|tree| tree.set_border(id, widths, color(red, green, blue, alpha)));
+    let value = color(red, green, blue, alpha);
+    layer_fields(node, layer, |fields| fields.border = Some((widths, value)));
 }
 
-/// `__ui_set_shadow(node, x, y, blur, spread, colour)` — in dp.
+/// `__ui_style_shadow(node, layer, x, y, blur, spread, colour)` — in dp.
 #[allow(
     clippy::too_many_arguments,
     reason = "an extern's arguments are the vilan call's, one scalar each"
 )]
-pub fn set_shadow(
+pub fn style_shadow(
     node: &Node,
+    layer: i32,
     x: f64,
     y: f64,
     blur: f64,
@@ -316,19 +489,18 @@ pub fn set_shadow(
     blue: f64,
     alpha: f64,
 ) {
-    let id = node.id();
     let shadow = DropShadow {
         offset: Point::new(x as f32, y as f32),
         blur: blur as f32,
         spread: spread as f32,
         color: color(red, green, blue, alpha),
     };
-    with_tree(|tree| tree.set_shadow(id, shadow));
+    layer_fields(node, layer, |fields| fields.shadow = Some(shadow));
 }
 
-/// `__ui_set_font(node, family, name)` — the inherited font family: 0
-/// sans-serif, 1 serif, 2 monospace, 3 the family `name`.
-pub fn set_font(node: &Node, family: i32, name: &Str) {
+/// `__ui_style_font(node, layer, family, name)` — the inherited font family:
+/// 0 sans-serif, 1 serif, 2 monospace, 3 the family `name`.
+pub fn style_font(node: &Node, layer: i32, family: i32, name: &Str) {
     let family = match family {
         0 => FontFamily::SansSerif,
         1 => FontFamily::Serif,
@@ -336,32 +508,131 @@ pub fn set_font(node: &Node, family: i32, name: &Str) {
         3 => FontFamily::Named(name.to_string()),
         _ => panic_with(&format!("{family} is not a `std::ui` font family code")),
     };
-    let id = node.id();
-    with_tree(|tree| tree.set_text_style(id, |text| text.family = Some(family)));
+    layer_fields(node, layer, |fields| fields.text.family = Some(family));
 }
 
-/// `__ui_append_text(node, run)` — a run of a text element's paragraph.
-pub fn append_text(node: &Node, run: &Str) {
-    let id = node.id();
-    with_tree(|tree| or_fail(tree.append_text(id, run)));
+// ------------------------------------------------------------ the rest ---
+
+/// `__ui_append_text(node, run)` — a run of a text element's paragraph;
+/// answers its index.
+pub fn append_text(node: &Node, run: &Str) -> i32 {
+    change(node, |tree, id| or_fail(tree.append_text(id, run))) as i32
+}
+
+/// `__ui_set_run(node, index, run)` — replaces a run (a bound one, written).
+pub fn set_run(node: &Node, index: i32, run: &Str) {
+    let index = usize::try_from(index).unwrap_or(usize::MAX);
+    change(node, |tree, id| or_fail(tree.set_run(id, index, run)));
 }
 
 /// `__ui_set_label(node, label)` — the accessibility label (R10).
 pub fn set_label(node: &Node, label: &Str) {
-    let id = node.id();
-    with_tree(|tree| tree.set_label(id, label));
+    with_tree(|tree| tree.set_label(node.id(), label));
 }
 
 /// `__ui_set_texture(node, texture)` — an image element's picture.
 pub fn set_texture(node: &Node, image: &Image) {
-    let id = node.id();
-    with_tree(|tree| or_fail(tree.set_texture(id, image.clone())));
+    change(node, |tree, id| {
+        or_fail(tree.set_texture(id, image.clone()))
+    });
 }
 
 /// `__ui_add_child(parent, child)` — appends `child`.
 pub fn add_child(parent: &Node, child: &Node) {
-    let (parent, child) = (parent.id(), child.id());
-    with_tree(|tree| or_fail(tree.add_child(parent, child)));
+    let child = child.id();
+    change(parent, |tree, parent| {
+        or_fail(tree.add_child(parent, child))
+    });
+}
+
+/// `__ui_set_focusable(node, focusable)` — focusable in tree order (`true`,
+/// tab index 0), or not at all.
+pub fn set_focusable(node: &Node, focusable: bool) {
+    with_tree(|tree| tree.set_tab_index(node.id(), focusable.then_some(0)));
+}
+
+/// `__ui_on(node, kind, handler)` — `handler` called for every event of
+/// `kind` the element receives (the table above).
+pub fn on(node: &Node, kind: i32, handler: Rc<dyn Fn()>) {
+    let kind = code(
+        &[
+            EventKind::PointerEnter,
+            EventKind::PointerLeave,
+            EventKind::PointerMove,
+            EventKind::Press,
+            EventKind::Release,
+            EventKind::Click,
+            EventKind::Scroll,
+            EventKind::Key,
+            EventKind::KeyRelease,
+            EventKind::Text,
+            EventKind::Focus,
+            EventKind::Blur,
+        ],
+        f64::from(kind),
+        "event kind",
+    );
+    with_tree(|tree| tree.add_handler(node.id(), kind, Handler::from_rc(handler)));
+}
+
+/// `__ui_stop()` — inside a handler: the event bubbles no further, and the
+/// framework's own response to it does not happen.
+pub fn stop() {
+    STOPPED.with(|stopped| stopped.set(true));
+}
+
+/// `__ui_focus(node)` — gives the element the focus (whether or not Tab
+/// reaches it).
+pub fn focus(node: &Node) {
+    let id = node.id();
+    let (deliveries, root) = with_tree(|tree| (tree.focus(Some(id)), tree.root_of(id)));
+    for delivery in deliveries {
+        delivery.handler.call();
+    }
+    request_frame(root);
+}
+
+/// `__ui_interaction(node)` — bits: 1 hovered, 2 pressed, 4 focused.
+pub fn interaction(node: &Node) -> i32 {
+    let state = with_tree(|tree| tree.interaction(node.id()));
+    i32::from(state.hovered) | i32::from(state.pressed) << 1 | i32::from(state.focused) << 2
+}
+
+/// `__ui_set_offset(node, x, y)` — where a scroll's child is moved to.
+pub fn set_offset(node: &Node, x: f64, y: f64) {
+    change(node, |tree, id| {
+        or_fail(tree.set_scroll_offset(id, Point::new(x as f32, y as f32)))
+    });
+    notify_offsets();
+}
+
+/// `__ui_offset(node, which)` — a scroll's offset, x (0) and y (1), and its
+/// range, x (2) and y (3), in dp.
+pub fn offset(node: &Node, which: i32) -> f64 {
+    let (offset, range) =
+        with_tree(|tree| (tree.scroll_offset(node.id()), tree.scroll_range(node.id())));
+    let (Some(offset), Some(range)) = (offset, range) else {
+        panic_with("only a `scroll` has an offset");
+    };
+    f64::from(match which {
+        0 => offset.x,
+        1 => offset.y,
+        2 => range.width,
+        3 => range.height,
+        _ => panic_with(&format!("{which} is not a `std::ui` offset number")),
+    })
+}
+
+/// `__ui_on_offset(node, handler)` — called when a scroll's offset moves
+/// other than by `__ui_set_offset`'s value.
+pub fn on_offset(node: &Node, handler: Rc<dyn Fn()>) {
+    with_tree(|tree| or_fail(tree.on_scroll_offset(node.id(), Handler::from_rc(handler))));
+}
+
+fn notify_offsets() {
+    for handler in with_tree(UiTree::take_offset_notices) {
+        handler.call();
+    }
 }
 
 fn units(scale_factor: f64) -> Units {
@@ -373,24 +644,175 @@ fn units(scale_factor: f64) -> Units {
 /// `__ui_layout(root, width, height, scale_factor)` — lays `root` out in a
 /// `width` x `height` dp viewport, snapped to the device grid at
 /// `scale_factor`. Solves only when something that moves a box changed.
+/// Recorded as the last frame's layout.
 pub fn layout(root: &Node, width: f64, height: f64, scale_factor: f64) {
     let id = root.id();
     let units = units(scale_factor);
     let size = Size::new(width as f32, height as f32);
-    with_tree(|tree| {
+    let started = Instant::now();
+    let stats = with_tree(|tree| {
         with_text(|text| {
             or_fail(tree.layout(id, size, units, text).map(|_| ()));
-        })
+        });
+        tree.last_pass()
     });
+    let took = started.elapsed().as_secs_f64() * 1.0e6;
+    LAST_FRAME.with(|last| {
+        let mut record = last.get();
+        record.layout_us = took;
+        record.stats = stats;
+        last.set(record);
+    });
+    notify_offsets();
 }
 
 /// `__ui_paint(frame, root)` — draws `root`, as last laid out, into the
-/// frame being filled.
+/// frame being filled. Recorded as the last frame's paint.
 pub fn paint(frame: u32, root: &Node) {
     let id = root.id();
+    let started = Instant::now();
     with_frame(frame, |builder| {
         with_tree(|tree| with_text(|text| or_fail(tree.paint(id, builder, text))))
     });
+    let took = started.elapsed().as_secs_f64() * 1.0e6;
+    let rebuilt = with_tree(|tree| tree.last_pass().rebuilt);
+    LAST_FRAME.with(|last| {
+        let mut record = last.get();
+        record.paint_us = took;
+        record.stats.rebuilt = rebuilt;
+        last.set(record);
+    });
+}
+
+/// `__ui_mount(window, root)` — `root` becomes window `window`'s contents:
+/// its frame callback lays the tree out at the window's size and scale and
+/// paints it; its events are routed into the tree first; a change to the
+/// tree asks for a frame.
+pub fn mount(window: u32, root: &Node) {
+    let id = root.id();
+    if with_tree(|tree| tree.root_of(id)) != id {
+        or_fail::<()>(Err(UiError::NotARoot));
+    }
+    let drawn = root.clone();
+    let mounted = with_window(window, |slot| {
+        slot.on_frame = Some(Rc::new(move || draw_mounted(&drawn)));
+        slot.ui_root = Some(root.clone());
+    });
+    if mounted.is_some() {
+        MOUNTS.with(|mounts| mounts.borrow_mut().insert(id, window));
+        super::request_redraw(window);
+    }
+}
+
+/// A mounted tree's frame: laid out at the frame's size and scale, and
+/// painted.
+fn draw_mounted(root: &Node) {
+    let token = super::frame_token();
+    layout(
+        root,
+        super::frame_number(1),
+        super::frame_number(2),
+        super::frame_number(3),
+    );
+    paint(token, root);
+}
+
+/// `__ui_frame_number(window, which)` — the last layout and paint (of any
+/// tree: a mounted one's frame, or `draw`'s):
+/// its layout time (0), its paint time (1) and window `window`'s draw time —
+/// encoding, submitting and presenting — of the last frame it presented (2),
+/// all in microseconds; whether the solver ran (3), the leaves it measured
+/// (4), the boxes that moved (5), the element scenes rebuilt (6).
+pub fn frame_number(window: u32, which: i32) -> f64 {
+    let record = LAST_FRAME.with(Cell::get);
+    match which {
+        0 => record.layout_us,
+        1 => record.paint_us,
+        2 => with_window(window, |slot| slot.last_draw_us).unwrap_or(0.0),
+        3 => f64::from(u8::from(record.stats.solved)),
+        4 => record.stats.measured as f64,
+        5 => record.stats.moved as f64,
+        6 => record.stats.rebuilt as f64,
+        _ => panic_with(&format!("{which} is not a `std::ui` frame number")),
+    }
+}
+
+/// Routes one window event into `root`'s tree and calls the handlers it
+/// names; asks the root's window for a frame when the tree changed.
+pub(crate) fn dispatch(root: &Node, raw: &RawEvent) {
+    let input = match raw.kind {
+        raw_input::POINTER_MOVED => Input::PointerMoved(position(raw)),
+        raw_input::POINTER_PRESSED if raw.numbers[2] == 0.0 => Input::Pressed(position(raw)),
+        raw_input::POINTER_RELEASED if raw.numbers[2] == 0.0 => Input::Released(position(raw)),
+        raw_input::POINTER_LEFT => Input::PointerLeft,
+        raw_input::SCROLLED => Input::Scrolled {
+            position: position(raw),
+            delta: Point::new(raw.numbers[2] as f32, raw.numbers[3] as f32),
+        },
+        raw_input::KEY_PRESSED => Input::Key {
+            name: raw.text.clone().unwrap_or_default(),
+            shift: (raw.numbers[1] as i32) & 1 != 0,
+        },
+        raw_input::KEY_RELEASED => Input::KeyReleased,
+        raw_input::TEXT_INPUT => Input::Text,
+        _ => return,
+    };
+    let id = root.id();
+    let (route, before) = with_tree(|tree| {
+        let before = tree.generations();
+        (tree.route(id, &input), before)
+    });
+    // `std::gfx`'s current event is the one being routed while its handlers
+    // run: what `current_event()` answers them.
+    let outer = STATE.with(|state| state.borrow_mut().current_event.replace(raw.clone()));
+    run_route(id, route);
+    STATE.with(|state| state.borrow_mut().current_event = outer);
+    if with_tree(|tree| tree.generations()) != before {
+        request_frame(id);
+    }
+}
+
+fn position(raw: &RawEvent) -> Point {
+    Point::new(raw.numbers[0] as f32, raw.numbers[1] as f32)
+}
+
+/// Calls a route's handlers, step by step; a step a handler stopped skips
+/// the rest of its handlers and its default; a default that runs may owe
+/// handlers of its own.
+fn run_route(root: NodeId, route: Route) {
+    for step in route.steps {
+        STOPPED.with(|stopped| stopped.set(false));
+        let mut stopped = false;
+        for delivery in &step.deliveries {
+            delivery.handler.call();
+            if step.stoppable && STOPPED.with(Cell::get) {
+                stopped = true;
+                break;
+            }
+        }
+        STOPPED.with(|stopped| stopped.set(false));
+        if !stopped && let Some(action) = step.default {
+            let more = with_tree(|tree| tree.perform(root, action));
+            run_route(root, more);
+        }
+    }
+    notify_offsets();
+}
+
+/// `__ui_deliver(root, kind, a, b, c, d, e, text)` — routes an event into
+/// `root`'s tree as a mounted window would (`std::gfx`'s event table): for a
+/// test, or a program that drives its tree itself.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an extern's arguments are the vilan call's, one scalar each"
+)]
+pub fn deliver(root: &Node, kind: i32, a: f64, b: f64, c: f64, d: f64, e: f64, text: &Str) {
+    let raw = RawEvent {
+        kind,
+        numbers: [a, b, c, d, e],
+        text: Some(text.to_string()),
+    };
+    dispatch(root, &raw);
 }
 
 /// `__ui_node_number(node, which)` — the element's box from the last layout,

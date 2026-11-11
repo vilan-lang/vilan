@@ -366,15 +366,17 @@ height).render(draw)` draws one frame into a `std::image` picture.
 
 ## Elements and layout
 
-[`std::ui`](../std/ui.md) builds a GPU window's contents from five element kinds
+[`std::ui`](../std/ui.md) builds a GPU window's contents from six element kinds
 and lays them out: `row` and `column` put their children in a line, `gap`
 apart, with `padding`, `grow`, `shrink`, `align`, `justify` and `wrap`; `stack`
 puts its children on top of one another, each at its `anchor`; `text` is a
 paragraph that wraps to the width it is given; `image` shows a texture by its
-`fit`. None has a look of its own: a look is a `Style` value — background,
-border, radius, shadow, opacity, text style — composed with `+`, and only its
-text fields are inherited. There are no margins: space between siblings is a
-gap, space inside an element its padding.
+`fit`; `scroll` is a clipped viewport over one child. Each kind is written as an
+element tag, `<row gap(dp(12))>..</row>`, which lowers to the builder calls
+`row().gap(dp(12)).child(..)`. None has a look of its own: a look is a `Style`
+value — background, border, radius, shadow, opacity, text style — composed with
+`+`, and only its text fields are inherited. There are no margins: space between
+siblings is a gap, space inside an element its padding.
 
 ```vilan,native
 import std::gfx::{ Color, Window, dp };
@@ -382,15 +384,16 @@ import std::io::print;
 import std::ui::{ Align, Element, column, mount, row, style, text };
 
 fun header(): Element {
-	row()
-		.padding(dp(16))
-		.gap(dp(12))
-		.align(Align::Center)
-		.style(style().background(Color::rgb(33, 36, 46)).text_color(Color::white()))
-		.child(text().child("vilan").style(style().text_size(dp(20)).weight(700)))
-		.child(row().grow(1.0))
-		.child("Guide")
-		.element()
+	<row
+		padding(dp(16))
+		gap(dp(12))
+		align(Align::Center)
+		style(style().background(Color::rgb(33, 36, 46)).text_color(Color::white()))
+	>
+		<text style(style().text_size(dp(20)).weight(700))>"vilan"</text>
+		<row grow(1.0) />
+		"Guide"
+	</row>.element()
 }
 
 fun main() {
@@ -401,25 +404,75 @@ fun main() {
 			ret;
 		},
 	};
-	mount(window, column()
-		.child(header())
-		.child(column().padding(dp(24)).gap(dp(12))
-			.child(text().child("Layout without a style sheet").style(style().text_size(dp(24))))
-			.child("Rows and columns place their children in a line; a paragraph wraps to the width it is given.")));
+	mount(window, <column>
+		{header()}
+		<column padding(dp(24)) gap(dp(12))>
+			<text style(style().text_size(dp(24)))>"Layout without a style sheet"</text>
+			"Rows and columns place their children in a line; a paragraph wraps to the width it is given."
+		</column>
+	</column>);
 }
 main();
 ```
 
-`mount` makes the tree the window's frame callback: each frame lays it out at
-the window's size and scale and draws it, so a resize lays it out again. The
-tree is RETAINED — built once, kept, laid out again only when something that
-moves a box changed — and every box is snapped to the device pixel grid by the
-renderer's own rule, so a 1 dp line stays one pixel at 150%.
-`vilan/examples/ui` is a whole documentation page: a header, a sidebar, a
-content column with wrapped paragraphs, and a picture card with a badge on its
-corner; its end-to-end test holds the page to recorded rectangles at two window
-sizes and two scales, and to golden images. Hit testing, events, focus,
-scrolling and properties bound to signals are the next part.
+`mount` makes the tree the window's contents: each frame lays it out at the
+window's size and scale and draws it, so a resize lays it out again. The tree is
+RETAINED — built once, kept, laid out again only where something that moves a box
+changed, and repainted only where something changed — and every box is snapped
+to the device pixel grid by the renderer's own rule, so a 1 dp line stays one
+pixel at 150%. `vilan/examples/ui` is a whole documentation page: a header, a
+sidebar, a content column with wrapped paragraphs, and a picture card with a
+badge on its corner; its end-to-end test holds the page to recorded rectangles at
+two window sizes and two scales, and to golden images.
+
+### Interaction
+
+Every attribute takes a value or a signal, and events are attributes too. A
+counter, its look supplied by the app as style conditions:
+
+```vilan,native
+import std::gfx::{ Color, Window, dp };
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ Style, column, focused, hovered, mount, pressed, row, style, text };
+
+fun main() {
+	let window = match Window::builder().title("Counter").size(dp(360), dp(240)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let count: SignalCell<i32> = Signal::new(0);
+	let look = style()
+		.background(Color::rgb(45, 95, 230))
+		.text_color(Color::white())
+		.radius(dp(8))
+		.when(hovered(), |look: Style| look.background(Color::rgb(70, 120, 250)))
+		.when(pressed(), |look: Style| look.background(Color::rgb(28, 70, 190)))
+		.when(focused(), |look: Style| look.text_color(Color::rgb(255, 220, 120)));
+	mount(window, <column padding(dp(24)) gap(dp(16))>
+		<text>{count.derive(|value: i32| i"Count: {value}")}</text>
+		<row padding(dp(12)) style(look) focusable on_click(|| count.set_with(|value: i32| value + 1))>
+			"Add one"
+		</row>
+	</column>);
+}
+main();
+```
+
+The count's text follows its signal: a click writes the signal, the one text
+is laid out again, and the window draws one frame. The button's looks follow
+the pointer and the focus with no code of the app's: `hovered()`, `pressed()` and
+`focused()` are typed conditions the framework resolves from hit testing and the
+focus, and a change repaints the one element. Tab and Shift+Tab move the focus;
+a `scroll` moves its child under the wheel without laying anything out.
+
+`vilan/examples/ui-counter` is this counter with two buttons and keyboard
+activation, and `vilan/examples/ui-list` a list of 10,000 rows in a `scroll`,
+one row changing on a click; their end-to-end test drives both through the X
+server, by pointer and keyboard, and holds every frame to "only on change".
 
 ## Debug by default
 
@@ -491,7 +544,8 @@ the point of emitting a language rather than machine code. `vilan build
 
 A desktop window shows a web page and nothing more yet: no menus, tray icon,
 notifications, deep links, secure token storage, or second window to manage,
-and no installer or package — each is its own slice. A GPU window is drawn by
-hand for now: the element tree, layout, styles and components that make a
-**native UI** of it (`std::ui`) come next, and paths, text editing, input
-methods and accessibility after them.
+and no installer or package — each is its own slice. A GPU window's **native
+UI** (`std::ui`) has its elements, layout, styles, events, focus and scrolling;
+its components (`std::ui::kit`: a button with behaviour, a text input, a virtual
+list) come next, and paths, text editing, input methods and accessibility after
+them.
