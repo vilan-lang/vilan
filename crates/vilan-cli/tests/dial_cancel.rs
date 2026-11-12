@@ -554,10 +554,14 @@ fn dial_within_times_out_a_hung_dial_and_closes_its_socket_on(backend: Backend) 
     let mut held = accept(&listener);
     assert_eq!(client.next_line(), "within:err:RpcError::Timeout");
     // The client is alive and waiting: the close is the cancelled dial's.
+    // What it sent first is its upgrade or NOTHING: the 300 ms deadline is the
+    // program's own clock, and the listener's backlog completes the connection
+    // before the client has written a byte, so a slow first dial (a loaded
+    // Windows runner, CI run 43260260833) is cancelled with the request unsent.
     let request = read_until_closed(&mut held);
     assert!(
-        String::from_utf8_lossy(&request).starts_with("GET / HTTP/1.1"),
-        "the client sent its upgrade: {:?}",
+        request.is_empty() || String::from_utf8_lossy(&request).starts_with("GET / HTTP/1.1"),
+        "the client sent its upgrade or nothing: {:?}",
         String::from_utf8_lossy(&request)
     );
     no_further_upgrade(&listener);
