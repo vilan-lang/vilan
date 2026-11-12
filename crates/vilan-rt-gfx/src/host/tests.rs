@@ -389,3 +389,71 @@ fn a_removed_element_drops_its_handlers_and_a_handler_holding_it_lets_it_go() {
     );
     let _ = root;
 }
+
+/// F169: after a present the X11 loop wakes on its own, on a schedule that
+/// starts at the present, passes each step it reaches and ends; nothing
+/// before the first present wakes it, and a new present starts the schedule
+/// again from the top.
+#[test]
+fn a_present_schedules_bounded_wakes_and_then_the_loop_sleeps() {
+    use std::time::{Duration, Instant};
+
+    use super::shell::PresentDrain;
+
+    let start = Instant::now();
+    let mut drain = PresentDrain::default();
+    assert_eq!(drain.next_wake(start), None, "no present, no wake");
+
+    drain.presented(start);
+    let mut now = start;
+    let mut wakes = Vec::new();
+    while let Some(wake) = drain.next_wake(now) {
+        assert!(wake > now, "a wake is always ahead of now");
+        wakes.push(wake - start);
+        now = wake;
+    }
+    assert_eq!(wakes, PresentDrain::STEPS.to_vec(), "every step, in order");
+    assert!(
+        *wakes.last().expect("a step") <= Duration::from_secs(3),
+        "the schedule ends within seconds of the present"
+    );
+    assert_eq!(drain.next_wake(now + Duration::from_secs(60)), None);
+
+    // A wait that overslept several steps resumes at the first still ahead.
+    drain.presented(start);
+    assert_eq!(
+        drain.next_wake(start + Duration::from_millis(100)),
+        Some(start + Duration::from_millis(128))
+    );
+    // A present starts the schedule again from its first step.
+    let later = start + Duration::from_millis(300);
+    drain.presented(later);
+    assert_eq!(drain.next_wake(later), Some(later + PresentDrain::STEPS[0]));
+}
+
+/// F169: the loop waits until the earlier of the program's deadline and the
+/// next drain wake, and for an event alone when there is neither — never
+/// `Poll`.
+#[test]
+fn the_loop_waits_for_the_earlier_of_the_deadline_and_the_drain_wake() {
+    use std::time::{Duration, Instant};
+
+    use winit::event_loop::ControlFlow;
+
+    use super::shell::wait_for;
+
+    let now = Instant::now();
+    let soon = now + Duration::from_millis(16);
+    let later = now + Duration::from_millis(500);
+    assert_eq!(wait_for(None, None), ControlFlow::Wait);
+    assert_eq!(wait_for(Some(later), None), ControlFlow::WaitUntil(later));
+    assert_eq!(wait_for(None, Some(soon)), ControlFlow::WaitUntil(soon));
+    assert_eq!(
+        wait_for(Some(later), Some(soon)),
+        ControlFlow::WaitUntil(soon)
+    );
+    assert_eq!(
+        wait_for(Some(soon), Some(later)),
+        ControlFlow::WaitUntil(soon)
+    );
+}
