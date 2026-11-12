@@ -172,6 +172,18 @@ impl TextLayout {
         Some(self.data.editing.as_ref()?.step(index, forward, word))
     }
 
+    /// The start of the grapheme under `point` (byte index), in dp from the
+    /// layout's top-left.
+    pub fn grapheme_at(&self, point: Point) -> Option<usize> {
+        Some(self.data.editing.as_ref()?.grapheme_at(point))
+    }
+
+    /// The run of word (or of other) graphemes around the grapheme starting
+    /// at byte `index`, as byte indices `start..end`: a double click's word.
+    pub fn word_around(&self, index: usize) -> Option<(usize, usize)> {
+        Some(self.data.editing.as_ref()?.word_around(index))
+    }
+
     /// The rectangles the graphemes between byte indices `from` and `to`
     /// cover, merged where they touch on a line.
     pub fn selection(&self, from: usize, to: usize) -> Option<Vec<Rect>> {

@@ -187,7 +187,14 @@ Rust workspace, seventeen crates, plus the language's own tree:
   a cell of its items); what it needed from the host is `on_resize` (told after a layout, and
   `__ui_layout` lays out again when a handler changed the tree), an offset kept unclamped while
   a layout is pending (`ScrollState::measured_at`), and Tab's reveal of an element with no box
-  yet waiting for the next layout (`pending_reveal`).
+  yet waiting for the next layout (`pending_reveal`). POINTER CAPTURE (F172, `ui/input.rs`'s
+  module doc is the rule): the press's target (`UiTree::pressed`) gets every move and the release
+  until the button comes up; `pressed` holds on its chain, `hovered` stays geometric, the click is
+  decided by where the release lands; removal and `release_pointer` end it. Presses in a row are
+  counted in the tree by the time the input CARRIES (`Input::Pressed { time }`, stamped by the
+  shell; a delivered press carries 0), so the tree's pins choose the clock. The host asks
+  `UiTree::refresh_hover` after every layout pass, so content moving under a still pointer moves
+  the hover in the same frame.
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

@@ -458,6 +458,70 @@ fun check(arguments: List<str>, count: i32) {
 	plain.reveal_key(301);
 	layout(plain_root, Size::new(dp(200), dp(300)), 1.0);
 	print(i"plain reveal 301: {rows_in(plain_root)}");
+
+	// 9. The list's own padding (60 dp above and below a 180 dp content box, no
+	// overscan): the rows built are the ones its padding box shows — a row in the
+	// padding shows too, the scroll clipping at the padding box — and `reveal`
+	// brings a row inside the content box.
+	let padded_rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let padded_offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
+	let padded = virtual_list(
+		Signal::new(Range::new(0, 1000).to_list()),
+		dp(20),
+		|number: i32| number,
+		|number: i32| {
+			let built = <text label(i"row {number}") focusable>{i"{number}"}</text>.element();
+			padded_rows.write().insert(number, built);
+			built
+		},
+	)
+		.overscan(0)
+		.offset(padded_offset)
+		.height(dp(300))
+		.padding_y(dp(60));
+	let padded_root = <column style(style().font(FontFamily::Named(font)))>{padded}</column>.element();
+	let padded_size = Size::new(dp(200), dp(400));
+	let padded_report = |what: str| {
+		layout(padded_root, padded_size, 1.0);
+		let (first, last) = padded.built();
+		mut focus = "none";
+		for (id, element) in padded_rows.read().entries() {
+			if element.interaction().focused {
+				focus = i"row {id}";
+			}
+		}
+		print(i"{what}: offset={padded_offset.get().y.value()} built={first}..{last} {rows_in(padded_root)} focused={focus}");
+	};
+	padded_report("padded");
+	padded_offset.set(Point::new(dp(0), dp(100)));
+	padded_report("padded, scrolled 100");
+	padded.reveal(30);
+	padded_report("padded, row 30 revealed");
+
+	// 10. A focused row the wheel scrolls out of the window is removed with the
+	// focus (decided: the window is one run of rows; the row's state belongs in
+	// the item), and comes back unfocused.
+	padded_offset.set(Point::new(dp(0), dp(0)));
+	layout(padded_root, padded_size, 1.0);
+	// Row 2 is at 60 + 40 in the padding box: its middle at y 110.
+	let on_row = Point::new(dp(100), dp(110));
+	deliver(padded_root, Event::PointerPressed(primary(on_row)));
+	deliver(padded_root, Event::PointerReleased(primary(on_row)));
+	padded_report("padded, row 2 pressed");
+	deliver(padded_root, Event::Scrolled(Scroll {
+		position = on_row,
+		x = dp(0),
+		y = dp(-400),
+		modifiers = none,
+	}));
+	padded_report("padded, wheel 400 down");
+	deliver(padded_root, Event::Scrolled(Scroll {
+		position = on_row,
+		x = dp(0),
+		y = dp(400),
+		modifiers = none,
+	}));
+	padded_report("padded, wheel 400 back up");
 }
 
 // --- Measure mode: costs with no window -------------------------------------------

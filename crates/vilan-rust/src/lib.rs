@@ -18632,8 +18632,12 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_text_edit_look", "ui::text_edit_look", &[0]),
         ("__ui_text_index_at", "ui::text_index_at", &[0]),
         ("__ui_text_step", "ui::text_step", &[0]),
+        ("__ui_text_word", "ui::text_word", &[0]),
         // P4's virtual list: a resize handler reads the size it is told.
         ("__ui_resized", "ui::resized", &[]),
+        // F172: pointer capture and presses in a row.
+        ("__ui_click_count", "ui::click_count", &[]),
+        ("__ui_release_pointer", "ui::release_pointer", &[0]),
     ];
     FUNCTIONS
         .iter()

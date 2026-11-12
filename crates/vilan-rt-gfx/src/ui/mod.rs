@@ -83,7 +83,10 @@ use taffy::{
 /// An element's id in its [`UiTree`].
 pub use taffy::NodeId;
 
-pub use input::{DefaultAction, Delivery, EventKind, Handler, Input, Route, Step};
+pub use input::{
+    DefaultAction, Delivery, EventKind, Handler, Input, MULTI_CLICK_DISTANCE, MULTI_CLICK_TIME,
+    Route, Step,
+};
 pub use style::{Condition, Interaction, StyleFields};
 
 use crate::color::{Color, Fill};
@@ -221,6 +224,33 @@ pub enum ScrollAxis {
     Horizontal,
     /// Both: the child is as large as it wants each way.
     Both,
+}
+
+/// An element's padding box seen down its height ([`UiTree::inner_box`]):
+/// its content box's height and the padding above and below it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InnerBox {
+    pub padding_top: f32,
+    pub content_height: f32,
+    pub padding_bottom: f32,
+}
+
+/// Which index of an edited text a point lands on ([`UiTree::text_index_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexRule {
+    /// The grapheme edge nearest the point: where a press puts the caret.
+    Nearest,
+    /// The start of the grapheme under the point: whose word a double click
+    /// selects.
+    Under,
+    /// A drag's: [`Nearest`](IndexRule::Nearest) while the point is across
+    /// the part of the text that shows; past its left or right edge (the
+    /// pointer outside the field, held there by the capture), the first
+    /// index out from that edge whose caret does not show whole — one
+    /// grapheme beyond what shows — so each move extends the selection a
+    /// grapheme further and the caret's reveal scrolls the field by it. In
+    /// a text that shows whole, the end it is past.
+    Drag,
 }
 
 /// The accessibility role an element announces (R10). Carried, read by
@@ -740,9 +770,19 @@ pub struct UiTree {
     window_width: Option<f32>,
     /// The interaction state (`input.rs`).
     hovered: Option<NodeId>,
+    /// The element the primary button went down on: it holds the pointer
+    /// (its CAPTURE, `input.rs`) until the button comes up.
     pressed: Option<NodeId>,
     focused: Option<NodeId>,
     pointer: Option<Point>,
+    /// The root whose window the pointer is in (its last pointer input).
+    pointer_root: Option<NodeId>,
+    /// Something moved under the pointer since the hover was last worked
+    /// out (a box, an offset, an element removed): the next
+    /// [`UiTree::refresh_hover`] hit tests again.
+    hover_stale: bool,
+    /// The last press, for counting presses in a row (`input.rs`).
+    last_press: Option<input::PressRecord>,
     /// Scrolls whose offset moved by the framework, to tell their programs.
     offset_notices: Vec<NodeId>,
     /// Elements listening for their size whose size the last layouts changed,
@@ -960,6 +1000,9 @@ impl UiTree {
             pressed: None,
             focused: None,
             pointer: None,
+            pointer_root: None,
+            hover_stale: false,
+            last_press: None,
             offset_notices: Vec::new(),
             resize_notices: Vec::new(),
             pending_reveal: None,
@@ -1178,7 +1221,8 @@ impl UiTree {
     /// REMOVES `node` from its parent for good (a keyed list's row going, a
     /// conditional turning off): the parent is laid out and painted again,
     /// the hover, press and focus inside the subtree are cleared (the press is
-    /// cancelled: no click follows it), and every handler of the subtree is
+    /// cancelled: no click follows it, and its capture ends, so the rest of
+    /// the drag goes to whatever is under the pointer), and every handler of the subtree is
     /// TAKEN OUT of the tree and answered, for the caller to drop with the
     /// tree no longer borrowed.
     ///
@@ -1213,6 +1257,9 @@ impl UiTree {
         if inside(self, self.hovered) {
             self.unhover_inside(node, parent);
         }
+        // What is under the pointer is known again after the next layout,
+        // when what moved into the removed element's place has its box.
+        self.hover_stale = true;
         let mut handlers = Vec::new();
         let mut pending = vec![node];
         while let Some(current) = pending.pop() {
@@ -1766,20 +1813,142 @@ impl UiTree {
         Ok(content.shaped_for(constraint, text))
     }
 
-    /// The UTF-16 index in an edited text nearest `point` (dp from its root's
+    /// The UTF-16 index in an edited text that `point` (dp from its root's
     /// top-left corner, as the window reports the pointer: the offsets of
-    /// the scrolls around it are taken into account).
+    /// the scrolls around it are taken into account) lands on, by `rule`
+    /// ([`IndexRule`]).
     pub fn text_index_at(
         &mut self,
         node: NodeId,
         point: Point,
+        rule: IndexRule,
         text: &mut TextSystem,
     ) -> Result<usize, UiError> {
         let layout = self.edited_layout(node, text)?;
         let origin = self.content_origin_on_screen(node);
-        let local = Point::new(point.x - origin.x, point.y - origin.y);
-        let byte = layout.index_at(local).ok_or(UiError::NotEdited)?;
+        let local = |point: Point| Point::new(point.x - origin.x, point.y - origin.y);
+        let byte = match rule {
+            IndexRule::Nearest => layout.index_at(local(point)),
+            IndexRule::Under => layout.grapheme_at(local(point)),
+            IndexRule::Drag => {
+                let shown = self.shown_on_screen(node);
+                let inside = Point::new(point.x.clamp(shown.left(), shown.right()), point.y);
+                let mut at = layout.index_at(local(inside)).ok_or(UiError::NotEdited)?;
+                let rightward = point.x > shown.right();
+                if rightward || point.x < shown.left() {
+                    let width = self.caret_width(node);
+                    let caret_x = |index: usize| {
+                        layout
+                            .caret(index, width)
+                            .map(|caret| origin.x + caret.left())
+                    };
+                    let shows_whole = |index: usize| {
+                        caret_x(index)
+                            .is_some_and(|x| x >= shown.left() && x + width <= shown.right())
+                    };
+                    // The neighbouring index drawn further the pointer's way
+                    // (logical order runs either way in a mixed-direction
+                    // text).
+                    let outward = |from: usize| {
+                        let here = caret_x(from)?;
+                        [true, false]
+                            .into_iter()
+                            .filter_map(|forward| layout.step(from, forward, false))
+                            .filter(|index| *index != from)
+                            .filter_map(|index| Some((index, caret_x(index)? - here)))
+                            .filter(|(_, moved)| {
+                                if rightward {
+                                    *moved > 0.0
+                                } else {
+                                    *moved < 0.0
+                                }
+                            })
+                            .min_by(|first, second| first.1.abs().total_cmp(&second.1.abs()))
+                            .map(|(index, _)| index)
+                    };
+                    // Out from the edge to the first index whose caret does
+                    // not show whole: its reveal scrolls it in, and the next
+                    // move lands one further.
+                    while shows_whole(at) {
+                        match outward(at) {
+                            Some(next) => at = next,
+                            None => break,
+                        }
+                    }
+                }
+                Some(at)
+            }
+        }
+        .ok_or(UiError::NotEdited)?;
         Ok(unit_of_byte(self.text(node).unwrap_or(""), byte))
+    }
+
+    /// The start (or with `end`, the end) of the run of word graphemes — or
+    /// of the others — around the grapheme at UTF-16 `index` of an edited
+    /// text (the last grapheme at the end of the text): a double click's word.
+    pub fn text_word(
+        &mut self,
+        node: NodeId,
+        index: usize,
+        end: bool,
+        text: &mut TextSystem,
+    ) -> Result<usize, UiError> {
+        let layout = self.edited_layout(node, text)?;
+        let content = self.text(node).unwrap_or("");
+        let (start, finish) = layout
+            .word_around(byte_of_unit(content, index))
+            .ok_or(UiError::NotEdited)?;
+        Ok(unit_of_byte(content, if end { finish } else { start }))
+    }
+
+    fn caret_width(&self, node: NodeId) -> f32 {
+        match &self.data(node).content {
+            Content::Text(TextContent {
+                editing: Some(editing),
+                ..
+            }) => editing.caret_width,
+            _ => 0.0,
+        }
+    }
+
+    /// The part of `node`'s content box that shows, in dp from its root's
+    /// top-left corner: its box moved by the offset of every scroll around
+    /// it and cut by every clipping element around it (to its padding box,
+    /// where its children are drawn and hit).
+    fn shown_on_screen(&self, node: NodeId) -> Rect {
+        let data = self.data(node);
+        let (mut left, mut top) = (
+            data.bounds.left() + data.content_offset.x,
+            data.bounds.top() + data.content_offset.y,
+        );
+        let (mut right, mut bottom) = (
+            left + data.content_size.width,
+            top + data.content_size.height,
+        );
+        let mut current = node;
+        while let Some(parent) = self.taffy.parent(current) {
+            if self.kind(parent) == ElementKind::Viewport {
+                break;
+            }
+            let data = self.data(parent);
+            if let Some(scroll) = &data.scroll {
+                left -= scroll.offset.x;
+                right -= scroll.offset.x;
+                top -= scroll.offset.y;
+                bottom -= scroll.offset.y;
+            }
+            if data.clip {
+                // Both in the parent's coordinates now: the offsets of the
+                // scrolls further up move them alike.
+                let (area, _) = padding_box(data);
+                left = left.max(area.left());
+                top = top.max(area.top());
+                right = right.min(area.right()).max(left);
+                bottom = bottom.min(area.bottom()).max(top);
+            }
+            current = parent;
+        }
+        Rect::new(left, top, right - left, bottom - top)
     }
 
     /// The UTF-16 index of the next (`forward`) or previous grapheme
@@ -2135,6 +2304,7 @@ impl UiTree {
             }
             if moved {
                 self.stats.moved += 1;
+                self.hover_stale = true;
                 self.invalidate(node);
             }
             if resized {
@@ -2187,6 +2357,7 @@ impl UiTree {
         if clamped != scroll.offset {
             scroll.offset = clamped;
             self.offset_notices.push(node);
+            self.hover_stale = true;
             self.invalidate(node);
         }
     }
@@ -2195,6 +2366,21 @@ impl UiTree {
     /// top-left corner.
     pub fn bounds(&self, node: NodeId) -> Rect {
         self.data(node).bounds
+    }
+
+    /// The part of the element its children are drawn in, from its last
+    /// layout — its padding box (a clipping element's clip) — down its
+    /// height: the content box and the padding above and below it.
+    pub fn inner_box(&self, node: NodeId) -> InnerBox {
+        let data = self.data(node);
+        let (area, _) = padding_box(data);
+        let content_top = data.bounds.top() + data.content_offset.y;
+        let content_height = data.content_size.height;
+        InnerBox {
+            padding_top: (content_top - area.top()).max(0.0),
+            content_height,
+            padding_bottom: (area.bottom() - content_top - content_height).max(0.0),
+        }
     }
 
     /// Every element under `root`, `root` first, in tree (paint) order.
@@ -2257,6 +2443,7 @@ impl UiTree {
         };
         if clamped != scroll.offset {
             scroll.offset = clamped;
+            self.hover_stale = true;
             self.invalidate(node);
         }
         if clamped != offset {

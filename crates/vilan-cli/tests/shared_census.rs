@@ -311,9 +311,10 @@ const CENSUS: &[(&str, usize, &str)] = &[
     ),
     (
         "ui/kit/inputs.vl",
-        7,
+        10,
         "E: a text input's caret, anchor, focus, disabled flag and caret and \
-         selection colours and width (P4) — minted by the builder, read and \
+         selection colours and width (P4), and the unit a press drags by with \
+         the word a double click selected (F172) — minted by the builder, read and \
          written by the element's handlers the tree keeps and by the `TextInput` \
          value's methods, which the program calls long after the builder returned",
     ),
@@ -451,7 +452,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 296,
+        total, 299,
         "the total number of `Shared` construction sites in std changed"
     );
 

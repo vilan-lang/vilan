@@ -175,13 +175,17 @@ fun pressable(role: Role, off: Shared<bool>, activate: (|| void) context turn_sc
 		})
 }
 
-/// `off` (a value, or a signal of one) disables `element`: no activation, and out
-/// of the tab order (a press no longer focuses it). Enabled again, it is focusable
-/// in tree order.
+/// `off` (a value, or a signal of one) disables `element`: no activation, out of
+/// the tab order (a press no longer focuses it), and a press it holds is let go (no
+/// `pressed()` look, no click on the release). Enabled again, it is focusable in
+/// tree order.
 fun bind_disabled<V: Bindable<bool>>(element: Element, off: Shared<bool>, own disabled: V) {
 	disabled.bind(|value: bool| {
 		off.write() = value;
 		ui_set_focusable(element.node, !value);
+		if value {
+			element.release_pointer();
+		}
 	});
 }
 

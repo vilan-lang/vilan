@@ -19,12 +19,18 @@
 // Ctrl+A (or Cmd+A) selects everything; Enter runs `on_submit`. Typed text arrives
 // as text events (`on_text`) and replaces the selection. A press places the caret
 // (with Shift, extends the selection to it) and a drag while the button is down
-// extends it.
+// extends it — off the input and off the window too (the press captured the
+// pointer): past the field's left or right edge each move extends the selection one
+// grapheme beyond what shows, and the caret's reveal scrolls the field by it. A
+// double click selects the word under the pointer (a run of word graphemes, or of
+// the others: a double click on a space selects the spaces), and a drag from it
+// extends by whole words; a triple click selects everything, and a drag from it
+// changes nothing.
 //
 // Not here: the clipboard (the window layer has none yet), an input method's
-// composition (P5: the text carries no preedit run; see the docs), a double click
-// selecting a word, the caret blinking (a blink is a frame every half second
-// forever; the caret is steady, so an idle window draws nothing).
+// composition (P5: the text carries no preedit run; see the docs), the caret
+// blinking (a blink needs a timer in the host that stops while the window is
+// unfocused; the caret is steady, so an idle window draws nothing).
 
 [platform("@process")] mod self;
 
@@ -41,6 +47,7 @@ import pkg::ui::{
 	Role,
 	ScrollAxis,
 	Style,
+	click_count,
 	row,
 	scroll,
 	stack,
@@ -74,9 +81,16 @@ external fun ui_text_edit_look(
 	selection_alpha: f64,
 ): void;
 
-/// The index nearest a point, in dp from the window's top-left.
+/// The index a point (dp from the window's top-left) lands on, by `rule`: 0 the
+/// nearest grapheme edge, 1 the start of the grapheme under it, 2 a drag's (one
+/// grapheme past the edge of what shows, when the point is beyond it).
 [extern("__ui_text_index_at")]
-external fun ui_text_index_at(node: Node, x: f64, y: f64): i32;
+external fun ui_text_index_at(node: Node, x: f64, y: f64, rule: i32): i32;
+
+/// The start (or with `end`, the end) of the word around `index`: the run of word
+/// graphemes, or of the others, the grapheme there is in.
+[extern("__ui_text_word")]
+external fun ui_text_word(node: Node, index: i32, end: bool): i32;
 
 /// The next (`forward`) or previous grapheme boundary from `index`, or with `word`
 /// the end of the next word or the start of the previous one.
@@ -101,6 +115,12 @@ export struct TextInput {
 	field: Node,
 	caret: Shared<usize>,
 	anchor: Shared<usize>,
+	/// What the press being dragged selects by: 1 graphemes, 2 words (a double
+	/// click), 3 everything (a triple click); and the word a double click selected,
+	/// which a drag by words keeps selected.
+	unit: Shared<usize>,
+	word_start: Shared<usize>,
+	word_end: Shared<usize>,
 	focused: Shared<bool>,
 	off: Shared<bool>,
 	placeholder: SignalCell<str>,
@@ -126,21 +146,25 @@ export fun text_input(value: SignalCell<str>): TextInput {
 	let placeholder_look: SignalCell<Style> = Signal::new(style());
 	let field = text().child(value);
 	let empty = value.derive(|now: str| now.is_empty());
-	let shell = row()
-		.role(Role::TextField)
-		.focusable()
-		.child(scroll()
-			.axis(ScrollAxis::Horizontal)
-			.grow(1.0)
-			.child(stack()
-				.child(when(empty, || text().style(placeholder_look).child(placeholder)))
-				.child(field)));
+	let shell = row().role(Role::TextField).focusable().child(scroll()
+		.axis(ScrollAxis::Horizontal)
+		.grow(1.0)
+		// Its own width, never the field's: a flex row's child shrinks to its
+		// longest word by default (CSS's rule), which would wrap a long value onto
+		// a second line instead of scrolling it.
+		.child(stack()
+			.shrink(0.0)
+			.child(when(empty, || text().style(placeholder_look).child(placeholder)))
+			.child(field)));
 	let input = TextInput {
 		element = shell.element(),
 		value,
 		field = field.element.node,
 		caret = Shared::new(0),
 		anchor = Shared::new(0),
+		unit = Shared::new(1),
+		word_start = Shared::new(0),
+		word_end = Shared::new(0),
 		focused = Shared::new(false),
 		off = Shared::new(false),
 		placeholder,
@@ -164,14 +188,14 @@ export fun text_input(value: SignalCell<str>): TextInput {
 				ret;
 			}
 			if current_event() is Some(Event::PointerPressed(let pointer)) {
-				let at = input.index_at(pointer.position);
-				input.place(at, pointer.modifiers.shift);
+				input.press(pointer.position, pointer.modifiers.shift);
 			}
 		})
 		.on_pointer_move(|point: Point| {
-			// A drag: the button went down on the input and is still down.
+			// A drag: the button went down on the input and is still down; the
+			// moves come here wherever the pointer is (the press captured it).
 			if !input.off.read() && input.element.interaction().pressed {
-				input.place(input.index_at(point), true);
+				input.drag(point);
 			}
 		})
 		.on_key(|key: KeyPress| input.key(key))
@@ -247,6 +271,10 @@ export impl TextInput {
 		disabled.bind(|value: bool| {
 			input.off.write() = value;
 			ui_set_focusable(input.element.node, !value);
+			if value {
+				// A drag in progress stops here.
+				input.element.release_pointer();
+			}
 			input.show();
 		});
 		self
@@ -306,8 +334,55 @@ impl TextInput {
 		);
 	}
 
-	fun index_at(self, point: Point): usize {
-		ui_text_index_at(self.field, point.x.value(), point.y.value()).as_usize()
+	fun index_at(self, point: Point, rule: i32): usize {
+		ui_text_index_at(self.field, point.x.value(), point.y.value(), rule).as_usize()
+	}
+
+	/// A press at `point`: by the count of presses in a row, the caret placed there
+	/// (with `extend`, the selection extended to it), the word under it, or
+	/// everything.
+	fun press(self, point: Point, extend: bool) {
+		let count = click_count();
+		if count >= 3 {
+			self.unit.write() = 3;
+			self.select(0, self.value.get().len());
+		} else if count == 2 {
+			self.unit.write() = 2;
+			let under = self.index_at(point, 1).as_i32();
+			let start = ui_text_word(self.field, under, false).as_usize();
+			let end = ui_text_word(self.field, under, true).as_usize();
+			self.word_start.write() = start;
+			self.word_end.write() = end;
+			self.select(start, end);
+		} else {
+			self.unit.write() = 1;
+			self.place(self.index_at(point, 0), extend);
+		}
+	}
+
+	/// The pointer at `point` while the press is held: the selection extended to it
+	/// by the press's unit.
+	fun drag(self, point: Point) {
+		let unit = self.unit.read();
+		if unit >= 3 {
+			ret;
+		}
+		let at = self.index_at(point, 2);
+		if unit == 1 {
+			self.place(at, true);
+			ret;
+		}
+		// By words: the double-clicked word stays selected, and the selection
+		// reaches the end of the word the pointer is in on the far side of it.
+		let (start, end) = (self.word_start.read(), self.word_end.read());
+		if at < start {
+			self.select(end, ui_text_word(self.field, at.as_i32(), false).as_usize());
+		} else if at > end {
+			let reached = ui_text_word(self.field, (at - 1).as_i32(), true).as_usize();
+			self.select(start, reached);
+		} else {
+			self.select(start, end);
+		}
 	}
 
 	fun step(self, from: usize, forward: bool, word: bool): usize {
