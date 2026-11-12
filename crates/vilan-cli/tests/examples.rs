@@ -197,6 +197,9 @@ fn post_build(directory: &str) -> PostBuild {
         // their native builds and their runs are `ui_interaction.rs`'s. Both
         // reach `std::gfx` first, as `ui` does.
         "ui-counter" | "ui-list" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P4's exit test: the virtual list of 100,000 rows; its
+        // native build and runs are `ui_interaction.rs`'s.
+        "ui-virtual-list" => PostBuild::NativeOnly { module: "std::gfx" },
         _ => PostBuild::BuildOnly,
     }
 }

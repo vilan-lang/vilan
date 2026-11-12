@@ -59,7 +59,8 @@
 //!
 //! Event kinds for `__ui_on`: 0 pointer enter, 1 pointer leave, 2 pointer
 //! move, 3 press, 4 release, 5 click, 6 scroll, 7 key, 8 key release, 9 text,
-//! 10 focus, 11 blur.
+//! 10 focus, 11 blur, 12 resize (never routed: told after a layout, see
+//! [`layout`]; `__ui_resized` reads the size while the handler runs).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -95,7 +96,16 @@ thread_local! {
     /// The last frame a mounted tree drew: its layout and paint times and
     /// what they did.
     static LAST_FRAME: Cell<FrameRecord> = const { Cell::new(FrameRecord::NONE) };
+    /// The size a resize handler is being told, while it runs.
+    static RESIZED: Cell<Size> = const { Cell::new(Size::new(0.0, 0.0)) };
 }
+
+/// How many times one [`layout`] lays its tree out: the pass, and once more
+/// after each round of handlers (resize, offset) that changed the tree, up to
+/// this many in all. A handler that keeps changing what it measures (a size
+/// that depends on itself) stops here: the frame draws the last pass, and the
+/// change it made asks for the next frame.
+const LAYOUT_ROUNDS: usize = 8;
 
 /// What the last frame of a mounted tree took and did.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -577,10 +587,16 @@ pub fn remove(node: &Node) {
 
 /// `__ui_scroll_into_view(node)` — every `scroll` around the element moves as
 /// little as it takes to show it (`UiTree::reveal`), as Tab does for the
-/// element it focuses; a bound offset follows.
+/// element it focuses; a bound offset follows. An element whose box is not
+/// current yet (built since the last layout) is revealed by the next layout
+/// (`UiTree::reveal_when_laid_out`).
 pub fn scroll_into_view(node: &Node) {
     let id = node.id();
-    let root = with_tree(|tree| tree.reveal(id).then(|| tree.root_of(id)));
+    let root = with_tree(|tree| {
+        let moved = tree.reveal_when_laid_out(id);
+        // A reveal left for the next layout asks for that layout.
+        (moved || tree.reveal_pending()).then(|| tree.root_of(id))
+    });
     if let Some(root) = root {
         request_frame(root);
     }
@@ -610,6 +626,7 @@ pub fn on(node: &Node, kind: i32, handler: Rc<dyn Fn()>) {
             EventKind::Text,
             EventKind::Focus,
             EventKind::Blur,
+            EventKind::Resize,
         ],
         f64::from(kind),
         "event kind",
@@ -686,18 +703,39 @@ fn units(scale_factor: f64) -> Units {
 /// `__ui_layout(root, width, height, scale_factor)` — lays `root` out in a
 /// `width` x `height` dp viewport, snapped to the device grid at
 /// `scale_factor`. Solves only when something that moves a box changed.
-/// Recorded as the last frame's layout.
+///
+/// After the pass, the programs of the scrolls whose offsets it clamped and
+/// of the elements whose size it changed (`on_resize`) are told, with the
+/// tree not borrowed; when what they did changed the layout, the tree is laid
+/// out again, so a frame never shows a layout its own handlers had already
+/// replaced (up to [`LAYOUT_ROUNDS`] passes). Recorded as the last frame's
+/// layout: every pass's time, and what they did together.
 pub fn layout(root: &Node, width: f64, height: f64, scale_factor: f64) {
     let id = root.id();
     let units = units(scale_factor);
     let size = Size::new(width as f32, height as f32);
     let started = Instant::now();
-    let stats = with_tree(|tree| {
-        with_text(|text| {
-            or_fail(tree.layout(id, size, units, text).map(|_| ()));
+    let mut stats = PassStats::default();
+    for _ in 0..LAYOUT_ROUNDS {
+        let pass = with_tree(|tree| {
+            with_text(|text| {
+                or_fail(tree.layout(id, size, units, text).map(|_| ()));
+            });
+            tree.last_pass()
         });
-        tree.last_pass()
-    });
+        stats.solved |= pass.solved;
+        stats.measured += pass.measured;
+        stats.moved += pass.moved;
+        let laid_out = with_tree(|tree| tree.generations().0);
+        notify_offsets();
+        for (handler, size) in with_tree(UiTree::take_resize_notices) {
+            RESIZED.with(|resized| resized.set(size));
+            handler.call();
+        }
+        if with_tree(|tree| tree.generations().0) == laid_out {
+            break;
+        }
+    }
     let took = started.elapsed().as_secs_f64() * 1.0e6;
     LAST_FRAME.with(|last| {
         let mut record = last.get();
@@ -705,7 +743,17 @@ pub fn layout(root: &Node, width: f64, height: f64, scale_factor: f64) {
         record.stats = stats;
         last.set(record);
     });
-    notify_offsets();
+}
+
+/// `__ui_resized(which)` — inside a resize handler: the size it is told, its
+/// width (0) and height (1) in dp.
+pub fn resized(which: i32) -> f64 {
+    let size = RESIZED.with(Cell::get);
+    f64::from(match which {
+        0 => size.width,
+        1 => size.height,
+        _ => panic_with(&format!("{which} is not a `std::ui` size number")),
+    })
 }
 
 /// `__ui_paint(frame, root)` — draws `root`, as last laid out, into the

@@ -1728,6 +1728,48 @@ fn a_blanket_over_a_blanket_binds_the_element_on_both_backends() {
     }
 }
 
+/// The same blanket chain over a cell built INSIDE a generic function, of that
+/// function's own `T` (`ListCell<T>`, `SignalCell<List<T>>`): the providers
+/// answer the receiver's `T`, still a generic where the impl is selected, and
+/// selection skipped every generic answer as if it were a provider's own
+/// unbound binder — so `open_rows`'s element stayed unbound and the native
+/// emitter refused the instance. A generic component that keys rows of its own
+/// (`std::ui::kit::virtual_list`'s window) is the shape; the instance's
+/// substitution grounds the receiver's `T`.
+#[test]
+fn a_blanket_over_a_cell_of_a_generic_functions_own_parameter_binds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_row_feed_over_a_generic_cell.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::reactive::{ ListCell, RowFeed, Signal, SignalCell };\n",
+            "\n",
+            "fun opened<T, S: RowFeed<T>>(own source: S): i32 {\n",
+            "\tlet instance = source.open_rows();\n",
+            "\t(instance.snapshot)().len().as_i32()\n",
+            "}\n",
+            "\n",
+            "fun counted<T>(items: List<T>): i32 {\n",
+            "\tlet listed: ListCell<T> = ListCell::of(items);\n",
+            "\tlet held: SignalCell<List<T>> = Signal::new(listed.get());\n",
+            "\topened(listed) * 10 + opened(held)\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(counted([1, 2, 3]));\n",
+            "\tprint(counted([\"a\", \"b\"]));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "33\n22\n", "{backend:?}");
+    }
+}
+
 /// A cell around a bare `None` under a written annotation: natively the `None`
 /// names no `T`, and Rust took the cell's element from its first reader — a
 /// generic one in `std::ui`'s `when` and `swap`, which could not settle it

@@ -23,6 +23,22 @@
 //! moved by 96 dp, laid out and painted), and `one_text_after_resize_*` (the
 //! same change in the first solve after a resize) against
 //! `one_text_settled_us` (the solve after that).
+//! - `windowed`: the same rows on `std::ui::kit::virtual_list`'s shape (part
+//!   P4), at 10,000 and 100,000 rows: a `scroll` over a column as tall as
+//!   every row (the count times 32 dp) holding only the rows its viewport
+//!   shows and two more on each side, the rows above stood in for by the
+//!   column's top padding. The tree operations are the ones the kit's window
+//!   makes (the program's own work — the keyed pass over the window, the
+//!   kept copy of the items — is not here: `vilan/examples/ui-virtual-list
+//!   --measure` times the whole). `first_us` and `first_paint_us` (the list
+//!   laid out, the viewport's rows built and laid out again, then painted),
+//!   and from the middle of the list, each laid out and painted:
+//!   `scroll_step_*` (96 dp down: three rows leave at the top, three are
+//!   built at the bottom, the padding grows), `one_text_*` (one row's value
+//!   text), `insert_top_*` (an item inserted above the window: every row in
+//!   it moves down one place, so the top one is new and the bottom one goes,
+//!   and the column grows by a row).
+//!
 //! Times are wall time on this thread, medians over runs: the passes are
 //! CPU-bound and single-threaded, so on an unloaded core wall time is CPU
 //! time, and on a loaded machine they are upper bounds. Text is shaped with
@@ -327,7 +343,275 @@ fn measure(name: &str, build: impl Fn(&mut Builder) -> NodeId, runs: usize) {
     }
 }
 
+/// One row of the list: a label and a value text, as `rows` builds them, at
+/// the kit's fixed extent.
+fn list_row(builder: &mut Builder, index: usize) -> (NodeId, NodeId) {
+    let row = builder.node(ElementKind::Row);
+    builder.tree.set_gap(row, 8.0).unwrap();
+    builder.tree.set_align(row, Align::Center).unwrap();
+    builder
+        .tree
+        .set_size(row, SizeProperty::Height, Length::Dp(EXTENT))
+        .unwrap();
+    builder
+        .tree
+        .set_padding(
+            row,
+            Edges {
+                top: 0.0,
+                right: 12.0,
+                bottom: 0.0,
+                left: 12.0,
+            },
+        )
+        .unwrap();
+    let label = builder.text(&format!("Row {index}"));
+    builder.tree.set_grow(label, 1.0).unwrap();
+    let value = builder.text("0 clicks");
+    builder.add(row, &[label, value]);
+    (row, value)
+}
+
+/// The kit's row extent, in dp.
+const EXTENT: f32 = 32.0;
+
+/// The rows built on each side of the viewport's.
+const OVERSCAN: usize = 2;
+
+/// `std::ui::kit::virtual_list`'s tree over `count` rows: the window `first
+/// .. first + rows.len()` built, in a column as tall as every row.
+struct Windowed {
+    root: NodeId,
+    scroll: NodeId,
+    column: NodeId,
+    count: usize,
+    first: usize,
+    rows: std::collections::VecDeque<(NodeId, NodeId)>,
+}
+
+impl Windowed {
+    fn new(builder: &mut Builder, count: usize) -> Windowed {
+        let root = builder.node(ElementKind::Column);
+        let heading = builder.text("100000 rows: scroll, and click one");
+        builder.padding(heading, 12.0);
+        let scroll = builder.node(ElementKind::Scroll);
+        builder.tree.set_grow(scroll, 1.0).unwrap();
+        builder.add(root, &[heading, scroll]);
+        let column = builder.node(ElementKind::Column);
+        builder.tree.set_shrink(column, 0.0).unwrap();
+        builder.add(scroll, &[column]);
+        let mut list = Windowed {
+            root,
+            scroll,
+            column,
+            count,
+            first: 0,
+            rows: std::collections::VecDeque::new(),
+        };
+        list.resize(builder);
+        list
+    }
+
+    fn resize(&mut self, builder: &mut Builder) {
+        builder
+            .tree
+            .set_size(
+                self.column,
+                SizeProperty::Height,
+                Length::Dp(self.count as f32 * EXTENT),
+            )
+            .unwrap();
+    }
+
+    /// The rows the viewport shows at `offset`, and the overscan: built,
+    /// removed and the padding set, as the kit's refresh does.
+    fn show(&mut self, builder: &mut Builder, offset: f32, viewport: f32) {
+        let visible = (offset / EXTENT).floor() as usize;
+        let first = visible.saturating_sub(OVERSCAN);
+        let last = (((offset + viewport) / EXTENT).ceil() as usize + OVERSCAN).min(self.count);
+        while self.first < first && !self.rows.is_empty() {
+            let (row, _) = self.rows.pop_front().unwrap();
+            drop(builder.tree.remove(row));
+            self.first += 1;
+        }
+        if self.rows.is_empty() {
+            self.first = first;
+        }
+        while self.first + self.rows.len() > last {
+            let (row, _) = self.rows.pop_back().unwrap();
+            drop(builder.tree.remove(row));
+        }
+        while self.first > first {
+            self.first -= 1;
+            let built = list_row(builder, self.first);
+            match self.rows.front() {
+                Some((front, _)) => builder.tree.insert_before(*front, built.0).unwrap(),
+                None => builder.tree.add_child(self.column, built.0).unwrap(),
+            }
+            self.rows.push_front(built);
+        }
+        while self.first + self.rows.len() < last {
+            let built = list_row(builder, self.first + self.rows.len());
+            builder.tree.add_child(self.column, built.0).unwrap();
+            self.rows.push_back(built);
+        }
+        builder
+            .tree
+            .set_padding_side(self.column, 0, self.first as f32 * EXTENT)
+            .unwrap();
+        builder
+            .tree
+            .set_scroll_offset(self.scroll, vilan_rt_gfx::Point::new(0.0, offset))
+            .unwrap();
+    }
+}
+
+fn measure_windowed(count: usize, runs: usize) {
+    let name = format!("windowed_{count}");
+    let mut samples = Samples::default();
+    let mut elements = 0;
+    let at_100 = Units::new(1.0, 1.0).unwrap();
+    let window = Size::new(960.0, 640.0);
+    for _ in 0..runs {
+        let mut text = TextSystem::without_system_fonts();
+        let font = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fonts/NotoMono-Regular.ttf"),
+        )
+        .expect("the test font");
+        text.register_font(font).unwrap();
+        let mut builder = Builder {
+            tree: UiTree::new(),
+        };
+        let paint = |tree: &mut UiTree, root: NodeId, text: &mut TextSystem| {
+            let mut scene = SceneBuilder::new();
+            tree.paint(root, &mut scene, text).unwrap();
+        };
+        // The first frame: laid out, the viewport's height read, its rows
+        // built and laid out again — one `__ui_layout`'s rounds — then painted.
+        let mut list = None;
+        let mut viewport = 0.0;
+        samples.push(
+            "first_us",
+            timed(|| {
+                let mut built = Windowed::new(&mut builder, count);
+                builder
+                    .tree
+                    .layout(built.root, window, at_100, &mut text)
+                    .unwrap();
+                viewport = builder.tree.bounds(built.scroll).size.height;
+                built.show(&mut builder, 0.0, viewport);
+                builder
+                    .tree
+                    .layout(built.root, window, at_100, &mut text)
+                    .unwrap();
+                list = Some(built);
+            }),
+        );
+        let mut list = list.expect("the list");
+        let root = list.root;
+        samples.push(
+            "first_paint_us",
+            timed(|| paint(&mut builder.tree, root, &mut text)),
+        );
+        elements = builder.tree.element_count();
+        // To the middle, settled.
+        let mut offset = (count / 2) as f32 * EXTENT;
+        list.show(&mut builder, offset, viewport);
+        builder
+            .tree
+            .layout(root, window, at_100, &mut text)
+            .unwrap();
+        paint(&mut builder.tree, root, &mut text);
+        for _ in 0..7 {
+            offset += 96.0;
+            samples.push(
+                "scroll_step_layout_us",
+                timed(|| {
+                    list.show(&mut builder, offset, viewport);
+                    builder
+                        .tree
+                        .layout(root, window, at_100, &mut text)
+                        .unwrap();
+                }),
+            );
+            samples.push("scroll_step_moved", builder.tree.last_pass().moved as u128);
+            samples.push(
+                "scroll_step_paint_us",
+                timed(|| paint(&mut builder.tree, root, &mut text)),
+            );
+            samples.push(
+                "scroll_step_rebuilt",
+                builder.tree.last_pass().rebuilt as u128,
+            );
+        }
+        for clicks in 1..=7 {
+            let value = list.rows[5].1;
+            builder
+                .tree
+                .set_run(value, 0, &format!("{clicks} clicks"))
+                .unwrap();
+            samples.push(
+                "one_text_layout_us",
+                timed(|| {
+                    builder
+                        .tree
+                        .layout(root, window, at_100, &mut text)
+                        .unwrap();
+                }),
+            );
+            samples.push(
+                "one_text_measured",
+                builder.tree.last_pass().measured as u128,
+            );
+            samples.push(
+                "one_text_paint_us",
+                timed(|| paint(&mut builder.tree, root, &mut text)),
+            );
+            samples.push("one_text_rebuilt", builder.tree.last_pass().rebuilt as u128);
+        }
+        for _ in 0..7 {
+            samples.push(
+                "insert_top_layout_us",
+                timed(|| {
+                    // The item above the window shifts every item in it down
+                    // one place: the keyed pass keeps each row (moving it),
+                    // builds the one that arrives at the top and removes the
+                    // one that leaves at the bottom.
+                    list.count += 1;
+                    list.resize(&mut builder);
+                    let (gone, _) = list.rows.pop_back().unwrap();
+                    drop(builder.tree.remove(gone));
+                    let built = list_row(&mut builder, list.first);
+                    let front = list.rows.front().unwrap().0;
+                    builder.tree.insert_before(front, built.0).unwrap();
+                    list.rows.push_front(built);
+                    builder
+                        .tree
+                        .layout(root, window, at_100, &mut text)
+                        .unwrap();
+                }),
+            );
+            samples.push("insert_top_moved", builder.tree.last_pass().moved as u128);
+            samples.push(
+                "insert_top_paint_us",
+                timed(|| paint(&mut builder.tree, root, &mut text)),
+            );
+            samples.push(
+                "insert_top_rebuilt",
+                builder.tree.last_pass().rebuilt as u128,
+            );
+        }
+    }
+    println!("{name}_elements={elements}");
+    for (key, values) in samples.rows {
+        println!("{name}_{key}={}", median(values));
+    }
+}
+
 fn main() {
     measure("screen", screen, 21);
     measure("rows", |builder| rows(builder, 10_000), 5);
+    measure_windowed(10_000, 7);
+    measure_windowed(100_000, 7);
 }

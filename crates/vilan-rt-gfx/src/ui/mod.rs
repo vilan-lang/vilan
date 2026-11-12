@@ -442,9 +442,13 @@ struct ScrollState {
     /// Told when the offset moves other than by the program setting it (a
     /// wheel, a clamp), so a bound signal follows.
     on_offset: Option<Handler>,
-    /// The range has been measured by a layout: an offset set before then is
-    /// kept as asked until the first layout clamps it.
-    measured: bool,
+    /// The layout generation the range was measured at. The range is CURRENT
+    /// only while the tree's layout generation is still that one: an offset set
+    /// while it is not (before the first layout, or after a change that can
+    /// move a box — a list that just grew) is kept as asked, and the next
+    /// layout clamps it into the range it measures, and tells the program when
+    /// that moved it.
+    measured_at: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -533,7 +537,7 @@ impl NodeData {
                 offset: Point::ZERO,
                 range: Size::default(),
                 on_offset: None,
-                measured: false,
+                measured_at: None,
             }),
             tab_index: None,
             interaction: Interaction::default(),
@@ -664,6 +668,13 @@ pub struct UiTree {
     pointer: Option<Point>,
     /// Scrolls whose offset moved by the framework, to tell their programs.
     offset_notices: Vec<NodeId>,
+    /// Elements listening for their size whose size the last layouts changed,
+    /// to tell their programs.
+    resize_notices: Vec<NodeId>,
+    /// An element to show (Tab's, `scroll_into_view`'s) asked for while its
+    /// tree's layout was pending: its box was not yet where it will be, so it
+    /// is revealed at the end of the next layout of its tree instead.
+    pending_reveal: Option<NodeId>,
     /// Elements the solver was told changed since it last ran: with their
     /// ancestors, the only elements whose children it can have moved.
     dirty: Vec<NodeId>,
@@ -871,6 +882,8 @@ impl UiTree {
             focused: None,
             pointer: None,
             offset_notices: Vec::new(),
+            resize_notices: Vec::new(),
+            pending_reveal: None,
             dirty: Vec::new(),
             stats: PassStats::default(),
             measured: Vec::new(),
@@ -1730,6 +1743,13 @@ impl UiTree {
             state.snapped = Some((units, state.solves));
         }
         self.data_mut(root).root = Some(state);
+        if let Some(node) = self.pending_reveal
+            && self.is_alive(node)
+            && self.root_of(node) == root
+        {
+            self.pending_reveal = None;
+            self.reveal(node);
+        }
         Ok(solve)
     }
 
@@ -1840,6 +1860,11 @@ impl UiTree {
             let moved = data.bounds != bounds
                 || data.content_offset != content_offset
                 || data.content_size != content_size;
+            let resized = data.bounds.size != bounds.size
+                && data
+                    .handlers
+                    .iter()
+                    .any(|(kind, _)| *kind == EventKind::Resize);
             data.bounds = bounds;
             data.content_offset = content_offset;
             data.content_size = content_size;
@@ -1849,6 +1874,9 @@ impl UiTree {
             if moved {
                 self.stats.moved += 1;
                 self.invalidate(node);
+            }
+            if resized {
+                self.resize_notices.push(node);
             }
             let descend = moved || chains.is_none_or(|chains| chains.contains(&node));
             if descend {
@@ -1868,6 +1896,7 @@ impl UiTree {
     /// A scroll's range from its child's laid-out box, and its offset
     /// clamped into it.
     fn measure_scroll_range(&mut self, node: NodeId) {
+        let generation = self.layout_generation;
         let data = self.data(node);
         let content = Rect::new(
             data.bounds.left() + data.content_offset.x,
@@ -1891,7 +1920,7 @@ impl UiTree {
         );
         let scroll = self.data_mut(node).scroll.as_mut().expect("a scroll");
         scroll.range = range;
-        scroll.measured = true;
+        scroll.measured_at = Some(generation);
         let clamped = clamp_offset(scroll.offset, range, scroll.axis);
         if clamped != scroll.offset {
             scroll.offset = clamped;
@@ -1944,20 +1973,22 @@ impl UiTree {
     }
 
     /// Where a scroll's child is moved to, as the program sets it: clamped
-    /// into the range of the last layout (a later layout clamps again, and
-    /// tells the program when that moved it). A paint-only change of the
-    /// scroll: nothing inside it is laid out or repainted.
+    /// into the range of the last layout while that range is current, kept as
+    /// asked while a layout is pending (the next one clamps it, and tells the
+    /// program when that moved it). A paint-only change of the scroll: nothing
+    /// inside it is laid out or repainted.
     pub fn set_scroll_offset(&mut self, node: NodeId, offset: Point) -> Result<(), UiError> {
         let kind = self.kind(node);
         finite(offset.x, "a scroll offset")?;
         finite(offset.y, "a scroll offset")?;
+        let generation = self.layout_generation;
         let Some(scroll) = self.data_mut(node).scroll.as_mut() else {
             return Err(UiError::WrongKind {
                 property: "offset",
                 kind,
             });
         };
-        let clamped = if scroll.measured {
+        let clamped = if scroll.measured_at == Some(generation) {
             clamp_offset(offset, scroll.range, scroll.axis)
         } else {
             offset
@@ -1994,6 +2025,27 @@ impl UiTree {
         };
         scroll.on_offset = Some(handler);
         Ok(())
+    }
+
+    /// The resize handlers of the elements whose size a layout changed since
+    /// the last call, each element once, with the size it has now (in dp).
+    pub fn take_resize_notices(&mut self) -> Vec<(Handler, Size)> {
+        let mut notices = std::mem::take(&mut self.resize_notices);
+        let mut seen = std::collections::HashSet::new();
+        notices.retain(|node| seen.insert(*node));
+        let mut calls = Vec::new();
+        for node in notices {
+            if !self.is_alive(node) {
+                continue;
+            }
+            let data = self.data(node);
+            for (kind, handler) in &data.handlers {
+                if *kind == EventKind::Resize {
+                    calls.push((handler.clone(), data.bounds.size));
+                }
+            }
+        }
+        calls
     }
 
     /// The handlers of the scrolls whose offsets moved by the framework

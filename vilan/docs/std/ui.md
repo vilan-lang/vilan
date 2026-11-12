@@ -21,9 +21,11 @@ A child can be reactive: a keyed list (`each`) or a conditional (`when`) keeps
 its place among the static children and inserts, removes and moves elements as
 its source changes ([below](#lists-and-conditional-children)).
 
+Components are `std::ui::kit`: the [virtual list](#a-virtual-list) holds only
+the rows near its viewport, however long its list is.
+
 Not here yet: grid layout, text editing, and publishing roles and labels to the
-system's accessibility API. Components (a button with behaviour, a text input, a
-virtual list) are `std::ui::kit`, a later part.
+system's accessibility API.
 
 ## Elements
 
@@ -43,6 +45,7 @@ impl Element {
 	fun scroll_into_view(self)                // every scroll around it shows it
 	fun interaction(self): Interaction        // hovered, pressed, focused now
 }
+impl Element with Attributes                 // an Element takes every attribute too
 struct OutlineEntry { depth: usize, kind: str, label: str, bounds: Rect }
 struct Interaction { hovered: bool, pressed: bool, focused: bool }
 
@@ -384,6 +387,7 @@ trait Attributes {
 	fun on_text(self, handler: |str| void): Self
 	fun on_focus(self, handler: || void): Self                // does not bubble
 	fun on_blur(self, handler: || void): Self                 // does not bubble
+	fun on_resize(self, handler: |Size| void): Self           // laid out at a new size
 }
 fun stop_event()                                              // inside a handler
 ```
@@ -400,6 +404,13 @@ to the innermost element holding both where the press and the release landed.
 Press, release and click are the primary button's; positions are dp from the
 window's top-left corner. Each handler runs as one turn, as a web event does: its
 signal writes settle as one wave.
+
+`on_resize` is not an input: it is told after a layout that gave the element a
+new size (its box, in dp) — the first layout, and every later one that changes
+it, a move alone not counted. It runs before the frame is painted, and what it
+changes is laid out again in the same frame, so a layout that depends on an
+element's size never shows a frame of the old one. The virtual list reads its
+viewport's height this way.
 
 ## Focus
 
@@ -440,8 +451,8 @@ scrolls it, and the wheel writes the cell.
 A scroll MOVING lays nothing out and repaints nothing inside it: only the
 scroll's own scene changes, and when the frame is drawn the rows outside the
 viewport are skipped whole. Every row is still a real element, laid out once —
-virtualising a list (laying out only the rows in view) is a `std::ui::kit`
-component, not this. Tab and `scroll_into_view` move a scroll to show an element
+laying out only the rows in view is `std::ui::kit`'s
+[virtual list](#a-virtual-list), not this. Tab and `scroll_into_view` move a scroll to show an element
 ([Focus](#focus)).
 
 ## Lists and conditional children
@@ -517,6 +528,93 @@ The region — its rows, its place, its subscription — belongs to the ambient 
 when there is one (`mount_root`, `run_with_owner`) and is taken out of the tree
 when that owner is disposed; with none, it lives as long as its source, as a
 bound attribute does.
+
+## A virtual list
+
+```vilan,fragment
+// std::ui::kit
+fun virtual_list<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(source: S, extent: Dp, key: |T| K, render: |T| C): VirtualList<T, K>
+fun virtual_list_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(source: S, extent: Dp, key: |T| K, render: |SignalCell<T>| C): VirtualList<T, K>
+impl VirtualList<T, K> {
+	fun overscan(self, rows: usize): VirtualList<T, K>               // 2 until set
+	fun offset(self, cell: SignalCell<Point>): VirtualList<T, K>     // bound both ways
+	fun reveal(self, index: usize)                                   // scroll to a row
+	fun reveal_key(self, key: K): bool
+	fun count(self): usize
+	fun built(self): (usize, usize)                                  // the rows in the tree
+	fun viewport(self): ScrollElement                                // the scroll underneath
+}
+impl VirtualList with Attributes, Child
+```
+
+A list of a hundred thousand rows as `each` would build it is a hundred thousand
+elements, laid out and kept. `std::ui::kit::virtual_list` is a keyed list on a
+`scroll` that builds, lays out and paints only the rows its viewport shows — and
+`overscan` more on each side, two until set — however long the list is. Its
+source, key and render are `each`'s, and so is what a change keeps; `virtual_list_by`
+is `each_by`'s twin, handing each row a cell. Every row is `extent` tall: the
+list sets that height on the element `render` answers, and the arithmetic of
+which rows the offset shows needs no layout. The scroll's range is still the whole
+list's (the rows above the window are padding), so a scrollbar drawn from it is
+right; the list takes every attribute an element takes, and grows or sizes like
+any `scroll`.
+
+```vilan,native
+import std::gfx::{ Size, dp };
+import std::io::print;
+import std::range::Range;
+import std::reactive::ListCell;
+import std::ui::kit::virtual_list;
+import std::ui::{ column, layout, row, text };
+
+fun main() {
+	let numbers: ListCell<i32> = ListCell::of(Range::new(0, 100000).to_list());
+	let list = virtual_list(numbers, dp(32), |number: i32| number, |number: i32| {
+		<row padding_x(dp(12))><text>{i"Row {number}"}</text></row>
+	})
+		.grow(1.0);
+	let screen = <column>{list}</column>;
+	layout(screen, Size::new(dp(480), dp(640)), 1.0);
+	let (first, last) = list.built();
+	print(i"{list.count()} rows, {last - first} built");   // 100000 rows, 22 built
+	list.reveal(50000);                                     // the window moves there
+	layout(screen, Size::new(dp(480), dp(640)), 1.0);
+}
+main();
+```
+
+WHAT MOVES THE WINDOW: the offset (the wheel, Tab, `reveal`, a write to the cell
+`offset` binds), the viewport's height (`on_resize`: laid out again in the same
+frame, so the first frame already shows rows), and the source — a `ListCell` is
+followed by its operations, a plain `SignalCell<List<T>>` by its whole list per
+change. A change outside the window changes the column's height and builds
+nothing. A row that STAYS in the window is the same element through every change
+— a scroll, an insert above it, another row's change — so its hover, press and
+focus stay with it. A row that LEAVES is removed as a keyed row is: its owner is
+disposed and its handlers are dropped. **State a row must keep after it leaves
+the window belongs in the item, or in the app's model, not in the row**: a text
+typed into it, whether it is expanded. The row is built again from its item when
+it comes back.
+
+`reveal(index)` scrolls as little as it takes to show a row, from the extent — so
+a row pushed in the same turn can be revealed — and the row is built by the end of
+the turn; `reveal_key` finds the row by its key first. TAB never leaves a list
+that has more rows: Tab inside it builds one row more after the window before the
+focus moves (Shift+Tab one before), and Tab's reveal then scrolls to the row it
+focused, which moves the window on. At the list's real ends Tab goes on through
+the tab order as it does anywhere. A row scrolled out of the window by the wheel
+takes the focus with it.
+
+What it costs: a scroll step builds the rows that arrive and removes the ones that
+leave; the rows that stay do not move, so the solver places the column's few rows
+again and measures only the newcomers. A change to the source is a pass over the
+window's items, whatever the list's length, plus the list's own copy of the
+items (an insert at the top moves that copy along, as a `List` does).
+
+The extent is fixed; a list whose rows differ in height (an estimate corrected by
+measuring the rows that are built) is not here yet. Every row's box is laid out in
+`f32`: past about four million dp (125,000 rows of 32 dp) its position loses part
+of a pixel.
 
 ## Showing it
 

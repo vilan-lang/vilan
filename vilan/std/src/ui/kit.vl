@@ -1,0 +1,9 @@
+// `std::ui::kit` — components made of `std::ui`'s elements (native-ui.md part P4):
+// the framework has no look of its own, and neither does a component — the app
+// supplies it. Each component is a file of its own under `kit/`, named in the
+// plural (`lists.vl` for `virtual_list`: a module and an item of one name are
+// ambiguous); this module declares and re-exports them, one line per component.
+
+[platform("@process")] mod self;
+
+export import pkg::ui::kit::lists::*;

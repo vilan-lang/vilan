@@ -175,7 +175,14 @@ Rust workspace, seventeen crates, plus the language's own tree:
   (a move when the element is already there) and `remove`, which is FINAL: it drops the
   subtree's handlers (B738), so the host drops them with the tree no longer borrowed. The xvfb
   suites share `crates/vilan-cli/tests/support/xvfb.rs`, whose `Running` ends its run's whole
-  process group on drop (N198).
+  process group on drop (N198). Components (P4) are `std::ui::kit`, `vilan/std/src/ui/kit/`:
+  one file per component, `kit.vl` only re-exports (a file may not share its component's
+  function name, so the files are plural — `kit::lists` holds `virtual_list`). The virtual list is plain vilan over a
+  `scroll` (a column as tall as every row, the rows above the window as its top padding, the
+  window an `each` over a cell of its items); what it needed from the host is `on_resize`
+  (told after a layout, and `__ui_layout` lays out again when a handler changed the tree), an
+  offset kept unclamped while a layout is pending (`ScrollState::measured_at`), and Tab's
+  reveal of an element with no box yet waiting for the next layout (`pending_reveal`).
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

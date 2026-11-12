@@ -27,6 +27,18 @@
 //!    top row removed: nothing measured) and `m` (the bottom row moved to the
 //!    top: nothing measured), each a frame with the row count it left.
 //!
+//! 4. The virtual list (`vilan/examples/ui-virtual-list`, part P4's
+//!    `std::ui::kit::virtual_list_by` over 100,000 rows): its `--check`, with
+//!    no window, held to `tests/ui/virtual-list-check.txt` (regenerated the
+//!    same way) — what the tree holds after each step: the first layout, the
+//!    wheel, a reveal half a list away, hover/press/focus kept across a
+//!    change in the window, an insert above it and a programmatic scroll,
+//!    thirty Tabs, Tab from the last row built, ops at either end, a reset,
+//!    and a plain `SignalCell<List<T>>` — and on every step no more than a
+//!    window's rows in the tree. Then in a window: `g` (the middle row
+//!    revealed), a wheel notch, a click on the row under the pointer, whose
+//!    id the program prints and the test works out from the offset alone.
+//!
 //! Ordering comes from the programs' lines — each injection waits for the
 //! line its predecessor caused — never from a sleep. No assertion reads a
 //! time: the frame times the programs print are for a person (the report's
@@ -412,6 +424,128 @@ fn the_counter_and_the_ten_thousand_row_list_run_end_to_end() {
             assert_eq!(measured, 0, "{frame}");
         }
     }
+    running.inject(&injector, &["close"]);
+    let (code, seen, stderr) = running.exit(started);
+    assert_eq!(
+        code,
+        Some(0),
+        "closing the list ended it with {code:?}:\n{}\n--- stderr\n{stderr}",
+        seen.join("\n")
+    );
+}
+
+/// The numbers of a `--check` line's `rows=a..b (n) elements=m`: the count of
+/// rows and of elements in the tree.
+fn tree_counts(line: &str) -> Option<(usize, usize)> {
+    let rows = line.split(" (").nth(1)?.split(')').next()?.parse().ok()?;
+    let elements = field(line, "elements=").parse().ok()?;
+    Some((rows, elements))
+}
+
+#[test]
+fn the_virtual_list_holds_only_its_window_and_a_click_far_down_lands_on_its_row() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let list = build_example("ui-virtual-list", "vlist");
+
+    // 1. With no window: the recorded steps, and the window's size at each.
+    let checked = Command::new(&list)
+        .arg("--check")
+        .arg("--font")
+        .arg(test_font())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run the check mode");
+    let listed = String::from_utf8_lossy(&checked.stdout).to_string();
+    assert!(
+        checked.status.success(),
+        "--check failed:\n{listed}{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let recorded = repository_root().join("crates/vilan-cli/tests/ui/virtual-list-check.txt");
+    if std::env::var_os("VILAN_REGENERATE_UI_CHECK").is_some() {
+        std::fs::write(&recorded, &listed).expect("write the listing");
+    }
+    let expected = std::fs::read_to_string(&recorded)
+        .expect("the recorded listing")
+        .replace("\r\n", "\n");
+    assert_eq!(
+        expected, listed,
+        "the virtual list no longer does what it recorded"
+    );
+    // Structure, whatever the recording says: 100,000 rows, and never more
+    // than a window of them (a 600 dp viewport of 32 dp rows, two overscan
+    // rows each side and one for Tab) in the tree, three elements a row.
+    let steps: Vec<(usize, usize)> = listed.lines().filter_map(tree_counts).collect();
+    assert!(steps.len() >= 15, "{listed}");
+    for (rows, elements) in &steps {
+        assert!(*rows <= 26 && *elements <= 3 * 26 + 10, "{listed}");
+    }
+    assert!(
+        listed.contains("count=100000 built=0..21"),
+        "the first layout built the rows the viewport shows: {listed}"
+    );
+
+    // 2. In a window: the middle revealed, a notch of the wheel, a click.
+    let injector = build_injector();
+    let started = Instant::now();
+    let mut running = Running::start(&list, &["--smoke"], "vilan ui virtual list");
+    running.wait_for("frame 1 ", started);
+    let viewport = running.wait_for("box viewport ", started);
+    let viewport_top: f64 = viewport
+        .split_whitespace()
+        .nth(3)
+        .and_then(|word| word.parse().ok())
+        .expect("the viewport's top");
+    let (x, y) = centre(&viewport);
+    running.inject(&injector, &["move", &x, &y]);
+    running.inject(&injector, &["key", "g"]);
+    let middle = running.wait_until("a frame at the middle", started, |line| {
+        line.starts_with("frame ") && field(line, "action=") == "middle"
+    });
+    let offset: f64 = field(&middle, "offset=").parse().expect("an offset");
+    assert!(offset > 1_000_000.0, "{middle}");
+    running.inject(&injector, &["wheel", "down", "1"]);
+    let scrolled = running.wait_until("a frame further down", started, |line| {
+        line.starts_with("frame ")
+            && field(line, "offset=").parse::<f64>().expect("an offset") > offset
+    });
+    let offset: f64 = field(&scrolled, "offset=").parse().expect("an offset");
+    for frame in running
+        .seen
+        .iter()
+        .filter(|line| line.starts_with("frame "))
+    {
+        let tree: usize = field(frame, "tree=").parse().expect("a count");
+        assert!(
+            tree <= 3 * 26 + 10,
+            "the tree held more than a window: {frame}"
+        );
+    }
+    running.inject(&injector, &["press", "release"]);
+    let clicked = running.wait_for("clicked ", started);
+    let id: f64 = clicked
+        .trim_start_matches("clicked ")
+        .trim()
+        .parse()
+        .expect("an id");
+    // The row under the pointer, from the offset alone: the content's y over
+    // the 32 dp rows (no row was added, so an id is its index). A pointer
+    // within a pixel of a boundary may land on either row.
+    let pointer_y: f64 = y.parse().expect("the pointer's y");
+    let content = offset + pointer_y - viewport_top;
+    let row = (content / 32.0).floor();
+    let near_a_boundary = (content - row * 32.0) < 1.0 || ((row + 1.0) * 32.0 - content) < 1.0;
+    assert!(
+        id == row || (near_a_boundary && (id - row).abs() == 1.0),
+        "clicked {id}, but the row under the pointer at offset {offset} is {row}:\n{}",
+        running.seen.join("\n")
+    );
+    running.wait_until("the clicked row's frame", started, |line| {
+        line.starts_with("frame ") && field(line, "clicked=") == format!("{id}")
+    });
     running.inject(&injector, &["close"]);
     let (code, seen, stderr) = running.exit(started);
     assert_eq!(

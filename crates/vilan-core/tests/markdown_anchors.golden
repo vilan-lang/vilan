@@ -670,6 +670,7 @@ std/ui.md h2 events
 std/ui.md h2 focus
 std/ui.md h2 scrolling
 std/ui.md h2 lists-and-conditional-children
+std/ui.md h2 a-virtual-list
 std/ui.md h2 showing-it
 std/window.md h1 windows
 std/window.md h2 how-a-desktop-program-ends

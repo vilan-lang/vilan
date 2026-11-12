@@ -18625,6 +18625,8 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_insert_before", "ui::insert_before", &[0, 1]),
         ("__ui_remove", "ui::remove", &[0]),
         ("__ui_scroll_into_view", "ui::scroll_into_view", &[0]),
+        // P4's virtual list: a resize handler reads the size it is told.
+        ("__ui_resized", "ui::resized", &[]),
     ];
     FUNCTIONS
         .iter()

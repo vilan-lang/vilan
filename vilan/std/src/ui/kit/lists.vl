@@ -1,0 +1,428 @@
+// `std::ui::kit`'s virtual list (native-ui.md section 4.4 and part P4): a keyed
+// list on a `scroll` that builds, lays out and paints only the rows near its
+// viewport, however long its source is.
+//
+// THE SHAPE. A `scroll` over one column. The column is as tall as every row would
+// be (the count times the row extent), so the scroll's range — and a scrollbar
+// drawn from it — is the whole list's; its top padding is the height of the rows
+// above the window, so the rows it holds sit where they would in the whole list.
+// The rows it holds are the WINDOW: the rows the viewport shows, and `overscan`
+// more on each side. They are an ordinary keyed run (`each`, or `each_by`) over the
+// window's items, so a row that stays in the window is the same element — its
+// hover, press and focus stay with it — and a row that leaves is removed, its owner
+// disposed and its handlers dropped, as any keyed row is.
+//
+// WHAT MOVES THE WINDOW: the offset (the wheel, Tab's reveal, `reveal`, the
+// program's own offset cell), the viewport's height (`on_resize`, told after a
+// layout and laid out again in the same frame), and the source. A source with a
+// log (`ListCell`) is followed by its ops into a copy of its items the list keeps;
+// a source without one (a `SignalCell<List<T>>`) by its whole list per change. An
+// op outside the window changes the column's height and nothing else.
+//
+// THE EXTENT is fixed and given by the app, in dp: every row is laid out at that
+// height (`height(extent)` on the element the render answers). That is what makes
+// the window arithmetic — which rows the offset shows, where row `i` is — exact and
+// free of layout, for a list of any length.
+//
+// TAB. Tab and Shift+Tab inside the list build one row more on that side before
+// the focus moves, so the focus never leaves a list that has more rows to give it;
+// Tab's reveal then scrolls to the row it focused, which moves the window.
+
+[platform("@process")] mod self;
+
+import pkg::compare::PartialEq;
+import pkg::debug::{ Location, caller };
+import pkg::gfx::{ Dp, KeyName, KeyPress, Point, Size, dp };
+import pkg::hash::Hashable;
+import pkg::reactive::delta::{ CollInstance, live_ops };
+import pkg::reactive::{
+	RowFeed,
+	SeqOp,
+	Signal,
+	SignalCell,
+	also_releasing,
+	owner_scope,
+	place_subscriber,
+	register_with_owner,
+	subscriber_of,
+};
+import pkg::shared::Shared;
+import pkg::ui::{
+	Attributes,
+	Child,
+	Column,
+	Element,
+	Role,
+	ScrollElement,
+	column,
+	each,
+	each_by,
+	scroll,
+};
+
+/// A list that builds only the rows near its viewport. See `virtual_list`. A
+/// `scroll` underneath: it takes every attribute an element takes (`grow`,
+/// `height`, `style`, `label` ...), and it is placed as any element is.
+export struct VirtualList<T, K> {
+	scroll: ScrollElement,
+	window: Window<T>,
+	key: |T| K,
+}
+
+/// Where the window stands: the numbers the list's changes read and write.
+struct Span {
+	/// Rows built on each side of the ones the viewport shows.
+	overscan: usize,
+	/// The viewport's height, from its last layout, in dp.
+	viewport: f64,
+	/// How far the list is scrolled, in dp.
+	scrolled: f64,
+	/// One row more after (before) the window: Tab (Shift+Tab) inside the list,
+	/// until the offset next moves.
+	ahead: usize,
+	behind: usize,
+	/// The rows built, `first .. last`, and whether their items changed since.
+	first: usize,
+	last: usize,
+	stale: bool,
+	/// The column's top padding and height as last set, in dp.
+	top: f64,
+	total: f64,
+}
+
+/// What a virtual list keeps between changes, shared by every copy of the list and
+/// by the handlers that change it.
+struct Window<T> {
+	/// The source's items, kept in step with its ops.
+	items: Shared<List<T>>,
+	span: Shared<Span>,
+	/// Every row's height, in dp.
+	extent: f64,
+	/// The scroll's offset, bound both ways.
+	offset: SignalCell<Point>,
+	/// The window's items: the keyed run the column holds reads them.
+	shown: SignalCell<List<T>>,
+	column: Column,
+}
+
+impl Window<type T> {
+	/// Applies one of the source's ops to the kept items, and marks the window
+	/// stale when the op changed what it shows: a splice before its end (a splice
+	/// above it moves every row in it), a change in place inside it, any reset or
+	/// move.
+	fun apply(self, op: SeqOp<T>) {
+		match op {
+			SeqOp::Splice(let at, let removed, let inserted) => {
+				mut taken = 0;
+				for taken < removed.len() {
+					let _gone = self.items.write().remove(at);
+					taken += 1;
+				}
+				mut offset = 0;
+				for item in inserted {
+					self.items.write().insert(at + offset, item);
+					offset += 1;
+				}
+				if at < self.span.read().last {
+					self.span.write().stale = true;
+				}
+			},
+			SeqOp::SetAt(let at, let _was, let value) => {
+				self.items.write()[at] = value;
+				let span = self.span.read();
+				if at >= span.first && at < span.last {
+					self.span.write().stale = true;
+				}
+			},
+			SeqOp::Reset(let items) => {
+				self.items.write() = items;
+				self.span.write().stale = true;
+			},
+			SeqOp::Move(let from, let count, let to) => {
+				mut lifted: List<T> = [];
+				mut taken = 0;
+				for taken < count {
+					lifted.push(self.items.write().remove(from));
+					taken += 1;
+				}
+				mut offset = 0;
+				for item in lifted {
+					self.items.write().insert(to + offset, item);
+					offset += 1;
+				}
+				self.span.write().stale = true;
+			},
+		}
+	}
+
+	/// Brings the column in step with the offset, the viewport and the items: the
+	/// window's rows (shown again only when the window moved or its items changed),
+	/// the padding above them and the column's height (each set only when it
+	/// changed, so a scroll inside the window lays nothing out).
+	fun refresh(self) {
+		let count = self.items.write().len();
+		let extent = self.extent;
+		let span = self.span.read();
+		let before = span.overscan + span.behind;
+		let after = span.overscan + span.ahead;
+		let visible_first = (span.scrolled / extent).floor().max(0.0).as_usize();
+		let visible_end = ((span.scrolled + span.viewport) / extent).ceil().max(0.0).as_usize();
+		mut last = visible_end + after;
+		if last > count {
+			last = count;
+		}
+		mut first = if visible_first > before { visible_first - before } else { 0 };
+		if first > last {
+			first = last;
+		}
+		if first != span.first || last != span.last || span.stale {
+			self.span.write().first = first;
+			self.span.write().last = last;
+			self.span.write().stale = false;
+			mut window: List<T> = [];
+			mut at = first;
+			for at < last {
+				window.push(self.items.write()[at]);
+				at += 1;
+			}
+			self.shown.set(window);
+		}
+		let top = first.as_f64() * extent;
+		if top != span.top {
+			self.span.write().top = top;
+			let _column = self.column.padding_top(dp(top));
+		}
+		let total = count.as_f64() * extent;
+		if total != span.total {
+			self.span.write().total = total;
+			let _column = self.column.height(dp(total));
+		}
+	}
+}
+
+/// A KEYED list of `source`'s items that builds only the rows near its viewport:
+/// each row is the element `render` builds for its item, under an owner of its own,
+/// laid out at `extent` tall. `source` and `key` are `each`'s — a `ListCell`
+/// (followed by its ops), a `SignalCell<List<T>>`, any list source or collection
+/// pipe, and the key that keeps a row the same row when the list changes — and so
+/// is what a change keeps: a row whose key stays in the window and whose item is
+/// equal is the same element (its hover, press and focus with it), one whose item
+/// changed is built again, and one that leaves the window is removed.
+///
+/// A list of 100,000 rows holds the twenty or so the viewport shows, `overscan` on
+/// each side (2 until set); the scroll's range is still the whole list's. State a
+/// row must keep after it leaves the window — a text typed into it, whether it is
+/// expanded — belongs in the item (or the app's model), not in the row: the row is
+/// built again when it comes back.
+///
+/// The extent is every row's height, gaps included: give the space between rows as
+/// padding inside the row.
+[track_caller]
+export fun virtual_list<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(
+	own source: S,
+	extent: Dp,
+	key: sync |T| K,
+	render: (sync |T| C) context owner_scope,
+): VirtualList<T, K> {
+	let window: Window<T> = open_window(extent);
+	window.column.child(each(window.shown, key, |item: T| render(item)
+		.into_element()
+		.height(extent)));
+	follow_source(window, source.open_rows(), caller());
+	finish(window, key)
+}
+
+/// `virtual_list`, with every row handed a CELL holding its item (`each_by`'s
+/// rule): a row whose key stays in the window is never built again — a changed item
+/// is written into its cell. Its items need no equality.
+[track_caller]
+export fun virtual_list_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(
+	own source: S,
+	extent: Dp,
+	key: sync |T| K,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+): VirtualList<T, K> {
+	let window: Window<T> = open_window(extent);
+	window.column.child(each_by(window.shown, key, |cell: SignalCell<T>| render(cell)
+		.into_element()
+		.height(extent)));
+	follow_source(window, source.open_rows(), caller());
+	finish(window, key)
+}
+
+/// The list's state and its column, before any row.
+fun open_window<T>(extent: Dp): Window<T> {
+	let empty: List<T> = [];
+	let none: List<T> = [];
+	Window {
+		items = Shared::new(empty),
+		span = Shared::new(Span {
+			overscan = 2,
+			viewport = 0.0,
+			scrolled = 0.0,
+			ahead = 0,
+			behind = 0,
+			first = 0,
+			last = 0,
+			stale = false,
+			top = 0.0,
+			total = 0.0,
+		}),
+		extent = extent.value().max(1.0),
+		offset = Signal::new(Point::new(dp(0), dp(0))),
+		shown = Signal::new(none),
+		// Its height is the whole list's, and it never shrinks to the viewport (a
+		// scroll's child would, to its content: CSS's flex rule, min-height auto).
+		column = column().role(Role::List).height(dp(0)).shrink(0.0),
+	}
+}
+
+/// The source, followed — `place_rows`' subscription in `std::ui`, into the kept
+/// items: its ops are applied, then the window is brought in step once per drain.
+fun follow_source<T>(window: Window<T>, instance: CollInstance<T>, site: Location) {
+	let drain = instance.drain;
+	let run = subscriber_of(|| {
+		for op in live_ops(drain()) {
+			window.apply(op);
+		}
+		window.refresh();
+	}, false);
+	place_subscriber(run.id, site);
+	let handle = (instance.attach)(run);
+	also_releasing(handle, instance.release);
+	let _owned = register_with_owner(handle);
+	window.items.write() = (instance.snapshot)();
+	window.span.write().stale = true;
+}
+
+/// The scroll around the column, and what moves the window: the offset, the
+/// viewport's height, Tab.
+fun finish<T, K>(window: Window<T>, key: |T| K): VirtualList<T, K> {
+	let viewport = scroll().offset(window.offset).child(window.column);
+	let _followed = register_with_owner(window.offset.sub(|point: Point| {
+		window.span.write().scrolled = point.y.value();
+		window.span.write().ahead = 0;
+		window.span.write().behind = 0;
+		window.refresh();
+	}));
+	let _sized = viewport.on_resize(|size: Size| {
+		window.span.write().viewport = size.height.value();
+		window.refresh();
+	});
+	// Tab inside the list: one row more on its side, built before the focus moves
+	// (the handler runs before the framework's response), so the tab order has a
+	// next row whenever the list does.
+	let _keyed = viewport.on_key(|key: KeyPress| {
+		match key.key {
+			KeyName::Tab => {
+				if key.modifiers.shift {
+					window.span.write().behind = 1;
+				} else {
+					window.span.write().ahead = 1;
+				}
+				window.refresh();
+			},
+			_ => {},
+		}
+	});
+	VirtualList { scroll = viewport, window, key }
+}
+
+export impl VirtualList<type T, type K: PartialEq> {
+	/// Rows built on each side of the ones the viewport shows (2 until set): what a
+	/// scroll step finds ready, and what Tab moves into. 0 builds only what shows.
+	fun overscan(self, rows: usize): VirtualList<T, K> {
+		self.window.span.write().overscan = rows;
+		self.window.refresh();
+		self
+	}
+
+	/// Binds how far the list is scrolled to `cell`, both ways, as
+	/// `ScrollElement::offset` does: the cell's value (now and at every write)
+	/// scrolls it, and the wheel, Tab, `reveal` and a clamp write the cell.
+	fun offset(self, cell: SignalCell<Point>): VirtualList<T, K> {
+		let inner = self.window.offset;
+		let _inward = register_with_owner(cell.sub(|point: Point| {
+			let held = inner.get();
+			if held.x.value() != point.x.value() || held.y.value() != point.y.value() {
+				inner.set(point);
+			}
+		}));
+		let _outward = register_with_owner(inner.sub(|point: Point| {
+			let held = cell.get();
+			if held.x.value() != point.x.value() || held.y.value() != point.y.value() {
+				cell.set(point);
+			}
+		}));
+		self
+	}
+
+	/// The `scroll` underneath: its `range()` is the whole list's, `scrolled()`
+	/// how far it is.
+	fun viewport(self): ScrollElement {
+		self.scroll
+	}
+
+	/// The number of rows, built or not.
+	fun count(self): usize {
+		self.window.items.write().len()
+	}
+
+	/// The rows built now, `first .. last` by index: the window and its overscan.
+	fun built(self): (usize, usize) {
+		let span = self.window.span.read();
+		(span.first, span.last)
+	}
+
+	/// Scrolls as little as it takes to show row `index` whole — not at all when it
+	/// shows already — and builds it (at the end of the turn, inside one). From the
+	/// row extent, so it needs no layout: a row added in the same turn can be
+	/// revealed. An index past the end does nothing.
+	fun reveal(self, index: usize) {
+		let window = self.window;
+		if index >= window.items.write().len() {
+			ret;
+		}
+		let start = index.as_f64() * window.extent;
+		let end = start + window.extent;
+		let view = window.span.read().viewport;
+		let scrolled = window.span.read().scrolled;
+		let wanted = if view <= 0.0 || start < scrolled || window.extent > view {
+			start
+		} else if end > scrolled + view {
+			end - view
+		} else {
+			scrolled
+		};
+		if wanted != scrolled {
+			window.offset.set(Point::new(dp(0), dp(wanted)));
+		}
+	}
+
+	/// `reveal` for the row whose key is `key`, found by walking the items; answers
+	/// whether there is one.
+	fun reveal_key(self, key: K): bool {
+		let count = self.window.items.write().len();
+		mut at: usize = 0;
+		for at < count {
+			if (self.key)(self.window.items.write()[at]) == key {
+				self.reveal(at);
+				ret true;
+			}
+			at += 1;
+		}
+		false
+	}
+}
+
+export impl VirtualList<type T, type K> with Attributes {
+	fun element(self): Element {
+		self.scroll.element()
+	}
+}
+
+export impl VirtualList<type T, type K> with Child {
+	fun into_element(self): Element {
+		self.scroll.element()
+	}
+}

@@ -30,6 +30,7 @@
 //! | scroll | the element under the pointer; the first `scroll` on the way up that can move takes it | yes, until a scroll moves |
 //! | key, key release, text | the focused element, or the root when nothing is | yes |
 //! | focus, blur | the element gaining or losing the focus | no |
+//! | resize | the element a layout gave a new size, after the layout (never routed) | no |
 //!
 //! A press focuses the innermost focusable element at or above where it
 //! landed, and takes the focus away when there is none. Tab moves the focus
@@ -107,6 +108,9 @@ pub enum EventKind {
     Text,
     Focus,
     Blur,
+    /// The element was laid out at a new size: never routed, told after a
+    /// layout ([`UiTree::take_resize_notices`]).
+    Resize,
 }
 
 /// One window input, as the tree routes it. Positions are dp from the
@@ -522,7 +526,7 @@ impl UiTree {
                 // Tab brings what it focused into view, and the content may
                 // have moved under a still pointer.
                 if let Some(focused) = self.focused()
-                    && self.reveal(focused)
+                    && self.reveal_when_laid_out(focused)
                     && let Some(pointer) = self.pointer
                 {
                     let hit = self.hit(root, pointer);
@@ -627,6 +631,35 @@ impl UiTree {
             bottom = (bottom - offset.y).min(view.bottom()).max(top);
         }
         moved
+    }
+
+    /// [`Self::reveal`] when `node`'s box is current — its tree laid out since
+    /// the last change that can move a box — and otherwise at the end of its
+    /// tree's next layout (the pending reveal: an element a handler built just
+    /// now has no box yet, and revealing its empty box at the origin scrolled
+    /// to the top). Answers whether an offset moved NOW.
+    pub fn reveal_when_laid_out(&mut self, node: NodeId) -> bool {
+        if !self.is_alive(node) {
+            return false;
+        }
+        let root = self.root_of(node);
+        let current = self
+            .data(root)
+            .root
+            .as_ref()
+            .and_then(|state| state.solved)
+            .is_some_and(|(_, generation)| generation == self.layout_generation);
+        if current {
+            self.reveal(node)
+        } else {
+            self.pending_reveal = Some(node);
+            false
+        }
+    }
+
+    /// Whether a reveal waits for the next layout.
+    pub fn reveal_pending(&self) -> bool {
+        self.pending_reveal.is_some()
     }
 
     fn key_target(&self, root: NodeId) -> NodeId {

@@ -2228,3 +2228,163 @@ fn revealing_an_element_scrolls_every_scroll_around_it_innermost_first() {
         "shown already: nothing moves"
     );
 }
+
+// ------------------------------------------------- sizes and stale boxes ---
+//
+// Part P4's virtual list reads its viewport's height after a layout (a resize
+// notice), builds rows that are not laid out yet, and may scroll to a row it
+// added in the same turn: three things the tree answers from boxes, each pinned
+// here at the tree's own level.
+
+#[test]
+fn a_resize_notice_tells_the_first_size_and_each_change_and_nothing_else() {
+    let mut fixture = Fixture::new();
+    let root = fixture.element(ElementKind::Column);
+    let watched = fixture.element(ElementKind::Column);
+    fixture.tree.set_grow(watched, 1.0).unwrap();
+    let unwatched = fixture.block(40.0, 40.0);
+    let spacer = fixture.block(40.0, 10.0);
+    fixture.add(root, &[spacer, watched, unwatched]);
+    let heard = Rc::new(std::cell::Cell::new(0));
+    let counter = Rc::clone(&heard);
+    fixture.tree.add_handler(
+        watched,
+        EventKind::Resize,
+        Handler::new(move || counter.set(counter.get() + 1)),
+    );
+    let sizes = |fixture: &mut Fixture| -> Vec<Size> {
+        fixture
+            .tree
+            .take_resize_notices()
+            .into_iter()
+            .map(|(handler, size)| {
+                handler.call();
+                size
+            })
+            .collect()
+    };
+    fixture.layout(root, 100.0, 200.0);
+    assert_eq!(
+        sizes(&mut fixture),
+        [Size::new(100.0, 150.0)],
+        "the first layout gives it a size: told once, with it"
+    );
+    assert_eq!(heard.get(), 1);
+    fixture.layout(root, 100.0, 200.0);
+    assert_eq!(sizes(&mut fixture), [], "the same size: nothing");
+    // It MOVES (the spacer grows) and shrinks; then only moves.
+    fixture
+        .tree
+        .set_size(spacer, SizeProperty::Height, Length::Dp(30.0))
+        .unwrap();
+    fixture.layout(root, 100.0, 200.0);
+    assert_eq!(sizes(&mut fixture), [Size::new(100.0, 130.0)]);
+    fixture
+        .tree
+        .set_size(spacer, SizeProperty::Height, Length::Dp(50.0))
+        .unwrap();
+    fixture
+        .tree
+        .set_size(unwatched, SizeProperty::Height, Length::Dp(20.0))
+        .unwrap();
+    fixture.layout(root, 100.0, 200.0);
+    assert_eq!(
+        sizes(&mut fixture),
+        [],
+        "moved down 20 and grown by 20 below: the same size, so nothing"
+    );
+    fixture.layout(root, 100.0, 400.0);
+    assert_eq!(
+        sizes(&mut fixture),
+        [Size::new(100.0, 330.0)],
+        "a new window size reaches it"
+    );
+    // Removed: its handlers go with it, the resize one included.
+    let handlers = fixture.tree.remove(watched);
+    assert_eq!(handlers.len(), 1);
+    fixture.layout(root, 100.0, 300.0);
+    assert_eq!(sizes(&mut fixture), []);
+}
+
+#[test]
+fn an_offset_set_while_a_layout_is_pending_is_kept_until_that_layout_clamps_it() {
+    let mut fixture = Fixture::new();
+    let (scroll, rows) = scrolled_list(&mut fixture);
+    let root = fixture.tree.root_of(scroll);
+    let column = fixture.tree.children(scroll)[0];
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(0.0, 400.0))
+    );
+    // Two rows more, and an offset past the old range in the same breath (a
+    // list that grew, scrolled to its new end): kept as asked.
+    let more = [fixture.block(100.0, 50.0), fixture.block(100.0, 50.0)];
+    fixture.add(column, &more);
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 500.0))
+        .unwrap();
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(0.0, 500.0)),
+        "the range is stale until the layout: not clamped to 400"
+    );
+    assert!(fixture.tree.take_offset_notices().is_empty());
+    fixture.layout(root, 300.0, 300.0);
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(0.0, 500.0)),
+        "inside the range the layout measured"
+    );
+    assert!(fixture.tree.take_offset_notices().is_empty());
+    // Past even the new range: the layout clamps it, and says so.
+    fixture.tree.remove(rows[0]);
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 900.0))
+        .unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(0.0, 450.0))
+    );
+    assert_eq!(fixture.tree.take_offset_notices().len(), 0, "no listener");
+    // With the range current, a set clamps at once (as before).
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 900.0))
+        .unwrap();
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(0.0, 450.0))
+    );
+}
+
+#[test]
+fn tab_onto_an_element_built_since_the_last_layout_reveals_it_after_the_next_layout() {
+    let mut fixture = Fixture::new();
+    let (root, scroll, rows) = scrolled_rows(&mut fixture, 6);
+    let column = fixture.tree.children(scroll)[0];
+    // Rows 0..6 at 30 dp in a 100 dp viewport: the last at 150..180.
+    fixture.tree.focus(Some(rows[5]));
+    assert!(fixture.tree.reveal(rows[5]));
+    assert_eq!(fixture.tree.scroll_offset(scroll).unwrap().y, 80.0);
+    // A row arrives after the focused one and is not laid out: its box is
+    // empty, at the origin. Tab focuses it; revealing that box would scroll to
+    // the top.
+    let fresh = fixture.block(50.0, 30.0);
+    fixture.tree.set_tab_index(fresh, Some(0));
+    fixture.add(column, &[fresh]);
+    tab(&mut fixture, root, false);
+    assert_eq!(fixture.tree.focused(), Some(fresh));
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll).unwrap().y,
+        80.0,
+        "nothing moves before the layout"
+    );
+    assert!(fixture.tree.reveal_pending());
+    fixture.layout(root, 200.0, 300.0);
+    // The fresh row at 180..210: its bottom at the viewport's.
+    assert_eq!(fixture.tree.scroll_offset(scroll).unwrap().y, 110.0);
+    assert!(!fixture.tree.reveal_pending());
+}
