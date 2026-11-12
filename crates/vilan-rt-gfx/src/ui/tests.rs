@@ -1852,3 +1852,379 @@ fn the_wheel_scrolls_the_innermost_scroll_that_can_move() {
         "no handler set"
     );
 }
+
+// ------------------------------------------- inserting, removing, moving ---
+
+/// A row of the list's shape: a label and a value, as `list` builds them.
+fn list_row(fixture: &mut Fixture, label: &str) -> NodeId {
+    let row = fixture.element(ElementKind::Row);
+    fixture.tree.set_gap(row, 8.0).unwrap();
+    let name = fixture.paragraph(label, 10.0);
+    fixture.tree.set_grow(name, 1.0).unwrap();
+    let value = fixture.paragraph("000", 10.0);
+    fixture.add(row, &[name, value]);
+    row
+}
+
+/// The boxes of every element under `root`, by a FULL snap: a new scale and
+/// back again snaps every box (`snapping_only_what_the_solver_re_ran_..`).
+fn full_snap_boxes(fixture: &mut Fixture, root: NodeId) -> Vec<Rect> {
+    let boxes = |fixture: &Fixture| {
+        fixture
+            .tree
+            .outline(root)
+            .into_iter()
+            .map(|entry| entry.bounds)
+            .collect::<Vec<_>>()
+    };
+    let incremental = boxes(fixture);
+    fixture.layout_at(root, 300.0, 2000.0, 2.0);
+    fixture.layout_at(root, 300.0, 2000.0, 1.0);
+    assert_eq!(incremental, boxes(fixture), "the incremental snap");
+    incremental
+}
+
+/// R9: a row inserted at the top tells the solver its PARENT changed and
+/// nothing else — the solver measures the newcomer's texts alone and places
+/// the other rows from its cache — and every box is the one a full snap
+/// gives.
+#[test]
+fn an_inserted_row_is_measured_alone_and_the_rows_below_it_move() {
+    let mut fixture = Fixture::new();
+    let (column, _) = list(&mut fixture, 50);
+    fixture.layout(column, 300.0, 2000.0);
+    paint_stats(&mut fixture, column);
+    let rows = fixture.tree.children(column);
+    let added = list_row(&mut fixture, "Row new");
+    fixture.tree.insert_before(rows[0], added).unwrap();
+    assert!(fixture.layout(column, 300.0, 2000.0), "the solver ran");
+    let texts = fixture.tree.children(added);
+    let measured = fixture.tree.last_measured();
+    assert!(
+        !measured.is_empty() && measured.iter().all(|node| texts.contains(node)),
+        "only the newcomer's texts: {measured:?}"
+    );
+    assert_eq!(fixture.tree.children(column)[0], added);
+    assert_eq!(fixture.tree.children(column)[1..], rows[..]);
+    assert_eq!(fixture.rect(added).1, 0.0);
+    assert_eq!(fixture.rect(rows[0]).1, fixture.rect(added).3);
+    full_snap_boxes(&mut fixture, column);
+}
+
+#[test]
+fn a_removed_row_is_measured_by_nobody_and_its_place_closes() {
+    let mut fixture = Fixture::new();
+    let (column, _) = list(&mut fixture, 30);
+    fixture.layout(column, 300.0, 2000.0);
+    let rows = fixture.tree.children(column);
+    let gone_at = fixture.rect(rows[10]).1;
+    let handlers = fixture.tree.remove(rows[10]);
+    assert!(handlers.is_empty());
+    assert!(fixture.layout(column, 300.0, 2000.0), "the solver ran");
+    assert!(fixture.tree.last_measured().is_empty(), "nothing measured");
+    assert_eq!(fixture.tree.children(column).len(), 29);
+    assert_eq!(fixture.rect(rows[11]).1, gone_at, "the next row closed up");
+    // The tree's own elements have no handle to wait for (a host element
+    // does: `host::ui`'s `Node`), so the removed row is still alive until
+    // its handle goes — then freed, with its texts.
+    assert!(fixture.tree.is_alive(rows[10]));
+    let texts = fixture.tree.children(rows[10]);
+    for text in &texts {
+        fixture.tree.release(*text);
+    }
+    fixture.tree.release(rows[10]);
+    assert!(!fixture.tree.is_alive(rows[10]));
+    assert!(texts.iter().all(|text| !fixture.tree.is_alive(*text)));
+    full_snap_boxes(&mut fixture, column);
+}
+
+/// A move is one element of the parent's children changing place: its
+/// state goes with it — the pointer's hover and press, the focus, its cached
+/// layout (nothing is measured) — and nothing else changes.
+#[test]
+fn a_moved_row_keeps_its_hover_press_and_focus_and_measures_nothing() {
+    let mut fixture = Fixture::new();
+    let (column, _) = list(&mut fixture, 20);
+    fixture.layout(column, 300.0, 2000.0);
+    let rows = fixture.tree.children(column);
+    let moving = rows[5];
+    fixture.tree.set_tab_index(moving, Some(0));
+    let (x, y, width, height) = fixture.rect(moving);
+    let over = Point::new(x + width / 2.0, y + height / 2.0);
+    fixture.tree.route(column, &Input::Pressed(over));
+    let before = fixture.tree.interaction(moving);
+    assert!(
+        before.hovered && before.pressed && before.focused,
+        "{before:?}"
+    );
+    fixture.tree.insert_before(rows[0], moving).unwrap();
+    assert_eq!(fixture.tree.children(column)[0], moving);
+    assert_eq!(fixture.tree.interaction(moving), before);
+    let pressed = fixture.tree.pressed();
+    assert!(pressed.is_some());
+    assert_eq!(fixture.tree.focused(), Some(moving));
+    assert!(fixture.layout(column, 300.0, 2000.0), "the solver ran");
+    assert!(fixture.tree.last_measured().is_empty(), "nothing measured");
+    assert_eq!(fixture.rect(moving).1, 0.0, "it is first");
+    // Moving it back in front of its old successor restores every box.
+    let original_next = rows[6];
+    fixture.tree.insert_before(original_next, moving).unwrap();
+    assert_eq!(fixture.tree.children(column), rows);
+    fixture.layout(column, 300.0, 2000.0);
+    assert_eq!(fixture.rect(moving), (x, y, width, height));
+    // The release over the moved row is still a click on it.
+    let recorder = Recorder::new();
+    recorder.listen(&mut fixture, moving, EventKind::Click, "moved");
+    assert_eq!(
+        recorder.route(&mut fixture, column, Input::Released(over)),
+        ["Click moved"]
+    );
+}
+
+/// Removal ends the element's interaction: the hover inside it rests on its
+/// parent, a press inside it is cancelled (no click follows the release),
+/// and the focus inside it is taken away with no blur — its handlers are the
+/// caller's to drop, every one of the subtree's, the scroll's offset handler
+/// included.
+#[test]
+fn a_removed_row_takes_its_hover_press_focus_and_handlers_with_it() {
+    let mut fixture = Fixture::new();
+    let (column, _) = list(&mut fixture, 10);
+    fixture.layout(column, 300.0, 2000.0);
+    let rows = fixture.tree.children(column);
+    let going = rows[3];
+    let text = fixture.tree.children(going)[0];
+    fixture.tree.set_tab_index(going, Some(0));
+    let recorder = Recorder::new();
+    recorder.listen(&mut fixture, going, EventKind::Blur, "blur going");
+    recorder.listen(&mut fixture, text, EventKind::Click, "click text");
+    recorder.listen(&mut fixture, column, EventKind::Click, "click column");
+    let (x, y, width, height) = fixture.rect(going);
+    let over = Point::new(x + width / 2.0, y + height / 2.0);
+    recorder.route(&mut fixture, column, Input::Pressed(over));
+    assert_eq!(fixture.tree.focused(), Some(going));
+    let handlers = fixture.tree.remove(going);
+    assert_eq!(handlers.len(), 2, "the row's blur and its text's click");
+    assert_eq!(fixture.tree.focused(), None);
+    assert_eq!(fixture.tree.pressed(), None);
+    assert_eq!(fixture.tree.hovered(), Some(column));
+    assert_eq!(fixture.tree.interaction(going), Interaction::default());
+    assert!(fixture.tree.interaction(column).hovered);
+    assert!(
+        !fixture.tree.interaction(column).pressed,
+        "the press is over"
+    );
+    fixture.layout(column, 300.0, 2000.0);
+    // The release lands on whatever row closed up under the pointer: there
+    // was no press to finish, so nobody hears a click — and no blur ran.
+    assert_eq!(
+        recorder.route(&mut fixture, column, Input::Released(over)),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn placing_before_an_element_needs_a_parent_and_the_one_place_rule_holds() {
+    let mut fixture = Fixture::new();
+    let column = fixture.element(ElementKind::Column);
+    let first = fixture.block(10.0, 10.0);
+    let alone = fixture.block(10.0, 10.0);
+    let newcomer = fixture.block(10.0, 10.0);
+    fixture.add(column, &[first]);
+    assert_eq!(
+        fixture.tree.insert_before(alone, newcomer),
+        Err(UiError::NoPosition)
+    );
+    let elsewhere = fixture.element(ElementKind::Row);
+    let placed = fixture.block(10.0, 10.0);
+    fixture.add(elsewhere, &[placed]);
+    assert_eq!(
+        fixture.tree.insert_before(first, placed),
+        Err(UiError::AlreadyPlaced)
+    );
+    assert_eq!(
+        fixture.tree.insert_before(first, column),
+        Err(UiError::Cycle)
+    );
+    fixture.tree.insert_before(first, first).unwrap();
+    assert_eq!(fixture.tree.children(column), [first], "itself: no change");
+}
+
+/// A region's marker holds a place and nothing else: no box (a column's gap
+/// does not count it), no paint, no hit, no outline entry, no tab stop, and
+/// it does not count as a scroll's one child.
+#[test]
+fn a_marker_holds_a_place_and_is_never_laid_out_painted_hit_or_listed() {
+    let mut fixture = Fixture::new();
+    let column = fixture.element(ElementKind::Column);
+    fixture.tree.set_gap(column, 5.0).unwrap();
+    let above = fixture.block(40.0, 10.0);
+    let marker = fixture.element(ElementKind::Marker);
+    let below = fixture.block(40.0, 10.0);
+    fixture.tree.set_tab_index(marker, Some(0));
+    fixture.add(column, &[above, marker, below]);
+    fixture.layout(column, 100.0, 100.0);
+    assert_eq!(fixture.rect(below).1, 15.0, "one gap, not two");
+    let kinds: Vec<_> = fixture
+        .tree
+        .outline(column)
+        .into_iter()
+        .map(|entry| entry.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ElementKind::Column,
+            ElementKind::Column,
+            ElementKind::Column
+        ]
+    );
+    assert_eq!(
+        fixture.tree.hit(column, Point::new(0.0, 10.5)),
+        Some(column)
+    );
+    // Placed before the marker: between the two blocks.
+    let between = fixture.block(40.0, 10.0);
+    fixture.tree.insert_before(marker, between).unwrap();
+    fixture.layout(column, 100.0, 100.0);
+    assert_eq!(fixture.rect(between).1, 15.0);
+    assert_eq!(fixture.rect(below).1, 30.0);
+    // Painted: three blocks with backgrounds, nothing for the marker.
+    for block in [above, between, below] {
+        fixture
+            .tree
+            .set_background(block, Color::new(1.0, 0.0, 0.0, 1.0));
+    }
+    let stats = paint_stats(&mut fixture, column);
+    assert_eq!(stats.rebuilt, 4, "the column and its three blocks");
+    // A scroll's one child is its one element; its markers do not count.
+    let scroll = fixture.element(ElementKind::Scroll);
+    let scroll_marker = fixture.element(ElementKind::Marker);
+    let content = fixture.element(ElementKind::Column);
+    let tall = fixture.block(40.0, 400.0);
+    fixture.add(content, &[tall]);
+    fixture.add(scroll, &[scroll_marker]);
+    fixture.tree.insert_before(scroll_marker, content).unwrap();
+    let second = fixture.block(1.0, 1.0);
+    assert_eq!(
+        fixture.tree.add_child(scroll, second),
+        Err(UiError::OneChild)
+    );
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Height, Length::Dp(100.0))
+        .unwrap();
+    fixture.layout(scroll, 100.0, 100.0);
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(0.0, 300.0))
+    );
+}
+
+// ------------------------------------------------- scrolling into view ---
+
+/// A scroll of `count` focusable 30 dp rows in a 100 dp viewport, inside a
+/// root column: `(root, scroll, rows)`.
+fn scrolled_rows(fixture: &mut Fixture, count: usize) -> (NodeId, NodeId, Vec<NodeId>) {
+    let root = fixture.element(ElementKind::Column);
+    let scroll = fixture.element(ElementKind::Scroll);
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Height, Length::Dp(100.0))
+        .unwrap();
+    let column = fixture.element(ElementKind::Column);
+    let mut rows = Vec::new();
+    for _ in 0..count {
+        let row = fixture.block(50.0, 30.0);
+        fixture.tree.set_tab_index(row, Some(0));
+        fixture.add(column, &[row]);
+        rows.push(row);
+    }
+    fixture.add(scroll, &[column]);
+    fixture.add(root, &[scroll]);
+    fixture.layout(root, 200.0, 300.0);
+    (root, scroll, rows)
+}
+
+fn tab(fixture: &mut Fixture, root: NodeId, backward: bool) {
+    let route = fixture.tree.route(
+        root,
+        &Input::Key {
+            name: "Tab".to_string(),
+            shift: backward,
+        },
+    );
+    Recorder::new().run(fixture, root, route);
+}
+
+/// Tab brings the element it focuses into view: as little scrolling as it
+/// takes — none while the element shows, its bottom edge to the viewport's
+/// going down, its top edge to the viewport's going up — and a wrap to the
+/// first element scrolls back to the top. The program is told, as a wheel's
+/// move is.
+#[test]
+fn tab_scrolls_the_focused_element_into_view_by_as_little_as_it_takes() {
+    let mut fixture = Fixture::new();
+    let (root, scroll, rows) = scrolled_rows(&mut fixture, 10);
+    let offset = |fixture: &Fixture| fixture.tree.scroll_offset(scroll).unwrap().y;
+    for _ in 0..3 {
+        tab(&mut fixture, root, false);
+    }
+    assert_eq!(fixture.tree.focused(), Some(rows[2]));
+    assert_eq!(offset(&fixture), 0.0, "rows 0 to 2 show (0..90 of 100)");
+    tab(&mut fixture, root, false);
+    assert_eq!(offset(&fixture), 20.0, "row 3 (90..120): its bottom at 100");
+    assert_eq!(
+        fixture.tree.take_offset_notices().len(),
+        0,
+        "no handler set"
+    );
+    for _ in 0..6 {
+        tab(&mut fixture, root, false);
+    }
+    assert_eq!(fixture.tree.focused(), Some(rows[9]));
+    assert_eq!(offset(&fixture), 200.0, "the last row's bottom at 100");
+    tab(&mut fixture, root, true);
+    tab(&mut fixture, root, true);
+    assert_eq!(fixture.tree.focused(), Some(rows[7]));
+    assert_eq!(offset(&fixture), 200.0, "rows 7 to 9 show (210..300)");
+    tab(&mut fixture, root, true);
+    assert_eq!(offset(&fixture), 180.0, "row 6 (180..210): its top at 0");
+    for _ in 0..4 {
+        tab(&mut fixture, root, false);
+    }
+    assert_eq!(fixture.tree.focused(), Some(rows[0]), "wrapped");
+    assert_eq!(offset(&fixture), 0.0);
+}
+
+/// `reveal` (`Element::scroll_into_view`) through two scrolls: the inner one
+/// shows the element, then the outer one shows what the inner one shows of
+/// it.
+#[test]
+fn revealing_an_element_scrolls_every_scroll_around_it_innermost_first() {
+    let mut fixture = Fixture::new();
+    let outer = fixture.element(ElementKind::Scroll);
+    fixture
+        .tree
+        .set_size(outer, SizeProperty::Height, Length::Dp(100.0))
+        .unwrap();
+    let outer_column = fixture.element(ElementKind::Column);
+    let spacer = fixture.block(50.0, 200.0);
+    let (_, inner, rows) = scrolled_rows(&mut fixture, 10);
+    // `scrolled_rows` gave the inner scroll a root column of its own; hang
+    // that column under the outer scroll's column, after a spacer.
+    let inner_parent = fixture.tree.root_of(inner);
+    fixture.add(outer_column, &[spacer, inner_parent]);
+    fixture.add(outer, &[outer_column]);
+    fixture.layout(outer, 200.0, 100.0);
+    assert!(fixture.tree.reveal(rows[5]));
+    // Inner: row 5 at 150..180 of a 100 dp viewport: offset 80.
+    assert_eq!(fixture.tree.scroll_offset(inner).unwrap().y, 80.0);
+    // Outer: the inner scroll at 200..300 shows rows 5 at its 70..100, so
+    // that part (270..300) is brought to the outer viewport's bottom.
+    assert_eq!(fixture.tree.scroll_offset(outer).unwrap().y, 200.0);
+    assert!(
+        !fixture.tree.reveal(rows[5]),
+        "shown already: nothing moves"
+    );
+}

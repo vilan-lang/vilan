@@ -290,6 +290,13 @@ const CENSUS: &[(&str, usize, &str)] = &[
          `<cycle>` (E283)",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
+    (
+        "ui.vl",
+        6,
+        "O: the native tree's regions (native-ui.md R9) — `when`'s shown \
+         element, `swap`'s shown element and last value, and a keyed run's keys, \
+         items and rows, the web's `each` bookkeeping for one element a row",
+    ),
     ("web/router.vl", 1, "R: the module-level `wired` latch"),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
@@ -414,7 +421,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 279,
+        total, 285,
         "the total number of `Shared` construction sites in std changed"
     );
 

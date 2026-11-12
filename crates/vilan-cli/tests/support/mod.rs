@@ -12,6 +12,7 @@ pub mod boot;
 pub mod ladder;
 pub mod mirror_tables;
 pub mod port;
+pub mod xvfb;
 
 /// The directory this test binary's scratch goes in — cargo's own
 /// `CARGO_TARGET_TMPDIR` under `target/`, never `std::env::temp_dir()`

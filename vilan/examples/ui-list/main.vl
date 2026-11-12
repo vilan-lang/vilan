@@ -1,28 +1,38 @@
-// A list of 10,000 rows in a `scroll` (native-ui.md part P3's exit test). Each row
-// is a label and a count of its clicks, bound to a signal of its own; a click on
-// a row adds one to that row's count, and a row under the pointer is lighter.
+// A KEYED list of 10,000 rows in a `scroll` (native-ui.md part P3's exit test, and
+// R9's keyed lists). The rows are a `ListCell` of entries, shown by `each_by`: a
+// row per entry, keyed by its id, reading its entry through a cell of its own. A
+// click on a row counts it — one `set_at`, which writes that one row's cell — and
+// a row under the pointer is lighter. Keys change the list:
+//
+//   a   a new row at the top          (one row built and inserted)
+//   d   the top row removed           (one row removed, its handlers dropped)
+//   m   the bottom row moved to the top  (one row moved; the rest stay where they are)
 //
 // What it shows about `std::ui`'s updates: the wheel moves the scroll's offset,
 // which repaints the scroll alone — nothing inside it is laid out or painted
 // again, and rows outside the viewport are skipped whole when the frame is
-// drawn; a click changes one text, which the solver measures alone (it then
-// places the column's rows again from its cache), and repaints one row. Every
-// row is a real element: virtualising a list, laying out only the rows in view,
-// is a `std::ui::kit` component (part P4), not this.
+// drawn; a click changes one text, which the solver measures alone, and repaints
+// one row; a row arriving, leaving or moving is one operation on the tree, which
+// tells the solver that the column changed and nothing else — it places the
+// column's rows again from its cache and measures only a new row. (Every row
+// BELOW the change then has a new box, and its scene is built again: scenes are
+// kept in the window's coordinates.) Every row is a real element: virtualising a
+// list, laying out only the rows in view, is a `std::ui::kit` component (part
+// P4), not this.
 //
 // Modes:
 //
-//   --smoke   a line per frame — the offset, the rows clicked, and what the frame
-//             took (layout, paint, the window's draw of the frame before) — and
-//             the first frame's scroll box; the test drives it with the wheel and
-//             a click
+//   --smoke   a line per frame — the offset, the rows clicked, the row count, the
+//             last action, and what the frame took (layout, paint, the window's
+//             draw of the frame before) — and the first frame's scroll box; the
+//             test drives it with the wheel, a click and the three keys
 //   --rows N  N rows instead of 10,000
 
-import std::gfx::{ Color, Frame, Point, Window, dp };
+import std::gfx::{ Color, Frame, KeyName, KeyPress, Point, Window, dp };
 import std::io::print;
 import std::process::args;
 import std::range::Range;
-import std::reactive::{ Signal, SignalCell };
+import std::reactive::{ ListCell, Signal, SignalCell };
 import std::shared::Shared;
 import std::ui::{
 	Align,
@@ -31,6 +41,7 @@ import std::ui::{
 	Style,
 	column,
 	draw,
+	each_by,
 	hovered,
 	last_frame,
 	mount,
@@ -40,30 +51,54 @@ import std::ui::{
 	text,
 };
 
-fun row_look(index: i32): Style {
-	let shade = if index % 2 == 0 { Color::rgb(252, 252, 253) } else { Color::rgb(244, 245, 248) };
+/// One row's data: its id (its key, and its label) and its clicks.
+struct Entry {
+	id: i32,
+	clicks: i32,
+}
+
+fun row_look(id: i32): Style {
+	let shade = if id % 2 == 0 { Color::rgb(252, 252, 253) } else { Color::rgb(244, 245, 248) };
 	style()
 		.background(shade)
 		.when(hovered(), |look: Style| look.background(Color::rgb(222, 230, 255)))
 }
 
-/// One row: its label, and its clicks — a signal of its own, so a click changes
-/// this row's text and nothing else.
-fun list_row(index: i32, clicked: Shared<i32>): Element {
-	let clicks: SignalCell<i32> = Signal::new(0);
+/// Where the entry with `id` is in the list now. (A copy of the list, walked: a
+/// click's cost, not a frame's.)
+fun position_of(entries: ListCell<Entry>, id: i32): Option<usize> {
+	let list = entries.get();
+	mut at: usize = 0;
+	for at < list.len() {
+		if list[at].id == id {
+			ret Some(at);
+		}
+		at += 1;
+	}
+	None
+}
+
+/// One row: its label, and its clicks — read through the row's own cell, so a
+/// click (which writes this entry in place) changes this row's text and nothing
+/// else.
+fun list_row(entry: SignalCell<Entry>, entries: ListCell<Entry>, clicked: Shared<i32>): Element {
+	let id = entry.get().id;
 	<row
 		padding_x(dp(12))
 		padding_y(dp(6))
 		gap(dp(8))
 		align(Align::Center)
-		style(row_look(index))
+		style(row_look(id))
 		on_click(|| {
-			clicks.set_with(|value: i32| value + 1);
-			clicked.write() = index;
+			match position_of(entries, id) {
+				Some(let at) => entries.set_at(at, Entry { id, clicks = entry.get().clicks + 1 }),
+				None => {},
+			}
+			clicked.write() = id;
 		})
 	>
-		<text grow(1.0)>{i"Row {index}"}</text>
-		<text>{clicks.derive(|value: i32| i"{value} clicks")}</text>
+		<text grow(1.0)>{i"Row {id}"}</text>
+		<text>{entry.derive(|now: Entry| i"{now.clicks} clicks")}</text>
 	</row>.element()
 }
 
@@ -84,17 +119,51 @@ fun main() {
 			ret;
 		},
 	};
-	let clicked: Shared<i32> = Shared::new(-1);
-	let offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
-	let rows = column().label("rows");
-	for index in Range::new(0, count) {
-		rows.child(list_row(index, clicked));
+	mut initial: List<Entry> = [];
+	for id in Range::new(0, count) {
+		initial.push(Entry { id, clicks = 0 });
 	}
-	let viewport: ScrollElement = scroll().grow(1.0).offset(offset).label("viewport");
-	viewport.child(rows);
-	let root = <column style(style().text_color(Color::rgb(30, 30, 40))) label("list")>
+	let entries: ListCell<Entry> = ListCell::of(initial);
+	let next_id: Shared<i32> = Shared::new(count);
+	let clicked: Shared<i32> = Shared::new(-1);
+	let action: Shared<str> = Shared::new("none");
+	let offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
+	// The three keys: a row added at the top, the top row removed, the bottom row
+	// moved to the top.
+	let on_key = |key: KeyPress| {
+		match key.key {
+			KeyName::Char(let typed) => {
+				if typed == "a" {
+					entries.insert_at(0, Entry { id = next_id.read(), clicks = 0 });
+					next_id.write() = next_id.read() + 1;
+					action.write() = "add";
+				} else if typed == "d" && entries.size() > 0 {
+					entries.remove_at(0);
+					action.write() = "remove";
+				} else if typed == "m" && entries.size() > 1 {
+					entries.move_range(entries.size() - 1, 1, 0);
+					action.write() = "move";
+				}
+			},
+			_ => {},
+		}
+	};
+	let viewport: ScrollElement = <scroll grow(1.0) offset(offset) label("viewport")>
+		<column label("rows")>
+			{each_by(
+				entries,
+				|entry: Entry| entry.id,
+				|entry: SignalCell<Entry>| list_row(entry, entries, clicked),
+			)}
+		</column>
+	</scroll>;
+	let root = <column
+		style(style().text_color(Color::rgb(30, 30, 40)))
+		label("list")
+		on_key(on_key)
+	>
 		<text padding(dp(12)) style(style().weight(700))>
-			{i"{count} rows: scroll, and click one"}
+			{i"{count} rows: scroll, click one, or press a, d or m"}
 		</text>
 		{viewport}
 	</column>;
@@ -109,7 +178,7 @@ fun main() {
 		draw(frame, root);
 		frames.write() = frames.read() + 1;
 		let times = last_frame(window);
-		print(i"frame {frames.read()} offset={offset.get().y.value()} clicked={clicked.read()} solved={times.solved} measured={times.measured} moved={times.moved} rebuilt={times.rebuilt} layout_us={times.layout.round()} paint_us={times.paint.round()} draw_us={times.draw.round()}");
+		print(i"frame {frames.read()} offset={offset.get().y.value()} clicked={clicked.read()} rows={entries.size()} action={action.read()} solved={times.solved} measured={times.measured} moved={times.moved} rebuilt={times.rebuilt} layout_us={times.layout.round()} paint_us={times.paint.round()} draw_us={times.draw.round()}");
 		if frames.read() == 1 {
 			let bounds = viewport.element().bounds();
 			print(i"box viewport {bounds.x.value()} {bounds.y.value()} {bounds.width.value()} {bounds.height.value()} range={viewport.range().height.value()}");

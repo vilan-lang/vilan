@@ -38,24 +38,29 @@
 // the GPU crate (`vilan-rt-gfx`, its `ui` module) with the layout solver; an
 // element here is a handle on it, so a copy is the same element and an element is
 // in one place in the tree. Every attribute takes a value or a signal (anything
-// `MaybeSignal`): a signal's write sets that one attribute again, which marks that
-// one element for layout or for paint and asks the mounted window for a frame —
-// nothing else is laid out or painted that the solver does not need.
+// `Bindable`): a signal's write sets that one attribute again, which marks that one
+// element for layout or for paint and asks the mounted window for a frame — nothing
+// else is laid out or painted that the solver does not need. A CHILD can be
+// reactive too — a keyed list (`each`, `each_by`, `each_values`), a conditional
+// (`when`), one of several subtrees (`swap`) — which inserts, removes and moves
+// elements as its source changes, and touches nothing else.
 //
 // EVENTS are attributes too (`on_click(|| ..)`, `on_key(|key| ..)`), delivered to
 // the element under the pointer (or holding the focus) and bubbling to its
 // ancestors that listen; `stop_event()` inside a handler ends that. Focus moves
-// with Tab and Shift+Tab through the focusable elements in tree order.
+// with Tab and Shift+Tab through the focusable elements in tree order, and Tab
+// scrolls the element it focuses into view.
 //
 // NATIVE ONLY, as `std::gfx` is: the JavaScript backend refuses a program that
 // reaches it, by name, when it builds; `vilan check` does not.
 //
-// Not here yet: keyed lists and conditional children (`each`, `when` for this
-// tree), grid layout, text editing, publishing roles and labels to the system's
-// accessibility API (R10: carried from this version).
+// Not here yet: grid layout, text editing, publishing roles and labels to the
+// system's accessibility API (R10: carried from this version).
 
 [platform("@process")] mod self;
 
+import pkg::compare::PartialEq;
+import pkg::debug::caller;
 import pkg::gfx::{
 	Border,
 	Button,
@@ -77,20 +82,32 @@ import pkg::gfx::{
 	current_event,
 	dp,
 };
+import pkg::hash::Hashable;
 import pkg::operators::Add;
 import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::delta::{ live_ops, settled_steps };
 import pkg::reactive::{
 	Flow,
 	FlushPolicy,
 	Owner,
+	RowFeed,
+	RowStep,
+	SeqOp,
 	SignalCell,
+	also_releasing,
 	comp,
+	defer_to_owner,
 	owner_scope,
+	place_subscriber,
+	reconcile,
 	register_with_owner,
+	run_with_owner,
+	subscriber_of,
 	tracking,
 	turn,
 	turn_scope,
 };
+import pkg::shared::Shared;
 
 // --- The seam ------------------------------------------------------------------
 //
@@ -112,7 +129,8 @@ import pkg::reactive::{
 //   __ui_on               0 pointer enter, 1 pointer leave, 2 pointer move,
 //                         3 press, 4 release, 5 click, 6 scroll, 7 key, 8 key
 //                         release, 9 text, 10 focus, 11 blur
-//   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll
+//   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll,
+//                         6 a region's marker (never laid out, painted or hit)
 //
 // The enums' codes are their declaration order.
 
@@ -220,6 +238,19 @@ external fun ui_set_texture(node: Node, texture: Texture): void;
 [extern("__ui_add_child")]
 external fun ui_add_child(parent: Node, child: Node): void;
 
+/// `child` immediately before `reference`, in `reference`'s parent: MOVED there
+/// when it is already that parent's child.
+[extern("__ui_insert_before")]
+external fun ui_insert_before(reference: Node, child: Node): void;
+
+/// Takes `node` out of its parent for good, and drops its subtree's handlers.
+[extern("__ui_remove")]
+external fun ui_remove(node: Node): void;
+
+/// Scrolls every `scroll` around `node` as little as it takes to show it.
+[extern("__ui_scroll_into_view")]
+external fun ui_scroll_into_view(node: Node): void;
+
 [extern("__ui_set_focusable")]
 external fun ui_set_focusable(node: Node, focusable: bool): void;
 
@@ -300,10 +331,18 @@ external fun ui_outline_text(index: i32, which: i32): str;
 /// One difference, deliberate: a reactive attribute belongs to the AMBIENT OWNER
 /// when there is one (`mount_root`, `run_with_owner`) and dies with it, and to its
 /// source otherwise — as a materialising node (`.cell()`) does — so a tree can be
-/// built and bound at the top of `main`. (`MaybeSignal`'s reactive arm requires an
-/// owner, and the context checker charges a requirement inside a trait's DEFAULT
-/// method to every call of it, the static ones included: every `.gap(dp(8))` would
-/// have needed an owner.)
+/// built and bound at the top of `main`. The reactive children (`each`, `when`)
+/// keep the same rule.
+///
+/// Why not `MaybeSignal` itself (re-asked once B737 let the checker resolve a
+/// trait default's dispatch per call site): its reactive arm REQUIRES an owner,
+/// and the native backend mints a context parameter per FUNCTION, not per
+/// instance (F36) — every attribute method, and every function reaching one,
+/// would declare an `Owner`, and a static `.gap(dp(8))` reached from code with no
+/// owner is refused natively though it checks. Every program would build its tree
+/// under `comp`. When F36 is gone the two can be one trait, and the remaining
+/// difference — a binding with no owner refused, instead of kept by its source — is
+/// the owner's call.
 export trait Bindable<T> {
 	fun bind(own self, apply: |T| void);
 }
@@ -956,6 +995,13 @@ export impl Element {
 		ui_focus(self.node);
 	}
 
+	/// Scrolls every `scroll` around it as little as it takes to show it, from the
+	/// last layout — innermost first, each showing what the one inside it shows
+	/// (Tab does this for the element it focuses). A bound offset follows.
+	fun scroll_into_view(self) {
+		ui_scroll_into_view(self.node);
+	}
+
 	/// Whether it is hovered, pressed and focused now.
 	fun interaction(self): Interaction {
 		let bits = ui_interaction(self.node);
@@ -997,10 +1043,11 @@ export impl str with Child {
 /// answers it, so they chain.
 ///
 /// Every attribute that takes a value takes a SIGNAL of it too (anything
-/// `MaybeSignal`: a `SignalCell`, a memo, a pipe): the attribute follows it, and
-/// each write marks that one element for layout (a size, a padding) or for paint (a
-/// style) and asks the window it is mounted in for a frame. A signal needs an owner
-/// to belong to: build under `mount_root` (or `run_with_owner`).
+/// `Bindable`: a `SignalCell`, a memo, a pipe): the attribute follows it, and each
+/// write marks that one element for layout (a size, a padding) or for paint (a
+/// style) and asks the window it is mounted in for a frame. The binding belongs to
+/// the ambient owner when there is one (`mount_root`, `run_with_owner`), and to its
+/// signal otherwise.
 export trait Attributes {
 	/// The element these set.
 	fun element(self): Element;
@@ -1284,11 +1331,13 @@ export fun stop_event() {
 
 /// The elements with children: rows, columns, stacks and scrolls.
 export trait Parent with Attributes {
-	/// Appends a child: an element of any kind, or a `str` (a `text` holding it).
-	/// An element is in one place: one already inside another is refused, and a
-	/// `scroll` takes one child.
-	fun child<C: Child>(self, content: C): Self {
-		ui_add_child(self.element().node, content.into_element().node);
+	/// Appends a child: anything `ChildSlot` — an element of any kind, a `str` (a
+	/// `text` holding it), an `Option` of one, or a reactive child (`each`,
+	/// `each_by`, `each_values`, `when`, `swap`), which keeps this place among the
+	/// children and fills it as its source changes. An element is in one place:
+	/// one already inside another is refused, and a `scroll` takes one child.
+	fun child<C: ChildSlot>(self, own content: C): Self {
+		content.place(self.element());
 		self
 	}
 }
@@ -1532,8 +1581,7 @@ export impl ScrollElement {
 	/// moving lays nothing out and repaints nothing inside it.
 	fun offset(self, cell: SignalCell<Point>): ScrollElement {
 		let node = self.element.node;
-		let _bound = register_with_owner(cell
-			.sub(|value: Point| ui_set_offset(node, value.x.value(), value.y.value())));
+		follow(cell, |value: Point| ui_set_offset(node, value.x.value(), value.y.value()));
 		ui_on_offset(node, || {
 			let now = Point::new(dp(ui_offset(node, 0)), dp(ui_offset(node, 1)));
 			let held = cell.get();
@@ -1553,6 +1601,525 @@ export impl ScrollElement {
 	fun range(self): Size {
 		Size::new(dp(ui_offset(self.element.node, 2)), dp(ui_offset(self.element.node, 3)))
 	}
+}
+
+// --- Reactive children (R9, section 4.4) -----------------------------------------
+//
+// A child position can be REACTIVE: a keyed list (`each`, `each_by`,
+// `each_values`), a conditional (`when`), or one of several subtrees (`swap`) — the
+// web UI's value forms, under the same names and in the same holes, so
+// `<column>{header}{each(items, |item| item.id, |item| <row>..</row>)}</column>`
+// reads the same in both. Each is a VALUE that `child` places: placing it puts a
+// MARKER element where it was written (never laid out, painted or hit), and every
+// element it shows is inserted before that marker, so the content keeps its place
+// among its static siblings however the parent grows afterwards.
+//
+// A ROW IS ONE ELEMENT. The web's rows are any `Slot` (a fragment, a text node),
+// which costs each row a marker of its own; this tree has no fragments — `child`
+// takes elements and the reactive forms, and a render closure answers anything
+// `Child` — so a row's element is its own boundary, and a list of n rows costs one
+// marker, not n.
+//
+// What a change costs the host: a row arriving is one insert, a row leaving one
+// removal, a row moving one move (an insert of an element already there), each of
+// which tells the solver that the PARENT changed and nothing else; rows that stay
+// where they are in the new order (`settled_steps`, A98's two scans) are not
+// touched at all. The plan is std's one `reconcile`, and a source with a log
+// (`ListCell`) is followed by its ops, exactly as the web's `each` is (A112 S3).
+//
+// OWNERSHIP, as the web's: each row (each instantiation of a `when`, each subtree
+// of a `swap`) is built under an owner of its own, disposed when the row leaves —
+// its bindings end — and the element is REMOVED, which drops its handlers (B738:
+// a handler that captures its own row would otherwise keep the row alive for
+// good). The region itself — its rows, its marker, its subscription — belongs to
+// the AMBIENT owner when there is one (`mount_root`, `run_with_owner`, `comp`) and
+// goes when that owner is disposed; with none it lives as long as its source,
+// `Bindable`'s rule. Hover, press and focus belong to the element, so they survive
+// a reorder, and they are cleared when it is removed (a press inside it is
+// cancelled: no click follows).
+
+/// What `child` takes (the web UI's `Slot`, for this tree): anything `Child` — an
+/// element of any kind, or a `str` — placed once; an `Option` of one, placed when
+/// it is `Some`; and the reactive children, `each`, `each_by`, `each_values`,
+/// `when` and `swap`.
+export trait ChildSlot {
+	fun place(own self, parent: Element);
+}
+
+/// An element, or a `str`: appended, once.
+export impl type C: Child with ChildSlot {
+	fun place(own self, parent: Element) {
+		ui_add_child(parent.node, self.into_element().node);
+	}
+}
+
+/// An optional child: `Some` places it, `None` places nothing — the static twin of
+/// `when`.
+export impl Option<type C: Child> with ChildSlot {
+	fun place(own self, parent: Element) {
+		match self {
+			Some(let child) => ui_add_child(parent.node, child.into_element().node),
+			None => {},
+		}
+	}
+}
+
+/// A binding's subscription: `observer` now and at every change, released with the
+/// ambient owner when there is one and kept by its source otherwise — `Bindable`'s
+/// rule (the web UI's `follow`, owner-optional). The observer runs with tracking
+/// cleared.
+[track_caller]
+fun follow<T, F: Flow<T>>(own flow: F, observer: (|T| void) context tracking) {
+	let _kept = register_with_owner(flow.sub(observer));
+}
+
+/// A region's place among `parent`'s children: a marker, appended where the
+/// reactive child is written.
+fun open_region(parent: Element): Node {
+	let anchor = ui_node(6);
+	ui_add_child(parent.node, anchor);
+	anchor
+}
+
+/// One element a region shows — a row of a run, a `when`'s body, a `swap`'s subtree
+/// — with the owner its bindings belong to and, for `each_by`, the cell it reads
+/// its item from.
+struct Shown<T> {
+	node: Node,
+	owner: Owner,
+	cell: Option<SignalCell<T>>,
+}
+
+/// Builds an element under a fresh owner, and places it before `reference`.
+fun show<T>(
+	reference: Node,
+	build: (sync || (Node, Option<SignalCell<T>>)) context owner_scope,
+): Shown<T> {
+	let owner = Owner::new();
+	let (node, cell) = run_with_owner(owner, || build());
+	ui_insert_before(reference, node);
+	Shown { node, owner, cell }
+}
+
+/// A shown element LEAVES: its owner goes first (its bindings end, and a region
+/// inside it takes its own rows out), then the element, with its handlers.
+fun retire<T>(shown: Shown<T>) {
+	shown.owner.dispose();
+	ui_remove(shown.node);
+}
+
+/// Conditional content as a child — the `when` value (the web UI's `Conditional`;
+/// here that name is a style's conditional fields).
+export struct When<S: Flow<bool>, C: Child> {
+	condition: S,
+	body: (|| C) context owner_scope,
+}
+
+/// Content at THIS position while `condition` holds: the body's element is built
+/// under a fresh owner when it turns true, and removed — its owner disposed, its
+/// handlers dropped — when it turns false.
+export fun when<S: Flow<bool>, C: Child>(
+	own condition: S,
+	body: (sync || C) context owner_scope,
+): When<S, C> {
+	When { condition, body }
+}
+
+export impl When<type S: Flow<bool>, type C: Child> with ChildSlot {
+	fun place(own self, parent: Element) {
+		let anchor = open_region(parent);
+		let live: Shared<Option<Shown<bool>>> = Shared::new(None);
+		// The content, then the marker, leave with the enclosing owner.
+		defer_to_owner(|| {
+			match live.read() {
+				Some(let shown) => retire(shown),
+				None => {},
+			}
+			ui_remove(anchor);
+		});
+		let body = self.body;
+		follow(self.condition, |on: bool| {
+			match live.read() {
+				Some(let shown) => {
+					if !on {
+						live.write() = None;
+						retire(shown);
+					}
+				},
+				None => {
+					if on {
+						live.write() = Some(show(anchor, || {
+							let none: Option<SignalCell<bool>> = None;
+							(body().into_element().node, none)
+						}));
+					}
+				},
+			}
+		});
+	}
+}
+
+/// One of several subtrees as a child — the `swap` value.
+export struct Swap<T: PartialEq, S: Flow<T>, C: Child> {
+	source: S,
+	render: (|T| C) context owner_scope,
+}
+
+/// The subtree for `source`'s value at THIS position: whenever the value CHANGES the
+/// previous subtree is removed (its owner disposed) and `render` builds the new one
+/// under a fresh owner. `swap(flag, |on| if on { a() } else { b() })` is one of two.
+export fun swap<T: PartialEq, S: Flow<T>, C: Child>(
+	own source: S,
+	render: (sync |T| C) context owner_scope,
+): Swap<T, S, C> {
+	Swap { source, render }
+}
+
+export impl Swap<type T: PartialEq, type S: Flow<T>, type C: Child> with ChildSlot {
+	fun place(own self, parent: Element) {
+		let anchor = open_region(parent);
+		let live: Shared<Option<Shown<T>>> = Shared::new(None);
+		let last: Shared<Option<T>> = Shared::new(None);
+		defer_to_owner(|| {
+			match live.read() {
+				Some(let shown) => retire(shown),
+				None => {},
+			}
+			ui_remove(anchor);
+		});
+		let render = self.render;
+		follow(self.source, |value: T| {
+			let unchanged = match last.read() {
+				Some(let previous) => previous == value,
+				None => false,
+			};
+			if !unchanged {
+				match live.read() {
+					Some(let shown) => retire(shown),
+					None => {},
+				}
+				last.write() = Some(value);
+				live.write() = Some(show(anchor, || {
+					let none: Option<SignalCell<T>> = None;
+					(render(value).into_element().node, none)
+				}));
+			}
+		});
+	}
+}
+
+/// A keyed reactive run as a child — the `each` value.
+export struct Each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child> {
+	source: S,
+	key: |T| K,
+	render: (|T| C) context owner_scope,
+}
+
+/// A run keyed by the item itself, as a child — the `each_values` value.
+export struct EachValues<T: PartialEq + Hashable, S: RowFeed<T>, C: Child> {
+	source: S,
+	render: (|T| C) context owner_scope,
+}
+
+/// A run whose rows read their item through a cell, as a child — the `each_by`
+/// value.
+export struct EachBy<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child> {
+	source: S,
+	key: |T| K,
+	render: (|SignalCell<T>| C) context owner_scope,
+}
+
+/// A KEYED run at THIS position: one row per item of `source` (a `ListCell`, a
+/// `SignalCell<List<T>>`, any list source or collection pipe), each the element
+/// `render` builds for it under an owner of its own. A change keeps every row whose
+/// key stays and whose item is equal — moving it, without building it again, when
+/// the order changed — builds a row for each new key or changed item, and removes
+/// each row whose key left. Over a `ListCell` the run follows its ops: a push
+/// builds one row, a removal removes one, a `set_at` rebuilds that row alone.
+export fun each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(
+	own source: S,
+	key: sync |T| K,
+	render: (sync |T| C) context owner_scope,
+): Each<T, K, S, C> {
+	Each { source, key, render }
+}
+
+/// `each`, keyed by the item itself.
+export fun each_values<T: PartialEq + Hashable, S: RowFeed<T>, C: Child>(
+	own source: S,
+	render: (sync |T| C) context owner_scope,
+): EachValues<T, S, C> {
+	EachValues { source, render }
+}
+
+/// `each`, with every row handed a CELL holding its item instead of the item: a row
+/// whose key stays is never built again — a changed item is written into its cell,
+/// and whatever the row binds to that cell follows. Its items need no equality.
+export fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(
+	own source: S,
+	key: sync |T| K,
+	render: (sync |SignalCell<T>| C) context owner_scope,
+): EachBy<T, K, S, C> {
+	EachBy { source, key, render }
+}
+
+export impl Each<type T: PartialEq, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Child> with ChildSlot {
+	fun place(own self, parent: Element) {
+		let render = self.render;
+		place_rows(parent, self.source, self.key, |before: T, after: T| before == after, |item: T| {
+			let none: Option<SignalCell<T>> = None;
+			(render(item).into_element().node, none)
+		});
+	}
+}
+
+export impl EachValues<type T: PartialEq + Hashable, type S: RowFeed<T>, type C: Child> with ChildSlot {
+	fun place(own self, parent: Element) {
+		let render = self.render;
+		place_rows(
+			parent,
+			self.source,
+			|item: T| item,
+			|before: T, after: T| before == after,
+			|item: T| {
+				let none: Option<SignalCell<T>> = None;
+				(render(item).into_element().node, none)
+			},
+		);
+	}
+}
+
+export impl EachBy<type T, type K: PartialEq + Hashable, type S: RowFeed<T>, type C: Child> with ChildSlot {
+	fun place(own self, parent: Element) {
+		let render = self.render;
+		// A surviving key is always KEPT: its cell takes the new item.
+		place_rows(parent, self.source, self.key, |_before: T, _after: T| true, |item: T| {
+			let cell: SignalCell<T> = SignalCell::new(item);
+			(render(cell).into_element().node, Some(cell))
+		});
+	}
+}
+
+/// The rows at `at .. at + count` of a held list, copied one at a time (a span
+/// costs the span, not a copy of the run).
+fun span_of<E>(held: Shared<List<E>>, at: usize, count: usize): List<E> {
+	if at == 0 && count == held.read().len() {
+		let run = held.read();
+		ret run;
+	}
+	mut span: List<E> = [];
+	mut index = at;
+	for index < at + count {
+		span.push(held.read()[index]);
+		index += 1;
+	}
+	span
+}
+
+/// The three keyed runs' one body: a region at `parent`'s end, its rows kept in step
+/// with `source`. `same` decides, for a key that stays, whether its row is KEPT (and
+/// handed the new item through its cell, when it has one) or built again; `build`
+/// makes a row's element, under the row's owner.
+///
+/// The web's `place_each` with one element a row (see the section's head): the
+/// whole-list pass diffs with `reconcile`, leaves the rows `settled_steps` finds in
+/// order where they are and moves every other kept row before the next settled one
+/// (or the region's end); a source with a log is followed by its ops — a splice
+/// that only removes or only inserts by position, one that does both by the pass
+/// over its span, a `set_at` one row at a time, a `Reset` or a `Move` by the pass.
+[track_caller]
+fun place_rows<T, K: PartialEq + Hashable, S: RowFeed<T>>(
+	parent: Element,
+	own source: S,
+	key: sync |T| K,
+	same: sync |T, T| bool,
+	build: (sync |T| (Node, Option<SignalCell<T>>)) context owner_scope,
+) {
+	let anchor = open_region(parent);
+	let row_keys: Shared<List<K>> = Shared::new([]);
+	let row_items: Shared<List<T>> = Shared::new([]);
+	let rows: Shared<List<Shown<T>>> = Shared::new([]);
+	// Whichever rows are live when the enclosing owner is disposed go with it, and
+	// the marker after them.
+	defer_to_owner(|| {
+		for row in rows.read() {
+			retire(row);
+		}
+		ui_remove(anchor);
+	});
+	// The keyed pass over ONE SPAN of the run — the rows at `at .. at + count` —
+	// against `list`, leaving every row outside the span where it is (A129).
+	let reconcile_span = |at: usize, count: usize, list: List<T>| {
+		let whole = at == 0 && count == rows.read().len();
+		let previous = span_of(rows, at, count);
+		// What bounds the span on the right: the first row after it, or the marker.
+		let boundary = if at + count < rows.read().len() {
+			rows.read()[at + count].node
+		} else {
+			anchor
+		};
+		let plan = if whole {
+			reconcile(row_keys.read(), row_items.read(), list, key, same)
+		} else {
+			reconcile(span_of(row_keys, at, count), span_of(row_items, at, count), list, key, same)
+		};
+		let settled = settled_steps(plan.steps);
+		// Each step's place: before the next SETTLED row in the new order, or the
+		// boundary — read from the end, since it is a property of what follows.
+		mut references: List<Node> = [];
+		mut reference = boundary;
+		mut back = plan.steps.len();
+		for back > 0 {
+			back -= 1;
+			references.push(reference);
+			if settled[back] {
+				match plan.steps[back] {
+					RowStep::Keep(let index) => {
+						reference = previous[index].node;
+					},
+					_ => {},
+				}
+			}
+		}
+		let references = references.reverse();
+		for gone in plan.removed {
+			retire(previous[gone]);
+		}
+		mut next: List<Shown<T>> = [];
+		mut position = 0;
+		for step in plan.steps {
+			let item = list[position];
+			match step {
+				RowStep::Keep(let kept) => {
+					let row = previous[kept];
+					if !settled[position] {
+						ui_insert_before(references[position], row.node);
+					}
+					match row.cell {
+						Some(let cell) => cell.set(item),
+						None => {},
+					}
+					next.push(row);
+				},
+				RowStep::Refresh(let old) => {
+					retire(previous[old]);
+					next.push(show(references[position], || build(item)));
+				},
+				RowStep::Fresh => {
+					next.push(show(references[position], || build(item)));
+				},
+			}
+			position += 1;
+		}
+		mut next_keys: List<K> = [];
+		for item in list {
+			next_keys.push(key(item));
+		}
+		if whole {
+			rows.write() = next;
+			row_keys.write() = next_keys;
+			row_items.write() = list;
+		} else {
+			// The span's entries replaced in place: a splice pays for the span.
+			mut taken = 0;
+			for taken < count {
+				let _row = rows.write().remove(at);
+				let _key = row_keys.write().remove(at);
+				let _item = row_items.write().remove(at);
+				taken += 1;
+			}
+			mut offset = 0;
+			for offset < next.len() {
+				rows.write().insert(at + offset, next[offset]);
+				row_keys.write().insert(at + offset, next_keys[offset]);
+				row_items.write().insert(at + offset, list[offset]);
+				offset += 1;
+			}
+		}
+	};
+	let reconcile_pass = |list: List<T>| reconcile_span(0, rows.read().len(), list);
+	// A splice applied by position: `removed` rows leave at `at` and `inserted`
+	// arrive there, with no plan — the op already says where the change is.
+	let splice_rows = |at: usize, removed: usize, inserted: List<T>| {
+		mut taken = 0;
+		for taken < removed {
+			retire(rows.write().remove(at));
+			let _key = row_keys.write().remove(at);
+			let _item = row_items.write().remove(at);
+			taken += 1;
+		}
+		let reference = if at < rows.read().len() { rows.read()[at].node } else { anchor };
+		mut offset = 0;
+		for item in inserted {
+			rows.write().insert(at + offset, show(reference, || build(item)));
+			row_keys.write().insert(at + offset, key(item));
+			row_items.write().insert(at + offset, item);
+			offset += 1;
+		}
+	};
+	let instance = source.open_rows();
+	let drain = instance.drain;
+	let run = subscriber_of(|| {
+		for op in live_ops(drain()) {
+			match op {
+				SeqOp::Splice(let at, let removed, let inserted) => {
+					if removed.len() == 0 || inserted.len() == 0 {
+						splice_rows(at, removed.len(), inserted);
+					} else {
+						reconcile_span(at, removed.len(), inserted);
+					}
+				},
+				// An element changed IN PLACE: the pass's rule, one row at a time —
+				// the same key and a `same` item keeps the row (its cell, if it has
+				// one, takes the item); anything else is the row built again.
+				SeqOp::SetAt(let at, let _was, let value) => {
+					let same_key = match row_keys.read().get(at) {
+						Some(let held) => key(value) == held,
+						None => false,
+					};
+					let kept = same_key && match row_items.read().get(at) {
+						Some(let held) => same(held, value),
+						None => false,
+					};
+					if kept {
+						row_items.write()[at] = value;
+						match rows.read().get(at) {
+							Some(let row) => match row.cell {
+								Some(let cell) => cell.set(value),
+								None => {},
+							},
+							None => {},
+						}
+					} else {
+						splice_rows(at, 1, [value]);
+					}
+				},
+				SeqOp::Reset(let items) => reconcile_pass(items),
+				// A reorder is the pass at the list AFTER the move (the web's
+				// reason): the moved rows keep their keys, so the pass moves them.
+				SeqOp::Move(let from, let count, let to) => {
+					mut moved = row_items.read();
+					mut lifted: List<T> = [];
+					mut taken = 0;
+					for taken < count {
+						lifted.push(moved.remove(from));
+						taken += 1;
+					}
+					mut offset = 0;
+					for item in lifted {
+						moved.insert(to + offset, item);
+						offset += 1;
+					}
+					reconcile_pass(moved);
+				},
+			}
+		}
+	}, false);
+	place_subscriber(run.id, caller());
+	let handle = (instance.attach)(run);
+	also_releasing(handle, instance.release);
+	let _owned = register_with_owner(handle);
+	reconcile_pass((instance.snapshot)());
 }
 
 // --- Layout, drawing and the window ---------------------------------------------

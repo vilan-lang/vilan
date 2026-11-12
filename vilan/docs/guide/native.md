@@ -469,10 +469,66 @@ the pointer and the focus with no code of the app's: `hovered()`, `pressed()` an
 focus, and a change repaints the one element. Tab and Shift+Tab move the focus;
 a `scroll` moves its child under the wheel without laying anything out.
 
-`vilan/examples/ui-counter` is this counter with two buttons and keyboard
-activation, and `vilan/examples/ui-list` a list of 10,000 rows in a `scroll`,
-one row changing on a click; their end-to-end test drives both through the X
-server, by pointer and keyboard, and holds every frame to "only on change".
+### Lists and conditional children
+
+A child can be REACTIVE, written the way the web UI writes it: `each(items, key,
+render)` is a keyed list — a row per item, kept across changes by its key and
+moved, not rebuilt, when the order changes — and `when(condition, || ..)` is
+content that is there while the condition holds. A change to the list inserts,
+removes or moves the elements it must, and nothing else is built:
+
+```vilan,native
+import std::gfx::{ KeyName, KeyPress, Window, dp };
+import std::io::print;
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::shared::Shared;
+import std::ui::{ column, each, mount, row, text, when };
+
+fun main() {
+	let window = match Window::builder().title("Tasks").size(dp(360), dp(480)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let tasks: ListCell<str> = ListCell::of(["Write", "Test"]);
+	let added: Shared<i32> = Shared::new(0);
+	let empty: SignalCell<bool> = Signal::new(false);
+	mount(window, <column padding(dp(16)) gap(dp(8)) on_key(|key: KeyPress| {
+		match key.key {
+			KeyName::Char(let typed) => {
+				if typed == "n" {
+					added.write() = added.read() + 1;
+					tasks.insert_at(0, i"Task {added.read()}");
+				} else if typed == "d" && tasks.size() > 0 {
+					tasks.remove_at(0);
+				}
+				empty.set(tasks.size() == 0);
+			},
+			_ => {},
+		}
+	})>
+		<text>"n adds a task at the top, d removes the top one"</text>
+		{each(tasks, |task: str| task, |task: str| <row padding(dp(8))>{task}</row>)}
+		{when(empty, || <text>"Nothing to do"</text>)}
+	</column>);
+}
+main();
+```
+
+A row is one element — whatever the render closure answers — and it is built
+under an owner of its own: when it leaves, its bindings end and its handlers are
+dropped with it. Hover, press and focus belong to the element, so a moved row
+keeps them. `each_by` hands each row a cell holding its item instead, so an item
+changed in place is written into its row and nothing is built; `swap(value, |v|
+..)` shows one of several subtrees.
+
+`vilan/examples/ui-counter` is the counter with two buttons and keyboard
+activation, and `vilan/examples/ui-list` a keyed list of 10,000 rows in a
+`scroll` — a click changes one row, and keys add a row at the top, remove one and
+move one; their end-to-end test drives both through the X server, by pointer and
+keyboard, and holds every frame to "only on change".
 
 ## Debug by default
 
@@ -545,7 +601,8 @@ the point of emitting a language rather than machine code. `vilan build
 A desktop window shows a web page and nothing more yet: no menus, tray icon,
 notifications, deep links, secure token storage, or second window to manage,
 and no installer or package — each is its own slice. A GPU window's **native
-UI** (`std::ui`) has its elements, layout, styles, events, focus and scrolling;
+UI** (`std::ui`) has its elements, layout, styles, events, focus, scrolling, and
+keyed lists and conditional children;
 its components (`std::ui::kit`: a button with behaviour, a text input, a virtual
 list) come next, and paths, text editing, input methods and accessibility after
 them.

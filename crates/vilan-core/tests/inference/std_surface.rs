@@ -9787,3 +9787,140 @@ fn ui_p3_style_conditions_are_plain_values_and_compose() {
         "3\n2\n700\n0\n4\ntrue\n0\n",
     );
 }
+
+// ----------------------------------------- native-ui.md R9: reactive children ---
+//
+// A child position of `std::ui`'s tree can be REACTIVE — `each`, `each_by`,
+// `each_values`, `when`, `swap` — written in a hole as the web UI writes them
+// (`child` takes anything `ChildSlot`). What they do to the tree (insert,
+// remove, move; state across a reorder; handlers dropped on removal) is pinned
+// by `vilan-rt-gfx`'s unit tests and `ui_interaction.rs`'s keyed list; these
+// pin the surface.
+
+fn ui_r9_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::gfx::{{ Size, dp }};
+        import std::reactive::{{ ListCell, Signal, SignalCell }};
+        import std::ui::{{
+            ChildSlot, Element, column, each, each_by, each_values, layout, row, swap, text, when,
+        }};
+        struct Item {{
+            id: i32,
+            name: str,
+        }}
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+/// Every reactive form fills a hole among static siblings, and an `Option` of
+/// an element fills one statically; the program checks.
+#[test]
+fn ui_r9_every_reactive_child_fills_a_hole_and_checks_clean() {
+    let body = r#"
+        let items: ListCell<i32> = ListCell::of([1, 2, 3]);
+        let named: SignalCell<List<Item>> = Signal::new([Item { id = 1, name = "a" }]);
+        let shown: SignalCell<bool> = Signal::new(true);
+        let mode: SignalCell<i32> = Signal::new(0);
+        let badge: Option<Element> = None;
+        let screen = <column>
+            "head"
+            {each(items, |item: i32| item, |item: i32| <row>{i"{item}"}</row>)}
+            {each_values(items, |item: i32| <text>{i"{item}"}</text>)}
+            {each_by(named, |item: Item| item.id, |item: SignalCell<Item>| <text>{item.derive(|now: Item| now.name)}</text>)}
+            {when(shown, || <text>"on"</text>)}
+            {swap(mode, |value: i32| if value == 0 { <text>"zero"</text>.element() } else { <row>"many"</row>.element() })}
+            {badge}
+            "tail"
+        </column>;
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_r9_program(body)) {
+        panic!("std::ui's reactive children must check: {errors:#?}");
+    }
+}
+
+/// A row is ONE element: a render closure answers anything `Child` (an
+/// element of any kind, a `str`), and a value that is none is the bound's
+/// ordinary refusal at the call.
+#[test]
+fn ui_r9_a_row_is_one_element_and_anything_else_is_refused() {
+    let errors = f1_m2_check(&ui_r9_program(
+        r#"
+        let items: ListCell<i32> = ListCell::of([1]);
+        let screen = column().child(each(items, |item: i32| item, |item: i32| item));
+        "#,
+    ))
+    .expect_err("a row that is not an element must be refused");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("does not implement trait 'Child'")),
+        "{errors:#?}"
+    );
+}
+
+/// The reactive forms are ChildSlot VALUES: a helper can answer one, naming
+/// its type, and `child` places it at the parent's current end.
+#[test]
+fn ui_r9_a_reactive_child_is_a_value_a_helper_can_answer() {
+    let body = r#"
+        let shown: SignalCell<bool> = Signal::new(false);
+        let screen = column().child("first").child(badge(shown)).child("last");
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+    "#;
+    let program = ui_r9_program(body).replace("ChildSlot, ", "ChildSlot, Text, When, ")
+        + concat!(
+            "\nfun badge(shown: SignalCell<bool>): When<SignalCell<bool>, Text> {\n",
+            "\twhen(shown, || text().child(\"new\"))\n",
+            "}\n",
+        );
+    if let Err(errors) = f1_m2_check(&program) {
+        panic!("a reactive child must be a value: {errors:#?}");
+    }
+}
+
+/// Item 2 of the R9 lane (`Bindable` against `std::reactive`'s `MaybeSignal`):
+/// `std::ui` KEEPS `Bindable` — a binding with no ambient owner belongs to its
+/// source — and the reactive children follow the same rule, so a tree with
+/// signal-bound attributes, a keyed list and a conditional can be built at the
+/// top of `main`, with no owner, and checks. (`MaybeSignal` would check here
+/// too since B737, but the native backend mints a context parameter per
+/// FUNCTION, not per instance — F36 — and refuses every static `.gap(dp(8))`
+/// reached from code with no owner; `native_differential`'s F36 pin holds
+/// that gap.)
+#[test]
+fn ui_r9_a_bound_tree_needs_no_owner_at_the_top_of_main() {
+    let body = r#"
+        let count: SignalCell<i32> = Signal::new(0);
+        let items: ListCell<i32> = ListCell::of([1, 2]);
+        let screen = column()
+            .gap(count.derive(|value: i32| dp(value.as_f64())))
+            .child(text().child(count.derive(|value: i32| i"{value}")))
+            .child(each(items, |item: i32| item, |item: i32| <text>{i"{item}"}</text>))
+            .child(when(count.derive(|value: i32| value > 0), || <text>"some"</text>));
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_r9_program(body)) {
+        panic!("a bound tree must check with no owner: {errors:#?}");
+    }
+}
+
+/// A program reaching a reactive child reaches `std::ui`: the JavaScript build
+/// refuses it by the module's name, as it does any element.
+#[test]
+fn ui_r9_the_javascript_build_refuses_a_reactive_child_by_the_modules_name() {
+    assert_fails_with(
+        &ui_r9_program(
+            r#"
+            let shown: SignalCell<bool> = Signal::new(true);
+            let screen = column().child(when(shown, || <text>"on"</text>));
+            "#,
+        ),
+        "this program reaches `std::ui` (its `__ui_",
+    );
+}

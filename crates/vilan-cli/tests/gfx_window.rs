@@ -42,16 +42,13 @@
 //! goldens with `VILAN_REGENERATE_GFX_GOLDENS=1` and LOOK at them before
 //! committing.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// How long one run may take before it is a hang. A run takes a few seconds
-/// warm (one of them the program's own idle second); the bound is for a
-/// loaded CI runner.
-const RUN_LIMIT: Duration = Duration::from_secs(120);
+mod support;
+
+use support::xvfb::Running;
 
 /// The window's title, by which the injector finds it.
 const TITLE: &str = "vilan gfx";
@@ -198,132 +195,6 @@ fn build_injector() -> PathBuf {
     target.join("debug/examples/x11_input")
 }
 
-/// A program in a virtual display, its stdout arriving line by line. The
-/// first line is the wrapper's: the display and its authority file, which
-/// the injector connects with.
-struct Running {
-    child: std::process::Child,
-    lines: mpsc::Receiver<String>,
-    seen: Vec<String>,
-    display: String,
-    authority: String,
-}
-
-impl Running {
-    fn start(binary: &Path, arguments: &[&str]) -> Running {
-        let mut child = Command::new("xvfb-run")
-            .args(["-a", "-s", "-screen 0 1280x1024x24", "sh", "-c"])
-            .arg("printf 'display %s %s\\n' \"$DISPLAY\" \"$XAUTHORITY\"; exec \"$0\" \"$@\"")
-            .arg(binary)
-            .args(arguments)
-            // X11 under xvfb whatever session the suite runs in, at 100%.
-            .env_remove("WAYLAND_DISPLAY")
-            .env_remove("WAYLAND_SOCKET")
-            .env("WINIT_X11_SCALE_FACTOR", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start the program under xvfb-run");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (sender, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if sender.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let started = Instant::now();
-        let first = lines
-            .recv_timeout(RUN_LIMIT)
-            .expect("the wrapper names the display");
-        let mut words = first.split_whitespace();
-        assert_eq!(words.next(), Some("display"), "{first}");
-        let display = words.next().expect("a display").to_string();
-        let authority = words.next().unwrap_or_default().to_string();
-        assert!(started.elapsed() < RUN_LIMIT);
-        Running {
-            child,
-            lines,
-            seen: Vec::new(),
-            display,
-            authority,
-        }
-    }
-
-    /// Waits for a line containing `wanted`, recording every line on the way.
-    fn wait_for(&mut self, wanted: &str, started: Instant) {
-        loop {
-            let left = RUN_LIMIT.saturating_sub(started.elapsed());
-            match self.lines.recv_timeout(left) {
-                Ok(line) => {
-                    let found = line.contains(wanted);
-                    self.seen.push(line);
-                    if found {
-                        return;
-                    }
-                }
-                Err(_) => {
-                    let _ = self.child.kill();
-                    let stderr = self.stderr();
-                    panic!(
-                        "the program never printed {wanted:?}; it printed:\n{}\n--- stderr\n{stderr}",
-                        self.seen.join("\n")
-                    );
-                }
-            }
-        }
-    }
-
-    fn stderr(&mut self) -> String {
-        let mut text = String::new();
-        if let Some(mut stderr) = self.child.stderr.take() {
-            let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
-        }
-        text
-    }
-
-    /// Moves, presses, releases or closes, through the X server, and returns
-    /// once the server has handled it.
-    fn inject(&self, injector: &Path, commands: &[&str]) {
-        let status = Command::new(injector)
-            .args(["--title", TITLE])
-            .args(commands)
-            .env("DISPLAY", &self.display)
-            .env("XAUTHORITY", &self.authority)
-            .status()
-            .expect("run the injector");
-        assert!(status.success(), "injecting {commands:?} failed: {status}");
-    }
-
-    /// Waits for the program to exit: its code, every stdout line, stderr.
-    fn exit(mut self, started: Instant) -> (Option<i32>, Vec<String>, String) {
-        loop {
-            if let Some(status) = self.child.try_wait().expect("wait on the program") {
-                // The reader thread ends at the pipe's end, after the last
-                // line; collect them all.
-                while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(5)) {
-                    self.seen.push(line);
-                }
-                let stderr = self.stderr();
-                return (status.code(), self.seen, stderr);
-            }
-            if started.elapsed() > RUN_LIMIT {
-                let _ = self.child.kill();
-                panic!(
-                    "the program did not exit; it printed:\n{}",
-                    self.seen.join("\n")
-                );
-            }
-            // A bounded poll of a process that has ALREADY been asked to end
-            // (the ordering is the output's, above): the interval only sets
-            // how soon the exit is noticed.
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
 /// The pids running `binary`, read from `/proc` — the program under
 /// `xvfb-run` and `sh`, which is the process SIGTERM is for.
 fn pids_running(binary: &Path) -> Vec<i32> {
@@ -436,7 +307,7 @@ fn the_gfx_example_draws_on_change_counts_a_click_and_ends_cleanly() {
 
     // 1-5. Hover, press, click, leave, idle, close — through the X server.
     let started = Instant::now();
-    let mut running = Running::start(&binary, &["--smoke"]);
+    let mut running = Running::start(&binary, &["--smoke"], TITLE);
     running.wait_for("frame 1 ", started);
     // The button is 144 x 48 dp at (108, 140); at 100% a dp is a pixel.
     running.inject(&injector, &["move", "180", "164"]);
@@ -470,7 +341,7 @@ fn the_gfx_example_draws_on_change_counts_a_click_and_ends_cleanly() {
 
     // 6. SIGTERM with the window open.
     let started = Instant::now();
-    let mut running = Running::start(&binary, &["--smoke"]);
+    let mut running = Running::start(&binary, &["--smoke"], TITLE);
     running.wait_for("frame 1 ", started);
     let pids = pids_running(&binary);
     assert_eq!(
@@ -499,7 +370,7 @@ fn the_gfx_example_draws_on_change_counts_a_click_and_ends_cleanly() {
     // 7. A failure inside a frame callback is the program's failure.
     let failing = build_failing_program();
     let started = Instant::now();
-    let mut running = Running::start(&failing, &[]);
+    let mut running = Running::start(&failing, &[], TITLE);
     running.wait_for("drawing", started);
     let (code, seen, stderr) = running.exit(started);
     assert_eq!(

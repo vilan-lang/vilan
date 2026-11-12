@@ -25,11 +25,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// How long the window may take to open, draw and close: a few seconds warm,
-/// the bound is for a loaded CI runner.
-const RUN_LIMIT: Duration = Duration::from_secs(120);
+mod support;
+
+use support::xvfb::Running;
 
 /// The two window sizes and two scales the listing records, in dp.
 const LAYOUTS: [(u32, u32, f64); 4] = [
@@ -215,41 +215,14 @@ fn the_ui_example_lays_out_to_its_recorded_rectangles_and_draws_its_goldens() {
         );
     }
 
-    // 3. A real window: laid out at its size, one frame, closed.
-    let log = scratch().join("smoke.log");
-    let errors = scratch().join("smoke-errors.log");
-    let mut child = Command::new("xvfb-run")
-        .args(["-a", "-s", "-screen 0 1280x1024x24"])
-        .arg(&binary)
-        .arg("--smoke")
-        .env_remove("WAYLAND_DISPLAY")
-        .env_remove("WAYLAND_SOCKET")
-        .env("WINIT_X11_SCALE_FACTOR", "1")
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(&log).expect("the smoke log"))
-        .stderr(std::fs::File::create(&errors).expect("the smoke's errors"))
-        .spawn()
-        .expect("run the window under xvfb-run");
+    // 3. A real window: laid out at its size, one frame, closed. The run is a
+    // process group the harness ends whatever happens here (N198).
     let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait on the window") {
-            break status;
-        }
-        if started.elapsed() > RUN_LIMIT {
-            let _ = child.kill();
-            panic!(
-                "the window did not close itself after its first frame:\n{}",
-                std::fs::read_to_string(&log).unwrap_or_default()
-            );
-        }
-        // A bounded poll of a program that ends by itself after one frame:
-        // the interval only sets how soon its exit is noticed.
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let stderr = std::fs::read_to_string(&errors).unwrap_or_default();
-    let said = std::fs::read_to_string(&log).unwrap_or_default();
+    let running = Running::start(&binary, &["--smoke"], "vilan ui");
+    let (code, seen, stderr) = running.exit(started);
+    let said = seen.join("\n");
     assert!(
-        status.success() && said.contains("frame 960 x 640 at 1"),
-        "the window did not lay the screen out at its size ({status}):\n{said}{stderr}"
+        code == Some(0) && said.contains("frame 960 x 640 at 1"),
+        "the window did not lay the screen out at its size ({code:?}):\n{said}\n{stderr}"
     );
 }

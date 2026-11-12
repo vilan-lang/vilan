@@ -1691,6 +1691,122 @@ fn n149_a_generic_print_of_negative_zero_is_identical_on_both_backends() {
     }
 }
 
+/// A blanket over a blanket (`RowFeed` over `DeltaFeed`, which a `ListCell`
+/// has through `Source<List<T>>` and `DeltaSource<List<T>, SeqOp<T>>`): the
+/// inner provider grounds its arguments one step deep, `List<T'>` in its own
+/// binder, and the native emitter met `open_rows`'s element unbound — every
+/// generic consumer of a `ListCell` (`std::ui`'s `each`) was refused. A cell
+/// with one blanket between (`SignalCell<List<str>>`) always worked; both are
+/// held here.
+#[test]
+fn a_blanket_over_a_blanket_binds_the_element_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_row_feed_over_list_cell.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::reactive::{ ListCell, RowFeed, Signal, SignalCell };\n",
+            "\n",
+            "fun opened<T, S: RowFeed<T>>(own source: S): i32 {\n",
+            "\tlet instance = source.open_rows();\n",
+            "\t(instance.snapshot)().len().as_i32()\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet numbers: ListCell<i32> = ListCell::of([1, 2, 3]);\n",
+            "\tprint(opened(numbers));\n",
+            "\tlet names: SignalCell<List<str>> = Signal::new([\"a\"]);\n",
+            "\tprint(opened(names));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "3\n1\n", "{backend:?}");
+    }
+}
+
+/// A cell around a bare `None` under a written annotation: natively the `None`
+/// names no `T`, and Rust took the cell's element from its first reader — a
+/// generic one in `std::ui`'s `when` and `swap`, which could not settle it
+/// (E0282), or none at all. The annotation is written, as it is for a cell
+/// around an empty list (F74).
+#[test]
+fn a_cell_around_a_bare_none_is_typed_by_its_annotation_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_cell_around_none.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::shared::Shared;\n",
+            "\n",
+            "fun describe<T>(value: Option<T>): str {\n",
+            "\tmatch value {\n",
+            "\t\tSome(let _held) => \"some\",\n",
+            "\t\tNone => \"none\",\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun held<T>(value: T): str {\n",
+            "\tlet live: Shared<Option<T>> = Shared::new(None);\n",
+            "\tlet before = describe(live.read());\n",
+            "\tlive.write() = Some(value);\n",
+            "\tbefore + \" \" + describe(live.read())\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(held(7));\n",
+            "\tprint(held(\"text\"));\n",
+            "\tlet unread: Shared<Option<i32>> = Shared::new(None);\n",
+            "\tprint(\"done\");\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "none some\nnone some\ndone\n", "{backend:?}");
+    }
+}
+
+/// F36, the reason `std::ui` keeps `Bindable` rather than `std::reactive`'s
+/// `MaybeSignal` (the R9 lane's item 2): the context pass mints a hidden
+/// `Owner` parameter on a FUNCTION when one candidate of a dispatch inside it
+/// reads the owner — `MaybeSignal`'s reactive arm does — so the instance a
+/// STATIC argument selects declares it too, and a caller with no owner threads
+/// none. The checker resolves the site per call (B737) and accepts the
+/// program; JavaScript passes `undefined`; the native emitter refuses the call
+/// by name. Un-ignore when instances carry their own context needs.
+#[test]
+#[ignore = "F36: a static MaybeSignal argument reached through a generic function is refused natively"]
+fn f36_a_static_maybe_signal_through_a_generic_needs_no_owner_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f36_static_maybe_signal.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::reactive::MaybeSignal;\n",
+            "\n",
+            "fun shown<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tvalue.bind(|text: str| print(text));\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tshown(\"static\");\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "static\n", "{backend:?}");
+    }
+}
+
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
 ///
 /// It prints the census — refused / identical — because that census IS the

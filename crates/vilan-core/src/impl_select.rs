@@ -418,7 +418,7 @@ fn bound_arguments_hold(
     }
     providers
         .iter()
-        .any(|(_, provided)| arguments_agree(program, wanted, provided))
+        .any(|provider| arguments_agree(program, wanted, &provider.arguments))
 }
 
 /// Whether a provider's arguments agree with what a bound WROTE — position by
@@ -848,11 +848,12 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
             if bound_arguments.is_empty() {
                 continue;
             }
-            let Some(provided) =
+            let Some(provider) =
                 provided_trait_arguments_matching(program, concrete, trait_id, &bound_arguments)
             else {
                 continue;
             };
+            let provided = provider.arguments;
             if provided.len() != bound_arguments.len() {
                 continue;
             }
@@ -871,6 +872,15 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
                 bind_subject(program, *pattern, actual, &mut from_bound);
             }
             for (binder, value) in from_bound {
+                // A provided argument is grounded one step deep (`ground_id`):
+                // a CONSTRUCTED one stays as its provider wrote it, so matching
+                // `List<type T>` against `ListCell<i32>`'s `List<T'>` binds `T`
+                // to the provider's own binder `T'`. The provider's bindings
+                // say what `T'` is (`i32`); follow them, or a blanket over a
+                // blanket (`RowFeed` over `DeltaFeed` over `ListCell`'s
+                // `Source<List<T'>>`) answered a binder where a type was due
+                // and the native emitter refused the instance as unbound.
+                let value = through_bindings(program, value, &provider.bindings);
                 bindings.entry(binder).or_insert(value);
             }
         }
@@ -975,24 +985,53 @@ fn provided_trait_arguments_matching(
     concrete: TypeId,
     trait_id: Id,
     wanted: &[TypeId],
-) -> Option<Vec<TypeId>> {
-    let providers: Vec<(TypeId, Vec<TypeId>)> =
-        provided_trait_argument_sets(program, concrete, trait_id)
-            .into_iter()
-            .filter(|(_, provided)| arguments_agree(program, wanted, provided))
-            .collect();
-    let maxima: Vec<&(TypeId, Vec<TypeId>)> = providers
+) -> Option<ProvidedSet> {
+    let providers: Vec<ProvidedSet> = provided_trait_argument_sets(program, concrete, trait_id)
+        .into_iter()
+        .filter(|provider| arguments_agree(program, wanted, &provider.arguments))
+        .collect();
+    let maxima: Vec<&ProvidedSet> = providers
         .iter()
-        .filter(|(subject, _)| {
+        .filter(|provider| {
             !providers
                 .iter()
-                .any(|(other, _)| subject_outranks(program, *other, *subject))
+                .any(|other| subject_outranks(program, other.subject, provider.subject))
         })
         .collect();
     match maxima.as_slice() {
-        [only] => Some(only.1.clone()),
-        _ => providers.first().map(|(_, provided)| provided.clone()),
+        [only] => Some((*only).clone()),
+        _ => providers.first().cloned(),
     }
+}
+
+/// One provider of a trait for a concrete type: the impl's subject, the
+/// arguments it provides grounded one step deep (`ground_id`), and the
+/// bindings of its own binders that grounding read — what a caller follows to
+/// ground a binder that is still inside a constructed argument.
+#[derive(Clone, Debug)]
+pub(crate) struct ProvidedSet {
+    subject: TypeId,
+    arguments: Vec<TypeId>,
+    bindings: HashMap<TypeId, TypeId>,
+}
+
+/// `value`, followed through `bindings` while it is a binder they bind (a
+/// bounded walk: a binding chain is as long as the blankets it crosses).
+fn through_bindings(
+    program: &Program,
+    mut value: TypeId,
+    bindings: &HashMap<TypeId, TypeId>,
+) -> TypeId {
+    for _ in 0..16 {
+        match program.type_id_to_type_map.get(&value) {
+            Some(Type::Generic(constraint_id)) => match bindings.get(constraint_id) {
+                Some(next) if *next != value => value = *next,
+                _ => return value,
+            },
+            _ => return value,
+        }
+    }
+    value
 }
 
 /// Every applying provider of `trait_id` for `concrete`, with the arguments it
@@ -1005,7 +1044,7 @@ fn provided_trait_argument_sets(
     program: &Program,
     concrete: TypeId,
     trait_id: Id,
-) -> Vec<(TypeId, Vec<TypeId>)> {
+) -> Vec<ProvidedSet> {
     debug_assert!(
         PROVING.with(|proving| proving.borrow().is_empty()),
         "provided_trait_argument_sets is never asked inside a provides_trait proof"
@@ -1027,7 +1066,7 @@ fn provided_trait_argument_sets_uncached(
     program: &Program,
     concrete: TypeId,
     trait_id: Id,
-) -> Vec<(TypeId, Vec<TypeId>)> {
+) -> Vec<ProvidedSet> {
     let mut providers = Vec::new();
     // B475's native half: a trait OBJECT provides its trait and that trait's
     // supertraits at the arguments it carries, threaded down the chain — no
@@ -1040,7 +1079,11 @@ fn provided_trait_argument_sets_uncached(
         && let Some(arguments) =
             object_trait_arguments(program, *object_trait_id, object_arguments, trait_id)
     {
-        providers.push((concrete, arguments));
+        providers.push(ProvidedSet {
+            subject: concrete,
+            arguments,
+            bindings: HashMap::default(),
+        });
     }
     for implementation in &program.implementations {
         // B419: through the supertrait chain — a one-block subtrait impl
@@ -1062,13 +1105,14 @@ fn provided_trait_argument_sets_uncached(
         // the receiver's own impls too, or `Upstream`'s argument comes back as
         // the blanket's bare `T` (B379's analyzer half, here for emission).
         bind_bound_binders(program, implementation.subject, &mut bindings);
-        providers.push((
-            implementation.subject,
-            written
+        providers.push(ProvidedSet {
+            subject: implementation.subject,
+            arguments: written
                 .iter()
                 .map(|argument| ground_id(program, *argument, &bindings))
                 .collect(),
-        ));
+            bindings,
+        });
     }
     providers
 }
@@ -1231,7 +1275,7 @@ pub struct SelectionMemos {
     /// [`memoized_proof`]'s answers.
     proofs: std::sync::Mutex<HashMap<ProofKey, bool>>,
     /// [`provided_trait_argument_sets`]' answers.
-    argument_sets: std::sync::Mutex<HashMap<(TypeId, Id), Vec<(TypeId, Vec<TypeId>)>>>,
+    argument_sets: std::sync::Mutex<HashMap<(TypeId, Id), Vec<ProvidedSet>>>,
     /// Per trait, the impls whose `with` clause provides it or a subtrait of
     /// it ([`provided_trait_ids`]), in declaration order.
     providers: std::sync::OnceLock<HashMap<Id, Vec<usize>>>,
@@ -1268,18 +1312,13 @@ impl SelectionMemos {
         locked(&self.proofs).insert(key, answer);
     }
 
-    fn argument_sets(&self, concrete: TypeId, trait_id: Id) -> Option<Vec<(TypeId, Vec<TypeId>)>> {
+    fn argument_sets(&self, concrete: TypeId, trait_id: Id) -> Option<Vec<ProvidedSet>> {
         locked(&self.argument_sets)
             .get(&(concrete, trait_id))
             .cloned()
     }
 
-    fn store_argument_sets(
-        &self,
-        concrete: TypeId,
-        trait_id: Id,
-        providers: Vec<(TypeId, Vec<TypeId>)>,
-    ) {
+    fn store_argument_sets(&self, concrete: TypeId, trait_id: Id, providers: Vec<ProvidedSet>) {
         locked(&self.argument_sets).insert((concrete, trait_id), providers);
     }
 
