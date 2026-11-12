@@ -11,6 +11,7 @@ use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
 
+use super::editing::{EditingGeometry, GraphemeBox, LineBox};
 use super::{
     FontFamily, GlyphContent, LayoutData, RasterizedGlyph, ShapedGlyph, ShapedRun, TextEngine,
     TextStyle,
@@ -105,6 +106,57 @@ impl ParleyEngine {
     }
 }
 
+/// Where each grapheme of `layout` is (`editing.rs`): parley's clusters are
+/// graphemes (intersected with its runs), and each line's glyph runs carry
+/// their clusters in visual order from the run's offset.
+fn editing_geometry(layout: &Layout<()>, text: &str, style: &TextStyle) -> EditingGeometry {
+    let mut graphemes = Vec::new();
+    let mut lines = Vec::new();
+    for (index, line) in layout.lines().enumerate() {
+        let metrics = line.metrics();
+        lines.push(LineBox {
+            top: metrics.block_min_coord,
+            height: metrics.block_max_coord - metrics.block_min_coord,
+        });
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+            let mut x = glyph_run.offset();
+            for cluster in glyph_run.run().visual_clusters() {
+                let range = cluster.text_range();
+                let word = text
+                    .get(range.clone())
+                    .and_then(|grapheme| grapheme.chars().next())
+                    .is_some_and(char::is_alphanumeric);
+                graphemes.push(GraphemeBox {
+                    start: range.start,
+                    end: range.end,
+                    x,
+                    width: cluster.advance(),
+                    line: index,
+                    rtl: cluster.is_rtl(),
+                    word,
+                });
+                x += cluster.advance();
+            }
+        }
+    }
+    if lines.is_empty() {
+        // No line at all (an empty text, for some engines): the caret's line
+        // is one of the style's height.
+        lines.push(LineBox {
+            top: 0.0,
+            height: style.size * style.line_height,
+        });
+    }
+    EditingGeometry {
+        text_len: text.len(),
+        graphemes,
+        lines,
+    }
+}
+
 fn family_property(family: &FontFamily) -> parley::FontFamily<'static> {
     match family {
         FontFamily::SansSerif => GenericFamily::SansSerif.into(),
@@ -139,7 +191,13 @@ impl TextEngine for ParleyEngine {
             .collect()
     }
 
-    fn shape(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> LayoutData {
+    fn shape(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+        editing: bool,
+    ) -> LayoutData {
         // Scale 1 and NO quantisation: positions stay fractional dp, so the
         // renderer can place them on any device grid (the module's header).
         let mut builder =
@@ -191,6 +249,7 @@ impl TextEngine for ParleyEngine {
             line_count,
             first_baseline: layout.first_baseline().unwrap_or(0.0),
             runs,
+            editing: editing.then(|| editing_geometry(&layout, text, style)),
         }
     }
 

@@ -1,0 +1,558 @@
+// A todo list on `std::ui::kit` (native-ui.md part P4's exit test): a text input
+// adds an item (Enter, or the Add button), a checkbox checks it off, a button
+// removes it. The kit gives each control its behaviour — focus, the pointer, the
+// keys, the caret — and nothing else: every colour, radius and spacing below is
+// this program's.
+//
+// Modes, for the end-to-end test:
+//
+//   --smoke         a line per frame (the draft, the items, the focus) and the
+//                   boxes the test aims at: the input's after the first frame,
+//                   and an item's checkbox and remove button after the frame
+//                   that first shows it
+//   --check --font <ttf>
+//                   no window: the screen laid out and driven with `deliver` —
+//                   typing, the caret keys, a selection by Shift and by a drag,
+//                   graphemes, Enter, a click on a checkbox, Space on a focused
+//                   one, a click on a remove button — with the state each step
+//                   left printed
+
+import std::display::Display;
+import std::fs::read_bytes;
+import std::gfx::{
+	Border,
+	Button,
+	Color,
+	Event,
+	FontFamily,
+	Frame,
+	KeyName,
+	KeyPress,
+	Modifiers,
+	Point,
+	Pointer,
+	Size,
+	Window,
+	dp,
+	register_font,
+};
+import std::io::print;
+import std::process::{ args, exit };
+import std::range::Range;
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::shared::Shared;
+import std::ui::kit::{ TextInput, button, checkbox, text_input };
+import std::ui::{
+	Align,
+	Anchor,
+	Element,
+	Justify,
+	Length,
+	OutlineEntry,
+	Style,
+	column,
+	deliver,
+	draw,
+	each_by,
+	focused,
+	hovered,
+	layout,
+	mount,
+	pressed,
+	row,
+	scroll,
+	stack,
+	style,
+	text,
+	when,
+};
+
+/// One item: its id (its key), its title, and whether it is done — a cell, which
+/// its checkbox reads and writes.
+struct Item {
+	id: i32,
+	title: str,
+	done: SignalCell<bool>,
+}
+
+// --- The app's look: the kit has none -------------------------------------------
+
+fun ink(): Color {
+	Color::rgb(32, 34, 44)
+}
+
+fun accent(): Color {
+	Color::rgb(46, 104, 220)
+}
+
+fun screen_look(font: str): Style {
+	let base = if font == "" { style() } else { style().font(FontFamily::Named(font)) };
+	base.background(Color::rgb(246, 246, 242)).text_color(ink()).text_size(dp(15))
+}
+
+fun field_look(): Style {
+	style()
+		.background(Color::white())
+		.radius(dp(6))
+		.border(Border::all(dp(1), Color::rgb(190, 192, 200)))
+		.when(hovered(), |look: Style| look.border(Border::all(dp(1), Color::rgb(140, 144, 160))))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), accent())))
+}
+
+fun button_look(): Style {
+	style()
+		.background(accent())
+		.text_color(Color::white())
+		.radius(dp(6))
+		.border(Border::all(dp(2), accent()))
+		.when(hovered(), |look: Style| look.background(Color::rgb(70, 126, 240)))
+		.when(pressed(), |look: Style| look.background(Color::rgb(30, 80, 190)))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), Color::rgb(255, 196, 60))))
+}
+
+/// The Add button while there is nothing to add: grey, and no hover look.
+fun button_off_look(): Style {
+	style()
+		.background(Color::rgb(200, 202, 208))
+		.text_color(Color::rgb(120, 122, 130))
+		.radius(dp(6))
+		.border(Border::all(dp(2), Color::rgb(200, 202, 208)))
+}
+
+fun remove_look(): Style {
+	style()
+		.text_color(Color::rgb(170, 60, 60))
+		.radius(dp(4))
+		.border(Border::all(dp(1), Color::rgba(0, 0, 0, 0.0)))
+		.when(hovered(), |look: Style| look.background(Color::rgb(250, 228, 228)))
+		.when(focused(), |look: Style| look.border(Border::all(dp(1), Color::rgb(170, 60, 60))))
+}
+
+fun item_look(): Style {
+	style().background(Color::white()).radius(dp(6))
+}
+
+/// The checkbox's box: outlined, and filled while checked.
+fun box_look(checked: bool): Style {
+	let base = style().radius(dp(4)).border(Border::all(dp(2), accent()));
+	if checked {
+		base.background(accent())
+	} else {
+		base.background(Color::white())
+	}
+}
+
+/// The checkbox itself (around the box): ringed while it has the focus — the
+/// condition reads the focusable element's own state, so it is set here, not on
+/// the box inside it.
+fun check_look(): Style {
+	style()
+		.radius(dp(6))
+		.border(Border::all(dp(2), Color::rgba(0, 0, 0, 0.0)))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), Color::rgb(255, 196, 60))))
+}
+
+// --- The screen ------------------------------------------------------------------
+
+/// One item's row: its checkbox (the box and the mark drawn here), its title, its
+/// remove button.
+fun item_row(item: SignalCell<Item>, items: ListCell<Item>, log: |str| void): Element {
+	let now = item.get();
+	let done = now.done;
+	let title = now.title;
+	let id = now.id;
+	let check = checkbox(done)
+		.label(i"check {title}")
+		.padding(dp(3))
+		.style(check_look())
+		.align(Align::Center)
+		.child(<stack width(dp(18)) height(dp(18)) style(done.derive(box_look))>
+			{when(done, ||
+				<stack
+					anchor(Anchor::Center)
+					width(dp(8))
+					height(dp(8))
+					style(style().background(Color::white()).radius(dp(2)))
+				>
+				</stack>)}
+		</stack>);
+	let remove = button("Remove", || {
+		log(i"remove {title}");
+		match position_of(items, id) {
+			Some(let at) => items.remove_at(at),
+			None => {},
+		}
+	}).label(i"remove {title}").padding_x(dp(8)).padding_y(dp(4)).style(remove_look());
+	<row padding(dp(8)) gap(dp(10)) align(Align::Center) style(item_look())>
+		{check}
+		<text
+			grow(1.0)
+			style(done.derive(|off: bool| if off {
+				style().text_color(Color::rgb(150, 152, 160))
+			} else {
+				style()
+			}))
+		>
+			{title}
+		</text>
+		{remove}
+	</row>.element()
+}
+
+fun position_of(items: ListCell<Item>, id: i32): Option<usize> {
+	let list = items.get();
+	mut at: usize = 0;
+	for at < list.len() {
+		if list[at].id == id {
+			ret Some(at);
+		}
+		at += 1;
+	}
+	None
+}
+
+/// What the program holds: the items, the draft, the next id, and the input.
+struct Todo {
+	items: ListCell<Item>,
+	draft: SignalCell<str>,
+	next_id: Shared<i32>,
+	input: TextInput,
+	root: Element,
+}
+
+fun todo(font: str, log: |str| void): Todo {
+	let items: ListCell<Item> = ListCell::of([]);
+	let draft: SignalCell<str> = Signal::new("");
+	let next_id: Shared<i32> = Shared::new(0);
+	let add = |title: str| {
+		let trimmed = title.trim();
+		if trimmed != "" {
+			log(i"add {trimmed}");
+			items.push(Item { id = next_id.read(), title = trimmed, done = Signal::new(false) });
+			next_id.write() = next_id.read() + 1;
+			draft.set("");
+		}
+	};
+	let empty = |now: str| now.trim() == "";
+	let input = text_input(draft)
+		.placeholder("What needs doing?")
+		.placeholder_style(style().text_color(Color::rgb(150, 152, 160)))
+		.caret(accent(), dp(2))
+		.selection_color(Color::rgba(46, 104, 220, 0.25))
+		.label("new item")
+		.grow(1.0)
+		.padding_x(dp(10))
+		.padding_y(dp(8))
+		.style(field_look())
+		.on_submit(|title: str| add(title));
+	let add_button = button("Add", || add(draft.get()))
+		.label("add")
+		.padding_x(dp(16))
+		.padding_y(dp(8))
+		.justify(Justify::Center)
+		.align(Align::Center)
+		.disabled(draft.derive(empty))
+		.style(draft.derive(|now: str| if empty(now) { button_off_look() } else { button_look() }));
+	let left = items.derive(|list: List<Item>| i"{list.len()} items");
+	// The screen hears every key nothing below it stopped: the input stops the
+	// keys it acts on and the keys that type, so a key reaching here while it
+	// has the focus is one it left alone (Tab, say).
+	let root = <column
+		padding(dp(20))
+		gap(dp(12))
+		style(screen_look(font))
+		label("todo")
+		on_key(|key: KeyPress| log("screen key"))
+	>
+		<text style(style().text_size(dp(22)).weight(700))>"Todo"</text>
+		<row gap(dp(8)) align(Align::Center)>
+			{input}
+			{add_button}
+		</row>
+		<scroll grow(1.0) label("list")>
+			<column gap(dp(6))>
+				{each_by(
+					items,
+					|item: Item| item.id,
+					|item: SignalCell<Item>| item_row(item, items, log),
+				)}
+			</column>
+		</scroll>
+		<text label("count")>{left}</text>
+	</column>.element();
+	Todo { items, draft, next_id, input, root }
+}
+
+fun listing(items: ListCell<Item>): str {
+	mut shown: List<str> = [];
+	for item in items.get() {
+		let mark = if item.done.get() { "[x]" } else { "[ ]" };
+		shown.push(i"{mark} {item.title}");
+	}
+	i"[{shown.join(", ")}]"
+}
+
+fun main() {
+	let arguments = args();
+	if arguments.contains("--check") {
+		check(arguments);
+		ret;
+	}
+	let smoke = arguments.contains("--smoke");
+	let window = match Window::builder().title("vilan ui todo").size(dp(420), dp(480)).open() {
+		Ok(let window) => window,
+		// No display, no GPU: say why.
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let log = |line: str| {
+		if smoke {
+			print(line);
+		}
+	};
+	let app = todo("", log);
+	mount(window, app.root);
+	if !smoke {
+		ret;
+	}
+	// Smoke mode: the same frames, through a frame callback of the program's own
+	// so each can be reported, with the boxes the test aims at.
+	let frames: Shared<i32> = Shared::new(0);
+	let boxed: Shared<List<str>> = Shared::new([]);
+	window.on_frame(|frame: Frame| {
+		draw(frame, app.root);
+		frames.write() = frames.read() + 1;
+		let focus = if app.input.element().interaction().focused { "input" } else { "-" };
+		print(i"frame {frames.read()} draft={app.draft.get()} items={listing(app.items)} focus={focus}");
+		for entry in app.root.outline() {
+			let aimed = entry.label == "new item"
+				|| entry.label.starts_with("check ")
+				|| entry.label.starts_with("remove ");
+			if aimed && !boxed.read().contains(entry.label) {
+				boxed.write().push(entry.label);
+				let bounds = entry.bounds;
+				print(i"box {entry.label.replace(" ", "-")} {bounds.x.value()} {bounds.y.value()} {bounds.width.value()} {bounds.height.value()}");
+			}
+		}
+	});
+	window.on_event(|event: Event| {
+		match event {
+			Event::CloseRequested => print(i"close requested after {frames.read()} frames"),
+			_ => {},
+		}
+	});
+}
+
+// --- Check mode: the tree, with no window --------------------------------------------
+
+fun check(arguments: List<str>) {
+	let font = match register_font(read_bytes(after(arguments, "--font"))) {
+		Ok(let families) => families[0],
+		Err(let reason) => {
+			print(i"font: {reason}");
+			exit(2);
+			""
+		},
+	};
+	let size = Size::new(dp(420), dp(480));
+	let lines: Shared<List<str>> = Shared::new([]);
+	let log = |line: str| lines.write().push(line);
+	let app = todo(font, log);
+	let root = app.root;
+	let input = app.input;
+	layout(root, size, 1.0);
+	for entry in root.outline() {
+		if entry.label != "" {
+			print(i"{"  ".repeat(entry.depth)}{entry.kind} {entry.label} {entry.bounds.x.value()} {entry.bounds.y.value()} {entry.bounds.width.value()} {entry.bounds.height.value()}");
+		}
+	}
+
+	let report = |what: str| {
+		layout(root, size, 1.0);
+		let now = input.selection();
+		let focus = if input.element().interaction().focused { "input" } else { "-" };
+		print(i"{what}: draft=\"{app.draft.get()}\" caret={now.caret} anchor={now.anchor} items={listing(app.items)} focus={focus} log=[{lines.read().join(", ")}]");
+		lines.write() = [];
+	};
+	let find = |label: str| {
+		mut found = Point::new(dp(-1), dp(-1));
+		for entry in root.outline() {
+			if entry.label == label {
+				found = Point::new(
+					entry.bounds.x + entry.bounds.width / 2.0,
+					entry.bounds.y + entry.bounds.height / 2.0,
+				);
+			}
+		}
+		found
+	};
+	let no = Modifiers { shift = false, control = false, alt = false, meta = false };
+	let shift = Modifiers { shift = true, control = false, alt = false, meta = false };
+	let control = Modifiers { shift = false, control = true, alt = false, meta = false };
+	let control_shift = Modifiers { shift = true, control = true, alt = false, meta = false };
+	let click = |at: Point, modifiers: Modifiers| {
+		deliver(root, Event::PointerMoved(at));
+		deliver(root, Event::PointerPressed(Pointer {
+			position = at,
+			button = Button::Left,
+			modifiers,
+		}));
+		deliver(root, Event::PointerReleased(Pointer {
+			position = at,
+			button = Button::Left,
+			modifiers,
+		}));
+	};
+	let key = |name: KeyName, modifiers: Modifiers| deliver(root, Event::KeyPressed(KeyPress {
+		key = name,
+		repeat = false,
+		modifiers,
+	}));
+	// A printable key types: its key event, then its text, as a window sends them.
+	let type_text = |typed: str| {
+		key(KeyName::Char(typed), no);
+		deliver(root, Event::TextInput(typed));
+	};
+
+	// 1. A click focuses the input; the Add button is disabled while it is empty.
+	report("start");
+	click(find("add"), no);
+	report("add while empty");
+	click(find("new item"), no);
+	report("focus");
+
+	// 2. Typing, then the caret keys.
+	for letter in ["m", "i", "l", "k"] {
+		type_text(letter);
+	}
+	report("typed milk");
+	key(KeyName::Left, no);
+	key(KeyName::Left, no);
+	report("left twice");
+	type_text("X");
+	report("typed X");
+	key(KeyName::Backspace, no);
+	report("backspace");
+	key(KeyName::Delete, no);
+	report("delete");
+	key(KeyName::Home, no);
+	report("home");
+	key(KeyName::End, shift);
+	report("shift end");
+	key(KeyName::Left, no);
+	report("left collapses");
+	key(KeyName::Right, shift);
+	key(KeyName::Right, shift);
+	report("shift right twice");
+	key(KeyName::Char("a"), control);
+	report("ctrl a");
+	type_text("milk and eggs");
+	report("typed over the selection");
+	key(KeyName::Left, control);
+	report("ctrl left");
+	key(KeyName::Left, control_shift);
+	report("ctrl shift left");
+	key(KeyName::Backspace, control);
+	report("ctrl backspace");
+	key(KeyName::End, no);
+	key(KeyName::Backspace, control);
+	report("ctrl backspace at the end");
+	key(KeyName::Home, no);
+	key(KeyName::Right, control);
+	report("home, ctrl right");
+	key(KeyName::Delete, control);
+	report("ctrl delete");
+	key(KeyName::Home, shift);
+	key(KeyName::Right, no);
+	report("shift home, right collapses");
+	key(KeyName::Char("a"), control);
+	key(KeyName::Delete, no);
+	report("select all, delete");
+
+	// 3. Graphemes: a step, Backspace and Delete take a whole one — a letter with
+	// a combining accent, a thumbs-up with a skin tone (two code points, four
+	// UTF-16 units), a flag (two regional indicators).
+	type_text("e\u{301}\u{1F44D}\u{1F3FD}\u{1F1EB}\u{1F1F7}z");
+	report("typed graphemes");
+	key(KeyName::Left, no);
+	report("left over z");
+	key(KeyName::Left, no);
+	report("left over the flag");
+	key(KeyName::Backspace, no);
+	report("backspace the thumbs-up");
+	key(KeyName::Home, no);
+	key(KeyName::Delete, no);
+	report("delete the accented e");
+	key(KeyName::Char("a"), control);
+	key(KeyName::Delete, no);
+
+	// 4. The pointer: a press places the caret, Shift extends, a drag selects —
+	// while the pointer stays on the input (a move goes to the element under the
+	// pointer, so a drag that leaves the input stops extending there).
+	type_text("bread");
+	let bounds = input.element().bounds();
+	let middle = bounds.y + bounds.height / 2.0;
+	let inside = bounds.x + dp(4);
+	let far = bounds.x + bounds.width - dp(4);
+	click(Point::new(inside, middle), no);
+	report("press at the input's left edge");
+	click(Point::new(bounds.x + dp(33), middle), shift);
+	report("shift press inside the text");
+	let drag = |from: Point, to: Point| {
+		deliver(root, Event::PointerPressed(Pointer {
+			position = from,
+			button = Button::Left,
+			modifiers = no,
+		}));
+		deliver(root, Event::PointerMoved(to));
+		deliver(root, Event::PointerReleased(Pointer {
+			position = to,
+			button = Button::Left,
+			modifiers = no,
+		}));
+	};
+	drag(Point::new(inside, middle), Point::new(far, middle));
+	report("drag across");
+	drag(Point::new(inside, middle), Point::new(far, bounds.y + bounds.height + dp(40)));
+	report("drag off the input");
+
+	// 5. Enter adds the draft (and goes no further: the screen hears no key);
+	// a second item through the Add button.
+	key(KeyName::Enter, no);
+	report("enter");
+	type_text("milk");
+	click(find("add"), no);
+	report("add button");
+
+	// 6. The checkbox: Tab from the input passes the disabled Add button and
+	// reaches the first checkbox, and Space checks it; a click unchecks it.
+	click(find("new item"), no);
+	key(KeyName::Tab, no);
+	key(KeyName::Char(" "), no);
+	report("tab, space");
+	click(find("check bread"), no);
+	report("click check bread");
+	click(find("check milk"), no);
+	report("click check milk");
+
+	// 7. Removing: a click on a remove button.
+	click(find("remove milk"), no);
+	report("remove milk");
+	click(find("remove bread"), no);
+	report("remove bread");
+}
+
+fun after(arguments: List<str>, flag: str): str {
+	for index in Range::new(1, arguments.len().as_i32()) {
+		if arguments[(index - 1).as_usize()] == flag {
+			ret arguments[index.as_usize()];
+		}
+	}
+	print(i"{flag} needs a value");
+	exit(2);
+	""
+}
+
+main();

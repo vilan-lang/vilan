@@ -18625,6 +18625,13 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_insert_before", "ui::insert_before", &[0, 1]),
         ("__ui_remove", "ui::remove", &[0]),
         ("__ui_scroll_into_view", "ui::scroll_into_view", &[0]),
+        // P4: `std::ui::kit`'s text input (`vilan/std/src/ui/kit/input.vl`):
+        // an edited text's caret and selection, and where a point or a step
+        // lands in it.
+        ("__ui_text_edit", "ui::text_edit", &[0]),
+        ("__ui_text_edit_look", "ui::text_edit_look", &[0]),
+        ("__ui_text_index_at", "ui::text_index_at", &[0]),
+        ("__ui_text_step", "ui::text_step", &[0]),
     ];
     FUNCTIONS
         .iter()

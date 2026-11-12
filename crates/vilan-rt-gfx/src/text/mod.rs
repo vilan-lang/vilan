@@ -28,13 +28,15 @@
 //! WebGL2 lacks, and it is wrong on rotated or transparent surfaces. Glyphs are
 //! greyscale coverage (or colour, for emoji).
 
+pub(crate) mod editing;
 pub(crate) mod parley_engine;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::GfxError;
-use crate::geometry::Size;
+use crate::geometry::{Point, Rect, Size};
+use editing::EditingGeometry;
 
 /// Horizontal subpixel positions a glyph is rasterised at: a quarter pixel.
 /// Four is GPUI's choice and the usual one: finer bins multiply atlas entries
@@ -96,6 +98,9 @@ pub(crate) struct LayoutData {
     pub(crate) line_count: usize,
     pub(crate) first_baseline: f32,
     pub(crate) runs: Vec<ShapedRun>,
+    /// Where each grapheme is, for a layout shaped for editing
+    /// ([`TextSystem::editable_layout`]); `None` for every other.
+    pub(crate) editing: Option<EditingGeometry>,
 }
 
 /// A run of glyphs in one font instance at one size.
@@ -138,6 +143,39 @@ impl TextLayout {
     /// Glyphs in the layout (one per positioned glyph, including spaces).
     pub fn glyph_count(&self) -> usize {
         self.data.runs.iter().map(|run| run.glyphs.len()).sum()
+    }
+
+    /// Whether it was shaped for editing, so the caret questions below have
+    /// answers ([`TextSystem::editable_layout`]).
+    pub fn is_editable(&self) -> bool {
+        self.data.editing.is_some()
+    }
+
+    /// The caret at byte `index` of the text (snapped to the start of the
+    /// grapheme it is inside): a `width` wide rectangle at the grapheme's
+    /// leading edge, as tall as its line, in dp from the layout's top-left.
+    /// `None` for a layout not shaped for editing. See `editing.rs`.
+    pub fn caret(&self, index: usize, width: f32) -> Option<Rect> {
+        Some(self.data.editing.as_ref()?.caret(index, width))
+    }
+
+    /// The caret position (a byte index on a grapheme boundary) nearest
+    /// `point`, in dp from the layout's top-left.
+    pub fn index_at(&self, point: Point) -> Option<usize> {
+        Some(self.data.editing.as_ref()?.index_at(point))
+    }
+
+    /// The next (`forward`) or previous grapheme boundary from byte `index`,
+    /// or with `word` the end of the next word or the start of the previous
+    /// one.
+    pub fn step(&self, index: usize, forward: bool, word: bool) -> Option<usize> {
+        Some(self.data.editing.as_ref()?.step(index, forward, word))
+    }
+
+    /// The rectangles the graphemes between byte indices `from` and `to`
+    /// cover, merged where they touch on a line.
+    pub fn selection(&self, from: usize, to: usize) -> Option<Vec<Rect>> {
+        Some(self.data.editing.as_ref()?.selection(from, to))
     }
 }
 
@@ -182,9 +220,16 @@ pub(crate) trait TextEngine: Send {
     /// collection), answering the family names it added.
     fn register_font(&mut self, data: Vec<u8>) -> Vec<String>;
 
-    /// Shapes `text` in `style`, wrapping at `max_width` dp when given. The
+    /// Shapes `text` in `style`, wrapping at `max_width` dp when given, and
+    /// with `editing` records where each grapheme is (`editing.rs`). The
     /// answer's `system` field is filled by the caller.
-    fn shape(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> LayoutData;
+    fn shape(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+        editing: bool,
+    ) -> LayoutData;
 
     /// Rasterises one glyph. `None` when the font cannot produce it (an id
     /// past the font's glyph count, or a font that no longer loads).
@@ -253,7 +298,28 @@ impl TextSystem {
 
     /// Shapes `text` in `style` on one line, or wrapped at `max_width` dp.
     pub fn layout(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> TextLayout {
-        let mut data = self.engine.shape(text, style, max_width);
+        self.shape(text, style, max_width, false)
+    }
+
+    /// [`layout`](TextSystem::layout), recording where each grapheme is: the
+    /// layout answers [`TextLayout::caret`] and the other editing questions.
+    pub fn editable_layout(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+    ) -> TextLayout {
+        self.shape(text, style, max_width, true)
+    }
+
+    fn shape(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+        editing: bool,
+    ) -> TextLayout {
+        let mut data = self.engine.shape(text, style, max_width, editing);
         data.system = self.id;
         TextLayout {
             data: Arc::new(data),

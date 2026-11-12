@@ -271,7 +271,9 @@ leg_webview() {
 #   native-ui.md P3's exit test): `vilan/examples/ui-counter` driven with no
 #   window and held to a recorded listing, then in a window under xvfb by
 #   pointer AND keyboard through XTEST; `vilan/examples/ui-list` (10,000 rows
-#   in a scroll) scrolled by the wheel and clicked. REQUIRED here too.
+#   in a scroll) scrolled by the wheel and clicked; and P4's exit test,
+#   `vilan/examples/ui-todo` on `std::ui::kit`, held to its own recorded
+#   listing and then typed into and clicked in a window. REQUIRED here too.
 leg_gfx() {
     status=0
     (

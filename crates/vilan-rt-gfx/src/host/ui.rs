@@ -532,6 +532,78 @@ pub fn set_label(node: &Node, label: &Str) {
     with_tree(|tree| tree.set_label(node.id(), label));
 }
 
+// ------------------------------------------------------------ editing ---
+//
+// `std::ui::kit`'s text input (P4): the program keeps a text's caret and
+// selection as UTF-16 indices (`str`'s own); the tree draws them and answers
+// where a point or a step lands, from the text's layout (`text/editing.rs`).
+
+fn index_of(value: i32) -> usize {
+    usize::try_from(value).unwrap_or(0)
+}
+
+/// `__ui_text_edit(node, caret, anchor, active)` — a text's caret and the
+/// other end of its selection, drawn while `active` (and then scrolled into
+/// view by the next layout).
+pub fn text_edit(node: &Node, caret: i32, anchor: i32, active: bool) {
+    change(node, |tree, id| {
+        or_fail(tree.text_edit(id, index_of(caret), index_of(anchor), active))
+    });
+}
+
+/// `__ui_text_edit_look(node, caret colour, caret width, selection colour)`
+/// — a NEGATIVE alpha leaves that colour to the text's (the caret's) or the
+/// text's at a quarter of its alpha (the selection's).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "an extern's arguments are the vilan call's, one scalar each"
+)]
+pub fn text_edit_look(
+    node: &Node,
+    caret_red: f64,
+    caret_green: f64,
+    caret_blue: f64,
+    caret_alpha: f64,
+    caret_width: f64,
+    selection_red: f64,
+    selection_green: f64,
+    selection_blue: f64,
+    selection_alpha: f64,
+) {
+    let caret =
+        (caret_alpha >= 0.0).then(|| color(caret_red, caret_green, caret_blue, caret_alpha));
+    let selection = (selection_alpha >= 0.0).then(|| {
+        color(
+            selection_red,
+            selection_green,
+            selection_blue,
+            selection_alpha,
+        )
+    });
+    change(node, |tree, id| {
+        or_fail(tree.text_edit_look(id, caret, caret_width as f32, selection))
+    });
+}
+
+/// `__ui_text_index_at(node, x, y)` — the UTF-16 index in an edited text
+/// nearest the point (dp from the window's top-left, as an event gives it).
+pub fn text_index_at(node: &Node, x: f64, y: f64) -> i32 {
+    let point = Point::new(x as f32, y as f32);
+    let index =
+        with_tree(|tree| with_text(|text| or_fail(tree.text_index_at(node.id(), point, text))));
+    i32::try_from(index).unwrap_or(i32::MAX)
+}
+
+/// `__ui_text_step(node, index, forward, word)` — the UTF-16 index of the
+/// next (`forward`) or previous grapheme boundary of an edited text, or with
+/// `word` the end of the next word or the start of the previous one.
+pub fn text_step(node: &Node, index: i32, forward: bool, word: bool) -> i32 {
+    let stepped = with_tree(|tree| {
+        with_text(|text| or_fail(tree.text_step(node.id(), index_of(index), forward, word, text)))
+    });
+    i32::try_from(stepped).unwrap_or(i32::MAX)
+}
+
 /// `__ui_set_texture(node, texture)` — an image element's picture.
 pub fn set_texture(node: &Node, image: &Image) {
     change(node, |tree, id| {

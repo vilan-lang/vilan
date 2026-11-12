@@ -2228,3 +2228,270 @@ fn revealing_an_element_scrolls_every_scroll_around_it_innermost_first() {
         "shown already: nothing moves"
     );
 }
+
+// ------------------------------------------------------------ editing ---
+//
+// `std::ui::kit`'s text input (P4): an EDITED text (`UiTree::text_edit`).
+// Noto Mono at 10 dp: every grapheme the font draws is 6 dp wide (to a
+// thousandth: its advance is 0.6 em in font units), and a line height of 1.2
+// makes a line 12 dp, so no box is snapped off its dp.
+
+/// A paragraph of `text` at 10 dp with 12 dp lines.
+fn line_paragraph(fixture: &mut Fixture, text: &str) -> NodeId {
+    let node = fixture.paragraph(text, 10.0);
+    fixture
+        .tree
+        .set_text_style(node, |style| style.line_height = Some(1.2));
+    node
+}
+
+/// [`line_paragraph`], edited, its caret at UTF-16 index `caret`.
+fn edited(fixture: &mut Fixture, text: &str, caret: usize, active: bool) -> NodeId {
+    let node = line_paragraph(fixture, text);
+    fixture.tree.text_edit(node, caret, caret, active).unwrap();
+    node
+}
+
+/// A 30 dp wide horizontal scroll over `text`, edited: `(root, scroll, text)`.
+fn scrolled_field(fixture: &mut Fixture, text: &str) -> (NodeId, NodeId, NodeId) {
+    let scroll = fixture.element(ElementKind::Scroll);
+    fixture
+        .tree
+        .set_scroll_axis(scroll, ScrollAxis::Horizontal)
+        .unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Width, Length::Dp(30.0))
+        .unwrap();
+    let node = edited(fixture, text, 0, false);
+    fixture.add(scroll, &[node]);
+    let root = fixture.element(ElementKind::Stack);
+    fixture.tree.set_padding(root, Edges::all(5.0)).unwrap();
+    fixture.add(root, &[scroll]);
+    fixture.layout(root, 300.0, 300.0);
+    (root, scroll, node)
+}
+
+#[test]
+fn an_edited_text_is_never_shorter_than_a_line_and_has_room_for_its_caret() {
+    let mut fixture = Fixture::new();
+    let column = fixture.element(ElementKind::Column);
+    fixture.tree.set_align(column, Align::Start).unwrap();
+    let plain = line_paragraph(&mut fixture, "abc");
+    let empty = edited(&mut fixture, "", 0, false);
+    let full = edited(&mut fixture, "abc", 0, false);
+    fixture.add(column, &[plain, empty, full]);
+    fixture.layout(column, 300.0, 300.0);
+    let (_, _, plain_width, line) = fixture.rect(plain);
+    assert_eq!((plain_width, line), (18.0, 12.0));
+    // One line's height even when empty, and one caret width (1 dp) wider.
+    assert_eq!(fixture.rect(empty).3, line);
+    assert_eq!(fixture.rect(full).2, 19.0);
+    // A wider caret is more room.
+    fixture.tree.text_edit_look(full, None, 3.0, None).unwrap();
+    fixture.layout(column, 300.0, 300.0);
+    assert_eq!(fixture.rect(full).2, 21.0);
+}
+
+#[test]
+fn steps_count_utf16_units_and_move_a_whole_grapheme() {
+    let mut fixture = Fixture::new();
+    // "a", an e with a combining acute (two units), a thumbs-up with a skin
+    // tone (two code points, four units), "b": eight units, four graphemes.
+    let node = edited(&mut fixture, "ae\u{301}\u{1F44D}\u{1F3FD}b", 0, false);
+    let mut forward = vec![0];
+    for _ in 0..5 {
+        let at = *forward.last().unwrap();
+        forward.push(
+            fixture
+                .tree
+                .text_step(node, at, true, false, &mut fixture.text)
+                .unwrap(),
+        );
+    }
+    assert_eq!(forward, [0, 1, 3, 7, 8, 8]);
+    let mut back = vec![8];
+    for _ in 0..5 {
+        let at = *back.last().unwrap();
+        back.push(
+            fixture
+                .tree
+                .text_step(node, at, false, false, &mut fixture.text)
+                .unwrap(),
+        );
+    }
+    assert_eq!(back, [8, 7, 3, 1, 0, 0]);
+    // From inside a grapheme (between the e and its accent; inside the
+    // surrogate pair): from its start.
+    assert_eq!(
+        fixture
+            .tree
+            .text_step(node, 2, true, false, &mut fixture.text)
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        fixture
+            .tree
+            .text_step(node, 4, false, false, &mut fixture.text)
+            .unwrap(),
+        1
+    );
+    // Words: the end of the next one, the start of the previous one.
+    let words = edited(&mut fixture, "milk and eggs", 0, false);
+    assert_eq!(
+        fixture
+            .tree
+            .text_step(words, 0, true, true, &mut fixture.text)
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        fixture
+            .tree
+            .text_step(words, 13, false, true, &mut fixture.text)
+            .unwrap(),
+        9
+    );
+}
+
+#[test]
+fn a_point_finds_its_index_through_the_scroll_around_the_text() {
+    let mut fixture = Fixture::new();
+    let (root, scroll, node) = scrolled_field(&mut fixture, "abcdefghij");
+    // The text starts at x 5 (the root's padding); "d" is 18..24 in it.
+    let at = |fixture: &mut Fixture, x: f32| {
+        fixture
+            .tree
+            .text_index_at(node, Point::new(x, 8.0), &mut fixture.text)
+            .unwrap()
+    };
+    assert_eq!(at(&mut fixture, 5.0 + 20.0), 3);
+    assert_eq!(at(&mut fixture, 5.0 + 22.0), 4);
+    assert_eq!(at(&mut fixture, -40.0), 0);
+    assert_eq!(at(&mut fixture, 400.0), 10);
+    // Scrolled 20 dp: the same point is 20 dp further into the text.
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(20.0, 0.0))
+        .unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    assert_eq!(at(&mut fixture, 5.0), 3);
+}
+
+#[test]
+fn an_active_caret_is_scrolled_into_view_by_the_next_layout() {
+    let mut fixture = Fixture::new();
+    let (root, scroll, node) = scrolled_field(&mut fixture, "abcdefghij");
+    // 60 dp of text and a 1 dp caret in a 30 dp viewport.
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(31.0, 0.0))
+    );
+    // Inactive (no focus): the scroll stays.
+    fixture.tree.text_edit(node, 10, 10, false).unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    assert_eq!(fixture.tree.scroll_offset(scroll), Some(Point::ZERO));
+    // Active at the end: the caret's right edge at the viewport's.
+    fixture.tree.text_edit(node, 10, 10, true).unwrap();
+    assert!(!fixture.layout(root, 300.0, 300.0), "no solve for a caret");
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(31.0, 0.0))
+    );
+    assert_eq!(
+        fixture.tree.take_offset_notices().len(),
+        0,
+        "no program listens to this scroll"
+    );
+    // A caret already in view moves nothing; one before the view brings its
+    // left edge to the viewport's.
+    fixture.tree.text_edit(node, 8, 8, true).unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(31.0, 0.0))
+    );
+    fixture.tree.text_edit(node, 2, 2, true).unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    let offset = fixture.tree.scroll_offset(scroll).unwrap();
+    assert_eq!((offset.x.round(), offset.y), (12.0, 0.0));
+}
+
+/// The rectangles an edited text's paint draws: its selection's and its
+/// caret's, in order, around its text.
+fn edited_paint(fixture: &mut Fixture, root: NodeId) -> Vec<String> {
+    let mut builder = SceneBuilder::new();
+    fixture
+        .tree
+        .paint(root, &mut builder, &mut fixture.text)
+        .unwrap();
+    flatten(&builder.finish().unwrap())
+        .into_iter()
+        .filter_map(|command| match command {
+            Command::Rectangle(rectangle) => {
+                let bounds = rectangle.bounds;
+                Some(format!(
+                    "rect {:.1} {:.1} {:.1} {:.1}",
+                    bounds.left(),
+                    bounds.top(),
+                    bounds.size.width,
+                    bounds.size.height
+                ))
+            }
+            Command::Text { .. } => Some("text".to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_focused_edited_text_paints_its_selection_under_and_its_caret_over_it() {
+    let mut fixture = Fixture::new();
+    let column = fixture.element(ElementKind::Column);
+    fixture.tree.set_align(column, Align::Start).unwrap();
+    let node = edited(&mut fixture, "abcd", 0, false);
+    fixture.add(column, &[node]);
+    fixture.layout(column, 300.0, 300.0);
+    assert_eq!(edited_paint(&mut fixture, column), ["text"], "no focus");
+    // "bc" selected, the caret after it (2 dp wide).
+    fixture.tree.text_edit_look(node, None, 2.0, None).unwrap();
+    fixture.tree.text_edit(node, 3, 1, true).unwrap();
+    fixture.layout(column, 300.0, 300.0);
+    assert_eq!(
+        edited_paint(&mut fixture, column),
+        [
+            "rect 6.0 0.0 12.0 12.0".to_string(),
+            "text".to_string(),
+            "rect 18.0 0.0 2.0 12.0".to_string(),
+        ]
+    );
+    // Moving the caret repaints the text alone: no layout.
+    fixture.tree.text_edit(node, 4, 4, true).unwrap();
+    assert!(!fixture.layout(column, 300.0, 300.0), "no solve");
+    assert_eq!(
+        edited_paint(&mut fixture, column),
+        ["text", "rect 24.0 0.0 2.0 12.0"]
+    );
+    assert_eq!(fixture.tree.last_pass().rebuilt, 2, "the text and the root");
+}
+
+#[test]
+fn caret_questions_to_a_text_not_edited_or_not_a_text_are_refused() {
+    let mut fixture = Fixture::new();
+    let plain = fixture.paragraph("abc", 10.0);
+    assert_eq!(
+        fixture
+            .tree
+            .text_step(plain, 0, true, false, &mut fixture.text),
+        Err(UiError::NotEdited)
+    );
+    let row = fixture.element(ElementKind::Row);
+    assert_eq!(
+        fixture.tree.text_edit(row, 0, 0, true),
+        Err(UiError::WrongKind {
+            property: "caret",
+            kind: ElementKind::Row,
+        })
+    );
+}

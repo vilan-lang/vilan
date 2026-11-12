@@ -1,0 +1,17 @@
+// `std::ui::kit` — components with behaviour and no look (native-ui.md part P4).
+//
+// Each component is a function that answers `std::ui`'s five elements, wired:
+// focusable, activated by the pointer and the keyboard, carrying its accessibility
+// role. None of them draws anything of its own — no colour, no radius, no spacing.
+// The app supplies every look through the ordinary attributes (`style`, `padding`,
+// `gap`, the conditions `hovered()`, `pressed()`, `focused()`), and a disabled
+// component is styled through the flag the app hands it.
+//
+// One file per component under `ui/kit/`; this module declares and re-exports them,
+// one line each. A file is named in the PLURAL (`buttons.vl` for `button`): a
+// module and an item of one name in one module are ambiguous, and the analyzer
+// refuses the pair.
+
+export import pkg::ui::kit::buttons::*;
+export import pkg::ui::kit::checkboxes::*;
+export import pkg::ui::kit::inputs::*;

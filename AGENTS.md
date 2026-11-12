@@ -175,7 +175,13 @@ Rust workspace, seventeen crates, plus the language's own tree:
   (a move when the element is already there) and `remove`, which is FINAL: it drops the
   subtree's handlers (B738), so the host drops them with the tree no longer borrowed. The xvfb
   suites share `crates/vilan-cli/tests/support/xvfb.rs`, whose `Running` ends its run's whole
-  process group on drop (N198).
+  process group on drop (N198). `std::ui::kit` (P4) is vilan in `vilan/std/src/ui/kit/`, one
+  PLURAL-named file per component (`buttons.vl` for `button`: a module and an item of one name
+  are ambiguous) re-exported by `ui/kit.vl`; its only host part is an EDITED text
+  (`UiTree::text_edit`): a text shaped with each grapheme's box (`text/editing.rs`, recorded only
+  when asked) that paints its own caret and selection and answers where a point or a step lands,
+  in the program's UTF-16 indices. `vilan/examples/ui-todo` is its exit test, in
+  `ui_interaction.rs` with its own recorded listing (`tests/ui/todo-check.txt`).
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

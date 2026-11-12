@@ -778,6 +778,7 @@ mod tests {
                 size: Size::new(10.0 * glyph_ids.len() as f32, 12.0),
                 line_count: 1,
                 first_baseline: 9.0,
+                editing: None,
                 runs: vec![ShapedRun {
                     font: 0,
                     font_size: 12.0,

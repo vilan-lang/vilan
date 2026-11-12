@@ -1,0 +1,412 @@
+// `std::ui::kit`'s single-line text input (native-ui.md P4), bound both ways to a
+// `str` signal.
+//
+// THE SHAPE. A focusable row (the app's look, its padding, its width) around a
+// horizontal `scroll` that clips and moves the text, around a stack of the text
+// and, while the value is empty, the placeholder. The text is EDITED: this module
+// keeps its caret and the other end of its selection, and the tree draws them in
+// the text's layout and answers where a point or a step lands (`vilan-rt-gfx`'s
+// `text/editing.rs`), because only the layout knows where the graphemes are.
+//
+// INDICES are `str`'s own (UTF-16 units, what `len` and `substring` count), and
+// always on a grapheme boundary: a step moves one grapheme (an emoji with its
+// modifiers, a letter with its combining marks), Backspace and Delete remove one.
+//
+// THE KEYS: Left and Right move a grapheme (with Ctrl or Alt, a word), Home and End
+// to the ends, each extending the selection with Shift; Left or Right with a
+// selection and no Shift collapse it to that side; Backspace and Delete remove the
+// selection, or a grapheme (with Ctrl or Alt, a word) before or after the caret;
+// Ctrl+A (or Cmd+A) selects everything; Enter runs `on_submit`. Typed text arrives
+// as text events (`on_text`) and replaces the selection. A press places the caret
+// (with Shift, extends the selection to it) and a drag while the button is down
+// extends it.
+//
+// Not here: the clipboard (the window layer has none yet), an input method's
+// composition (P5: the text carries no preedit run; see the docs), a double click
+// selecting a word, the caret blinking (a blink is a frame every half second
+// forever; the caret is steady, so an idle window draws nothing).
+
+[platform("@process")] mod self;
+
+import pkg::gfx::{ Color, Dp, Event, KeyName, KeyPress, Point, current_event };
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::{ Signal, SignalCell, turn_scope };
+import pkg::shared::Shared;
+import pkg::ui::{
+	Attributes,
+	Bindable,
+	Child,
+	Element,
+	Node,
+	Role,
+	ScrollAxis,
+	Style,
+	row,
+	scroll,
+	stack,
+	stop_event,
+	style,
+	text,
+	ui_set_focusable,
+	when,
+};
+
+// --- The seam: `vilan-rt-gfx`'s `host::ui`, an edited text ---------------------------
+
+/// A text's caret and the other end of its selection (`str` indices), drawn while
+/// `active` and then scrolled into view.
+[extern("__ui_text_edit")]
+external fun ui_text_edit(node: Node, caret: i32, anchor: i32, active: bool): void;
+
+/// An edited text's caret colour and width, and its selection's colour; a negative
+/// alpha leaves a colour to the text's.
+[extern("__ui_text_edit_look")]
+external fun ui_text_edit_look(
+	node: Node,
+	caret_red: f64,
+	caret_green: f64,
+	caret_blue: f64,
+	caret_alpha: f64,
+	caret_width: f64,
+	selection_red: f64,
+	selection_green: f64,
+	selection_blue: f64,
+	selection_alpha: f64,
+): void;
+
+/// The index nearest a point, in dp from the window's top-left.
+[extern("__ui_text_index_at")]
+external fun ui_text_index_at(node: Node, x: f64, y: f64): i32;
+
+/// The next (`forward`) or previous grapheme boundary from `index`, or with `word`
+/// the end of the next word or the start of the previous one.
+[extern("__ui_text_step")]
+external fun ui_text_step(node: Node, index: i32, forward: bool, word: bool): i32;
+
+// --- The input -----------------------------------------------------------------
+
+/// The two ends of a text input's selection, as `str` counts (UTF-16 units):
+/// `caret`, where typing goes, and `anchor`, the other end — the same index when
+/// nothing is selected.
+export struct Selection {
+	anchor: usize,
+	caret: usize,
+}
+
+/// A single-line text input. See `text_input(..)`.
+export struct TextInput {
+	element: Element,
+	value: SignalCell<str>,
+	/// The edited text's element.
+	field: Node,
+	caret: Shared<usize>,
+	anchor: Shared<usize>,
+	focused: Shared<bool>,
+	off: Shared<bool>,
+	placeholder: SignalCell<str>,
+	placeholder_look: SignalCell<Style>,
+	/// The caret's colour and width and the selection's colour: `None` leaves a
+	/// colour to the text's.
+	caret_color: Shared<Option<Color>>,
+	caret_width: Shared<f64>,
+	selection_color: Shared<Option<Color>>,
+}
+
+/// A single-line text input over `value`: what it shows is the cell's value, and
+/// every edit writes the cell. Its role is `Role::TextField`; its look, its size
+/// and its label are the app's (`style`, `padding`, `width`, `label`), and so are
+/// the caret's and the selection's colours (`caret`, `selection_color`), which
+/// otherwise follow the text's. The text style it inherits, or is given with
+/// `style`, is the text's.
+///
+/// A text wider than the input scrolls sideways to keep the caret in view; the
+/// caret and the selection show while the input has the focus.
+export fun text_input(value: SignalCell<str>): TextInput {
+	let placeholder: SignalCell<str> = Signal::new("");
+	let placeholder_look: SignalCell<Style> = Signal::new(style());
+	let field = text().child(value);
+	let empty = value.derive(|now: str| now.is_empty());
+	let shell = row()
+		.role(Role::TextField)
+		.focusable()
+		.child(scroll()
+			.axis(ScrollAxis::Horizontal)
+			.grow(1.0)
+			.child(stack()
+				.child(when(empty, || text().style(placeholder_look).child(placeholder)))
+				.child(field)));
+	let input = TextInput {
+		element = shell.element(),
+		value,
+		field = field.element.node,
+		caret = Shared::new(0),
+		anchor = Shared::new(0),
+		focused = Shared::new(false),
+		off = Shared::new(false),
+		placeholder,
+		placeholder_look,
+		caret_color = Shared::new(None),
+		caret_width = Shared::new(1.0),
+		selection_color = Shared::new(None),
+	};
+	input.show();
+	input
+		.on_focus(|| {
+			input.focused.write() = true;
+			input.show();
+		})
+		.on_blur(|| {
+			input.focused.write() = false;
+			input.show();
+		})
+		.on_press(|| {
+			if input.off.read() {
+				ret;
+			}
+			if current_event() is Some(Event::PointerPressed(let pointer)) {
+				let at = input.index_at(pointer.position);
+				input.place(at, pointer.modifiers.shift);
+			}
+		})
+		.on_pointer_move(|point: Point| {
+			// A drag: the button went down on the input and is still down.
+			if !input.off.read() && input.element.interaction().pressed {
+				input.place(input.index_at(point), true);
+			}
+		})
+		.on_key(|key: KeyPress| input.key(key))
+		.on_text(|typed: str| {
+			if input.off.read() {
+				ret;
+			}
+			let now = input.selection();
+			input.replace(now.anchor.min(now.caret), now.anchor.max(now.caret), typed);
+			stop_event();
+		})
+}
+
+export impl TextInput with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl TextInput with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl TextInput {
+	/// What it shows while its value is empty: a `str`, or a signal of one.
+	fun placeholder<V: Bindable<str>>(self, own placeholder: V): TextInput {
+		let cell = self.placeholder;
+		placeholder.bind(|now: str| cell.set(now));
+		self
+	}
+
+	/// The placeholder's style (over the text style it inherits): a `Style`, or a
+	/// signal of one.
+	fun placeholder_style<V: Bindable<Style>>(self, own look: V): TextInput {
+		let cell = self.placeholder_look;
+		look.bind(|now: Style| cell.set(now));
+		self
+	}
+
+	/// The caret's colour and width.
+	fun caret(self, color: Color, width: Dp): TextInput {
+		self.caret_color.write() = Some(color);
+		self.caret_width.write() = width.value();
+		self.show_look();
+		self
+	}
+
+	/// The selection's colour (drawn under the selected text).
+	fun selection_color(self, color: Color): TextInput {
+		self.selection_color.write() = Some(color);
+		self.show_look();
+		self
+	}
+
+	/// Enter, while it has the focus, runs `handler` with the value (and goes no
+	/// further up the tree).
+	fun on_submit(self, handler: (|str| void) context turn_scope): TextInput {
+		let input = self;
+		self.on_key(|key: KeyPress| {
+			if !input.off.read() && key.key is KeyName::Enter {
+				handler(input.value.get());
+				stop_event();
+			}
+		})
+	}
+
+	/// Disabled while `disabled` (a `bool`, or a signal of one) holds: no edit, no
+	/// caret, and Tab and a press pass it by.
+	fun disabled<V: Bindable<bool>>(self, own disabled: V): TextInput {
+		let input = self;
+		disabled.bind(|value: bool| {
+			input.off.write() = value;
+			ui_set_focusable(input.element.node, !value);
+			input.show();
+		});
+		self
+	}
+
+	/// Whether it is disabled now.
+	fun is_disabled(self): bool {
+		self.off.read()
+	}
+
+	/// The selection now (both ends at the caret when nothing is selected), kept
+	/// within the value.
+	fun selection(self): Selection {
+		let length = self.value.get().len();
+		Selection { anchor = self.anchor.read().min(length), caret = self.caret.read().min(length) }
+	}
+
+	/// Selects from `anchor` to `caret` (kept within the value; the tree moves an
+	/// index inside a grapheme to its start when it draws it).
+	fun select(self, anchor: usize, caret: usize) {
+		let length = self.value.get().len();
+		self.anchor.write() = anchor.min(length);
+		self.caret.write() = caret.min(length);
+		self.show();
+	}
+}
+
+/// The input's own steps.
+impl TextInput {
+	/// Tells the tree where the caret and the selection are, and whether they show.
+	fun show(self) {
+		let now = self.selection();
+		ui_text_edit(
+			self.field,
+			now.caret.as_i32(),
+			now.anchor.as_i32(),
+			self.focused.read() && !self.off.read(),
+		);
+	}
+
+	fun show_look(self) {
+		let (caret_red, caret_green, caret_blue, caret_alpha) = channels(self.caret_color.read());
+		let (selection_red, selection_green, selection_blue, selection_alpha) = channels(
+			self.selection_color.read(),
+		);
+		ui_text_edit_look(
+			self.field,
+			caret_red,
+			caret_green,
+			caret_blue,
+			caret_alpha,
+			self.caret_width.read(),
+			selection_red,
+			selection_green,
+			selection_blue,
+			selection_alpha,
+		);
+	}
+
+	fun index_at(self, point: Point): usize {
+		ui_text_index_at(self.field, point.x.value(), point.y.value()).as_usize()
+	}
+
+	fun step(self, from: usize, forward: bool, word: bool): usize {
+		ui_text_step(self.field, from.as_i32(), forward, word).as_usize()
+	}
+
+	/// The caret to `at`; the anchor stays when `extend`, and follows otherwise.
+	fun place(self, at: usize, extend: bool) {
+		self.caret.write() = at;
+		if !extend {
+			self.anchor.write() = at;
+		}
+		self.show();
+	}
+
+	/// The value with `from .. to` replaced by `inserted`, and the caret after it.
+	fun replace(self, from: usize, to: usize, inserted: str) {
+		let now = self.value.get();
+		self.value.set(now.substring(0, from) + inserted + now.substring(to, now.len()));
+		let at = from + inserted.len();
+		self.caret.write() = at;
+		self.anchor.write() = at;
+		self.show();
+	}
+
+	/// A key, while it has the focus (see the module's head). A key it acts on goes
+	/// no further; so does a key that types (its text arrives as a text event), so
+	/// an app's shortcut on an ancestor does not fire while the user types.
+	fun key(self, key: KeyPress) {
+		if self.off.read() {
+			ret;
+		}
+		let modifiers = key.modifiers;
+		let command = modifiers.control || modifiers.meta;
+		let word = modifiers.control || modifiers.alt;
+		let extend = modifiers.shift;
+		let now = self.selection();
+		let (start, end) = (now.anchor.min(now.caret), now.anchor.max(now.caret));
+		let selected = start != end;
+		match key.key {
+			KeyName::Left => {
+				if selected && !extend {
+					self.place(start, false);
+				} else {
+					self.place(self.step(now.caret, false, word), extend);
+				}
+				stop_event();
+			},
+			KeyName::Right => {
+				if selected && !extend {
+					self.place(end, false);
+				} else {
+					self.place(self.step(now.caret, true, word), extend);
+				}
+				stop_event();
+			},
+			KeyName::Home => {
+				self.place(0, extend);
+				stop_event();
+			},
+			KeyName::End => {
+				self.place(self.value.get().len(), extend);
+				stop_event();
+			},
+			KeyName::Backspace => {
+				if selected {
+					self.replace(start, end, "");
+				} else {
+					let from = self.step(now.caret, false, word);
+					self.replace(from, now.caret, "");
+				}
+				stop_event();
+			},
+			KeyName::Delete => {
+				if selected {
+					self.replace(start, end, "");
+				} else {
+					let to = self.step(now.caret, true, word);
+					self.replace(now.caret, to, "");
+				}
+				stop_event();
+			},
+			KeyName::Char(let typed) => {
+				if command && (typed == "a" || typed == "A") {
+					self.select(0, self.value.get().len());
+					stop_event();
+				} else if !command && !modifiers.alt {
+					stop_event();
+				}
+			},
+			_ => {},
+		}
+	}
+}
+
+/// A colour's channels, or a negative alpha for none.
+fun channels(color: Option<Color>): (f64, f64, f64, f64) {
+	match color {
+		Some(let color) => (color.red, color.green, color.blue, color.alpha),
+		None => (0.0, 0.0, 0.0, -1.0),
+	}
+}

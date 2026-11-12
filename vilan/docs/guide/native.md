@@ -530,6 +530,50 @@ activation, and `vilan/examples/ui-list` a keyed list of 10,000 rows in a
 move one; their end-to-end test drives both through the X server, by pointer and
 keyboard, and holds every frame to "only on change".
 
+### Components
+
+`std::ui::kit` is components with behaviour and no look: `button(content,
+on_click)`, `checkbox(cell)` over a `bool` signal, and `text_input(cell)` over a
+`str` signal. Each is built from the elements above and takes every attribute an
+element does, so the app supplies its look exactly as it does a row's — `style`,
+`padding`, `gap`, the conditions — and the kit supplies the focus, the pointer,
+the keys and the role:
+
+```vilan,native
+import std::gfx::{ Color, Window, dp };
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::kit::{ button, text_input };
+import std::ui::{ Style, column, focused, mount, style, text };
+
+fun main() {
+	let window = match Window::builder().title("Greeter").size(dp(360), dp(200)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let name: SignalCell<str> = Signal::new("");
+	let greeting: SignalCell<str> = Signal::new("");
+	let ring = style().when(focused(), |look: Style| look.background(Color::rgb(230, 236, 250)));
+	mount(window, <column padding(dp(16)) gap(dp(8))>
+		{text_input(name).placeholder("Your name").padding(dp(6)).style(ring).on_submit(|now: str| greeting.set(i"Hello, {now}"))}
+		{button("Greet", || greeting.set(i"Hello, {name.get()}")).padding(dp(6)).style(ring)}
+		<text>{greeting}</text>
+	</column>);
+}
+main();
+```
+
+The text input keeps a caret and a selection in grapheme clusters, scrolls a long
+text sideways to keep the caret in view, and stops the keys it uses from reaching
+the app's own shortcuts. `vilan/examples/ui-todo` is a todo list on the kit —
+add an item with the input, check it off, remove it — with every colour, radius
+and spacing its own; its end-to-end test drives the screen with no window against
+a recorded listing (typing, selections, graphemes, Tab, Space) and then in a
+window through the X server.
+
 ## Debug by default
 
 `vilan run --backend rust` builds in **debug**, and so does `vilan build
@@ -601,8 +645,7 @@ the point of emitting a language rather than machine code. `vilan build
 A desktop window shows a web page and nothing more yet: no menus, tray icon,
 notifications, deep links, secure token storage, or second window to manage,
 and no installer or package — each is its own slice. A GPU window's **native
-UI** (`std::ui`) has its elements, layout, styles, events, focus, scrolling, and
-keyed lists and conditional children;
-its components (`std::ui::kit`: a button with behaviour, a text input, a virtual
-list) come next, and paths, text editing, input methods and accessibility after
-them.
+UI** (`std::ui`) has its elements, layout, styles, events, focus, scrolling,
+keyed lists and conditional children, and its first components (`std::ui::kit`: a
+button, a checkbox, a single-line text input); paths, multi-line text editing,
+the clipboard, input methods and accessibility come after them.

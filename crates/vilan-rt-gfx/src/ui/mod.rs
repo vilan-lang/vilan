@@ -365,6 +365,72 @@ struct TextContent {
     /// Paragraphs shaped since the text or its style last changed: what the
     /// reuse rule below saves is pinned by it.
     shapings: u32,
+    /// Its caret and selection, when it is being edited (`text_edit`).
+    editing: Option<Editing>,
+    /// The width constraint it was last painted at: the layout the caret
+    /// questions are answered from.
+    painted_at: Option<f32>,
+}
+
+/// A text being edited (`std::ui::kit`'s text input, native-ui.md P4): its
+/// caret and selection, which it paints itself because only its layout knows
+/// where its graphemes are. The program keeps the indices; the tree draws
+/// them and answers where a point or a step lands (`text/editing.rs`).
+///
+/// An edited text is shaped with its graphemes' geometry, is never shorter
+/// than one line (an empty one still has a caret), and is `caret_width`
+/// wider than its text (room for the caret after the last grapheme).
+#[derive(Clone, Debug, PartialEq)]
+struct Editing {
+    /// UTF-16 indices into the text, as the program counts (each read
+    /// against the text as it is when it is used): the caret, and the other
+    /// end of the selection (the caret itself when nothing is selected).
+    caret: usize,
+    anchor: usize,
+    /// The caret and the selection are drawn (the input has the focus).
+    active: bool,
+    /// The caret's colour (the text's when `None`) and width in dp.
+    caret_color: Option<Color>,
+    caret_width: f32,
+    /// The selection's colour (the text's at a quarter of its alpha when
+    /// `None`).
+    selection_color: Option<Color>,
+}
+
+impl Default for Editing {
+    fn default() -> Editing {
+        Editing {
+            caret: 0,
+            anchor: 0,
+            active: false,
+            caret_color: None,
+            caret_width: 1.0,
+            selection_color: None,
+        }
+    }
+}
+
+/// The byte offset of UTF-16 index `index` in `text` (the program's indices,
+/// as `str`'s `len` and `substring` count): clamped to the text, and the
+/// start of the character a unit inside a surrogate pair belongs to.
+fn byte_of_unit(text: &str, index: usize) -> usize {
+    let mut units = 0;
+    for (byte, character) in text.char_indices() {
+        let width = character.len_utf16();
+        if units + width > index {
+            return byte;
+        }
+        units += width;
+    }
+    text.len()
+}
+
+/// The UTF-16 index of byte offset `byte` in `text`.
+fn unit_of_byte(text: &str, byte: usize) -> usize {
+    text.char_indices()
+        .take_while(|(at, _)| *at < byte)
+        .map(|(_, character)| character.len_utf16())
+        .sum()
 }
 
 /// How many shaped widths a text element keeps: a pass measures at its
@@ -405,7 +471,11 @@ impl TextContent {
             self.shaped.insert(0, shaped);
             return layout;
         }
-        let layout = text.layout(&self.text, &self.resolved.style, constraint);
+        let layout = if self.editing.is_some() {
+            text.editable_layout(&self.text, &self.resolved.style, constraint)
+        } else {
+            text.layout(&self.text, &self.resolved.style, constraint)
+        };
         self.shapings += 1;
         self.shaped.insert(
             0,
@@ -571,6 +641,8 @@ pub enum UiError {
     NotFinite(&'static str),
     /// A run index a text does not have.
     NoSuchRun(usize),
+    /// A caret question to a text that is not being edited.
+    NotEdited,
     /// An element placed before one that is in no parent.
     NoPosition,
 }
@@ -608,6 +680,11 @@ impl std::fmt::Display for UiError {
             }
             UiError::NotFinite(what) => write!(formatter, "{what} must be a finite number"),
             UiError::NoSuchRun(index) => write!(formatter, "a text has no run {index}"),
+            UiError::NotEdited => write!(
+                formatter,
+                "a text answers where its caret goes only while it is edited (`std::ui::kit`'s \
+                 text input edits its own)"
+            ),
             UiError::NoPosition => write!(
                 formatter,
                 "an element can be placed before another only when that one is inside a parent"
@@ -670,6 +747,8 @@ pub struct UiTree {
     stats: PassStats,
     /// The leaves the last solve measured, once each.
     measured: Vec<NodeId>,
+    /// Edited texts whose caret the next layout scrolls into view.
+    caret_reveals: Vec<NodeId>,
 }
 
 impl Default for UiTree {
@@ -874,6 +953,7 @@ impl UiTree {
             dirty: Vec::new(),
             stats: PassStats::default(),
             measured: Vec::new(),
+            caret_reveals: Vec::new(),
         }
     }
 
@@ -1588,6 +1668,187 @@ impl UiTree {
         Ok(())
     }
 
+    fn text_content(&mut self, node: NodeId) -> Result<&mut TextContent, UiError> {
+        let kind = self.kind(node);
+        match &mut self.data_mut(node).content {
+            Content::Text(content) => Ok(content),
+            _ => Err(UiError::WrongKind {
+                property: "caret",
+                kind,
+            }),
+        }
+    }
+
+    /// `node`, a text, EDITED (`Editing`): its caret and the other end of
+    /// its selection at the program's UTF-16 indices `caret` and `anchor`,
+    /// drawn while `active`. The first call makes it an edited text, which
+    /// lays it out again; every later one repaints it alone. While it is
+    /// active, the next layout scrolls its caret into view.
+    pub fn text_edit(
+        &mut self,
+        node: NodeId,
+        caret: usize,
+        anchor: usize,
+        active: bool,
+    ) -> Result<(), UiError> {
+        let content = self.text_content(node)?;
+        let first = content.editing.is_none();
+        let editing = content.editing.get_or_insert_with(Editing::default);
+        let changed = (editing.caret, editing.anchor, editing.active) != (caret, anchor, active);
+        editing.caret = caret;
+        editing.anchor = anchor;
+        editing.active = active;
+        if first {
+            // Shaped again, with its graphemes' geometry, and measured again.
+            content.reshape();
+            self.text_changed(node);
+        } else if changed {
+            self.invalidate(node);
+        }
+        if active && !self.caret_reveals.contains(&node) {
+            self.caret_reveals.push(node);
+        }
+        Ok(())
+    }
+
+    /// An edited text's caret colour (its text colour when `None`) and width
+    /// in dp, and its selection's colour (its text colour at a quarter of
+    /// its alpha when `None`).
+    pub fn text_edit_look(
+        &mut self,
+        node: NodeId,
+        caret_color: Option<Color>,
+        caret_width: f32,
+        selection_color: Option<Color>,
+    ) -> Result<(), UiError> {
+        let caret_width = finite(caret_width, "a caret width")?.max(0.0);
+        let content = self.text_content(node)?;
+        let editing = content.editing.get_or_insert_with(Editing::default);
+        let reshapes = editing.caret_width != caret_width;
+        editing.caret_color = caret_color;
+        editing.caret_width = caret_width;
+        editing.selection_color = selection_color;
+        if reshapes {
+            // The caret's room is part of its measure.
+            content.reshape();
+            self.text_changed(node);
+        } else {
+            self.invalidate(node);
+        }
+        Ok(())
+    }
+
+    /// An edited text's layout as it was last painted (one line, before its
+    /// first paint), shaped again if its text changed since.
+    fn edited_layout(
+        &mut self,
+        node: NodeId,
+        text: &mut TextSystem,
+    ) -> Result<TextLayout, UiError> {
+        let content = self.text_content(node)?;
+        if content.editing.is_none() {
+            return Err(UiError::NotEdited);
+        }
+        let constraint = content.painted_at;
+        Ok(content.shaped_for(constraint, text))
+    }
+
+    /// The UTF-16 index in an edited text nearest `point` (dp from its root's
+    /// top-left corner, as the window reports the pointer: the offsets of
+    /// the scrolls around it are taken into account).
+    pub fn text_index_at(
+        &mut self,
+        node: NodeId,
+        point: Point,
+        text: &mut TextSystem,
+    ) -> Result<usize, UiError> {
+        let layout = self.edited_layout(node, text)?;
+        let origin = self.content_origin_on_screen(node);
+        let local = Point::new(point.x - origin.x, point.y - origin.y);
+        let byte = layout.index_at(local).ok_or(UiError::NotEdited)?;
+        Ok(unit_of_byte(self.text(node).unwrap_or(""), byte))
+    }
+
+    /// The UTF-16 index of the next (`forward`) or previous grapheme
+    /// boundary of an edited text from `index`, or with `word` the end of the
+    /// next word or the start of the previous one (`text/editing.rs`).
+    pub fn text_step(
+        &mut self,
+        node: NodeId,
+        index: usize,
+        forward: bool,
+        word: bool,
+        text: &mut TextSystem,
+    ) -> Result<usize, UiError> {
+        let layout = self.edited_layout(node, text)?;
+        let content = self.text(node).unwrap_or("");
+        let byte = byte_of_unit(content, index);
+        let stepped = layout.step(byte, forward, word).ok_or(UiError::NotEdited)?;
+        Ok(unit_of_byte(content, stepped))
+    }
+
+    /// Where `node`'s content box is drawn, in dp from its root's top-left
+    /// corner: its laid-out place moved by the offset of every scroll around
+    /// it.
+    fn content_origin_on_screen(&self, node: NodeId) -> Point {
+        let data = self.data(node);
+        let mut origin = Point::new(
+            data.bounds.left() + data.content_offset.x,
+            data.bounds.top() + data.content_offset.y,
+        );
+        let mut current = node;
+        while let Some(parent) = self.taffy.parent(current) {
+            if self.kind(parent) == ElementKind::Viewport {
+                break;
+            }
+            if let Some(scroll) = &self.data(parent).scroll {
+                origin.x -= scroll.offset.x;
+                origin.y -= scroll.offset.y;
+            }
+            current = parent;
+        }
+        origin
+    }
+
+    /// Scrolls the caret of every edited text that asked into view (after a
+    /// layout, so from its boxes).
+    fn reveal_carets(&mut self, text: &mut TextSystem) {
+        for node in std::mem::take(&mut self.caret_reveals) {
+            if !self.is_alive(node) {
+                continue;
+            }
+            let data = self.data(node);
+            let origin = Point::new(
+                data.bounds.left() + data.content_offset.x,
+                data.bounds.top() + data.content_offset.y,
+            );
+            let Ok(layout) = self.edited_layout(node, text) else {
+                continue;
+            };
+            let content = self.text(node).unwrap_or("");
+            let Content::Text(TextContent {
+                editing: Some(editing),
+                ..
+            }) = &self.data(node).content
+            else {
+                continue;
+            };
+            if !editing.active {
+                continue;
+            }
+            let width = editing.caret_width;
+            if let Some(caret) = layout.caret(byte_of_unit(content, editing.caret), width) {
+                let area = Rect::new(
+                    origin.x + caret.left(),
+                    origin.y + caret.top(),
+                    width,
+                    caret.size.height,
+                );
+                self.reveal_area(node, area);
+            }
+        }
+    }
+
     /// The element's text style after inheritance, as of the last layout.
     pub fn resolved_text(&self, node: NodeId) -> ResolvedText {
         (*self.data(node).resolved).clone()
@@ -1730,6 +1991,7 @@ impl UiTree {
             state.snapped = Some((units, state.solves));
         }
         self.data_mut(root).root = Some(state);
+        self.reveal_carets(text);
         Ok(solve)
     }
 
@@ -2123,9 +2385,22 @@ impl UiTree {
         match &mut self.data_mut(node).content {
             Content::Parent => {}
             Content::Text(content) => {
-                if !content.text.is_empty() {
-                    let layout = content.shaped_for(Some(content_size.width), text);
-                    builder.text(&layout, placed.origin, color);
+                // An edited text's layout is shaped at its text's width, not
+                // the caret's extra room (see `Editing`).
+                let width = match &content.editing {
+                    Some(editing) => (content_size.width - editing.caret_width).max(0.0),
+                    None => content_size.width,
+                };
+                let shown = !content.text.is_empty() || content.editing.is_some();
+                if shown {
+                    content.painted_at = Some(width);
+                    let layout = content.shaped_for(Some(width), text);
+                    match content.editing.as_ref().filter(|editing| editing.active) {
+                        Some(editing) => {
+                            paint_edited(builder, &content.text, &layout, editing, placed, color)
+                        }
+                        None => builder.text(&layout, placed.origin, color),
+                    }
                 }
             }
             Content::Image(content) => {
@@ -2134,6 +2409,60 @@ impl UiTree {
                 }
             }
         }
+    }
+}
+
+/// An edited text with the focus: its selection under its glyphs, and its
+/// caret over them, clamped into its box.
+fn paint_edited(
+    builder: &mut SceneBuilder,
+    text: &str,
+    layout: &TextLayout,
+    editing: &Editing,
+    placed: Rect,
+    color: Color,
+) {
+    let origin = placed.origin;
+    let selection_color = editing.selection_color.unwrap_or(Color::new(
+        color.red,
+        color.green,
+        color.blue,
+        color.alpha * 0.25,
+    ));
+    let (caret, anchor) = (
+        byte_of_unit(text, editing.caret),
+        byte_of_unit(text, editing.anchor),
+    );
+    for area in layout.selection(anchor, caret).unwrap_or_default() {
+        builder.rectangle(Rectangle {
+            bounds: Rect::new(
+                origin.x + area.left(),
+                origin.y + area.top(),
+                area.size.width,
+                area.size.height,
+            ),
+            corner_radii: Corners::default(),
+            fill: Fill::Solid(selection_color),
+            border: Border::NONE,
+        });
+    }
+    builder.text(layout, origin, color);
+    if let Some(caret) = layout.caret(caret, editing.caret_width) {
+        let x = caret
+            .left()
+            .min(placed.size.width - editing.caret_width)
+            .max(0.0);
+        builder.rectangle(Rectangle {
+            bounds: Rect::new(
+                origin.x + x,
+                origin.y + caret.top(),
+                caret.size.width,
+                caret.size.height,
+            ),
+            corner_radii: Corners::default(),
+            fill: Fill::Solid(editing.caret_color.unwrap_or(color)),
+            border: Border::NONE,
+        });
     }
 }
 
@@ -2243,7 +2572,7 @@ fn measure(
             match &mut data.content {
                 Content::Parent => taffy::Size::ZERO,
                 Content::Text(content) => {
-                    if content.text.is_empty() {
+                    if content.text.is_empty() && content.editing.is_none() {
                         return taffy::Size {
                             width: known.width.unwrap_or(0.0),
                             height: known.height.unwrap_or(0.0),
@@ -2256,7 +2585,15 @@ fn measure(
                     });
                     let layout = content.shaped_for(constraint, text);
                     first_baseline = Some(layout.first_baseline());
-                    let shaped = layout.size();
+                    let mut shaped = layout.size();
+                    if let Some(editing) = &content.editing {
+                        // Room for the caret after the last grapheme, and
+                        // one line for an empty text's caret.
+                        shaped.width += editing.caret_width;
+                        if let Some(caret) = layout.caret(0, 0.0) {
+                            shaped.height = shaped.height.max(caret.size.height);
+                        }
+                    }
                     taffy::Size {
                         width: known.width.unwrap_or(shaped.width),
                         height: known.height.unwrap_or(shaped.height),
