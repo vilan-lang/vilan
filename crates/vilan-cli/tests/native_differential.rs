@@ -1814,16 +1814,14 @@ fn a_cell_around_a_bare_none_is_typed_by_its_annotation_on_both_backends() {
     }
 }
 
-/// F168, the reason `std::ui` keeps `Bindable` rather than `std::reactive`'s
-/// `MaybeSignal` (the R9 lane's item 2): the context pass mints a hidden
-/// `Owner` parameter on a FUNCTION when one candidate of a dispatch inside it
-/// reads the owner — `MaybeSignal`'s reactive arm does — so the instance a
-/// STATIC argument selects declares it too, and a caller with no owner threads
-/// none. The checker resolves the site per call (B737) and accepts the
-/// program; JavaScript passes `undefined`; the native emitter refuses the call
-/// by name. Un-ignore when instances carry their own context needs.
+/// F168: the context pass mints a hidden `Owner` parameter on a FUNCTION when
+/// one candidate of a dispatch inside it reads the owner — `MaybeSignal`'s
+/// reactive arm does — and a caller with no owner threads none to it. The
+/// checker resolves the site per call (B737) and accepts the program;
+/// JavaScript passes `undefined`; natively the INSTANCE a static argument
+/// selects declares only the hidden parameters its body names, which is none,
+/// so the call passes nothing and needs nothing. (It was refused by name.)
 #[test]
-#[ignore = "F168: a static MaybeSignal argument reached through a generic function is refused natively"]
 fn f168_a_static_maybe_signal_through_a_generic_needs_no_owner_on_both_backends() {
     let staged = stage();
     let file = "native_probe_f168_static_maybe_signal.vl";
@@ -1847,6 +1845,313 @@ fn f168_a_static_maybe_signal_through_a_generic_needs_no_owner_on_both_backends(
         assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
         assert_eq!(run.stdout, "static\n", "{backend:?}");
     }
+}
+
+/// F168: one program, its probe written beside the staged corpus, run on both
+/// backends and held to `expected` on each.
+fn f168_agrees(file: &str, source: &str, expected: &str) {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
+/// F168: ONE generic reached with a static argument and with a reactive one,
+/// from code with an ambient owner and from code with none. Two instances: the
+/// static one declares no hidden parameter, so the calls that hold an owner
+/// pass none to it and the call from `main` needs none; the reactive one
+/// declares the owner and is reached only where there is one. A forwarding
+/// generic resolves the same way through its own instance.
+#[test]
+fn f168_one_generic_at_a_static_and_a_reactive_argument_with_and_without_an_owner() {
+    f168_agrees(
+        "native_probe_f168_static_and_reactive.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "fun shown<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tvalue.bind(|text: str| print(text));\n",
+            "}\n",
+            "\n",
+            "fun forwarded<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tshown(value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tshown(\"top\");\n",
+            "\tforwarded(\"forwarded top\");\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tshown(\"inside\");\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tshown(cell);\n",
+            "\t\tlet other: SignalCell<str> = Signal::new(\"forwarded signal\");\n",
+            "\t\tforwarded(other);\n",
+            "\t\tforwarded(\"forwarded inside\");\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "top\nforwarded top\ninside\nsignal\nforwarded signal\nforwarded inside\n",
+    );
+}
+
+/// F168, B737's shape: a trait DEFAULT method generic over `MaybeSignal`,
+/// called on a concrete receiver and through a bounded one (`T: Labeled`).
+/// Each default instance declares what its own binding reads.
+#[test]
+fn f168_a_trait_default_and_a_bounded_receiver_need_no_owner_for_a_static_value() {
+    f168_agrees(
+        "native_probe_f168_trait_default.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "trait Labeled {\n",
+            "\tfun name(self): str;\n",
+            "\n",
+            "\tfun label<V: MaybeSignal<str>>(self, own value: V) {\n",
+            "\t\tlet name = self.name();\n",
+            "\t\tvalue.bind(|text: str| print(i\"{name}: {text}\"));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "struct Badge {\n",
+            "\tid: i32,\n",
+            "}\n",
+            "\n",
+            "impl Badge with Labeled {\n",
+            "\tfun name(self): str {\n",
+            "\t\ti\"badge {self.id}\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun decorate<T: Labeled>(item: T) {\n",
+            "\titem.label(\"decorated\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet badge = Badge { id = 1 };\n",
+            "\tbadge.label(\"static\");\n",
+            "\tdecorate(Badge { id = 2 });\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tBadge { id = 3 }.label(cell);\n",
+            "\t\tdecorate(Badge { id = 4 });\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "badge 1: static\nbadge 2: decorated\nbadge 3: signal\nbadge 4: decorated\n",
+    );
+}
+
+/// F168: recursion. A recursive call reaches its own instance while that
+/// instance is still being walked, so the emitter assumes what it declares and
+/// walks the program again when the assumption fails (`vilan_rust::emit`).
+/// The static instances only hand the owner to themselves and declare nothing
+/// (the least answer: `main` calls them with no owner); the reactive ones read
+/// it, which the first round assumed they did not — so this program is the one
+/// that needs the second round, through self-recursion and through a mutual
+/// recursion alike.
+#[test]
+fn f168_a_recursion_declares_the_owner_only_where_an_instance_reads_it() {
+    f168_agrees(
+        "native_probe_f168_recursion.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "fun repeated<V: MaybeSignal<str>>(own value: V, times: i32) {\n",
+            "\tif times > 1 {\n",
+            "\t\trepeated(value, times - 1);\n",
+            "\t} else {\n",
+            "\t\tvalue.bind(|text: str| print(text));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun ping<V: MaybeSignal<str>>(own value: V, times: i32) {\n",
+            "\tif times > 0 {\n",
+            "\t\tpong(value, times - 1);\n",
+            "\t} else {\n",
+            "\t\tvalue.bind(|text: str| print(i\"ping {text}\"));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun pong<V: MaybeSignal<str>>(own value: V, times: i32) {\n",
+            "\tping(value, times);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\trepeated(\"static\", 3);\n",
+            "\tping(\"static\", 2);\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\trepeated(cell, 2);\n",
+            "\t\tlet other: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tping(other, 2);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "static\nping static\nsignal\nping signal\n",
+    );
+}
+
+/// F168: a context other than the owner — a user-declared one, strict, read by
+/// one impl of the trait a generic dispatches through. The instance at the
+/// impl that reads nothing declares nothing, whether its caller holds the
+/// context (inside `run`) or not (`main`).
+#[test]
+fn f168_a_user_declared_context_is_declared_per_instance_too() {
+    f168_agrees(
+        "native_probe_f168_user_context.vl",
+        concat!(
+            "import std::context::Context;\n",
+            "\n",
+            "let depth_context: Context<i32> = Context::new();\n",
+            "\n",
+            "trait Describe {\n",
+            "\tfun describe(self): str;\n",
+            "}\n",
+            "\n",
+            "impl i32 with Describe {\n",
+            "\tfun describe(self): str {\n",
+            "\t\ti\"plain {self}\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl bool with Describe {\n",
+            "\tfun describe(self): str {\n",
+            "\t\ti\"{self} at depth {depth_context.get()}\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun told<T: Describe>(value: T) {\n",
+            "\tprint(value.describe());\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\ttold(3);\n",
+            "\tdepth_context.run(2, || told(true));\n",
+            "\tdepth_context.run(5, || told(4));\n",
+            "}\n",
+        ),
+        "plain 3\ntrue at depth 2\nplain 4\n",
+    );
+}
+
+/// F168: a closure inside the generic captures the hidden parameter its body
+/// hands to the dispatch. At the static instance that argument is not passed,
+/// so the closure does not capture the parameter and the instance does not
+/// declare it; and a closure in `main` calling the generic reaches the same
+/// instance it names.
+#[test]
+fn f168_a_closure_captures_the_owner_only_where_its_body_names_it() {
+    f168_agrees(
+        "native_probe_f168_closure.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "fun later<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tlet go = |inner: V| inner.bind(|text: str| print(text));\n",
+            "\tgo(value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlater(\"closure\");\n",
+            "\tlet show = |text: str| later(text);\n",
+            "\tshow(\"stored\");\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tlater(cell);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "closure\nstored\nsignal\n",
+    );
+}
+
+/// F168: a `for` loop's implicit `next` is handed the context arguments the
+/// pass threaded to it (`for_each_context_arguments`), and passes only those
+/// the `next` instance declares — none at the static one, though the loop
+/// stands where an owner is held.
+#[test]
+fn f168_a_for_loops_next_takes_only_the_contexts_its_instance_declares() {
+    f168_agrees(
+        "native_probe_f168_for_each.vl",
+        concat!(
+            "import std::iterator::Iterator;\n",
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "struct Spoken<V> {\n",
+            "\tvalue: Option<V>,\n",
+            "}\n",
+            "\n",
+            "impl Spoken<type V: MaybeSignal<str>> with Iterator<i32> {\n",
+            "\tfun next(&mut self): Option<i32> {\n",
+            "\t\tmatch self.value.take() {\n",
+            "\t\t\tSome(let value) => {\n",
+            "\t\t\t\tvalue.bind(|text: str| print(text));\n",
+            "\t\t\t\tSome(1)\n",
+            "\t\t\t},\n",
+            "\t\t\tNone => None,\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet inside = Spoken { value = Some(\"inside\") };\n",
+            "\t\tfor count in inside {\n",
+            "\t\t\tprint(count);\n",
+            "\t\t}\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tlet bound = Spoken { value = Some(cell) };\n",
+            "\t\tfor count in bound {\n",
+            "\t\t\tprint(count);\n",
+            "\t\t}\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "inside\n1\nsignal\n1\n",
+    );
+}
+
+/// F168: a `dyn` object's slot keeps the DECLARATION's signature — every
+/// context any implementation reads (B617) — and forwards to the selected
+/// implementation's instance only the hidden parameters that instance
+/// declares.
+#[test]
+fn f168_a_dyn_slot_forwards_only_the_contexts_its_instance_declares() {
+    f168_agrees(
+        "native_probe_f168_dyn_slot.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "trait Speaker {\n",
+            "\tfun speak(own self);\n",
+            "}\n",
+            "\n",
+            "struct Holder<V> {\n",
+            "\tvalue: V,\n",
+            "}\n",
+            "\n",
+            "impl Holder<type V: MaybeSignal<str>> with Speaker {\n",
+            "\tfun speak(own self) {\n",
+            "\t\tself.value.bind(|text: str| print(text));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tlet speakers: List<dyn Speaker> = [Holder { value = \"static\" }, Holder { value = cell }];\n",
+            "\t\tfor speaker in speakers {\n",
+            "\t\t\tspeaker.speak();\n",
+            "\t\t}\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "static\nsignal\n",
+    );
 }
 
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.

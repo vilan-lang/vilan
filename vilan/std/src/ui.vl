@@ -343,14 +343,14 @@ external fun ui_outline_text(index: i32, which: i32): str;
 /// keep the same rule.
 ///
 /// Why not `MaybeSignal` itself (re-asked once B737 let the checker resolve a
-/// trait default's dispatch per call site): its reactive arm REQUIRES an owner,
-/// and the native backend mints a context parameter per FUNCTION, not per
-/// instance (F168) — every attribute method, and every function reaching one,
-/// would declare an `Owner`, and a static `.gap(dp(8))` reached from code with no
-/// owner is refused natively though it checks. Every program would build its tree
-/// under `comp`. When F168 is gone the two can be one trait, and the remaining
-/// difference — a binding with no owner refused, instead of kept by its source — is
-/// the owner's call.
+/// trait default's dispatch per call site, and again once F168 let a native
+/// instance declare only the context parameters its body names, so a static
+/// `.gap(dp(8))` from code with no owner builds natively): its reactive arm
+/// REQUIRES an owner, so a binding with no owner is refused instead of kept by its
+/// source. That difference is the owner's call. (Tried 2026-11-12: a keyed child
+/// placed from code with no owner is then still refused natively, because the
+/// context pass decides a hidden parameter's FLAVOUR — strict or optional — per
+/// function too.)
 export trait Bindable<T> {
 	fun bind(own self, apply: |T| void);
 }

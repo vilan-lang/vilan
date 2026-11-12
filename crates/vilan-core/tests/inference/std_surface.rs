@@ -9888,11 +9888,11 @@ fn ui_r9_a_reactive_child_is_a_value_a_helper_can_answer() {
 /// `std::ui` KEEPS `Bindable` — a binding with no ambient owner belongs to its
 /// source — and the reactive children follow the same rule, so a tree with
 /// signal-bound attributes, a keyed list and a conditional can be built at the
-/// top of `main`, with no owner, and checks. (`MaybeSignal` would check here
-/// too since B737, but the native backend mints a context parameter per
-/// FUNCTION, not per instance — F168 — and refuses every static `.gap(dp(8))`
-/// reached from code with no owner; `native_differential`'s F168 pin holds
-/// that gap.)
+/// top of `main`, with no owner, and checks. (Under `MaybeSignal` this tree is
+/// refused: a reactive binding with no ambient owner is the one ruled
+/// difference. A static one — `.gap(dp(8))` from code with no owner — checks
+/// and, since F168, builds natively too: an instance declares only the
+/// context parameters its body names; `native_differential`'s F168 pins.)
 #[test]
 fn ui_r9_a_bound_tree_needs_no_owner_at_the_top_of_main() {
     let body = r#"
