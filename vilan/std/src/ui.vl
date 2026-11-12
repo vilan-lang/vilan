@@ -54,6 +54,9 @@
 // NATIVE ONLY, as `std::gfx` is: the JavaScript backend refuses a program that
 // reaches it, by name, when it builds; `vilan check` does not.
 //
+// COMPONENTS are `std::ui::kit` (part P4), under `ui/kit/`: built from these
+// elements, with no look of their own either.
+//
 // Not here yet: grid layout, text editing, publishing roles and labels to the
 // system's accessibility API (R10: carried from this version).
 
@@ -128,7 +131,7 @@ import pkg::shared::Shared;
 //                         widths at least / below, negative for none
 //   __ui_on               0 pointer enter, 1 pointer leave, 2 pointer move,
 //                         3 press, 4 release, 5 click, 6 scroll, 7 key, 8 key
-//                         release, 9 text, 10 focus, 11 blur
+//                         release, 9 text, 10 focus, 11 blur, 12 resize
 //   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll,
 //                         6 a region's marker (never laid out, painted or hit)
 //
@@ -266,6 +269,11 @@ external fun ui_focus(node: Node): void;
 /// Bits: 1 hovered, 2 pressed, 4 focused.
 [extern("__ui_interaction")]
 external fun ui_interaction(node: Node): i32;
+
+/// While a resize handler runs: the size it reports, width (0) and height (1), in
+/// dp.
+[extern("__ui_resized")]
+external fun ui_resized(which: i32): f64;
 
 [extern("__ui_set_offset")]
 external fun ui_set_offset(node: Node, x: f64, y: f64): void;
@@ -1031,6 +1039,15 @@ export impl Element with Child {
 	}
 }
 
+/// An element of any kind takes the attributes every element has: a function that
+/// answers an `Element` answers something that can still be sized, styled and
+/// listened to.
+export impl Element with Attributes {
+	fun element(self): Element {
+		self
+	}
+}
+
 export impl str with Child {
 	fun into_element(self): Element {
 		text().child(self).element
@@ -1318,6 +1335,20 @@ export trait Attributes {
 	fun on_blur(self, handler: (|| void) context (turn_scope, tracking)): Self {
 		ui_on(self.element().node, 11, || turn(FlushPolicy::AtSuspension, || tracking
 			.clear(|| handler())));
+		self
+	}
+
+	/// It was laid out at a new size (its box, in dp): at the first layout that
+	/// gives it one, and at every later layout that changes it. The handler runs
+	/// after the layout pass and before the frame is painted, and what it changes
+	/// is laid out again in the same frame, so a layout that depends on an
+	/// element's size (`kit::virtual_list` builds the rows its height shows) never
+	/// draws a frame of the old one. Does not bubble.
+	fun on_resize(self, handler: (|Size| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 12, || {
+			let size = Size::new(dp(ui_resized(0)), dp(ui_resized(1)));
+			turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(size)));
+		});
 		self
 	}
 }

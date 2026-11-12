@@ -861,12 +861,23 @@ fn bind_bound_binders(program: &Program, subject: TypeId, bindings: &mut HashMap
             // is never overwritten by a bound's — a bound argument grounded no
             // further than a provider's binder would otherwise replace the
             // receiver's `i32` with that binder (B409's native half).
+            //
+            // A provided argument that is still a generic is skipped only when
+            // it is the PROVIDER's own binder, which nothing past this provider
+            // can ground. A generic of the RECEIVER's — `ListCell<T>` built
+            // inside a generic function, whose `T` the caller's instance binds —
+            // is the answer: the native emitter reads it through the
+            // substitution of the instance it emits, and skipping it left the
+            // bound's binder unbound, so `each` over a cell a generic component
+            // made was refused natively.
+            let mut provider_binders = Vec::new();
+            collect_subject_binders(program, provider.subject, &mut provider_binders);
             let mut from_bound = HashMap::default();
             for (pattern, actual) in bound_arguments.iter().zip(provided) {
-                if matches!(
-                    program.type_id_to_type_map.get(&actual),
-                    Some(Type::Generic(_))
-                ) {
+                if let Some(Type::Generic(constraint_id)) = program.type_id_to_type_map.get(&actual)
+                    && (provider_binders.contains(constraint_id)
+                        || provider.bindings.contains_key(constraint_id))
+                {
                     continue;
                 }
                 bind_subject(program, *pattern, actual, &mut from_bound);

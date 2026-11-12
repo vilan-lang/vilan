@@ -317,6 +317,16 @@ const CENSUS: &[(&str, usize, &str)] = &[
          written by the element's handlers the tree keeps and by the `TextInput` \
          value's methods, which the program calls long after the builder returned",
     ),
+    (
+        "ui/kit/lists.vl",
+        2,
+        "E: a virtual list's window (native-ui.md P4) — the kept copy of its \
+         source's items and the numbers of where the window stands (the rows \
+         built, the offset, the viewport, the overscan), minted by \
+         `virtual_list` and read and written by the source's subscription, the \
+         offset's, the resize and key handlers and every copy of the list's \
+         handle (`reveal`, `built`)",
+    ),
     ("web/router.vl", 1, "R: the module-level `wired` latch"),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
@@ -441,7 +451,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 294,
+        total, 296,
         "the total number of `Shared` construction sites in std changed"
     );
 

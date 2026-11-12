@@ -12,6 +12,9 @@
 // module and an item of one name in one module are ambiguous, and the analyzer
 // refuses the pair.
 
+[platform("@process")] mod self;
+
 export import pkg::ui::kit::buttons::*;
 export import pkg::ui::kit::checkboxes::*;
 export import pkg::ui::kit::inputs::*;
+export import pkg::ui::kit::lists::*;

@@ -671,6 +671,7 @@ std/ui.md h2 events
 std/ui.md h2 focus
 std/ui.md h2 scrolling
 std/ui.md h2 lists-and-conditional-children
+std/ui.md h2 a-virtual-list
 std/ui.md h2 showing-it
 std/ui.md h2 components-stduikit
 std/window.md h1 windows

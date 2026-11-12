@@ -524,10 +524,42 @@ keeps them. `each_by` hands each row a cell holding its item instead, so an item
 changed in place is written into its row and nothing is built; `swap(value, |v|
 ..)` shows one of several subtrees.
 
+A long list wants `std::ui::kit::virtual_list` instead: the same source, key and
+render, plus a row height, and only the rows near the viewport are in the tree —
+about twenty for a list of 100,000 — while the scroll's range stays the whole
+list's. Rows that leave the window are removed (state that must survive belongs
+in the items), Tab walks on past the window, and `reveal(index)` scrolls to any
+row ([the reference](../std/ui.md#a-virtual-list)):
+
+```vilan,native
+import std::gfx::{ Window, dp };
+import std::io::print;
+import std::range::Range;
+import std::reactive::ListCell;
+import std::ui::kit::virtual_list;
+import std::ui::{ mount, row, text };
+
+fun main() {
+	let window = match Window::builder().title("Rows").size(dp(360), dp(480)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let numbers: ListCell<i32> = ListCell::of(Range::new(0, 100000).to_list());
+	mount(window, virtual_list(numbers, dp(28), |number: i32| number, |number: i32| {
+		<row padding_x(dp(12)) focusable><text>{i"Row {number}"}</text></row>
+	}));
+}
+main();
+```
+
 `vilan/examples/ui-counter` is the counter with two buttons and keyboard
-activation, and `vilan/examples/ui-list` a keyed list of 10,000 rows in a
-`scroll` — a click changes one row, and keys add a row at the top, remove one and
-move one; their end-to-end test drives both through the X server, by pointer and
+activation, `vilan/examples/ui-list` a keyed list of 10,000 rows in a `scroll` —
+a click changes one row, and keys add a row at the top, remove one and move one —
+and `vilan/examples/ui-virtual-list` the same list of 100,000 rows on the virtual
+list; their end-to-end test drives them through the X server, by pointer and
 keyboard, and holds every frame to "only on change".
 
 ### Components
@@ -647,5 +679,5 @@ notifications, deep links, secure token storage, or second window to manage,
 and no installer or package — each is its own slice. A GPU window's **native
 UI** (`std::ui`) has its elements, layout, styles, events, focus, scrolling,
 keyed lists and conditional children, and its first components (`std::ui::kit`: a
-button, a checkbox, a single-line text input); paths, multi-line text editing,
-the clipboard, input methods and accessibility come after them.
+button, a checkbox, a single-line text input, a virtual list); paths, multi-line
+text editing, the clipboard, input methods and accessibility come after them.

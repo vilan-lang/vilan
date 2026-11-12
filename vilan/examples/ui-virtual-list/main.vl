@@ -1,0 +1,515 @@
+// A KEYED list of 100,000 rows on `std::ui::kit::virtual_list_by` (native-ui.md
+// part P4's virtual list): the rows are a `ListCell` of entries, each row reading
+// its entry through a cell of its own, and the tree holds only the rows near the
+// viewport — about twenty — whatever the count. The scroll's range is the whole
+// list's. A click on a row counts it (one `set_at`), and keys change the list:
+//
+//   a     a new row at the top              d     the top row removed
+//   m     the bottom row moved to the top   g     the middle row revealed
+//   End   the last row revealed
+//
+// Modes:
+//
+//   --smoke            a line per frame: the offset, the rows built, the
+//                      elements in the tree, the row clicked, the last action
+//                      and what the frame took; the first frame's scroll box
+//   --check --font F   no window: the tree laid out and driven with `deliver`,
+//                      a line per step (what is built, what the rows' hover,
+//                      press and focus are), held to a recorded listing
+//   --measure --font F no window: what the list's changes cost, in milliseconds
+//                      over many repetitions (layout and the program's own
+//                      work; no paint)
+//   --rows N           N rows instead of 100,000
+
+import std::fs::read_bytes;
+import std::gfx::{
+	Button,
+	Color,
+	Event,
+	FontFamily,
+	Frame,
+	KeyName,
+	KeyPress,
+	Modifiers,
+	Point,
+	Pointer,
+	Scroll,
+	Size,
+	Window,
+	dp,
+	register_font,
+};
+import std::hash_map::HashMap;
+import std::io::print;
+import std::process::{ args, exit };
+import std::range::Range;
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::shared::Shared;
+import std::time::now;
+import std::ui::kit::{ VirtualList, virtual_list, virtual_list_by };
+import std::ui::{
+	Align,
+	Element,
+	Interaction,
+	Style,
+	column,
+	deliver,
+	draw,
+	focused,
+	hovered,
+	last_frame,
+	layout,
+	mount,
+	row,
+	style,
+	text,
+};
+
+/// One row's data: its id (its key, and its label) and its clicks.
+struct Entry {
+	id: i32,
+	clicks: i32,
+}
+
+/// Every row is this tall.
+fun extent(): f64 {
+	32.0
+}
+
+fun row_look(id: i32): Style {
+	let shade = if id % 2 == 0 { Color::rgb(252, 252, 253) } else { Color::rgb(244, 245, 248) };
+	style()
+		.background(shade)
+		.when(hovered(), |look: Style| look.background(Color::rgb(222, 230, 255)))
+		.when(focused(), |look: Style| look.background(Color::rgb(200, 214, 255)))
+}
+
+/// Where the entry with `id` is in the list now. (A copy of the list, walked: a
+/// click's cost, not a frame's.)
+fun position_of(entries: ListCell<Entry>, id: i32): Option<usize> {
+	let list = entries.get();
+	mut at: usize = 0;
+	for at < list.len() {
+		if list[at].id == id {
+			ret Some(at);
+		}
+		at += 1;
+	}
+	None
+}
+
+/// One row: its label, and its clicks read through the row's own cell. Focusable,
+/// so Tab walks the rows.
+fun list_row(entry: SignalCell<Entry>, entries: ListCell<Entry>, clicked: |i32| void): Element {
+	let id = entry.get().id;
+	let name = i"row {id}";
+	<row
+		padding_x(dp(12))
+		gap(dp(8))
+		align(Align::Center)
+		style(row_look(id))
+		label(name)
+		focusable
+		on_click(|| {
+			match position_of(entries, id) {
+				Some(let at) => entries.set_at(at, Entry { id, clicks = entry.get().clicks + 1 }),
+				None => {},
+			}
+			clicked(id);
+		})
+	>
+		<text grow(1.0)>{i"Row {id}"}</text>
+		<text>{entry.derive(|now: Entry| i"{now.clicks} clicks")}</text>
+	</row>.element()
+}
+
+fun entries_of(count: i32): ListCell<Entry> {
+	mut initial: List<Entry> = [];
+	for id in Range::new(0, count) {
+		initial.push(Entry { id, clicks = 0 });
+	}
+	ListCell::of(initial)
+}
+
+/// The list over `entries`, every row registered in `rows` by id as it is built.
+fun entry_list(
+	entries: ListCell<Entry>,
+	rows: Shared<HashMap<i32, Element>>,
+	clicked: |i32| void,
+): VirtualList<Entry, i32> {
+	virtual_list_by(entries, dp(extent()), |entry: Entry| entry.id, |entry: SignalCell<Entry>| {
+		let element = list_row(entry, entries, clicked);
+		rows.write().insert(entry.get().id, element);
+		element
+	})
+}
+
+/// `1,2,3`.
+fun numbers_of(numbers: List<i32>): str {
+	mut listed = "";
+	for number in numbers {
+		listed = if listed == "" { i"{number}" } else { i"{listed},{number}" };
+	}
+	listed
+}
+
+fun after(arguments: List<str>, flag: str, fallback: str): str {
+	for index in Range::new(1, arguments.len().as_i32()) {
+		if arguments[(index - 1).as_usize()] == flag {
+			ret arguments[index.as_usize()];
+		}
+	}
+	fallback
+}
+
+fun main() {
+	let arguments = args();
+	let count = after(arguments, "--rows", "100000").parse_f64().unwrap_or(100000.0).as_i32();
+	if arguments.contains("--check") {
+		check(arguments, count);
+		ret;
+	}
+	if arguments.contains("--measure") {
+		measure(arguments, count);
+		ret;
+	}
+	let smoke = arguments.contains("--smoke");
+	let window = match Window::builder()
+		.title("vilan ui virtual list")
+		.size(dp(480), dp(640))
+		.open() {
+		Ok(let window) => window,
+		// No display, no GPU: say why.
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let entries = entries_of(count);
+	let next_id: Shared<i32> = Shared::new(count);
+	let clicked: Shared<i32> = Shared::new(-1);
+	let action: Shared<str> = Shared::new("none");
+	let offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
+	let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let list = entry_list(entries, rows, |id: i32| {
+		clicked.write() = id;
+		if smoke {
+			print(i"clicked {id}");
+		}
+	}).grow(1.0).offset(offset).label("viewport");
+	let on_key = |key: KeyPress| {
+		match key.key {
+			KeyName::Char(let typed) => {
+				if typed == "a" {
+					entries.insert_at(0, Entry { id = next_id.read(), clicks = 0 });
+					next_id.write() = next_id.read() + 1;
+					action.write() = "add";
+				} else if typed == "d" && entries.size() > 0 {
+					entries.remove_at(0);
+					action.write() = "remove";
+				} else if typed == "m" && entries.size() > 1 {
+					entries.move_range(entries.size() - 1, 1, 0);
+					action.write() = "move";
+				} else if typed == "g" {
+					list.reveal(entries.size() / 2);
+					action.write() = "middle";
+				}
+			},
+			KeyName::End => {
+				if entries.size() > 0 {
+					list.reveal(entries.size() - 1);
+					action.write() = "end";
+				}
+			},
+			_ => {},
+		}
+	};
+	let root = <column
+		style(style().text_color(Color::rgb(30, 30, 40)))
+		label("list")
+		on_key(on_key)
+	>
+		<text padding(dp(12)) style(style().weight(700))>
+			{i"{count} rows: scroll, click one, Tab, or press a, d, m, g or End"}
+		</text>
+		{list}
+	</column>;
+	mount(window, root);
+	if !smoke {
+		ret;
+	}
+	let frames: Shared<i32> = Shared::new(0);
+	window.on_frame(|frame: Frame| {
+		draw(frame, root);
+		frames.write() = frames.read() + 1;
+		let times = last_frame(window);
+		let (first, last) = list.built();
+		print(i"frame {frames.read()} offset={offset.get().y.value()} rows={entries.size()} built={first}..{last} tree={root.element().outline().len()} clicked={clicked.read()} action={action.read()} solved={times.solved} measured={times.measured} moved={times.moved} rebuilt={times.rebuilt} layout_us={times.layout.round()} paint_us={times.paint.round()} draw_us={times.draw.round()}");
+		if frames.read() == 1 {
+			let bounds = list.element().bounds();
+			print(i"box viewport {bounds.x.value()} {bounds.y.value()} {bounds.width.value()} {bounds.height.value()}");
+		}
+	});
+}
+
+// --- Check mode: the tree with no window -----------------------------------------
+
+fun state(interaction: Interaction): str {
+	mut letters = "";
+	if interaction.hovered {
+		letters = letters + "h";
+	}
+	if interaction.pressed {
+		letters = letters + "p";
+	}
+	if interaction.focused {
+		letters = letters + "f";
+	}
+	if letters == "" {
+		"-"
+	} else {
+		letters
+	}
+}
+
+fun font_of(arguments: List<str>): str {
+	match register_font(read_bytes(after(arguments, "--font", ""))) {
+		Ok(let families) => families[0],
+		Err(let reason) => {
+			print(i"font: {reason}");
+			exit(2);
+			""
+		},
+	}
+}
+
+/// The rows the tree holds now, by their labels: `first..last (n)` when they are
+/// consecutive ids in order, every id otherwise; and the tree's whole size.
+fun rows_in(root: Element): str {
+	let entries = root.outline();
+	mut ids: List<i32> = [];
+	for entry in entries {
+		if entry.label.starts_with("row ") {
+			ids.push(entry.label
+				.substring(4, entry.label.len())
+				.parse_f64()
+				.unwrap_or(-1.0)
+				.as_i32());
+		}
+	}
+	mut consecutive = true;
+	for index in Range::new(1, ids.len().as_i32()) {
+		if ids[index.as_usize()] != ids[(index - 1).as_usize()] + 1 {
+			consecutive = false;
+		}
+	}
+	let listed = if ids.len() == 0 {
+		"none"
+	} else if consecutive {
+		i"{ids[0]}..{ids[ids.len() - 1]}"
+	} else {
+		numbers_of(ids)
+	};
+	i"rows={listed} ({ids.len()}) elements={entries.len()}"
+}
+
+fun check(arguments: List<str>, count: i32) {
+	let font = font_of(arguments);
+	let size = Size::new(dp(480), dp(640));
+	let entries = entries_of(count);
+	let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let clicks: Shared<List<i32>> = Shared::new([]);
+	let offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
+	let list = entry_list(entries, rows, |id: i32| clicks.write().push(id))
+		.grow(1.0)
+		.offset(offset)
+		.label("viewport");
+	let root = <column style(style().font(FontFamily::Named(font))) label("list")>
+		<text padding(dp(12))>"A virtual list"</text>
+		{list}
+	</column>.element();
+	let row = |id: i32| rows.read().get(id).unwrap();
+	let report = |what: str| {
+		layout(root, size, 1.0);
+		let (first, last) = list.built();
+		print(i"{what}: offset={offset.get().y.value()} range={list.viewport().range().height.value()} count={list.count()} built={first}..{last} {rows_in(root)}");
+	};
+	// Where a row is on the screen: laid out in the column, moved by the offset.
+	let centre = |id: i32| {
+		let bounds = row(id).bounds();
+		Point::new(bounds.x + bounds.width / 2.0, bounds.y + bounds.height / 2.0 - offset.get().y)
+	};
+	let none = Modifiers { shift = false, control = false, alt = false, meta = false };
+	let primary = |at: Point| Pointer { position = at, button = Button::Left, modifiers = none };
+	let tab = |shift: bool| {
+		deliver(root, Event::KeyPressed(KeyPress {
+			key = KeyName::Tab,
+			repeat = false,
+			modifiers = Modifiers { shift, control = false, alt = false, meta = false },
+		}));
+	};
+	let focused_row = || {
+		mut found = "none";
+		for (id, element) in rows.read().entries() {
+			if element.interaction().focused {
+				found = i"row {id}";
+			}
+		}
+		found
+	};
+
+	// 1. The first layout: the viewport's height reaches the list after the pass,
+	// and the rows it shows are built and laid out in the same `layout`.
+	report("first layout");
+	let viewport = list.element().bounds();
+	let whole = list.viewport().range().height.value() + viewport.height.value();
+	print(i"the range and the viewport make the whole list: {(whole - count.as_f64() * extent()).abs() <= 1.0}");
+
+	// 2. The wheel: the window follows the offset.
+	deliver(root, Event::Scrolled(Scroll {
+		position = Point::new(dp(240), dp(300)),
+		x = dp(0),
+		y = dp(-96),
+		modifiers = none,
+	}));
+	report("wheel 96 down");
+
+	// 3. Far down, by reveal: nothing in between was ever built.
+	list.reveal((count / 2).as_usize());
+	report("reveal middle");
+
+	// 4. Hover, press and focus on a row survive changes that keep it in the
+	// window: another row's change, a programmatic scroll of one row, an insert
+	// at the top (every row moves down one place; the window keeps its offset).
+	let target = count / 2 - 5;
+	deliver(root, Event::PointerMoved(centre(target)));
+	deliver(root, Event::PointerPressed(primary(centre(target))));
+	report(i"pressed row {target}");
+	print(i"row {target}: {state(row(target).interaction())}");
+	let built_before = row(target);
+	entries.set_at((target + 2).as_usize(), Entry { id = target + 2, clicks = 5 });
+	report("another row changed");
+	// The app's own offset cell, written: the list follows it.
+	offset.set(Point::new(dp(0), dp(offset.get().y.value() - extent())));
+	report("the program scrolled one row up");
+	entries.insert_at(0, Entry { id = -1, clicks = 0 });
+	report("inserted at the top");
+	print(i"row {target}: {state(row(target).interaction())} same element={row(target).bounds().y.value() == built_before.bounds().y.value()}");
+	deliver(root, Event::PointerReleased(primary(centre(target))));
+	report("released");
+	let clicked = numbers_of(clicks.read());
+	print(i"row {target}: {state(row(target).interaction())} clicks={clicked}");
+
+	// 5. Tab walks the rows past the window: each Tab focuses the next row and
+	// reveals it, which moves the window.
+	for _step in Range::new(0, 30) {
+		tab(false);
+		layout(root, size, 1.0);
+	}
+	report("tab x30");
+	print(i"focused {focused_row()}");
+	for _step in Range::new(0, 3) {
+		tab(true);
+		layout(root, size, 1.0);
+	}
+	report("shift+tab x3");
+	print(i"focused {focused_row()}");
+
+	// 6. Tab from the LAST BUILT row (focused by the program, not revealed): the
+	// list builds the next row before the focus moves, so the focus stays in it.
+	let (_first, last) = list.built();
+	let last_id = entries.get()[last - 1].id;
+	row(last_id).focus();
+	print(i"focused {focused_row()} (the last built)");
+	tab(false);
+	report("tab from the last built row");
+	print(i"focused {focused_row()}");
+
+	// 7. Ops outside the window change the height and nothing else; at the end.
+	entries.remove_at(0);
+	report("removed at the top");
+	list.reveal(entries.size() - 1);
+	report("revealed the last row");
+	entries.push(Entry { id = count, clicks = 0 });
+	list.reveal(entries.size() - 1);
+	report("pushed and revealed in one go");
+	// A reset to ten rows while scrolled to the end: the layout clamps the offset,
+	// and the window follows it in the same layout.
+	mut ten: List<Entry> = [];
+	for id in Range::new(0, 10) {
+		ten.push(Entry { id, clicks = 0 });
+	}
+	entries.set(ten);
+	report("reset to ten rows");
+
+	// 8. A plain signal of a list, with `virtual_list` (rows built again when
+	// their item changes).
+	let numbers: SignalCell<List<i32>> = Signal::new(Range::new(0, 1000).to_list());
+	let plain = virtual_list(numbers, dp(20), |number: i32| number, |number: i32| {
+		let name = i"row {number}";
+		<text label(name)>{i"{number}"}</text>
+	}).height(dp(200));
+	let plain_root = <column style(style().font(FontFamily::Named(font)))>{plain}</column>.element();
+	layout(plain_root, Size::new(dp(200), dp(300)), 1.0);
+	print(i"plain: {rows_in(plain_root)}");
+	numbers.set(Range::new(0, 500).to_list().filter(|number: i32| number % 2 == 1));
+	layout(plain_root, Size::new(dp(200), dp(300)), 1.0);
+	print(i"plain odd: {rows_in(plain_root)} count={plain.count()}");
+	plain.reveal_key(301);
+	layout(plain_root, Size::new(dp(200), dp(300)), 1.0);
+	print(i"plain reveal 301: {rows_in(plain_root)}");
+}
+
+// --- Measure mode: costs with no window -------------------------------------------
+
+fun measure(arguments: List<str>, count: i32) {
+	let font = font_of(arguments);
+	let size = Size::new(dp(480), dp(640));
+	mut firsts: List<i32> = [];
+	for _run in Range::new(0, 7) {
+		let started = now();
+		let entries = entries_of(count);
+		let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+		let list = entry_list(entries, rows, |_id: i32| {}).grow(1.0);
+		let root = <column style(style().font(FontFamily::Named(font)))>{list}</column>.element();
+		layout(root, size, 1.0);
+		firsts.push(now().since(started).as_millis().as_i32());
+	}
+	let listed = numbers_of(firsts);
+	print(i"rows={count} first_ms(7 runs)={listed}");
+	let entries = entries_of(count);
+	let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let list = entry_list(entries, rows, |_id: i32| {}).grow(1.0);
+	let root = <column style(style().font(FontFamily::Named(font)))>{list}</column>.element();
+	layout(root, size, 1.0);
+	list.reveal((count / 2).as_usize());
+	layout(root, size, 1.0);
+	let repeats = 200;
+	let timed = |name: str, step: |i32| void| {
+		let started = now();
+		for index in Range::new(0, repeats) {
+			step(index);
+			layout(root, size, 1.0);
+		}
+		let total = now().since(started).as_millis();
+		print(i"rows={count} {name}_us={total.as_i32() * 1000 / repeats} ({repeats} repetitions)");
+	};
+	let middle = (count / 2).as_usize();
+	timed("scroll_step", |index: i32| {
+		// 96 dp down: three rows leave at the top, three are built at the bottom.
+		list.reveal(middle + 20 + 3 * index.as_usize());
+	});
+	timed("one_row_change", |index: i32| {
+		let (first, _last) = list.built();
+		// No row has been added yet: an entry's id is its index.
+		entries.set_at(first + 5, Entry { id = (first + 5).as_i32(), clicks = index });
+	});
+	timed("insert_at_top", |index: i32| {
+		entries.insert_at(0, Entry { id = count + index, clicks = 0 });
+	});
+	timed("remove_at_top", |_index: i32| {
+		entries.remove_at(0);
+	});
+}
+
+main();

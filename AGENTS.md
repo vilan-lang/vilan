@@ -176,12 +176,18 @@ Rust workspace, seventeen crates, plus the language's own tree:
   subtree's handlers (B738), so the host drops them with the tree no longer borrowed. The xvfb
   suites share `crates/vilan-cli/tests/support/xvfb.rs`, whose `Running` ends its run's whole
   process group on drop (N198). `std::ui::kit` (P4) is vilan in `vilan/std/src/ui/kit/`, one
-  PLURAL-named file per component (`buttons.vl` for `button`: a module and an item of one name
-  are ambiguous) re-exported by `ui/kit.vl`; its only host part is an EDITED text
-  (`UiTree::text_edit`): a text shaped with each grapheme's box (`text/editing.rs`, recorded only
-  when asked) that paints its own caret and selection and answers where a point or a step lands,
-  in the program's UTF-16 indices. `vilan/examples/ui-todo` is its exit test, in
-  `ui_interaction.rs` with its own recorded listing (`tests/ui/todo-check.txt`).
+  PLURAL-named file per component (`buttons.vl` for `button`, `lists.vl` for `virtual_list`: a
+  module and an item of one name are ambiguous) re-exported by `ui/kit.vl`. The controls' only
+  host part is an EDITED text (`UiTree::text_edit`): a text shaped with each grapheme's box
+  (`text/editing.rs`, recorded only when asked) that paints its own caret and selection and
+  answers where a point or a step lands, in the program's UTF-16 indices.
+  `vilan/examples/ui-todo` is their exit test, in `ui_interaction.rs` with its own recorded
+  listing (`tests/ui/todo-check.txt`). The virtual list is plain vilan over a `scroll` (a column
+  as tall as every row, the rows above the window as its top padding, the window an `each` over
+  a cell of its items); what it needed from the host is `on_resize` (told after a layout, and
+  `__ui_layout` lays out again when a handler changed the tree), an offset kept unclamped while
+  a layout is pending (`ScrollState::measured_at`), and Tab's reveal of an element with no box
+  yet waiting for the next layout (`pending_reveal`).
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

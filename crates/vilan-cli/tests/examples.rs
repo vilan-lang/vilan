@@ -200,6 +200,9 @@ fn post_build(directory: &str) -> PostBuild {
         // P4's exit test: the todo list on `std::ui::kit`, run by
         // `ui_interaction.rs`; it reaches `std::gfx` first too.
         "ui-todo" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P4's exit test: the virtual list of 100,000 rows; its
+        // native build and runs are `ui_interaction.rs`'s.
+        "ui-virtual-list" => PostBuild::NativeOnly { module: "std::gfx" },
         _ => PostBuild::BuildOnly,
     }
 }
