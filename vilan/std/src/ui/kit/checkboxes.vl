@@ -1,0 +1,59 @@
+// `std::ui::kit`'s checkbox (native-ui.md P4): a two-state control bound both ways
+// to a `bool` signal. It has a button's behaviour (a click, Enter, Space) and no
+// look at all: the app draws the box and the mark as its children, from the same
+// signal.
+
+[platform("@process")] mod self;
+
+import pkg::reactive::SignalCell;
+import pkg::shared::Shared;
+import pkg::ui::kit::buttons::{ #bind_disabled, #pressable };
+import pkg::ui::{ Attributes, Bindable, Child, Element, Flex, Parent, Role };
+
+/// A checkbox. See `checkbox(..)`.
+export struct Checkbox {
+	element: Element,
+	/// Disabled now: no toggling, and out of the tab order.
+	off: Shared<bool>,
+}
+
+/// A checkbox over `checked`: a click, and Enter or Space while it has the focus,
+/// write the cell's opposite; a write from anywhere else is what it shows next. It
+/// is an empty ROW with the role `Role::Checkbox`: the app gives it its children —
+/// the box, the mark (`when(checked, || ..)`), a text — and its look, and labels it
+/// with `label(..)`.
+export fun checkbox(checked: SignalCell<bool>): Checkbox {
+	let off: Shared<bool> = Shared::new(false);
+	let toggle = pressable(Role::Checkbox, off, || checked.set(!checked.get()));
+	Checkbox { element = toggle.element(), off }
+}
+
+export impl Checkbox with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl Checkbox with Parent {}
+
+export impl Checkbox with Flex {}
+
+export impl Checkbox with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl Checkbox {
+	/// Disabled while `disabled` (a `bool`, or a signal of one) holds: it does not
+	/// toggle, and Tab and a press pass it by.
+	fun disabled<V: Bindable<bool>>(self, own disabled: V): Checkbox {
+		bind_disabled(self.element, self.off, disabled);
+		self
+	}
+
+	/// Whether it is disabled now.
+	fun is_disabled(self): bool {
+		self.off.read()
+	}
+}

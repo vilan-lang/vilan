@@ -27,6 +27,16 @@
 //!    top row removed: nothing measured) and `m` (the bottom row moved to the
 //!    top: nothing measured), each a frame with the row count it left.
 //!
+//! 4. native-ui.md P4's exit test, "a todo app with the look supplied by the
+//!    app": `vilan/examples/ui-todo`, on `std::ui::kit`. Its `--check` drives
+//!    the screen with no window — typing, the caret keys, a selection by
+//!    Shift and by a drag, graphemes, Enter, Tab, Space and clicks on the
+//!    checkboxes and the remove buttons — held to `tests/ui/todo-check.txt`
+//!    line for line (the same regeneration). Then in a window: a click
+//!    focuses the input, `m`, `i`, `l`, `k` type, Return adds the item, a
+//!    click checks it off, a click on its remove button removes it, the close
+//!    button ends it with exit 0.
+//!
 //! Ordering comes from the programs' lines — each injection waits for the
 //! line its predecessor caused — never from a sleep. No assertion reads a
 //! time: the frame times the programs print are for a person (the report's
@@ -266,31 +276,7 @@ fn the_counter_and_the_ten_thousand_row_list_run_end_to_end() {
     let counter = build_example("ui-counter", "counter");
 
     // 1. The tree driven with no window: both spellings, and every event.
-    let checked = Command::new(&counter)
-        .arg("--check")
-        .arg("--font")
-        .arg(test_font())
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY")
-        .output()
-        .expect("run the check mode");
-    let listed = String::from_utf8_lossy(&checked.stdout).to_string();
-    assert!(
-        checked.status.success(),
-        "--check failed:\n{listed}{}",
-        String::from_utf8_lossy(&checked.stderr)
-    );
-    let recorded = repository_root().join("crates/vilan-cli/tests/ui/counter-check.txt");
-    if std::env::var_os("VILAN_REGENERATE_UI_CHECK").is_some() {
-        std::fs::write(&recorded, &listed).expect("write the listing");
-    }
-    let expected = std::fs::read_to_string(&recorded)
-        .expect("the recorded listing")
-        .replace("\r\n", "\n");
-    assert_eq!(
-        expected, listed,
-        "the counter's tree no longer does what it recorded"
-    );
+    let listed = assert_check_listing(&counter, "counter-check.txt");
     assert!(listed.starts_with("spellings agree=true"), "{listed}");
 
     let list = build_example("ui-list", "list");
@@ -419,5 +405,94 @@ fn the_counter_and_the_ten_thousand_row_list_run_end_to_end() {
         Some(0),
         "closing the list ended it with {code:?}:\n{}\n--- stderr\n{stderr}",
         seen.join("\n")
+    );
+}
+
+/// The recorded listing of an example's `--check`, compared line for line
+/// (regenerated with `VILAN_REGENERATE_UI_CHECK=1`: READ it first).
+fn assert_check_listing(binary: &Path, recorded: &str) -> String {
+    let checked = Command::new(binary)
+        .arg("--check")
+        .arg("--font")
+        .arg(test_font())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run the check mode");
+    let listed = String::from_utf8_lossy(&checked.stdout).to_string();
+    assert!(
+        checked.status.success(),
+        "--check failed:\n{listed}{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let recorded = repository_root()
+        .join("crates/vilan-cli/tests/ui")
+        .join(recorded);
+    if std::env::var_os("VILAN_REGENERATE_UI_CHECK").is_some() {
+        std::fs::write(&recorded, &listed).expect("write the listing");
+    }
+    let expected = std::fs::read_to_string(&recorded)
+        .expect("the recorded listing")
+        .replace("\r\n", "\n");
+    assert_eq!(expected, listed, "the tree no longer does what it recorded");
+    listed
+}
+
+#[test]
+fn the_todo_list_on_the_kit_runs_end_to_end() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let todo = build_example("ui-todo", "todo");
+
+    // 1. With no window: every behaviour of the three components, recorded.
+    let listed = assert_check_listing(&todo, "todo-check.txt");
+    assert!(
+        listed.contains("remove bread: draft=\"\" caret=0 anchor=0 items=[]"),
+        "{listed}"
+    );
+
+    // 2. In a window, by pointer and keyboard: add an item, check it off,
+    // remove it.
+    let injector = build_injector();
+    let started = Instant::now();
+    let mut running = Running::start(&todo, &["--smoke"], "vilan ui todo");
+    running.wait_for("frame 1 ", started);
+    let input = running.wait_for("box new-item ", started);
+    let (x, y) = centre(&input);
+    running.inject(&injector, &["move", &x, &y, "press", "release"]);
+    running.wait_for("focus=input", started);
+    running.inject(&injector, &["key", "m", "key", "i", "key", "l", "key", "k"]);
+    running.wait_for("draft=milk items=[] focus=input", started);
+    running.inject(&injector, &["key", "Return"]);
+    running.wait_for("draft= items=[[ ] milk]", started);
+    let check = running.wait_for("box check-milk ", started);
+    let remove = running.wait_for("box remove-milk ", started);
+    let (x, y) = centre(&check);
+    running.inject(&injector, &["move", &x, &y, "press", "release"]);
+    running.wait_for("items=[[x] milk]", started);
+    let (x, y) = centre(&remove);
+    running.inject(&injector, &["move", &x, &y, "press", "release"]);
+    running.wait_for("items=[] ", started);
+    running.inject(&injector, &["close"]);
+    let (code, seen, stderr) = running.exit(started);
+    let report = format!("{}\n--- stderr\n{stderr}", seen.join("\n"));
+    for (line, what) in [
+        ("add milk", "Return in the input adding the item"),
+        ("remove milk", "the click on the remove button"),
+    ] {
+        assert!(
+            seen.iter().any(|seen| seen == line),
+            "{what} never ran:\n{report}"
+        );
+    }
+    assert!(
+        seen.iter().any(|line| line.starts_with("close requested")),
+        "the close request never reached the program:\n{report}"
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "closing the todo list ended it with {code:?}:\n{report}"
     );
 }

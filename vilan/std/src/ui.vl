@@ -252,7 +252,7 @@ external fun ui_remove(node: Node): void;
 external fun ui_scroll_into_view(node: Node): void;
 
 [extern("__ui_set_focusable")]
-external fun ui_set_focusable(node: Node, focusable: bool): void;
+export(in pkg) external fun ui_set_focusable(node: Node, focusable: bool): void;
 
 [extern("__ui_on")]
 external fun ui_on(node: Node, kind: i32, handler: || void): void;

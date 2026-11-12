@@ -21,9 +21,10 @@ A child can be reactive: a keyed list (`each`) or a conditional (`when`) keeps
 its place among the static children and inserts, removes and moves elements as
 its source changes ([below](#lists-and-conditional-children)).
 
-Not here yet: grid layout, text editing, and publishing roles and labels to the
-system's accessibility API. Components (a button with behaviour, a text input, a
-virtual list) are `std::ui::kit`, a later part.
+Components with behaviour and no look — a button, a checkbox, a single-line text
+input — are [`std::ui::kit`](#components-stduikit). Not here yet: grid layout,
+text editing beyond one line, input methods, and publishing roles and labels to
+the system's accessibility API.
 
 ## Elements
 
@@ -576,3 +577,104 @@ edge on its own: boxes that share an edge in dp share it on the screen, and a
 1 dp line is one device pixel at 100%, 125% and 150%. `bounds` answers the
 snapped box in dp (an element inside a `scroll` is where it is laid out, before
 the scroll's offset).
+
+## Components: `std::ui::kit`
+
+```vilan,fragment
+fun button<C: ButtonContent>(content: C, on_click: || void): Button   // a str (its label too) or an element
+fun checkbox(checked: SignalCell<bool>): Checkbox                    // toggles the cell
+fun text_input(value: SignalCell<str>): TextInput                    // edits the cell
+
+impl Button   { fun disabled(self, disabled: Bindable<bool>): Button  fun is_disabled(self): bool }
+impl Checkbox { fun disabled(self, disabled: Bindable<bool>): Checkbox  fun is_disabled(self): bool }
+impl TextInput {
+	fun placeholder(self, text: Bindable<str>): TextInput
+	fun placeholder_style(self, look: Bindable<Style>): TextInput
+	fun caret(self, color: Color, width: Dp): TextInput
+	fun selection_color(self, color: Color): TextInput
+	fun on_submit(self, handler: |str| void): TextInput           // Enter, with the value
+	fun disabled(self, disabled: Bindable<bool>): TextInput
+	fun selection(self): Selection                                 // { anchor: usize, caret: usize }
+	fun select(self, anchor: usize, caret: usize)
+}
+```
+
+The kit is behaviour with no look. A component is built from the elements above
+— a button and a checkbox are rows, a text input a row around a horizontal
+`scroll` — and has every attribute an element has, so the app dresses it as it
+dresses a row: `style`, `padding`, `gap`, `width`, and the conditions
+`hovered()`, `pressed()` and `focused()`. The kit sets no colour, no radius and no
+spacing of its own. Each carries its accessibility role (`Role::Button`,
+`Role::Checkbox`, `Role::TextField`); a button made from a `str` is labelled with
+it, and the app labels the rest with `label(..)`.
+
+A **button** runs `on_click` on a click, and on Enter or Space while it has the
+focus (a held key runs it once); Enter and Space go no further up the tree. A
+**checkbox** writes the opposite of its cell the same three ways, and is an empty
+row: the app draws the box and the mark as its children, from the same cell. A
+component is **disabled** while the flag it is handed holds — a `bool` or a
+signal of one: it does nothing, and Tab and a press pass it by. The app styles
+that state from the same signal, `style(off.derive(|off: bool| if off { dim }
+else { look }))`, where a disabled look with no `hovered()` in it shows no hover.
+
+A **text input** edits its cell: every edit writes it, and a write from anywhere
+else is what it shows. A press places the caret and a drag selects; Left and
+Right move a grapheme (with Ctrl or Alt, a word), Home and End to the ends, each
+extending the selection with Shift; Backspace and Delete remove the selection,
+or a grapheme (with Ctrl or Alt, a word); Ctrl+A (or Cmd+A) selects everything;
+typed text replaces the selection; Enter runs `on_submit`. Indices are `str`'s
+own (UTF-16 units, as `len` and `substring` count) and always on a GRAPHEME
+boundary: an emoji with its skin tone, a flag or a letter with a combining accent
+is one step and one Backspace. A text wider than the input scrolls sideways to
+keep the caret in view. The caret and the selection show while the input has the
+focus, drawn by the text itself in its own layout; their colours are the app's
+(`caret`, `selection_color`), and otherwise follow the text colour. The keys the
+input acts on, and the keys that type, go no further up the tree, so a shortcut
+on an ancestor does not fire while the user types.
+
+```vilan,native
+import std::gfx::{ Border, Color, Window, dp };
+import std::io::print;
+import std::reactive::{ ListCell, Signal, SignalCell };
+import std::ui::kit::{ button, checkbox, text_input };
+import std::ui::{ Style, column, each, focused, hovered, mount, row, style, text, when };
+
+fun main() {
+	let window = match Window::builder().title("Tasks").size(dp(360), dp(320)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let tasks: ListCell<str> = ListCell::of([]);
+	let draft: SignalCell<str> = Signal::new("");
+	let urgent: SignalCell<bool> = Signal::new(false);
+	let field = style()
+		.background(Color::white())
+		.border(Border::all(dp(1), Color::rgb(180, 180, 190)))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), Color::rgb(46, 104, 220))));
+	let add = || {
+		if draft.get() != "" {
+			tasks.push(if urgent.get() { draft.get() + "!" } else { draft.get() });
+			draft.set("");
+		}
+	};
+	mount(window, <column padding(dp(16)) gap(dp(8))>
+		<row gap(dp(8))>
+			{text_input(draft).placeholder("A task").grow(1.0).padding(dp(6)).style(field).on_submit(|_: str| add())}
+			{button("Add", add).padding(dp(6)).style(style().when(hovered(), |look: Style| look.background(Color::rgb(220, 226, 240))))}
+		</row>
+		{checkbox(urgent).label("urgent").gap(dp(6)).child(text().child(urgent.derive(|on: bool| if on { "[x] urgent" } else { "[ ] urgent" })))}
+		{each(tasks, |task: str| task, |task: str| <text>{task}</text>)}
+		{when(tasks.derive(|list: List<str>| list.len() == 0), || <text>"Nothing yet"</text>)}
+	</column>);
+}
+main();
+```
+
+Not in the kit yet: the clipboard (the window layer offers none), an input
+method's composition (the part after this one, P5), a double click selecting a
+word, a blinking caret (the caret is steady, so an idle window draws nothing),
+and a drag that leaves the input extending the selection there (a pointer move
+goes to the element under the pointer).

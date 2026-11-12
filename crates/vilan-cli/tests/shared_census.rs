@@ -297,6 +297,26 @@ const CENSUS: &[(&str, usize, &str)] = &[
          element, `swap`'s shown element and last value, and a keyed run's keys, \
          items and rows, the web's `each` bookkeeping for one element a row",
     ),
+    (
+        "ui/kit/buttons.vl",
+        1,
+        "E: a button's disabled flag (native-ui.md P4) — minted by the builder, \
+         read by the element's click and key handlers the tree keeps and by the \
+         `Button` value's own methods, written by the bound `disabled` signal",
+    ),
+    (
+        "ui/kit/checkboxes.vl",
+        1,
+        "E: a checkbox's disabled flag, as the button's",
+    ),
+    (
+        "ui/kit/inputs.vl",
+        7,
+        "E: a text input's caret, anchor, focus, disabled flag and caret and \
+         selection colours and width (P4) — minted by the builder, read and \
+         written by the element's handlers the tree keeps and by the `TextInput` \
+         value's methods, which the program calls long after the builder returned",
+    ),
     ("web/router.vl", 1, "R: the module-level `wired` latch"),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
@@ -421,7 +441,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 285,
+        total, 294,
         "the total number of `Shared` construction sites in std changed"
     );
 

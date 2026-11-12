@@ -573,6 +573,12 @@ impl UiTree {
             return false;
         }
         let bounds = self.data(node).bounds;
+        self.reveal_area(node, bounds)
+    }
+
+    /// [`reveal`](UiTree::reveal) for a part of `node`: `bounds`, in the
+    /// coordinates its box is laid out in (an edited text's caret).
+    pub(super) fn reveal_area(&mut self, node: NodeId, bounds: Rect) -> bool {
         // The part to show, in the coordinates every box is laid out in
         // (before any scroll's offset), moved by the offsets of the scrolls
         // already passed on the way up.

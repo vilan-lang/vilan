@@ -1,0 +1,218 @@
+// `std::ui::kit`'s button (native-ui.md P4): a focusable row that runs its action
+// on a click, and on Enter or Space while it has the focus. It has no look: the app
+// styles it with `style(..)` and the `hovered()`, `pressed()` and `focused()`
+// conditions, and a disabled one through the flag it hands `disabled(..)`.
+
+[platform("@process")] mod self;
+
+import pkg::gfx::{ KeyName, KeyPress };
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::turn_scope;
+import pkg::shared::Shared;
+import pkg::ui::{
+	Attributes,
+	Bindable,
+	Child,
+	Column,
+	Element,
+	Flex,
+	ImageElement,
+	Parent,
+	Role,
+	Row,
+	ScrollElement,
+	Stack,
+	Text,
+	row,
+	stop_event,
+	ui_set_focusable,
+};
+
+/// What a button shows: a `str` — a text, which is the button's accessibility label
+/// too — or an element of any kind (label it with `label(..)`).
+export trait ButtonContent {
+	/// The element the button holds.
+	fun into_face(self): Element;
+
+	/// The label it gives the button, if it has one.
+	fun face_label(self): Option<str>;
+}
+
+export impl str with ButtonContent {
+	fun into_face(self): Element {
+		self.into_element()
+	}
+
+	fun face_label(self): Option<str> {
+		Some(self)
+	}
+}
+
+export impl Element with ButtonContent {
+	fun into_face(self): Element {
+		self
+	}
+
+	fun face_label(self): Option<str> {
+		None
+	}
+}
+
+export impl Row with ButtonContent {
+	fun into_face(self): Element {
+		self.into_element()
+	}
+
+	fun face_label(self): Option<str> {
+		None
+	}
+}
+
+export impl Column with ButtonContent {
+	fun into_face(self): Element {
+		self.into_element()
+	}
+
+	fun face_label(self): Option<str> {
+		None
+	}
+}
+
+export impl Stack with ButtonContent {
+	fun into_face(self): Element {
+		self.into_element()
+	}
+
+	fun face_label(self): Option<str> {
+		None
+	}
+}
+
+export impl Text with ButtonContent {
+	fun into_face(self): Element {
+		self.into_element()
+	}
+
+	fun face_label(self): Option<str> {
+		None
+	}
+}
+
+export impl ImageElement with ButtonContent {
+	fun into_face(self): Element {
+		self.into_element()
+	}
+
+	fun face_label(self): Option<str> {
+		None
+	}
+}
+
+export impl ScrollElement with ButtonContent {
+	fun into_face(self): Element {
+		self.into_element()
+	}
+
+	fun face_label(self): Option<str> {
+		None
+	}
+}
+
+/// A button. See `button(..)`.
+export struct Button {
+	element: Element,
+	/// Disabled now: no activation, and out of the tab order.
+	off: Shared<bool>,
+}
+
+/// A button showing `content` (a `str`, or an element) that runs `on_click` when it
+/// is clicked, and when Enter or Space goes down while it has the focus (a key held
+/// until it repeats runs it once). It is a ROW: its content is its one child, and
+/// `justify`, `align`, `padding`, `style` and every other row attribute lay it out
+/// and dress it. Its role is `Role::Button`, and a `str` content is its label.
+///
+/// Enter and Space go no further than the button that ran (`stop_event`); a click
+/// bubbles on, as every click does.
+export fun button<C: ButtonContent>(content: C, on_click: (|| void) context turn_scope): Button {
+	let off: Shared<bool> = Shared::new(false);
+	let pressed = pressable(Role::Button, off, on_click).child(content.into_face());
+	let labelled = match content.face_label() {
+		Some(let label) => pressed.label(label),
+		None => pressed,
+	};
+	Button { element = labelled.element(), off }
+}
+
+/// Enter and Space, pressed (not repeating): what activates a button or a checkbox.
+fun activates(key: KeyPress): bool {
+	if key.repeat {
+		ret false;
+	}
+	match key.key {
+		KeyName::Enter => true,
+		KeyName::Char(let typed) => typed == " ",
+		_ => false,
+	}
+}
+
+/// The behaviour a button and a checkbox share: a focusable row with `role` that
+/// runs `activate` on a click, and on Enter or Space while it has the focus — never
+/// while `off` holds.
+fun pressable(role: Role, off: Shared<bool>, activate: (|| void) context turn_scope): Row {
+	row()
+		.role(role)
+		.focusable()
+		.on_click(|| {
+			if !off.read() {
+				activate();
+			}
+		})
+		.on_key(|key: KeyPress| {
+			if !off.read() && activates(key) {
+				activate();
+				stop_event();
+			}
+		})
+}
+
+/// `off` (a value, or a signal of one) disables `element`: no activation, and out
+/// of the tab order (a press no longer focuses it). Enabled again, it is focusable
+/// in tree order.
+fun bind_disabled<V: Bindable<bool>>(element: Element, off: Shared<bool>, own disabled: V) {
+	disabled.bind(|value: bool| {
+		off.write() = value;
+		ui_set_focusable(element.node, !value);
+	});
+}
+
+export impl Button with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl Button with Parent {}
+
+export impl Button with Flex {}
+
+export impl Button with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl Button {
+	/// Disabled while `disabled` (a `bool`, or a signal of one) holds: a click,
+	/// Enter and Space do nothing, and Tab and a press pass it by. Style the
+	/// disabled look with a style bound to the same signal:
+	/// `style(off.derive(|off: bool| if off { dim } else { look }))`.
+	fun disabled<V: Bindable<bool>>(self, own disabled: V): Button {
+		bind_disabled(self.element, self.off, disabled);
+		self
+	}
+
+	/// Whether it is disabled now.
+	fun is_disabled(self): bool {
+		self.off.read()
+	}
+}
