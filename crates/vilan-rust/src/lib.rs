@@ -215,10 +215,30 @@ impl OptionalCrates {
 /// that wrote it, in exactly the shape a compiler diagnostic takes — so
 /// `vilan build --backend rust` reports an unsupported program the way it
 /// reports any other refusal, rather than producing Rust that will not build.
+///
+/// F168: an instance declares the hidden context parameters its body names
+/// ([`Emitter::instance_contexts`]), which is known once its body is walked.
+/// A call reaching an instance still being walked (recursion) cannot wait for
+/// that, so it ASSUMES — nothing in the first round, the previous round's
+/// answer after — and the round is repeated when an assumption turns out
+/// wrong. Each round's answers contain the last's (passing more arguments
+/// only names more parameters), and every answer is bounded by the function's
+/// own parameters, so the rounds climb to the LEAST consistent answer and
+/// stop: a recursion that only hands a context to itself declares nothing,
+/// and one that reads it declares it in the second round. A program whose
+/// recursions carry no context, or carry one they read and no caller lacks,
+/// is emitted once.
 pub fn emit(program: &Program<'_>, options: &BuildOptions) -> Result<Emitted, Error> {
-    let mut emitter = Emitter::new(program);
-    emitter.dbg_policy = options.dbg;
-    emitter.run()
+    let mut seed: HashMap<String, HashSet<Id>> = HashMap::default();
+    loop {
+        let mut emitter = Emitter::new(program);
+        emitter.dbg_policy = options.dbg;
+        emitter.context_seed = std::mem::take(&mut seed);
+        match emitter.run()? {
+            Round::Done(emitted) => return Ok(emitted),
+            Round::Again(next) => seed = next,
+        }
+    }
 }
 
 /// The name `async fun main`'s body takes, since `fn main` cannot be `async`
@@ -415,6 +435,27 @@ struct Reserved {
     slot: usize,
 }
 
+/// F168: what one emitted instance declares of its function's hidden context
+/// parameters ([`Emitter::instance_contexts`]).
+struct InstanceContexts {
+    /// The instance's structural key — the key [`Emitter::context_seed`] and
+    /// the round's assumptions are written against, stable across rounds where
+    /// a name's sequence number need not be.
+    key: String,
+    /// The hidden parameters the signature declares: those the walked body
+    /// names. `None` while the body is being walked.
+    declared: Option<HashSet<Id>>,
+}
+
+/// F168: how one round of [`Emitter::run`] ended.
+enum Round {
+    /// Every assumption the round made about an instance still being walked
+    /// held: the program.
+    Done(Emitted),
+    /// One did not; the next round's seed (see [`emit`]).
+    Again(HashMap<String, HashSet<Id>>),
+}
+
 struct Emitter<'a, 'src> {
     program: &'a Program<'src>,
     /// `dbg`'s generated printers (debugging.md S1, `dbg.rs`): by type key
@@ -438,6 +479,32 @@ struct Emitter<'a, 'src> {
     /// that type's structural key). Keyed separately from [`Self::instances`]
     /// because what varies is `Self`, not a written generic parameter.
     default_instances: HashMap<(Id, String), Reserved>,
+    /// F168: per instance, by its Rust name, which of its function's hidden
+    /// context parameters its signature DECLARES — the ones its body names.
+    ///
+    /// The context pass mints a hidden parameter per FUNCTION, when any
+    /// candidate of any dispatch inside it reads the context; an instance is
+    /// a function at one binding, whose dispatches are resolved. One that
+    /// selects only candidates reading nothing (`MaybeSignal`'s static arm,
+    /// through `fun shown<V: MaybeSignal<str>>`) hands the parameter to no
+    /// callee that takes it and reads it nowhere, so its body never names it
+    /// and its signature does not declare it; a call to it passes only what
+    /// it declares. That is what lets a caller with no owner call it: the
+    /// checker accepted the call per entry (B737), JavaScript passes
+    /// `undefined`, and natively there is nothing to pass.
+    instance_contexts: HashMap<String, InstanceContexts>,
+    /// F168: the hidden context parameters named while walking the current
+    /// body ([`Self::binding_name`] records them; [`Self::function_body`]
+    /// scopes the set per instance and a closure literal per body).
+    referenced_hidden: std::cell::RefCell<HashSet<Id>>,
+    /// F168: what this round assumes an instance STILL BEING WALKED declares
+    /// (a recursive call reaches its own instance, or one up its chain), by
+    /// structural key: the previous round's answer, and nothing in the first.
+    context_seed: HashMap<String, HashSet<Id>>,
+    /// F168: every such assumption this round made — (instance key, hidden
+    /// parameter, whether it was assumed declared) — checked against the
+    /// instance's own answer once the program is walked.
+    context_assumptions: Vec<(String, Id, bool)>,
     /// F131: the binding each instance a DISPATCHED call reached was minted
     /// under ([`Self::dispatch_to_member`]), by instance name — what the
     /// call's arguments are positioned against, as a direct call's are.
@@ -874,6 +941,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             functions: BTreeMap::new(),
             instances: HashMap::default(),
             default_instances: HashMap::default(),
+            instance_contexts: HashMap::default(),
+            referenced_hidden: std::cell::RefCell::new(HashSet::new()),
+            context_seed: HashMap::default(),
+            context_assumptions: Vec::new(),
             dispatched_bindings: HashMap::default(),
             types: BTreeMap::new(),
             type_instances: HashMap::default(),
@@ -945,7 +1016,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
     }
 
-    fn run(mut self) -> Result<Emitted, Error> {
+    fn run(mut self) -> Result<Round, Error> {
         let global_scope = self
             .program
             .scopes
@@ -1018,6 +1089,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             );
         }
 
+        // F168: every assumption this round made about an instance still
+        // being walked, against the instance's own answer. One that did not
+        // hold makes this round's text wrong where it was made, so the
+        // program is walked again on the answers (see [`emit`]).
+        if let Some(next) = self.next_context_seed()? {
+            return Ok(Round::Again(next));
+        }
+
         let mut source = String::from(PRELUDE);
         for declaration in self.types.values() {
             source.push('\n');
@@ -1037,7 +1116,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         source.push('\n');
         source.push_str(&main_body);
-        Ok(Emitted {
+        Ok(Round::Done(Emitted {
             source,
             host_gaps: self.host_gaps.iter().cloned().collect(),
             optional_crates: OptionalCrates {
@@ -1056,7 +1135,59 @@ impl<'a, 'src> Emitter<'a, 'src> {
             capture_copies: self.capture_copies,
             cell_read_copies: self.cell_read_copies,
             cell_read_borrows: self.cell_read_borrows,
-        })
+        }))
+    }
+
+    /// F168: `None` when every assumption this round made about an instance
+    /// still being walked matches what the instance declared; otherwise the
+    /// next round's seed — this round's answers, joined with the seed it ran
+    /// on, so the rounds only ever climb.
+    ///
+    /// Climbing is what bounds the loop in [`emit`]: an answer is a subset of
+    /// its function's hidden parameters, so a round that changes no answer
+    /// while an assumption fails would loop forever — an emitter defect
+    /// (the round's answers are a function of its seed), refused by name
+    /// rather than spun on.
+    fn next_context_seed(&self) -> Result<Option<HashMap<String, HashSet<Id>>>, Error> {
+        let answers: HashMap<&str, &HashSet<Id>> = self
+            .instance_contexts
+            .values()
+            .filter_map(|instance| {
+                instance
+                    .declared
+                    .as_ref()
+                    .map(|declared| (instance.key.as_str(), declared))
+            })
+            .collect();
+        // An instance with no answer never finished its body — only a census
+        // walk discards an error and goes on, and its text is thrown away — so
+        // nothing was written against the assumption that could be wrong.
+        let held = self
+            .context_assumptions
+            .iter()
+            .all(|(key, parameter, assumed)| {
+                answers
+                    .get(key.as_str())
+                    .is_none_or(|declared| declared.contains(parameter) == *assumed)
+            });
+        if held {
+            return Ok(None);
+        }
+        let mut next = self.context_seed.clone();
+        let mut climbed = false;
+        for (key, declared) in answers {
+            let entry = next.entry(key.to_string()).or_default();
+            for parameter in declared {
+                climbed |= entry.insert(*parameter);
+            }
+        }
+        if !climbed {
+            return Err(unsupported(
+                "a recursion whose context parameters do not settle (an emitter defect: F168)",
+                Span::new((), 0..0),
+            ));
+        }
+        Ok(Some(next))
     }
 
     /// R3, as ruled: v1 boxes EVERY mutably-captured binding into a counted
@@ -2985,7 +3116,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // J6: a context-threaded hidden parameter has no `parameters` record to
         // take a name from — it is not source. Its name says what it is, so an
         // emitted signature carrying one reads honestly.
+        // F168: and naming one is what makes an instance declare it — every
+        // text that reads the parameter is written through here, so the set
+        // this records is the body's own (`Self::function_body`).
         if self.program.context_hidden_parameters.contains_key(&id) {
+            self.referenced_hidden.borrow_mut().insert(id);
             return format!("context_{}", id.0);
         }
         let name = self
@@ -4944,6 +5079,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         let slot = self.next_function_slot;
         self.next_function_slot += 1;
+        self.reserve_instance_contexts(&name, format!("{}:{}", id.0, key.join("\u{1f}")));
         self.instances.insert(
             (id, key),
             Reserved {
@@ -5012,6 +5148,52 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// F22: the async bits the CALLEE of `call_expr_id` must be emitted at, as
     /// this instance recorded them.
+    /// F168: opens `name`'s record in [`Self::instance_contexts`], unanswered
+    /// until its body is walked.
+    fn reserve_instance_contexts(&mut self, name: &str, key: String) {
+        self.instance_contexts.insert(
+            name.to_string(),
+            InstanceContexts {
+                key,
+                declared: None,
+            },
+        );
+    }
+
+    /// F168: whether the instance named `instance` takes an argument at
+    /// `parameter` — every written parameter, and a hidden context parameter
+    /// when the instance declares it.
+    ///
+    /// An instance still being walked has no answer yet, so the round's seed
+    /// gives one and the assumption is recorded ([`emit`] repeats the round
+    /// when it fails). A call that names no instance (`None`: a call through a
+    /// `dyn` slot's declaration, positioned against the declaration's own
+    /// parameters) passes every parameter, as before F168.
+    fn instance_declares(&mut self, instance: Option<&str>, parameter: Id) -> bool {
+        if !self
+            .program
+            .context_hidden_parameters
+            .contains_key(&parameter)
+        {
+            return true;
+        }
+        let Some(record) = instance.and_then(|name| self.instance_contexts.get(name)) else {
+            return true;
+        };
+        match &record.declared {
+            Some(declared) => declared.contains(&parameter),
+            None => {
+                let assumed = self
+                    .context_seed
+                    .get(&record.key)
+                    .is_some_and(|seeded| seeded.contains(&parameter));
+                let key = record.key.clone();
+                self.context_assumptions.push((key, parameter, assumed));
+                assumed
+            }
+        }
+    }
+
     fn callee_bits(&self, call_expr_id: Id) -> Vec<Id> {
         self.current_instance
             .as_ref()
@@ -5107,7 +5289,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .is_some_and(|instance| instance.is_async);
         let mut parameters = Vec::new();
         for parameter_id in &function.parameters {
-            parameters.push(self.parameter_declaration(*parameter_id, span)?);
+            parameters.push((
+                *parameter_id,
+                self.parameter_declaration(*parameter_id, span)?,
+            ));
         }
         let returned = match self.return_type_of(function) {
             Some(type_id) => {
@@ -5154,16 +5339,46 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .map(|type_id| self.concrete(type_id));
         let saved_return_type = std::mem::replace(&mut self.current_return_type, declared_return);
         let saved_origin = self.current_origin.replace(function.name);
+        // F168: the hidden context parameters THIS body names, and so the ones
+        // its signature declares — scoped to the instance, since a nested
+        // walk (a callee, or this function at another binding) names its own.
+        let saved_referenced = self.referenced_hidden.take();
         let boxed = self.boxed_parameter_prologue(&function.parameters);
         if !boxed.is_empty() {
             let _ = writeln!(body, "    {}", boxed.trim_end());
         }
         let walked = self.emit_block(&function.body.0, function.body.1, &mut body, 1);
+        let referenced = self.referenced_hidden.replace(saved_referenced);
         self.current_origin = saved_origin;
         self.current_return_type = saved_return_type;
         self.returns_an_async_closure = saved_returns_async;
         self.current_returns_view = saved_view;
         walked?;
+        let declared: HashSet<Id> = function
+            .parameters
+            .iter()
+            .copied()
+            .filter(|parameter| {
+                self.program
+                    .context_hidden_parameters
+                    .contains_key(parameter)
+                    && referenced.contains(parameter)
+            })
+            .collect();
+        let parameters: Vec<String> = parameters
+            .into_iter()
+            .filter(|(parameter, _)| {
+                !self
+                    .program
+                    .context_hidden_parameters
+                    .contains_key(parameter)
+                    || declared.contains(parameter)
+            })
+            .map(|(_, rendered)| rendered)
+            .collect();
+        if let Some(record) = self.instance_contexts.get_mut(name) {
+            record.declared = Some(declared);
+        }
 
         let mut out = String::new();
         // F25: whether `main`'s body was opened inside a `main_guard` closure
@@ -8327,7 +8542,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // const N]`'s `eq(self, b: [T; N])`, and its inner literals met an
             // unbound `T` and rendered `vec![..]`.
             self.argument_substitution = Some(substitution);
-            let arguments = self.call_arguments(member_id, &[left, right], depth, &mut prelude);
+            let arguments = self.call_arguments(
+                member_id,
+                Some(&instance.name),
+                &[left, right],
+                depth,
+                &mut prelude,
+            );
             self.argument_substitution = None;
             let arguments = arguments?;
             let call = Self::with_argument_prelude(
@@ -10905,14 +11126,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // papers-54's B?2: the context arguments the context pass threaded to
         // the loop's `next` (`Program::for_each_context_arguments`), after the
         // receiver — a hidden parameter's read, a `Some(..)` of one, `None`.
+        // F168: each one stands at the `next` parameter after the receiver
+        // in its position, and is passed only where the instance declares
+        // that parameter — the rule of an ordinary call's arguments.
+        let next_parameters: Vec<Id> = self
+            .instance_target(&next)
+            .and_then(|target| self.program.functions.get(&target))
+            .map(|function| function.parameters.iter().skip(1).copied().collect())
+            .unwrap_or_default();
         let mut context_arguments = String::new();
-        for argument_id in self
+        for (position, argument_id) in self
             .program
             .for_each_context_arguments
             .get(&id)
             .cloned()
             .unwrap_or_default()
+            .into_iter()
+            .enumerate()
         {
+            if let Some(parameter) = next_parameters.get(position)
+                && !self.instance_declares(Some(&next), *parameter)
+            {
+                continue;
+            }
             context_arguments.push_str(", ");
             context_arguments.push_str(&self.value_of(argument_id, depth)?);
         }
@@ -11114,10 +11350,26 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .copied()
             .collect();
         let captures = self.closure_capture_handles(&captured);
+        let saved_referenced = self.referenced_hidden.take();
         self.closure_captures.push(captured);
         let body = self.closure_body(&closure, depth);
         self.closure_captures.pop();
+        let named_inside = self.referenced_hidden.replace(saved_referenced);
+        self.referenced_hidden
+            .borrow_mut()
+            .extend(named_inside.iter().copied());
         let body = body?;
+        // F168: a hidden context parameter the scan saw read but the body no
+        // longer names — its one read was an argument the callee instance
+        // does not declare — is not captured either, so the enclosing
+        // instance need not declare it for the closure's sake.
+        let captures: Vec<Id> = captures
+            .into_iter()
+            .filter(|binding| {
+                !self.program.context_hidden_parameters.contains_key(binding)
+                    || named_inside.contains(binding)
+            })
+            .collect();
         let prelude = self.capture_prelude(&captures);
         // A future-answering closure answers `Boxed<R>` on every call, so its
         // body is an `async move` block behind `pin_future`. The captures are
@@ -11125,8 +11377,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // them, which would make the closure itself `FnOnce` and no
         // `Rc<dyn Fn>` at all.
         if wants_a_future {
-            let inner =
-                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
+            let inner = self.async_capture_prelude_declaring(
+                closure.return_,
+                &declared_inside_seed,
+                Some(&named_inside),
+            );
             return Ok(format!(
                 "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::pin_future(async move {{ {body} }}) }}){as_counted} }}",
                 parameters.join(", ")
@@ -11137,8 +11392,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // position declares. The origin is the enclosing function's, as it is
         // for a written spawn.
         if floats {
-            let inner =
-                self.async_capture_prelude_declaring(closure.return_, &declared_inside_seed);
+            let inner = self.async_capture_prelude_declaring(
+                closure.return_,
+                &declared_inside_seed,
+                Some(&named_inside),
+            );
             let origin = rust_string(self.current_origin.unwrap_or("a floating handler"));
             return Ok(format!(
                 "{{ {prelude}std::rc::Rc::new(move |{}| {{ {inner}vilan_rt::executor::spawn(async move {{ {body} }}, {origin}); }}){as_counted} }}",
@@ -13900,13 +14158,23 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// already says a capture is a copy, and a handle's copy is the same
     /// handle.
     fn async_capture_prelude(&mut self, body: Id) -> String {
-        self.async_capture_prelude_declaring(body, &HashSet::new())
+        self.async_capture_prelude_declaring(body, &HashSet::new(), None)
     }
 
     /// [`Emitter::async_capture_prelude`] with names the CALLER knows are
     /// declared inside and the body walk cannot see — a tuple parameter's
     /// destructured binders (F18).
-    fn async_capture_prelude_declaring(&mut self, body: Id, seed: &HashSet<Id>) -> String {
+    ///
+    /// F168: `named` is the set of hidden context parameters a closure
+    /// literal's body names, when this is that literal's inner prelude: one it
+    /// does not name is not captured by the literal ([`Self::closure`]), so the
+    /// block does not take it either.
+    fn async_capture_prelude_declaring(
+        &mut self,
+        body: Id,
+        seed: &HashSet<Id>,
+        named: Option<&HashSet<Id>>,
+    ) -> String {
         let mut declared_inside = seed.clone();
         let mut referenced = HashSet::new();
         let mut visited = HashSet::new();
@@ -13920,10 +14188,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     && !self.module_bindings.contains(binding)
                     && (self.program.variables.contains_key(binding)
                         || self.program.parameters.contains_key(binding)
-                        || self
+                        || (self
                             .program
                             .context_hidden_parameters
-                            .contains_key(binding))
+                            .contains_key(binding)
+                            && named.is_none_or(|named| named.contains(binding))))
             })
             .collect();
         captures.sort_by_key(|binding| binding.0);
@@ -14682,11 +14951,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = self
             .ensure_function_with_bits(target, &substitution, &bits)?
             .name;
-        self.refuse_unthreaded_context(target, &function_call.argument_ids, span)?;
+        self.refuse_unthreaded_context(target, &name, &function_call.argument_ids, span)?;
         let mut prelude = String::new();
         self.argument_substitution = Some(substitution.clone());
         let arguments = self.call_arguments_adapting(
             target,
+            Some(&name),
             &function_call.argument_ids,
             depth,
             &mut prelude,
@@ -14729,14 +14999,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// JS has for free. Reference arguments are left where they are: hoisting
     /// one would name a borrow rather than a value, and two loans of ONE
     /// binding where either is mutable is what rule 4 refuses anyway.
+    ///
+    /// F168: `instance` names the callee instance where the call has one, and
+    /// an argument at a hidden context parameter the instance does not declare
+    /// is not passed ([`Self::instance_declares`]).
     fn call_arguments(
         &mut self,
         target: Id,
+        instance: Option<&str>,
         argument_ids: &[Id],
         depth: usize,
         prelude: &mut String,
     ) -> Result<Vec<String>, Error> {
-        self.call_arguments_adapting(target, argument_ids, depth, prelude, &[])
+        self.call_arguments_adapting(target, instance, argument_ids, depth, prelude, &[])
     }
 
     /// [`Self::call_arguments`], told which of the callee's parameters this
@@ -14744,6 +15019,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
     fn call_arguments_adapting(
         &mut self,
         target: Id,
+        instance: Option<&str>,
         argument_ids: &[Id],
         depth: usize,
         prelude: &mut String,
@@ -14903,10 +15179,25 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 span,
             ));
         }
+        let parameter_ids: Vec<Id> = self
+            .program
+            .functions
+            .get(&target)
+            .map(|function| function.parameters.clone())
+            .unwrap_or_default();
         let mut rendered = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             if arity.is_some_and(|arity| index >= arity) {
                 break;
+            }
+            // F168: a hidden context argument the callee instance does not
+            // declare — its body names the parameter nowhere — is not passed.
+            // It is the pass's read of a context value, so leaving it
+            // unevaluated changes nothing else.
+            if let Some(parameter) = parameter_ids.get(index)
+                && !self.instance_declares(instance, *parameter)
+            {
+                continue;
             }
             // F20: an argument standing in a `lazy` parameter is a cell, not a
             // value — see [`Emitter::lazy_argument`].
@@ -15720,38 +16011,50 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// a call that threads FEWER context arguments than the callee's instance
     /// declares.
     ///
-    /// The context pass can mint a hidden parameter on an instance whose
-    /// caller it threads nothing from — `blanket-impl.vl`'s `main` calls
-    /// `badge("static")`, whose instance declares the ambient `Owner` because
-    /// ONE impl of the trait member it dispatches through reaches it — and
-    /// JavaScript fills the gap with `undefined`, which that path never reads.
-    /// A Rust call cannot omit an argument, and there is no `Owner` to invent,
-    /// so the shape is refused by name rather than answered with a value the
-    /// program never had. (The context pass is the analyzer's; the fix that
-    /// makes this call emittable belongs there — F36's report.)
+    /// The context pass mints a hidden parameter per FUNCTION and threads it
+    /// at a call only from a caller that holds the value, so a caller with no
+    /// owner threads nothing to a function some other binding of which reads
+    /// one — `blanket-impl.vl`'s `main` calls `badge("static")`, and the
+    /// checker accepts it because the call's own binding selects an impl that
+    /// reads nothing (B737's per-entry resolution). JavaScript passes
+    /// `undefined` for the gap. Natively the INSTANCE that call reaches
+    /// declares only the hidden parameters its body names (F168,
+    /// [`Self::instance_declares`]), so a gap at a parameter it does not
+    /// declare is no gap. A gap at one it DOES declare has no value to stand
+    /// in — there is no `Owner` to invent — and is refused by name.
     fn refuse_unthreaded_context(
-        &self,
+        &mut self,
         target: Id,
+        instance: &str,
         argument_ids: &[Id],
         span: Span,
     ) -> Result<(), Error> {
         let Some(function) = self.program.functions.get(&target) else {
             return Ok(());
         };
-        let unthreaded = argument_ids.len() < function.parameters.len()
-            && function.parameters[argument_ids.len()..]
-                .iter()
-                .any(|parameter| {
-                    self.program
-                        .context_hidden_parameters
-                        .contains_key(parameter)
-                });
+        let name = function.name;
+        let missing: Vec<Id> = function
+            .parameters
+            .iter()
+            .skip(argument_ids.len())
+            .copied()
+            .collect();
+        let mut unthreaded = false;
+        for parameter in missing {
+            if self
+                .program
+                .context_hidden_parameters
+                .contains_key(&parameter)
+                && self.instance_declares(Some(instance), parameter)
+            {
+                unthreaded = true;
+            }
+        }
         if unthreaded {
             return Err(unsupported(
                 &format!(
-                    "a call to `{}` that threads fewer context arguments than its instance \
-                     declares (the JS backend passes `undefined` for the missing one)",
-                    function.name
+                    "a call to `{name}` that threads fewer context arguments than its instance \
+                     declares (the JS backend passes `undefined` for the missing one)"
                 ),
                 span,
             ));
@@ -16744,7 +17047,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // `undefined` the JS table passes, which that flavour reads as "no
             // ambient value"; a missing STRICT one has no value to stand in
             // and is refused.
-            let forwarded_here = self.object_slot_arguments(slot, &target_parameters);
+            // F168: the implementation's INSTANCE takes only the hidden
+            // parameters its body names, so the slot forwards only those.
+            let mut instance_parameters = Vec::with_capacity(target_parameters.len());
+            for parameter in &target_parameters {
+                if self.instance_declares(Some(&function_name), *parameter) {
+                    instance_parameters.push(*parameter);
+                }
+            }
+            let forwarded_here = self.object_slot_arguments(slot, &instance_parameters);
             let Some(forwarded_here) = forwarded_here else {
                 self.object_impls
                     .remove(&(object.name.clone(), rendered_subject.clone()));
@@ -16893,7 +17204,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let receiver = self.expression(*receiver_id, depth)?;
         let mut prelude = String::new();
         let saved_views = std::mem::replace(&mut self.no_cell_views, true);
-        let rendered = self.call_arguments(slot.declaration, argument_ids, depth, &mut prelude);
+        let rendered =
+            self.call_arguments(slot.declaration, None, argument_ids, depth, &mut prelude);
         self.no_cell_views = saved_views;
         let mut rendered = rendered?;
         if !rendered.is_empty() {
@@ -17167,7 +17479,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let mut prelude = String::new();
                 let arguments = match target {
                     Some(target) => {
-                        self.refuse_unthreaded_context(target, argument_ids, span)?;
+                        self.refuse_unthreaded_context(target, &name, argument_ids, span)?;
                         // F131: each argument's position is its parameter
                         // under the INSTANCE's binding, as at a direct call —
                         // `grid == [[1, 2], [3, 4]]` reaches `impl [type T:
@@ -17175,8 +17487,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         // the inner literals met an unbound `T` and rendered
                         // `vec![..]`.
                         self.argument_substitution = self.dispatched_bindings.get(&name).cloned();
-                        let arguments =
-                            self.call_arguments(target, argument_ids, depth, &mut prelude);
+                        let arguments = self.call_arguments(
+                            target,
+                            Some(&name),
+                            argument_ids,
+                            depth,
+                            &mut prelude,
+                        );
                         self.argument_substitution = None;
                         arguments?
                     }
@@ -17278,6 +17595,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = format!("{}_{}_d{sequence}", sanitize(function.name), default_id.0);
         let slot = self.next_function_slot;
         self.next_function_slot += 1;
+        self.reserve_instance_contexts(&name, format!("{}:default:{}", default_id.0, key.1));
         self.default_instances.insert(
             key,
             Reserved {
@@ -18055,6 +18373,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::SharedIdentity => format!("({}).identity()", next()),
             Intrinsic::SharedDowngrade => format!("({}).downgrade()", next()),
             Intrinsic::WeakUpgrade => format!("({}).upgrade()", next()),
+            // B739: `weak.get(): Option<&T> borrows self` — a VIEW of the
+            // cell's value, never a copy (`ListCell::peek` lends its list
+            // through it). `upgrade` pins the cell, `borrow` lends the value,
+            // and `as_deref` answers the `Option<&T>` the source names. The
+            // two guards are temporaries of the expression, so they live as
+            // long as the statement that reads the view — a `match` subject's
+            // whole match, which is the only place the emitter lets an
+            // `Option` with a view payload stand (F21) — and that is the
+            // extent `shared.vl` promises: the cell is pinned for the view's
+            // extent, and a write of the cell inside it is the runtime's
+            // reentrancy stop, as a read inside `update` is.
+            Intrinsic::WeakGet => format!(
+                "({}).upgrade().as_ref().map(vilan_rt::Shared::borrow).as_deref()",
+                next()
+            ),
             Intrinsic::OptionTake => format!("({}).take()", next()),
             Intrinsic::OptionReplace => format!("({}).replace({})", next(), next()),
             Intrinsic::SetNew => "vilan_rt::Set::new()".to_string(),
