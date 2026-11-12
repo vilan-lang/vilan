@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**Native: `ListCell::peek`, `HashMapCell::peek`, `HashSetCell::peek` and `Weak::get` build (B739).** The native backend refused the `WeakGet` intrinsic by name, so every `peek` was a JavaScript-only read. `weak.get()` is now a view of the cell's value, not a copy: the cell is pinned and its value lent for the statement that reads the view (a `match` subject's whole match), and a write of the cell inside that extent is the runtime's reentrancy stop, as a read inside `update` is. `vilan/examples/ui-virtual-list` reads its list in place with `peek` again.
+
+---
+
+<!-- family: fix -->
 **Native: an instance declares only the context parameters its body names (F168).** The context pass mints a hidden context parameter on a FUNCTION when any candidate of a dispatch inside it reads the context, so `fun shown<V: MaybeSignal<str>>(own value: V)` took an `Owner` at every binding, and `shown("static")` from code with no owner, which the checker accepts (B737) and JavaScript runs, was refused natively by name. Natively each monomorphic instance now declares the hidden parameters its emitted body names, and a call passes only those: the static instance takes no owner, the reactive one still does and is still reached only where there is one. This holds through a forwarding generic, a trait default and a bounded receiver, a closure (which captures the parameter only when its body names it), a `for` loop's `next`, a `dyn` slot (which keeps the declaration's signature and forwards what the instance declares), and any context, the owner, `turn_scope` or one of the program's own. A recursion reaches an instance still being walked; the emitter assumes what it declares, and walks the program again when the assumption fails, climbing to the least answer, so a recursion that only hands a context to itself declares nothing. JavaScript output is unchanged.
 
 ---

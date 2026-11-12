@@ -84,18 +84,20 @@ fun row_look(id: i32): Style {
 		.when(focused(), |look: Style| look.background(Color::rgb(200, 214, 255)))
 }
 
-/// Where the entry with `id` is in the list now. (A copy of the list, walked: a
-/// click's cost, not a frame's.)
+/// Where the entry with `id` is in the list now: the list walked in place
+/// (`peek`), with no copy of it and no subscription to it.
 fun position_of(entries: ListCell<Entry>, id: i32): Option<usize> {
-	let list = entries.get();
-	mut at: usize = 0;
-	for at < list.len() {
-		if list[at].id == id {
-			ret Some(at);
+	entries.peek(|list: &List<Entry>| {
+		mut found: Option<usize> = None;
+		mut at: usize = 0;
+		for found.is_none() && at < list.len() {
+			if list[at].id == id {
+				found = Some(at);
+			}
+			at += 1;
 		}
-		at += 1;
-	}
-	None
+		found
+	})
 }
 
 /// One row: its label, and its clicks read through the row's own cell. Focusable,
@@ -418,7 +420,7 @@ fun check(arguments: List<str>, count: i32) {
 	// 6. Tab from the LAST BUILT row (focused by the program, not revealed): the
 	// list builds the next row before the focus moves, so the focus stays in it.
 	let (_first, last) = list.built();
-	let last_id = entries.get()[last - 1].id;
+	let last_id = entries.peek(|list: &List<Entry>| list[last - 1].id);
 	row(last_id).focus();
 	print(i"focused {focused_row()} (the last built)");
 	tab(false);

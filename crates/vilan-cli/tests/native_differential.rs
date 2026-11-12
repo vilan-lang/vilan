@@ -2154,6 +2154,50 @@ fn f168_a_dyn_slot_forwards_only_the_contexts_its_instance_declares() {
     );
 }
 
+/// B739: `Weak::get` — a VIEW of the cell's value, `Option<&T> borrows self` —
+/// natively, and the three collection cells' `peek`, which lend their own
+/// value through it: `ListCell` (before and after a write), `HashMapCell`,
+/// `HashSetCell`, and a direct `match` on a weak handle's view reading two
+/// fields of a struct in place. It was refused by name (`WeakGet`).
+#[test]
+fn b739_a_weak_view_and_every_cells_peek_read_in_place_on_both_backends() {
+    f168_agrees(
+        "native_probe_b739_weak_get.vl",
+        concat!(
+            "import std::hash_map::HashMap;\n",
+            "import std::hash_set::HashSet;\n",
+            "import std::reactive::{HashMapCell, HashSetCell, ListCell};\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "struct Pair {\n",
+            "\tleft: i32,\n",
+            "\tright: str,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet rows: ListCell<i32> = ListCell::of([4, 5, 6]);\n",
+            "\tprint(rows.peek(|list: &List<i32>| list.len()));\n",
+            "\tprint(rows.peek(|list: &List<i32>| list[1]));\n",
+            "\trows.push(7);\n",
+            "\tprint(rows.peek(|list: &List<i32>| list[3]));\n",
+            "\tlet ages: HashMapCell<str, i32> = HashMapCell::new();\n",
+            "\tages.insert(\"ada\", 36);\n",
+            "\tprint(ages.peek(|map: &HashMap<str, i32>| map.len()));\n",
+            "\tlet online: HashSetCell<str> = HashSetCell::new();\n",
+            "\tonline.insert(\"ada\");\n",
+            "\tprint(online.peek(|set: &HashSet<str>| set.contains(\"ada\")));\n",
+            "\tlet cell: Shared<Pair> = Shared::new(Pair { left = 1, right = \"one\" });\n",
+            "\tlet weak = cell.downgrade();\n",
+            "\tmatch weak.get() {\n",
+            "\t\tSome(let pair) => print(i\"{pair.left} {pair.right}\"),\n",
+            "\t\tNone => print(\"gone\"),\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "3\n5\n7\n1\ntrue\n1 one\n",
+    );
+}
+
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
 ///
 /// It prints the census — refused / identical — because that census IS the

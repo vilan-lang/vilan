@@ -18373,6 +18373,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Intrinsic::SharedIdentity => format!("({}).identity()", next()),
             Intrinsic::SharedDowngrade => format!("({}).downgrade()", next()),
             Intrinsic::WeakUpgrade => format!("({}).upgrade()", next()),
+            // B739: `weak.get(): Option<&T> borrows self` — a VIEW of the
+            // cell's value, never a copy (`ListCell::peek` lends its list
+            // through it). `upgrade` pins the cell, `borrow` lends the value,
+            // and `as_deref` answers the `Option<&T>` the source names. The
+            // two guards are temporaries of the expression, so they live as
+            // long as the statement that reads the view — a `match` subject's
+            // whole match, which is the only place the emitter lets an
+            // `Option` with a view payload stand (F21) — and that is the
+            // extent `shared.vl` promises: the cell is pinned for the view's
+            // extent, and a write of the cell inside it is the runtime's
+            // reentrancy stop, as a read inside `update` is.
+            Intrinsic::WeakGet => format!(
+                "({}).upgrade().as_ref().map(vilan_rt::Shared::borrow).as_deref()",
+                next()
+            ),
             Intrinsic::OptionTake => format!("({}).take()", next()),
             Intrinsic::OptionReplace => format!("({}).replace({})", next(), next()),
             Intrinsic::SetNew => "vilan_rt::Set::new()".to_string(),
