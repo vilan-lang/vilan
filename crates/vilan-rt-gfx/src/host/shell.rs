@@ -10,12 +10,33 @@
 //! deadline reached). After every turn [`Shell::settle`] does what only the
 //! host can: make the windows asked for, close the windows closed, present
 //! the frames built.
+//!
+//! # The wakes after a present (F169)
+//!
+//! On X11 the window and its GPU surface share ONE connection to the X server
+//! (`winit`'s, handed to `wgpu` as the surface's display), and the driver may
+//! read that connection from a thread of its own while it finishes a present:
+//! Mesa's swapchain thread ("WSI swapchain q") asks the server for the
+//! window's geometry and waits for the reply, and every event that arrives
+//! meanwhile — a key, the window manager's close — is read off the socket
+//! into the client-side queue on that thread. `winit` checks that queue only
+//! when its loop wakes, and its loop sleeps on the socket, which then has
+//! nothing to read: the event waits for the next one to arrive. Observed
+//! under xvfb with Mesa's software Vulkan (about 5 runs in 100 of the 10,000-
+//! row list lost a key or the close); traced to the thread by reading which
+//! thread took each event off the socket.
+//!
+//! So after every presented frame the loop wakes a few times on its own, on
+//! [`PresentDrain`]'s schedule, and each wake has `winit` drain the queue: an
+//! event the driver's thread read in that time reaches the program within the
+//! next step of the schedule. The schedule ends two seconds after the last
+//! present, and the loop sleeps as before — an idle window costs no wake.
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use vilan_rt::executor::Turn;
 use vilan_rt::{panic_with, str_new};
@@ -36,12 +57,14 @@ use crate::window::{FrameOutcome, WindowRenderer};
 pub(crate) fn run(event_loop: EventLoop<HostWake>, turn: &dyn Fn() -> Turn) {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut shell = Shell {
+        shares_x_connection: shares_x_connection(&event_loop),
         turn,
         renderers: HashMap::new(),
         ids: HashMap::new(),
         started: false,
         owes_a_turn: false,
         deadline: None,
+        drain: PresentDrain::default(),
         finished: false,
         failure: None,
     };
@@ -60,8 +83,26 @@ pub(crate) fn run(event_loop: EventLoop<HostWake>, turn: &dyn Fn() -> Turn) {
     }
 }
 
+/// Whether the loop is `winit`'s X11 one, whose connection the GPU surface
+/// shares (the module's "The wakes after a present"). Wayland's client
+/// library is built for several readers (a reader announces itself and the
+/// others are woken with what it read), and Windows and macOS deliver window
+/// events through a queue of the thread's own: none of them needs the wakes.
+#[cfg(all(unix, not(target_vendor = "apple"), not(target_os = "android")))]
+fn shares_x_connection(event_loop: &EventLoop<HostWake>) -> bool {
+    use winit::platform::x11::EventLoopExtX11;
+    event_loop.is_x11()
+}
+
+#[cfg(not(all(unix, not(target_vendor = "apple"), not(target_os = "android"))))]
+fn shares_x_connection(_event_loop: &EventLoop<HostWake>) -> bool {
+    false
+}
+
 struct Shell<'turn> {
     turn: &'turn dyn Fn() -> Turn,
+    /// The loop is X11's: every present starts [`PresentDrain`]'s schedule.
+    shares_x_connection: bool,
     /// Each open window's surface and renderer, by the program's id.
     renderers: HashMap<u32, WindowRenderer>,
     /// The program's id of each open window.
@@ -72,8 +113,73 @@ struct Shell<'turn> {
     owes_a_turn: bool,
     /// The last turn's deadline: turn again then, if nothing comes first.
     deadline: Option<Instant>,
+    /// The wakes owed after the last presented frame (F169).
+    drain: PresentDrain,
     finished: bool,
     failure: Option<Box<dyn Any + Send>>,
+}
+
+/// When the loop wakes after a presented frame, though nothing asked it to,
+/// so `winit` reads events a driver's thread took off the shared X
+/// connection (the module's "The wakes after a present"). A wake runs no turn:
+/// it only lets `winit` look at its queue again.
+#[derive(Default)]
+pub(crate) struct PresentDrain {
+    /// The last present, while some step of the schedule is still ahead.
+    presented: Option<Instant>,
+    /// The first step of [`PresentDrain::STEPS`] not yet passed.
+    step: usize,
+}
+
+impl PresentDrain {
+    /// The wakes, as times after the last present: doubling from one frame at
+    /// 60 Hz, so an event read off the socket while the driver finishes a
+    /// present waits at most as long again as it had been since that present,
+    /// and the last a little over two seconds on. A present that takes the
+    /// driver longer than that (a machine stalled for seconds) is the one
+    /// case left uncovered; the next event of any kind still delivers it.
+    pub(crate) const STEPS: [Duration; 8] = [
+        Duration::from_millis(16),
+        Duration::from_millis(32),
+        Duration::from_millis(64),
+        Duration::from_millis(128),
+        Duration::from_millis(256),
+        Duration::from_millis(512),
+        Duration::from_millis(1024),
+        Duration::from_millis(2048),
+    ];
+
+    /// A frame was presented at `now`: the schedule starts again from it.
+    pub(crate) fn presented(&mut self, now: Instant) {
+        self.presented = Some(now);
+        self.step = 0;
+    }
+
+    /// The next wake still ahead of `now`, passing the ones `now` has
+    /// reached; `None` once the schedule is over (and until a present).
+    pub(crate) fn next_wake(&mut self, now: Instant) -> Option<Instant> {
+        let presented = self.presented?;
+        while let Some(step) = Self::STEPS.get(self.step) {
+            let wake = presented + *step;
+            if wake > now {
+                return Some(wake);
+            }
+            self.step += 1;
+        }
+        self.presented = None;
+        None
+    }
+}
+
+/// The control flow to wait with: until the earlier of the program's
+/// deadline and the next drain wake, or for an event when there is neither.
+/// Never `Poll`: an idle loop sleeps.
+pub(crate) fn wait_for(deadline: Option<Instant>, drain_wake: Option<Instant>) -> ControlFlow {
+    match (deadline, drain_wake) {
+        (Some(deadline), Some(wake)) => ControlFlow::WaitUntil(deadline.min(wake)),
+        (Some(at), None) | (None, Some(at)) => ControlFlow::WaitUntil(at),
+        (None, None) => ControlFlow::Wait,
+    }
 }
 
 impl Shell<'_> {
@@ -217,6 +323,9 @@ impl Shell<'_> {
             match rendered {
                 Ok(FrameOutcome::Presented(_)) => {
                     super::with_window(id, |slot| slot.last_draw_us = took);
+                    if self.shares_x_connection {
+                        self.drain.presented(Instant::now());
+                    }
                 }
                 // A minimised or covered window, or a surface that had to be
                 // reconfigured: the system asks for a frame again when the
@@ -258,8 +367,16 @@ fn make_window(
 }
 
 impl ApplicationHandler<HostWake> for Shell<'_> {
+    /// A wait that ended at its time owes the program a turn only when the
+    /// time was the program's deadline: a drain wake ([`PresentDrain`]) is
+    /// for `winit`'s queue alone, and turns the program only if that queue
+    /// held an event for it.
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. })
+            && self
+                .deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+        {
             self.owes_a_turn = true;
         }
     }
@@ -377,10 +494,8 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
             self.turn_now(event_loop);
         }
         if !self.finished {
-            event_loop.set_control_flow(match self.deadline {
-                Some(deadline) => ControlFlow::WaitUntil(deadline),
-                None => ControlFlow::Wait,
-            });
+            let drain_wake = self.drain.next_wake(Instant::now());
+            event_loop.set_control_flow(wait_for(self.deadline, drain_wake));
         }
     }
 }
