@@ -355,3 +355,31 @@ class = "ci"
 ratio = 1.01
 reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0013 at next 85ce6095, x1.0011 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
 item = "M202"
+
+[[bump]]
+subject = "example:todo"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (B737, the context pass resolves a trait default method's bound dispatch per call site: dispatch sites are entries of what they can select, 70399859): callgrind on one machine read x1.0088 of the count at its parent 3dd1109d (x1.0054 to x1.0102 on every example that loads the reactive std, x1.0000 on example:math); CI read x1.0157 of the ceiling at next 0e65bdc6 where the limit stood at x1.0150. Second 1% row on this subject this order, x1.0201 cumulative"
+item = "M203"
+
+[[bump]]
+subject = "example:walkthrough"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (B737, the context pass resolves a trait default method's bound dispatch per call site: dispatch sites are entries of what they can select, 70399859): callgrind on one machine read x1.0102 of the count at its parent 3dd1109d (x1.0054 to x1.0102 on every example that loads the reactive std, x1.0000 on example:math); CI read x1.0164 of the ceiling at next 0e65bdc6 where the limit stood at x1.0150. Second 1% row on this subject this order, x1.0201 cumulative"
+item = "M203"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (B737, the context pass resolves a trait default method's bound dispatch per call site: dispatch sites are entries of what they can select, 70399859): callgrind on one machine read x1.0159 of the count at its parent 3dd1109d (x1.0054 to x1.0102 on every example that loads the reactive std, x1.0000 on example:math); CI read x1.0205 of the ceiling at next 0e65bdc6 where the limit stood at x1.0150. Second 1% row on this subject this order, x1.0201 cumulative"
+item = "M203"
+
+[[bump]]
+subject = "example:ssr"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (B737, the context pass resolves a trait default method's bound dispatch per call site: dispatch sites are entries of what they can select, 70399859): callgrind on one machine read x1.0077 of the count at its parent 3dd1109d (x1.0054 to x1.0102 on every example that loads the reactive std, x1.0000 on example:math); CI read x1.0149 of the ceiling at next 0e65bdc6 where the limit stood at x1.0150 - under it by a hair, bumped with the three red rows so the row does not flip on the next small change. Second 1% row on this subject this order, x1.0201 cumulative"
+item = "M203"
