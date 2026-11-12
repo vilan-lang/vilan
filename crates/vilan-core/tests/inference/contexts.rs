@@ -849,3 +849,233 @@ fn a_dispatch_the_consumer_did_not_list_keeps_the_fallback() {
         "the `gap` dispatches unlisted: the site must keep every candidate"
     );
 }
+
+// --- M203: what the refinement's cost work must not move. ---
+//
+// The context pass settles a per-entry edge per context only where a node on
+// its hand-off path can establish (or clear) some context; every other path
+// joins the site-level edges once, before the per-context loop. The pins
+// above hold the `run` and the `clear` body; these hold the other two
+// establishing shapes, a DECLARING generic body and a DEFERRED literal.
+
+/// The fixture plus `extra` declarations ahead of `main`.
+fn default_method_program_with(extra: &str, body: &str) -> String {
+    default_method_program(body).replace("\nfun main() {", &format!("\n{extra}\n\nfun main() {{"))
+}
+
+#[test]
+fn m203_a_declaring_generic_body_takes_its_dispatch_on_its_own_clause() {
+    // `declared_gap` declares `owner_scope`, so the reactive arm under its
+    // `row.gap(..)` has the owner `declared_gap`'s callers must hand it: an
+    // ownerless caller is refused ONCE, at the call, by the clause — never
+    // also for the read inside, which charging the caller with the edge would
+    // add.
+    let declared =
+        "fun declared_gap<V: MaybeSignal<Dp>>(own row: Row, own gap: V): Row context owner_scope {
+    row.gap(gap)
+}";
+    assert_compiles_and_runs(
+        &default_method_program_with(
+            declared,
+            "    run_with_owner(Owner::new(), || { declared_gap(Row { id = 1 }, cell()); });",
+        ),
+        "gap 1 1\n",
+    );
+    let ownerless = default_method_program_with(
+        declared,
+        "    let row = declared_gap(Row { id = 1 }, cell());",
+    );
+    assert_fails_once_with(
+        &ownerless,
+        "context `owner_scope` is required by `declared_gap`'s `context` clause",
+    );
+    assert_fails_without(
+        &ownerless,
+        "is read here, but this code can be reached without",
+    );
+}
+
+#[test]
+fn m203_a_deferred_literal_in_a_generic_body_takes_the_owner_it_is_handed() {
+    // The `row.gap(..)` dispatch sits in a literal written at a `context
+    // owner_scope` position, so it runs with whatever owner `with_owner`
+    // hands that literal — here one `with_owner` makes — and not with
+    // `deferred_gap`'s caller's, which has none.
+    assert_compiles_and_runs(
+        &default_method_program_with(
+            "fun with_owner(body: (|| void) context owner_scope) {
+    run_with_owner(Owner::new(), || body());
+}
+
+fun deferred_gap<V: MaybeSignal<Dp>>(own row: Row, own gap: V) {
+    with_owner(|| { row.gap(gap); });
+}",
+            "    deferred_gap(Row { id = 1 }, cell());",
+        ),
+        "gap 1 1\n",
+    );
+}
+
+#[test]
+fn m203_the_impls_a_selection_reads_are_the_ones_a_scan_finds() {
+    // `impl_members_for_bound`'s first filter, answered from an index built
+    // once per program: an impl is read when it declares the member, when one
+    // of its traits declares it, or when it lists one of the bound's traits.
+    // Each of the three is a key of the index, and each is pinned here
+    // against the scan it replaced, over std's impls and the fixture's.
+    let source = default_method_program("    let row = Row { id = 1 }.gap(Dp { value = 4.0 });");
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            use vilan_core::dispatch_refine::{impls_a_selection_reads, impls_implementing};
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(errors.is_empty(), "expected a clean analysis");
+            let program = program.expect("a program");
+            let scan = |member: &str, traits: &[vilan_core::id::Id]| -> Vec<usize> {
+                program
+                    .implementations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, implementation)| {
+                        implementation.declarations.contains_key(member)
+                            || implementation.trait_ids.iter().any(|trait_id| {
+                                traits.contains(trait_id)
+                                    || program.traits.get(trait_id).is_some_and(|trait_| {
+                                        trait_.declarations.contains_key(member)
+                                    })
+                            })
+                    })
+                    .map(|(index, _)| index)
+                    .collect()
+            };
+            let mut members: Vec<&str> = program
+                .implementations
+                .iter()
+                .flat_map(|implementation| implementation.declarations.keys().copied())
+                .chain(
+                    program
+                        .traits
+                        .values()
+                        .flat_map(|trait_| trait_.declarations.keys().copied()),
+                )
+                .collect();
+            members.sort_unstable();
+            members.dedup();
+            assert!(members.contains(&"gap") && members.contains(&"bind"));
+            // By member: an impl that declares it (`Loud::gap`), one that
+            // inherits it from its trait (`Row`'s `gap`), both at once.
+            for member in &members {
+                assert_eq!(
+                    impls_a_selection_reads(&program, member, &[]),
+                    scan(member, &[]),
+                    "the impls a selection of `{member}` reads"
+                );
+            }
+            // By trait: every trait as a bound, with a member no impl or
+            // trait declares (the trait's own impls alone) and with each
+            // member the trait declares (both keys at once).
+            for trait_ in program.traits.values() {
+                let bound = [trait_.id];
+                for member in std::iter::once("m203 no such member")
+                    .chain(trait_.declarations.keys().copied())
+                {
+                    assert_eq!(
+                        impls_a_selection_reads(&program, member, &bound),
+                        scan(member, &bound),
+                        "the impls a selection of `{member}` under `{}` reads",
+                        trait_.name
+                    );
+                }
+                let implementing: Vec<usize> = program
+                    .implementations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, implementation)| implementation.trait_ids.contains(&trait_.id))
+                    .map(|(index, _)| index)
+                    .collect();
+                assert_eq!(
+                    impls_implementing(&program, trait_.id),
+                    implementing,
+                    "the impls of `{}`",
+                    trait_.name
+                );
+            }
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+}
+
+#[test]
+fn m203_a_function_called_only_with_the_wrong_arity_elsewhere_keeps_the_fallback() {
+    // The refinement counts only a WIRED call's subject as call position, so
+    // `spaced`, named once by a call refused for its arity, is a function
+    // taken as a value there: its entries cannot be enumerated and the `bind`
+    // site it reaches keeps every candidate. The context pass's own value-use
+    // set reads that subject as a call (B241) — the two are answered by one
+    // scan now (M203), and the refinement must keep its own answer. Read
+    // through the fence's face: the pass stands down in a program that does
+    // not type, after refining.
+    let program = default_method_program(
+        "    let row = spaced(Row { id = 1 }, Dp { value = 4.0 });
+    let other = spaced(Row { id = 2 });",
+    );
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            use vilan_core::call_graph::CallGraph;
+            use vilan_core::dispatch_refine::{
+                dispatch_fallbacks, member_name_at, reset_dispatch_fallbacks,
+            };
+            let leaked: &'static str = Box::leak(program.into_boxed_str());
+            reset_dispatch_fallbacks();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let fallbacks = dispatch_fallbacks();
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.msg.contains("expects 2 arguments, but got 1")),
+                "the fixture's arity error: {:#?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            let program = program.expect("a program");
+            let graph = CallGraph::build(&program);
+            let bind_sites: Vec<_> = graph
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    program
+                        .functions
+                        .get(&node.id())
+                        .is_some_and(|function| function.name == "gap")
+                })
+                .flat_map(|node| graph.calls_of(node.id()))
+                .filter(|call| member_name_at(&program, call.call_id) == Some("bind"))
+                .map(|call| call.call_id)
+                .collect();
+            assert_eq!(bind_sites.len(), 1, "the fixture has one `bind` in `gap`");
+            assert!(
+                fallbacks.iter().any(|(call, _)| bind_sites.contains(call)),
+                "`spaced` is taken as a value for the refinement: the `bind` site keeps every \
+                 candidate"
+            );
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+}

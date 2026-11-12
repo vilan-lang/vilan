@@ -676,6 +676,8 @@ fn call_target(program: &Program, call_id: Id) -> Option<Id> {
 /// (`dispatch_refine::RefinedEdge::via`): `(caller, callee)` each, the caller
 /// `None` for top-level code. Kept apart from the site-level edges because
 /// who a callee's value comes from along the path is a per-context answer.
+/// Before the per-context loop `via` is narrowed to the nodes on the path
+/// that establish some context (M203); the order is the path's.
 struct EntryCoverageEdges {
     via: std::rc::Rc<[Id]>,
     edges: Vec<(Option<Id>, Id)>,
@@ -1828,38 +1830,28 @@ fn analyze(
     // graph, which must stay checked. Outside entries: calls made by
     // top-level statements (the graph has no top-level node), and functions
     // taken as values (called indirectly; the value-use error also fires).
-    let owned_call_ids: HashSet<Id> = graph
-        .nodes()
-        .iter()
-        .flat_map(|node| graph.calls_of(node.id()))
-        .map(|call| call.call_id)
-        .collect();
-    let top_level_targets: HashSet<Id> = program
-        .function_calls
-        .iter()
-        .filter(|(call_id, _)| !owned_call_ids.contains(call_id))
-        .filter_map(|(_, call)| local_target(program, call.subject_id))
-        .collect();
-    // Every entity that names a callee IN CALL POSITION. `function_calls`
-    // holds the calls the solver WIRED; an arity-invalid call is refused
-    // before wiring, and its subject would otherwise read as the callee taken
-    // as a value (B241) — the same "a written call the site scan cannot see"
-    // hole B229 found under `run`, with a different lid. A call written with
-    // the wrong number of arguments is still a CALL of the name it wrote.
-    let call_subject_entities: HashSet<Id> = program
+    // The first are `top_level_incoming`'s keys (the index below).
+    //
+    // Every entity that names a callee IN CALL POSITION: the subjects of the
+    // calls the solver WIRED (`function_calls`), and those of the calls it
+    // did not. An arity-invalid call is refused before wiring, and its
+    // subject would otherwise read as the callee taken as a value (B241) —
+    // the same "a written call the site scan cannot see" hole B229 found
+    // under `run`, with a different lid. A call written with the wrong number
+    // of arguments is still a CALL of the name it wrote.
+    let wired_subjects: HashSet<Id> = program
         .function_calls
         .values()
         .map(|call| call.subject_id)
-        .chain(
-            program
-                .arity_invalid_calls
-                .iter()
-                .map(|(_, subject_id)| *subject_id),
-        )
+        .collect();
+    let unwired_subjects: HashSet<Id> = program
+        .arity_invalid_calls
+        .iter()
+        .map(|(_, subject_id)| *subject_id)
         // E189: and the subject of every call that never wired at all — the
         // third face of the same hole. `f(bad)` where `bad` does not type
         // leaves `f` named in call position and recorded nowhere, so the scan
-        // above read it as `f` taken AS A VALUE: a "reads context, so it can't
+        // below read it as `f` taken AS A VALUE: a "reads context, so it can't
         // be used as a value" refusal at a call, and a callee the value-use
         // entry then holds permanently uncovered for its whole transitive read
         // set. A call written with an argument that did not type is still a
@@ -1876,23 +1868,40 @@ fn analyze(
     // refusal reads the sites — one scan of the entity map for both, where the
     // refusal used to rescan it per context (6 ms of kolt's client leg per
     // context; Order 50). Scan order is the map's, as the refusal's was.
-    let function_value_sites: Vec<(Id, Id)> = program
-        .entity_map
-        .iter()
-        .filter_map(|(entity_id, expr)| match expr {
-            Expr::Local(target)
-                if program.functions.contains_key(target)
-                    && !call_subject_entities.contains(entity_id) =>
-            {
-                Some((*entity_id, *target))
+    //
+    // The same scan answers the dispatch refinement's value-taken set
+    // (`dispatch_refine::RefineIndex::value_taken`), which the refinement
+    // used to rescan for itself (M203). It counts only a WIRED call's subject
+    // as call position, so it holds every function above plus any named only
+    // as an unwired call's subject — none in a program that types; the
+    // refinement's verdicts were drawn with that set, and keep it.
+    let mut function_value_sites: Vec<(Id, Id)> = Vec::new();
+    let mut refine_value_taken: HashSet<Id> = HashSet::default();
+    for (entity_id, expr) in &program.entity_map {
+        if let Expr::Local(target) = expr
+            && program.functions.contains_key(target)
+            && !wired_subjects.contains(entity_id)
+        {
+            refine_value_taken.insert(*target);
+            if !unwired_subjects.contains(entity_id) {
+                function_value_sites.push((*entity_id, *target));
             }
-            _ => None,
-        })
-        .collect();
+        }
+    }
     let value_taken: HashSet<Id> = function_value_sites
         .iter()
         .map(|(_, target)| *target)
         .collect();
+
+    // The calls the graph's nodes make, and every function's incoming calls
+    // from nodes and from top-level code: the A2 walk-back below reads them,
+    // and so does the dispatch refinement, which takes this index rather than
+    // building its own (M203).
+    let refine_index =
+        crate::dispatch_refine::RefineIndex::with_value_taken(program, graph, refine_value_taken);
+    let owned_call_ids = &refine_index.node_owned_calls;
+    let incoming_calls = &refine_index.incoming_calls;
+    let top_level_incoming = &refine_index.top_level_incoming;
 
     // --- Coverage-only dispatch refinement (element-syntax H8 →
     // proposal/requirement-polymorphism.md): the union edges above stay for
@@ -1904,29 +1913,6 @@ fn analyze(
     // shape widening back to the whole candidate list. The resolution rules
     // live in [`crate::dispatch_refine`] (extracted for the const-only
     // capability check, backlog B143 — see that module's documentation).
-    // Incoming direct calls per function, and top-level incoming calls (the
-    // A2 walk-back below reads these; the refinement recomputes its own
-    // internally, so its edges are a function of program + graph alone).
-    let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
-    for node in graph.nodes() {
-        for call in graph.calls_of(node.id()) {
-            if let CallTarget::Function(target) = call.target {
-                incoming_calls
-                    .entry(target)
-                    .or_default()
-                    .push((node.id(), call.call_id));
-            }
-        }
-    }
-    let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::default();
-    for (call_id, call) in &program.function_calls {
-        if owned_call_ids.contains(call_id) {
-            continue;
-        }
-        if let Some(target) = local_target(program, call.subject_id) {
-            top_level_incoming.entry(target).or_default().push(*call_id);
-        }
-    }
     // A `Node` edge draws a coverage edge from that caller; a `TopLevel`
     // edge marks the callee outside-entered — always uncovered.
     let refinement_sites: Vec<crate::dispatch_refine::DispatchSite> = dispatch_sites
@@ -1948,7 +1934,9 @@ fn analyze(
     let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
     let mut coverage_outside: HashSet<Id> = HashSet::default();
     let mut entry_coverage_edges: Vec<EntryCoverageEdges> = Vec::new();
-    for edge in crate::dispatch_refine::refined_edges(program, graph, &refinement_sites) {
+    for edge in
+        crate::dispatch_refine::refined_edges_over(program, graph, &refinement_sites, &refine_index)
+    {
         if edge.via.is_empty() {
             match edge.caller {
                 crate::dispatch_refine::RefinedCaller::Node(caller) => {
@@ -2686,7 +2674,8 @@ fn analyze(
             .collect();
         injected_appearances.sort_by_key(|entity| entity.0);
         for entity in injected_appearances {
-            if call_subject_entities.contains(&entity)
+            if wired_subjects.contains(&entity)
+                || unwired_subjects.contains(&entity)
                 || allowed_forwards.contains(&entity)
                 || run_body_entities.contains(&entity)
                 || refused_landings.contains(&entity)
@@ -2774,6 +2763,54 @@ fn analyze(
     // unused-clause warning are both about the whole clause against the whole
     // body, so both are answered after the loop.
     let mut inferred_of_function: HashMap<Id, HashSet<Id>> = HashMap::default();
+
+    // M203: an entry edge is settled per context only because a node on its
+    // path may establish (or clear) THIS context — a `run` body, a deferred
+    // literal, a declaring function, a `clear` body. A path that crosses no
+    // node establishing ANY context settles to its own caller in every
+    // context, so its edges join the site-level ones once, here; the rest
+    // keep only the nodes that can establish something, in path order. The
+    // per-context test implies this one, so the first node it accepts in the
+    // kept list is the first it accepts on the whole path — the same answer,
+    // asked of a few nodes per group instead of every node of every group in
+    // every context.
+    let may_establish_some_context = |node: Id| {
+        run_closures.contains_key(&node)
+            || clear_closures.contains_key(&node)
+            || deferred.values().any(|closures| closures.contains(&node))
+            || declared_of_context
+                .values()
+                .any(|functions| functions.contains(&node))
+    };
+    let entry_coverage_edges: Vec<EntryCoverageEdges> = entry_coverage_edges
+        .into_iter()
+        .filter_map(|group| {
+            let establishers: std::rc::Rc<[Id]> = group
+                .via
+                .iter()
+                .copied()
+                .filter(|node| may_establish_some_context(*node))
+                .collect();
+            if !establishers.is_empty() {
+                return Some(EntryCoverageEdges {
+                    via: establishers,
+                    edges: group.edges,
+                });
+            }
+            for (caller, callee) in group.edges {
+                match caller {
+                    Some(caller) => coverage_dispatch_callers
+                        .entry(callee)
+                        .or_default()
+                        .push(caller),
+                    None => {
+                        coverage_outside.insert(callee);
+                    }
+                }
+            }
+            None
+        })
+        .collect();
 
     // --- Per-context effect inference + coverage. ---
     for &context in &plan.contexts {
@@ -3114,7 +3151,8 @@ fn analyze(
                     let no_edges = callers.is_empty() && through_dispatch().next().is_none();
                     if coverage_outside.contains(&id)
                         || entry_outside.contains(&id)
-                        || top_level_targets.contains(&id)
+                        // top-level code calls it by name
+                        || top_level_incoming.contains_key(&id)
                         || value_taken.contains(&id)
                     {
                         // Entered from outside the graph — uncovered
