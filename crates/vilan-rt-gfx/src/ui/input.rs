@@ -53,6 +53,21 @@ use super::style::Interaction;
 use super::{ElementKind, NodeData, NodeId, ScrollAxis, UiTree, clamp_offset, inside_rounded};
 use crate::geometry::{Point, Rect};
 
+/// The offset along one axis that shows the span `start..end` (relative to a
+/// viewport of length `length` scrolled to `offset`) with the least movement:
+/// `offset` itself when it shows the span already; the span's start when the
+/// span lies before the viewport or is longer than it; its end at the
+/// viewport's end otherwise.
+fn shown(start: f32, end: f32, length: f32, offset: f32) -> f32 {
+    if start < offset || end - start > length {
+        start
+    } else if end > offset + length {
+        end - length
+    } else {
+        offset
+    }
+}
+
 /// A vilan handler, as the tree keeps it: a `|| void` closure the host calls.
 #[derive(Clone)]
 pub struct Handler(Rc<dyn Fn()>);
@@ -221,6 +236,9 @@ impl UiTree {
 
     fn hit_node(&self, node: NodeId, point: Point) -> Option<NodeId> {
         let data = self.data(node);
+        if data.kind == ElementKind::Marker {
+            return None;
+        }
         let inside = inside_rounded(data.bounds, data.paint.corners, point);
         let children_reachable = if data.clip {
             let (area, corners) = super::padding_box(data);
@@ -501,6 +519,15 @@ impl UiTree {
             DefaultAction::MoveFocus { backward } => {
                 let focus = self.move_focus(root, backward);
                 route.plain(focus);
+                // Tab brings what it focused into view, and the content may
+                // have moved under a still pointer.
+                if let Some(focused) = self.focused()
+                    && self.reveal(focused)
+                    && let Some(pointer) = self.pointer
+                {
+                    let hit = self.hit(root, pointer);
+                    self.hover(root, hit, &mut route);
+                }
             }
             DefaultAction::Scroll { node, delta } => {
                 if !self.is_alive(node) {
@@ -533,12 +560,107 @@ impl UiTree {
         route
     }
 
+    /// Scrolls every `scroll` around `node` as little as it takes to show
+    /// it, innermost first: a scroll that shows all of it already does not
+    /// move; one where it lies above (left) moves so its top (left) edge is
+    /// the viewport's, one where it lies below (right) so its bottom (right)
+    /// edge is — or its top, when it is larger than the viewport. Each outer
+    /// scroll then shows what the inner one shows of it. From the last
+    /// layout, as hit testing is. Answers whether an offset moved; a moved
+    /// one is told to its program as a wheel's is.
+    pub fn reveal(&mut self, node: NodeId) -> bool {
+        if !self.is_alive(node) {
+            return false;
+        }
+        let bounds = self.data(node).bounds;
+        // The part to show, in the coordinates every box is laid out in
+        // (before any scroll's offset), moved by the offsets of the scrolls
+        // already passed on the way up.
+        let (mut left, mut top) = (bounds.left(), bounds.top());
+        let (mut right, mut bottom) = (bounds.right(), bounds.bottom());
+        let mut moved = false;
+        let mut current = node;
+        while let Some(parent) = self.taffy.parent(current) {
+            if self.kind(parent) == ElementKind::Viewport {
+                break;
+            }
+            current = parent;
+            let data = self.data(parent);
+            let Some(scroll) = &data.scroll else {
+                continue;
+            };
+            let view = Rect::new(
+                data.bounds.left() + data.content_offset.x,
+                data.bounds.top() + data.content_offset.y,
+                data.content_size.width,
+                data.content_size.height,
+            );
+            let wanted = Point::new(
+                shown(
+                    left - view.left(),
+                    right - view.left(),
+                    view.size.width,
+                    scroll.offset.x,
+                ),
+                shown(
+                    top - view.top(),
+                    bottom - view.top(),
+                    view.size.height,
+                    scroll.offset.y,
+                ),
+            );
+            let offset = clamp_offset(wanted, scroll.range, scroll.axis);
+            if offset != scroll.offset {
+                self.data_mut(parent)
+                    .scroll
+                    .as_mut()
+                    .expect("a scroll")
+                    .offset = offset;
+                self.offset_notices.push(parent);
+                self.invalidate(parent);
+                moved = true;
+            }
+            // What this scroll now shows of it, as its parent sees it.
+            left = (left - offset.x).max(view.left());
+            right = (right - offset.x).min(view.right()).max(left);
+            top = (top - offset.y).max(view.top());
+            bottom = (bottom - offset.y).min(view.bottom()).max(top);
+        }
+        moved
+    }
+
     fn key_target(&self, root: NodeId) -> NodeId {
         let focused = self.chain_in(root, self.focused);
         focused.first().copied().unwrap_or(root)
     }
 
-    fn release_press(&mut self) {
+    /// The focus is taken away with no blur: what had it is being removed,
+    /// handlers and all (`UiTree::remove`).
+    pub(super) fn clear_focus(&mut self) {
+        if let Some(old) = self.focused() {
+            self.set_flag(old, Flag::Focused, false);
+        }
+        self.focused = None;
+    }
+
+    /// The hovered element is inside `removed`, which is leaving: the part
+    /// of the hover chain inside it is no longer hovered, and the hover rests
+    /// on `parent` (still under the pointer as far as anything knows until
+    /// the pointer moves again), with no leave delivered to the elements
+    /// going.
+    pub(super) fn unhover_inside(&mut self, removed: NodeId, parent: Option<NodeId>) {
+        if let Some(hovered) = self.hovered() {
+            for node in self.chain(hovered) {
+                self.set_flag(node, Flag::Hovered, false);
+                if node == removed {
+                    break;
+                }
+            }
+        }
+        self.hovered = parent;
+    }
+
+    pub(super) fn release_press(&mut self) {
         if let Some(pressed) = self.pressed() {
             for node in self.chain(pressed) {
                 self.set_flag(node, Flag::Pressed, false);

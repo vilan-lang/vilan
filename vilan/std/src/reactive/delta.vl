@@ -2601,6 +2601,120 @@ export impl type P: CollPipe<type T> with RowFeed<T> {
 	}
 }
 
+/// A98: which of `steps` name a row the order pass can LEAVE WHERE IT IS — the
+/// order pass of both UIs' `each` (`std::web::ui`'s and `std::ui`'s), which is why
+/// it lives beside `RowFeed` rather than in either.
+///
+/// A settled row is one whose previous index reads as part of an INCREASING run
+/// across the new order: those rows already stand in the document in their new
+/// relative order, so leaving them alone and threading every other row around them
+/// (each inserted before the next settled row's marker) produces exactly the new
+/// order. Before A98 nothing was settled — every live row was cut by span and
+/// re-inserted at the anchor, whether or not it had gone anywhere — which is one
+/// `extractContents`, one marker move and one content move per row per pass, for a
+/// list that may not have moved at all.
+///
+/// TWO SCANS, and the better of them wins. A forward greedy run keeps the
+/// EARLIEST row of each increasing chain and is optimal when one row moved
+/// backward (a row dragged to the end); a backward greedy run keeps the LATEST
+/// and is optimal when one row moved forward (a row dragged to the front).
+/// Neither is the maximum increasing subsequence — that is a patience sort, and
+/// the two scans agree with it on every shape a real list takes (an append, a
+/// prepend, a removal at either end, a value refresh, one row moved either way,
+/// two rows swapped) and fall short of it only on a reshuffle, where nearly
+/// every row has to move whichever set is chosen. `Refresh` and `Fresh` are
+/// never settled: both build a row that is not in the document yet.
+[internal("a keyed run's order pass (A98), shared by the web UI's and std::ui's")]
+export fun settled_steps(steps: List<RowStep>): List<bool> {
+	mut forward: List<bool> = [];
+	mut forward_count = 0;
+	// I5 S2: "nothing kept yet" is `None`, where it was the `-1` below every index.
+	mut highest: Option<usize> = None;
+	for step in steps {
+		match step {
+			RowStep::Keep(let index) => {
+				let rises = match highest {
+					Some(let top) => index > top,
+					None => true,
+				};
+				if rises {
+					highest = Some(index);
+					forward_count += 1;
+					forward.push(true);
+				} else {
+					forward.push(false);
+				}
+			},
+			_ => {
+				forward.push(false);
+			},
+		}
+	}
+	// The same greedy run read from the end. `lowest` starts above every index (an
+	// empty run has nothing to its right), and a row settles when it sits strictly
+	// below whatever settled after it — which, read forwards, is the increasing
+	// condition again.
+	mut backward: List<bool> = [];
+	mut backward_count = 0;
+	mut lowest = steps.len();
+	mut at = steps.len();
+	for at > 0 {
+		at -= 1;
+		match steps[at] {
+			RowStep::Keep(let index) => {
+				if index < lowest {
+					lowest = index;
+					backward_count += 1;
+					backward.push(true);
+				} else {
+					backward.push(false);
+				}
+			},
+			_ => {
+				backward.push(false);
+			},
+		}
+	}
+	if forward_count >= backward_count {
+		forward
+	} else {
+		backward.reverse()
+	}
+}
+
+/// A drain's ops from its LAST `Reset` on (A129). A `Reset` says what the
+/// collection BECAME, whatever it was, so every op ahead of it in the same drain is
+/// superseded — and applying them would build rows the reset's pass then cuts,
+/// where the pass alone, reading only the list the drain settles on, never builds
+/// them.
+[internal("a keyed run's drain (A129), shared by the web UI's and std::ui's")]
+export fun live_ops<T>(ops: List<SeqOp<T>>): List<SeqOp<T>> {
+	// I5 S2: "no `Reset` in the drain" is `None`, where it was the `-1` below every
+	// position (B407 refuses the negative at a `usize`).
+	mut last: Option<usize> = None;
+	mut index = 0;
+	for op in ops {
+		match op {
+			SeqOp::Reset(let _items) => {
+				last = Some(index);
+			},
+			_ => {},
+		}
+		index += 1;
+	}
+	let from = match last {
+		Some(let at) if at > 0 => at,
+		_ => ret ops,
+	};
+	mut live: List<SeqOp<T>> = [];
+	index = from;
+	for index < ops.len() {
+		live.push(ops[index]);
+		index += 1;
+	}
+	live
+}
+
 // === Map and set pipes (A138 S2, `proposal/reactive-maps-sets.md` §5) ========
 //
 // §6's collection pipes, for the Map and Set shapes. A map OPERATOR returns a

@@ -17,8 +17,11 @@ reaches this module, naming it; `vilan check` accepts one. What is plain vilan �
 a `Style` and its `+`, its conditions, the enums — runs anywhere; the refusal is
 by reach, at the first element made.
 
-Not here yet: keyed lists and conditional children for this tree (`each`,
-`when`), grid layout, text editing, and publishing roles and labels to the
+A child can be reactive: a keyed list (`each`) or a conditional (`when`) keeps
+its place among the static children and inserts, removes and moves elements as
+its source changes ([below](#lists-and-conditional-children)).
+
+Not here yet: grid layout, text editing, and publishing roles and labels to the
 system's accessibility API. Components (a button with behaviour, a text input, a
 virtual list) are `std::ui::kit`, a later part.
 
@@ -37,12 +40,14 @@ impl Element {
 	fun bounds(self): Rect                    // its box from the last layout, in dp
 	fun outline(self): List<OutlineEntry>     // every element in its tree, in paint order
 	fun focus(self)                           // gives it the focus
+	fun scroll_into_view(self)                // every scroll around it shows it
 	fun interaction(self): Interaction        // hovered, pressed, focused now
 }
 struct OutlineEntry { depth: usize, kind: str, label: str, bounds: Rect }
 struct Interaction { hovered: bool, pressed: bool, focused: bool }
 
 trait Child { fun into_element(self): Element; }   // every kind, an Element, a str
+trait ChildSlot { fun place(own self, parent: Element); }   // what `child` takes
 ```
 
 Each kind is an `[element]` function with no parameters that answers a builder,
@@ -82,8 +87,10 @@ fun main() {
 main();
 ```
 
-`child` takes anything `Child`: an element of any kind, or a `str`, which
-becomes a `text` holding it. A `text`'s own `child` takes a `str` (or a signal of
+`child` takes anything `ChildSlot`: anything `Child` — an element of any kind,
+or a `str`, which becomes a `text` holding it — an `Option` of one (placed when
+it is `Some`), or a reactive child ([Lists and conditional
+children](#lists-and-conditional-children)). A `text`'s own `child` takes a `str` (or a signal of
 one) and appends it to the paragraph. Elements are RETAINED: an element is built
 once and kept, a copy of one is the same element, and an element is in one place —
 giving it a second parent, or making it a child of itself or of an element inside
@@ -111,7 +118,11 @@ that changed and the chain of scenes above them. Nothing else runs.
 `Bindable` is `std::reactive`'s `MaybeSignal` with one difference: a binding
 belongs to the ambient owner when there is one (`mount_root`, `run_with_owner`)
 and dies with it, and to its source otherwise, so a tree can be built and bound
-at the top of `main`.
+at the top of `main`. (`MaybeSignal`'s reactive arm requires an owner, and the
+native backend gives every function that could reach it an owner parameter,
+whatever value a call passes: with it, every tree would have to be built under
+`mount_root` or `comp`, static ones included. The two become one trait when the
+backend stops doing that.)
 
 ## Attributes every element has
 
@@ -167,7 +178,7 @@ and published to the system by a later one; `outline` lists the label too.
 
 ```vilan,fragment
 trait Parent with Attributes {
-	fun child<C: Child>(self, content: C): Self
+	fun child<C: ChildSlot>(self, content: C): Self
 }
 trait Flex with Parent {                      // rows and columns
 	fun gap<V: Bindable<Dp>>(self, gap: V): Self
@@ -398,7 +409,10 @@ before the elements in tree order, lowest first; a negative one is focusable by 
 press or by `focus()` but never reached by Tab. Tab moves the focus to the next
 element of the tab order and Shift+Tab to the previous one, wrapping at the ends;
 a press focuses the innermost focusable element at or above where it landed, and
-takes the focus away when there is none. Key and text events go to the focused
+takes the focus away when there is none. Tab also brings the element it focuses
+into view: every `scroll` around it moves as little as it takes to show it —
+not at all when it shows already — and `scroll_into_view()` does the same for any
+element. Key and text events go to the focused
 element first. The `focused()` condition, `on_focus` and `on_blur` follow it.
 
 ## Scrolling
@@ -427,7 +441,82 @@ A scroll MOVING lays nothing out and repaints nothing inside it: only the
 scroll's own scene changes, and when the frame is drawn the rows outside the
 viewport are skipped whole. Every row is still a real element, laid out once —
 virtualising a list (laying out only the rows in view) is a `std::ui::kit`
-component, not this.
+component, not this. Tab and `scroll_into_view` move a scroll to show an element
+([Focus](#focus)).
+
+## Lists and conditional children
+
+```vilan,fragment
+fun each<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(source: S, key: |T| K, render: |T| C): Each<T, K, S, C>
+fun each_values<T: PartialEq + Hashable, S: RowFeed<T>, C: Child>(source: S, render: |T| C): EachValues<T, S, C>
+fun each_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(source: S, key: |T| K, render: |SignalCell<T>| C): EachBy<T, K, S, C>
+fun when<S: Flow<bool>, C: Child>(condition: S, body: || C): When<S, C>
+fun swap<T: PartialEq, S: Flow<T>, C: Child>(source: S, render: |T| C): Swap<T, S, C>
+```
+
+A child position can be REACTIVE, written as the web UI writes it, in a hole or
+handed to `child`: `each` is a KEYED list over a list source (a `ListCell`, a
+`SignalCell<List<T>>`, a collection pipe) — a row per item, built by `render`; `when`
+is content that is there while its condition holds; `swap` is the subtree for a
+value, built again when the value changes (one of two: `swap(flag, |on| if on {
+a() } else { b() })`). Each keeps the place where it is written among its static
+siblings, however the parent grows afterwards.
+
+```vilan,native
+import std::gfx::{ Size, dp };
+import std::io::print;
+import std::reactive::{ FlushPolicy, ListCell, Signal, SignalCell, turn };
+import std::ui::{ column, each, layout, row, text, when };
+
+fun main() {
+	let names: ListCell<str> = ListCell::of(["Ada", "Grace"]);
+	let busy: SignalCell<bool> = Signal::new(false);
+	let screen = <column gap(dp(4))>
+		<text>"Team"</text>
+		{each(names, |name: str| name, |name: str| <row label(name)>{name}</row>)}
+		{when(busy, || <text label("busy")>"Saving…"</text>)}
+		<text>"end"</text>
+	</column>;
+	turn(FlushPolicy::AtSuspension, || {
+		names.insert_at(0, "Linus");
+		busy.set(true);
+	});
+	layout(screen, Size::new(dp(320), dp(200)), 1.0);
+	for entry in screen.element().outline() {
+		if entry.label != "" {
+			print(entry.label);   // Linus, Ada, Grace, busy: in place, between the two texts
+		}
+	}
+}
+main();
+```
+
+A ROW IS ONE ELEMENT — whatever `render` answers, anything `Child` — and each row is
+built under an OWNER of its own. A change keeps every row whose key stays (and,
+for `each`, whose item is equal), MOVING it when the order changed; it builds a
+row for each new key or changed item, and it REMOVES each row whose key left: the
+row's owner is disposed, so its bindings end, and the element leaves the tree
+with its handlers dropped — a handler that holds its own row does not keep it
+alive. Over a `ListCell` the list follows its operations: a push builds one row,
+a removal removes one, a `set_at` rebuilds that one row, a `move_range` moves the
+rows that moved. `each_values` keys a row by its item. `each_by` hands each row a
+CELL holding its item instead of the item: a row whose key stays is never built
+again, a changed item is written into its cell, and whatever the row binds to
+that cell follows — its items need no equality.
+
+What the tree pays: a row arriving is one insert, a row leaving one removal, a
+row moving one move — each tells the layout solver that the PARENT changed and
+nothing else, so it places the parent's children again from its cache and
+measures only a new row's texts; the rows that stay where they are in the new
+order are not touched at all. Hover, press and focus belong to the element, so a
+moved row keeps them; a removed one takes them with it (a press inside it is
+cancelled, and no click follows its release). Every row below an insert or a
+removal has a new box, and its scene is built again.
+
+The region — its rows, its place, its subscription — belongs to the ambient owner
+when there is one (`mount_root`, `run_with_owner`) and is taken out of the tree
+when that owner is disposed; with none, it lives as long as its source, as a
+bound attribute does.
 
 ## Showing it
 

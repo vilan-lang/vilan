@@ -170,6 +170,12 @@ Rust workspace, seventeen crates, plus the language's own tree:
   `ui_interaction.rs` (the counter with no window against a recorded listing, then by XTEST
   pointer and keyboard; the 10,000-row list scrolled and clicked), in the same `gfx` leg.
   `crates/vilan-rt-gfx/examples/ui_measure.rs` prints the layout and paint costs (release).
+  Reactive children (R9: `each`, `when`, `swap` in `ui.vl`) keep their place through a `Marker`
+  element (never laid out, painted, hit or listed) and change the tree only by `insert_before`
+  (a move when the element is already there) and `remove`, which is FINAL: it drops the
+  subtree's handlers (B738), so the host drops them with the tree no longer borrowed. The xvfb
+  suites share `crates/vilan-cli/tests/support/xvfb.rs`, whose `Running` ends its run's whole
+  process group on drop (N198).
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

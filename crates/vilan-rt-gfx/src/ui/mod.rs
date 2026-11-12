@@ -106,6 +106,10 @@ pub enum ElementKind {
     Text,
     Image,
     Scroll,
+    /// A position among its parent's children, holding none of its own: where
+    /// a keyed list's or a conditional's elements go (`std::ui`'s regions). It
+    /// is never laid out, painted, hit or listed.
+    Marker,
     Viewport,
 }
 
@@ -119,6 +123,7 @@ impl ElementKind {
             ElementKind::Text => "text",
             ElementKind::Image => "image",
             ElementKind::Scroll => "scroll",
+            ElementKind::Marker => "marker",
             ElementKind::Viewport => "viewport",
         }
     }
@@ -566,6 +571,8 @@ pub enum UiError {
     NotFinite(&'static str),
     /// A run index a text does not have.
     NoSuchRun(usize),
+    /// An element placed before one that is in no parent.
+    NoPosition,
 }
 
 impl std::fmt::Display for UiError {
@@ -601,6 +608,10 @@ impl std::fmt::Display for UiError {
             }
             UiError::NotFinite(what) => write!(formatter, "{what} must be a finite number"),
             UiError::NoSuchRun(index) => write!(formatter, "a text has no run {index}"),
+            UiError::NoPosition => write!(
+                formatter,
+                "an element can be placed before another only when that one is inside a parent"
+            ),
         }
     }
 }
@@ -791,6 +802,10 @@ fn initial_style(kind: ElementKind) -> taffy::Style {
             style.display = Display::Flex;
             style.item_is_replaced = true;
         }
+        // No box: the solver skips it, and so does every pass after it.
+        ElementKind::Marker => {
+            style.display = Display::None;
+        }
     }
     style
 }
@@ -961,11 +976,68 @@ impl UiTree {
 
     /// Appends `child` to `parent`'s children.
     pub fn add_child(&mut self, parent: NodeId, child: NodeId) -> Result<(), UiError> {
+        self.check_placement(parent, child)?;
+        self.taffy
+            .add_child(parent, child)
+            .expect("a child appended");
+        self.placed(parent, child);
+        Ok(())
+    }
+
+    /// Puts `child` immediately before `reference`, in `reference`'s parent: a
+    /// child of that parent already MOVES there (its state — hover, press,
+    /// focus, scroll offset, cached layout — goes with it); any other is
+    /// placed there as `add_child` places one at the end.
+    ///
+    /// The solver is told that the parent changed, and nothing else: it lays
+    /// the parent's children out again from their cached sizes, measuring only
+    /// a newcomer's leaves.
+    pub fn insert_before(&mut self, reference: NodeId, child: NodeId) -> Result<(), UiError> {
+        let parent = self
+            .taffy
+            .parent(reference)
+            .filter(|parent| self.kind(*parent) != ElementKind::Viewport)
+            .ok_or(UiError::NoPosition)?;
+        if child == reference {
+            return Ok(());
+        }
+        if self.taffy.parent(child) == Some(parent) {
+            let from = self.index_of(parent, child);
+            self.taffy
+                .remove_child_at_index(parent, from)
+                .expect("a child moved");
+            let to = self.index_of(parent, reference);
+            self.taffy
+                .insert_child_at_index(parent, to, child)
+                .expect("a child moved");
+            self.dirty.push(parent);
+            self.invalidate(parent);
+            self.layout_changed();
+            return Ok(());
+        }
+        self.check_placement(parent, child)?;
+        let to = self.index_of(parent, reference);
+        self.taffy
+            .insert_child_at_index(parent, to, child)
+            .expect("a child inserted");
+        self.placed(parent, child);
+        Ok(())
+    }
+
+    /// Whether `child` may become a child of `parent`; a root laid out on its
+    /// own loses its viewport when it may.
+    fn check_placement(&mut self, parent: NodeId, child: NodeId) -> Result<(), UiError> {
         let kind = self.kind(parent);
         if !kind.is_parent() || kind == ElementKind::Viewport {
             return Err(UiError::NotAParent(kind));
         }
-        if kind == ElementKind::Scroll && self.taffy.child_count(parent) > 0 {
+        if kind == ElementKind::Scroll
+            && self.kind(child) != ElementKind::Marker
+            && self
+                .children(parent)
+                .iter()
+                .any(|existing| self.kind(*existing) != ElementKind::Marker)
+        {
             return Err(UiError::OneChild);
         }
         if parent == child || self.is_ancestor(child, parent) {
@@ -979,14 +1051,99 @@ impl UiTree {
             // goes.
             self.drop_viewport(child);
         }
-        self.taffy
-            .add_child(parent, child)
-            .expect("a child appended");
+        Ok(())
+    }
+
+    /// `child` was placed in `parent`: the parent is laid out and painted
+    /// again, and the child's text style resolved from its new parent.
+    fn placed(&mut self, parent: NodeId, child: NodeId) {
         self.dirty.push(parent);
         self.pending_text.push(child);
         self.invalidate(parent);
         self.layout_changed();
-        Ok(())
+    }
+
+    /// `child`'s index among `parent`'s children, searched from both ends at
+    /// once: a list's region inserts at its end (its anchor is its last
+    /// child) or near its start, and either is found in a step or two.
+    fn index_of(&self, parent: NodeId, child: NodeId) -> usize {
+        let count = self.taffy.child_count(parent);
+        let (mut front, mut back) = (0, count);
+        while front < back {
+            if self.taffy.get_child_id(parent, front) == child {
+                return front;
+            }
+            back -= 1;
+            if self.taffy.get_child_id(parent, back) == child {
+                return back;
+            }
+            front += 1;
+        }
+        panic!("a child is among its parent's children")
+    }
+
+    /// REMOVES `node` from its parent for good (a keyed list's row going, a
+    /// conditional turning off): the parent is laid out and painted again,
+    /// the hover, press and focus inside the subtree are cleared (the press is
+    /// cancelled: no click follows it), and every handler of the subtree is
+    /// TAKEN OUT of the tree and answered, for the caller to drop with the
+    /// tree no longer borrowed.
+    ///
+    /// Dropping the handlers is what ends an element (B738): a handler that
+    /// captures its own element (`on_click(|| row.focus())`) holds that
+    /// element's handle, and the element holds the handler, so with the
+    /// handlers kept the element would outlive every other handle and live
+    /// until the program ends. Removal is the one place an element of a tree
+    /// leaves it (a move is not a removal), so it is where its handlers go;
+    /// the element itself is then freed when its last handle is gone, as any
+    /// parentless element is. An element removed while the program still
+    /// holds it stays, with no handlers and no parent.
+    pub fn remove(&mut self, node: NodeId) -> Vec<Handler> {
+        if !self.is_alive(node) {
+            return Vec::new();
+        }
+        let parent = self
+            .taffy
+            .parent(node)
+            .filter(|parent| self.kind(*parent) != ElementKind::Viewport);
+        let inside = |tree: &UiTree, other: Option<NodeId>| {
+            other.is_some_and(|other| {
+                tree.is_alive(other) && (other == node || tree.is_ancestor(node, other))
+            })
+        };
+        if inside(self, self.pressed) {
+            self.release_press();
+        }
+        if inside(self, self.focused) {
+            self.clear_focus();
+        }
+        if inside(self, self.hovered) {
+            self.unhover_inside(node, parent);
+        }
+        let mut handlers = Vec::new();
+        let mut pending = vec![node];
+        while let Some(current) = pending.pop() {
+            let data = self.data_mut(current);
+            handlers.extend(data.handlers.drain(..).map(|(_, handler)| handler));
+            if let Some(scroll) = data.scroll.as_mut()
+                && let Some(handler) = scroll.on_offset.take()
+            {
+                handlers.push(handler);
+            }
+            pending.extend(self.children(current));
+        }
+        if let Some(parent) = parent {
+            self.taffy
+                .remove_child(parent, node)
+                .expect("a child removed");
+            self.dirty.push(parent);
+            self.invalidate(parent);
+            if !self.data(node).handle {
+                self.free(node);
+            }
+        }
+        self.layout_changed();
+        handlers
     }
 
     fn is_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
@@ -1696,7 +1853,10 @@ impl UiTree {
             let descend = moved || chains.is_none_or(|chains| chains.contains(&node));
             if descend {
                 for index in 0..self.taffy.child_count(node) {
-                    pending.push((self.taffy.get_child_id(node, index), origin));
+                    let child = self.taffy.get_child_id(node, index);
+                    if self.kind(child) != ElementKind::Marker {
+                        pending.push((child, origin));
+                    }
                 }
             }
         }
@@ -1717,7 +1877,11 @@ impl UiTree {
         );
         let mut reach = Size::new(0.0, 0.0);
         for index in 0..self.taffy.child_count(node) {
-            let child = self.data(self.taffy.get_child_id(node, index)).bounds;
+            let child = self.data(self.taffy.get_child_id(node, index));
+            if child.kind == ElementKind::Marker {
+                continue;
+            }
+            let child = child.bounds;
             reach.width = reach.width.max(child.right() - content.left());
             reach.height = reach.height.max(child.bottom() - content.top());
         }
@@ -1755,7 +1919,9 @@ impl UiTree {
                 bounds: data.bounds,
             });
             for child in self.children(node).into_iter().rev() {
-                pending.push((child, depth + 1));
+                if self.kind(child) != ElementKind::Marker {
+                    pending.push((child, depth + 1));
+                }
             }
         }
         entries
@@ -1871,7 +2037,9 @@ impl UiTree {
         let mut children = Vec::with_capacity(count);
         for index in 0..count {
             let child = self.taffy.get_child_id(node, index);
-            children.push(self.compose(child, text));
+            if self.kind(child) != ElementKind::Marker {
+                children.push(self.compose(child, text));
+            }
         }
         let mut builder = SceneBuilder::new();
         let opacity = self.data(node).paint.opacity;

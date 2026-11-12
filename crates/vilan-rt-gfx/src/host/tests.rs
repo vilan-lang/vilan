@@ -334,3 +334,58 @@ fn a_handler_runs_with_the_routed_event_as_the_current_one() {
     assert_eq!(*seen.borrow(), [(input::SCROLLED, -32.0)]);
     assert_eq!(event_current(), -1, "none after");
 }
+
+/// Counts its drops: what a handler that must be dropped captures.
+struct DropCount(Rc<std::cell::Cell<u32>>);
+
+impl Drop for DropCount {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+/// B738: a handler that captures its own element is a cycle — the element
+/// holds the handler, the handler holds the element's handle — so the
+/// element outlived every handle the program had and lived until the program
+/// ended. Removing the element drops its subtree's handlers, after the tree
+/// is released (a handle's drop releases its element in the tree): the
+/// cycle's last handle goes, and the element is freed with its child.
+#[test]
+fn a_removed_element_drops_its_handlers_and_a_handler_holding_it_lets_it_go() {
+    let root = ui::node(1);
+    let alive = ui::element_count();
+    let row = ui::node(0);
+    let label = ui::node(3);
+    ui::add_child(&row, &label);
+    ui::add_child(&root, &row);
+    let drops = Rc::new(std::cell::Cell::new(0));
+    // The row's handler holds the row (`on_click(|| row.focus())`), its
+    // child's holds the child, each with a drop counter beside it.
+    for (element, kind) in [(&row, 5), (&label, 10)] {
+        let held = element.clone();
+        let counted = DropCount(Rc::clone(&drops));
+        ui::on(
+            element,
+            kind,
+            Rc::new(move || {
+                let _ = (&held, &counted);
+            }),
+        );
+    }
+    drop(label);
+    assert_eq!(ui::element_count(), alive + 2);
+    ui::remove(&row);
+    assert_eq!(drops.get(), 2, "both handlers dropped");
+    assert_eq!(
+        ui::element_count(),
+        alive + 2,
+        "the program still holds the row"
+    );
+    drop(row);
+    assert_eq!(
+        ui::element_count(),
+        alive,
+        "the row and its child are freed"
+    );
+    let _ = root;
+}

@@ -8030,13 +8030,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
     }
 
     /// Whether an initializer leaves its own type to its READERS natively: an
-    /// empty list literal, or `Shared::new` around one — the cell is typed by
-    /// the list, and the list by nothing. Rust settles such a binding from its
+    /// empty list literal, a bare `None`, or `Shared::new` around one — the
+    /// cell is typed by the list, and the list by nothing. Rust settles such a binding from its
     /// first use, and a use that reads a member through it (`lease.key`) comes
     /// before anything has (E0282), so the binding's type is written.
     fn cannot_type_itself(&self, id: Id) -> bool {
         match self.program.entity_map.get(&id) {
             Some(Expr::List(items)) => items.is_empty(),
+            // A bare `None`: `Option`'s payload-less variant names no `T`, so
+            // `Shared::new(None)` read its element only from a later reader —
+            // which may be generic, or absent (`std::ui`'s `when`, E0282).
+            Some(Expr::Local(_) | Expr::EnumVariant(..)) => self.builds_a_host_variant(id),
             Some(Expr::Call(call_id)) => {
                 let Some(call) = self.program.function_calls.get(call_id) else {
                     return false;
@@ -18616,6 +18620,11 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_outline", "ui::outline", &[0]),
         ("__ui_outline_number", "ui::outline_number", &[]),
         ("__ui_outline_text", "ui::outline_text", &[]),
+        // P3's reactive children: a region's marker is `__ui_node(6)`; rows
+        // are placed before a reference and removed for good.
+        ("__ui_insert_before", "ui::insert_before", &[0, 1]),
+        ("__ui_remove", "ui::remove", &[0]),
+        ("__ui_scroll_into_view", "ui::scroll_into_view", &[0]),
     ];
     FUNCTIONS
         .iter()

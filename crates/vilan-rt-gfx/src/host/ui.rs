@@ -45,7 +45,8 @@
 //!
 //! `__ui_set_length` properties: 0 width, 1 height, 2 min width, 3 max width,
 //! 4 min height, 5 max height; units 0 auto, 1 dp, 2 fraction of the parent.
-//! Element kinds: 0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll.
+//! Element kinds: 0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll, 6 a
+//! marker (a region's place among its parent's children, never laid out).
 //!
 //! Style fields go to a LAYER (`ui/style.rs`): `__ui_style_group` starts a
 //! group (-1 a new one, or the number of one to write again),
@@ -199,6 +200,7 @@ pub fn node(kind: i32) -> Node {
             ElementKind::Text,
             ElementKind::Image,
             ElementKind::Scroll,
+            ElementKind::Marker,
         ],
         f64::from(kind),
         "element kind",
@@ -545,6 +547,46 @@ pub fn add_child(parent: &Node, child: &Node) {
     });
 }
 
+/// `__ui_insert_before(reference, child)` — `child` immediately before
+/// `reference` in `reference`'s parent: moved there when it is already a child
+/// of that parent (its state goes with it), placed there otherwise.
+pub fn insert_before(reference: &Node, child: &Node) {
+    let child = child.id();
+    change(reference, |tree, reference| {
+        or_fail(tree.insert_before(reference, child))
+    });
+}
+
+/// `__ui_remove(node)` — `node` leaves its parent for good, and its subtree's
+/// handlers are dropped (`UiTree::remove`; B738): AFTER the tree is released,
+/// because a handler may hold the last handle of an element, and that
+/// handle's drop releases the element in the tree.
+pub fn remove(node: &Node) {
+    let id = node.id();
+    let (handlers, root) = with_tree(|tree| {
+        let root = tree.is_alive(id).then(|| tree.root_of(id));
+        (tree.remove(id), root)
+    });
+    drop(handlers);
+    if let Some(root) = root
+        && root != id
+    {
+        request_frame(root);
+    }
+}
+
+/// `__ui_scroll_into_view(node)` — every `scroll` around the element moves as
+/// little as it takes to show it (`UiTree::reveal`), as Tab does for the
+/// element it focuses; a bound offset follows.
+pub fn scroll_into_view(node: &Node) {
+    let id = node.id();
+    let root = with_tree(|tree| tree.reveal(id).then(|| tree.root_of(id)));
+    if let Some(root) = root {
+        request_frame(root);
+    }
+    notify_offsets();
+}
+
 /// `__ui_set_focusable(node, focusable)` — focusable in tree order (`true`,
 /// tab index 0), or not at all.
 pub fn set_focusable(node: &Node, focusable: bool) {
@@ -869,6 +911,12 @@ pub fn outline_text(index: i32, which: i32) -> Str {
         1 => str_new(entry.label.as_deref().unwrap_or("")),
         _ => panic_with(&format!("{which} is not a `std::ui` outline text")),
     })
+}
+
+/// The elements alive in the program's tree: what a pin on releasing reads.
+#[cfg(test)]
+pub(super) fn element_count() -> usize {
+    with_tree(|tree| tree.element_count())
 }
 
 /// Identity, as every host value's is.

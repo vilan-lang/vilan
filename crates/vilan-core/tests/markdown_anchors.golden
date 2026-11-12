@@ -83,6 +83,7 @@ guide/native.md h2 a-desktop-window
 guide/native.md h2 a-gpu-drawn-window
 guide/native.md h2 elements-and-layout
 guide/native.md h3 interaction
+guide/native.md h3 lists-and-conditional-children
 guide/native.md h2 debug-by-default
 guide/native.md h2 numbers
 guide/native.md h2 where-the-emitted-rust-goes
@@ -668,6 +669,7 @@ std/ui.md h2 conditions
 std/ui.md h2 events
 std/ui.md h2 focus
 std/ui.md h2 scrolling
+std/ui.md h2 lists-and-conditional-children
 std/ui.md h2 showing-it
 std/window.md h1 windows
 std/window.md h2 how-a-desktop-program-ends

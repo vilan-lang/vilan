@@ -19,9 +19,13 @@
 //!    an idle second that draws no frame, the close button — exit 0. Every
 //!    frame after the first shows a state the frame before it did not (an X
 //!    server may expose a new window once more, repeating the first).
-//! 3. The list in a real window: three wheel notches, each a frame that moved
-//!    the offset and ran no layout; then a click on a row, a frame whose solver
-//!    measured that row alone and moved no box.
+//! 3. The list in a real window — a keyed list (`each_by` over a `ListCell`):
+//!    three wheel notches, each a frame that moved the offset and ran no
+//!    layout; a click on a row (one `set_at`: that row's cell), a frame whose
+//!    solver measured that row alone and moved no box; then `a` (a row
+//!    inserted at the top: the solver measured the newcomer alone), `d` (the
+//!    top row removed: nothing measured) and `m` (the bottom row moved to the
+//!    top: nothing measured), each a frame with the row count it left.
 //!
 //! Ordering comes from the programs' lines — each injection waits for the
 //! line its predecessor caused — never from a sleep. No assertion reads a
@@ -35,15 +39,13 @@
 //! windows. `VILAN_REQUIRE_GFX=1` (the `gfx` CI job, through
 //! `scripts/ci-local.sh gfx`) turns a skip into a failure.
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-/// How long one run may take before it is a hang: a few seconds warm (one
-/// of them the counter's own idle second); the bound is for a loaded runner.
-const RUN_LIMIT: Duration = Duration::from_secs(120);
+mod support;
+
+use support::xvfb::Running;
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -148,142 +150,6 @@ fn build_injector() -> PathBuf {
     target.join("debug/examples/x11_input")
 }
 
-/// A program in a virtual display, its stdout arriving line by line. The
-/// first line is the wrapper's: the display and its authority file, which
-/// the injector connects with.
-struct Running {
-    child: std::process::Child,
-    lines: mpsc::Receiver<String>,
-    seen: Vec<String>,
-    display: String,
-    authority: String,
-    title: &'static str,
-}
-
-impl Running {
-    fn start(binary: &Path, arguments: &[&str], title: &'static str) -> Running {
-        let mut child = Command::new("xvfb-run")
-            .args(["-a", "-s", "-screen 0 1280x1024x24", "sh", "-c"])
-            .arg("printf 'display %s %s\\n' \"$DISPLAY\" \"$XAUTHORITY\"; exec \"$0\" \"$@\"")
-            .arg(binary)
-            .args(arguments)
-            // X11 under xvfb whatever session the suite runs in, at 100%.
-            .env_remove("WAYLAND_DISPLAY")
-            .env_remove("WAYLAND_SOCKET")
-            .env("WINIT_X11_SCALE_FACTOR", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("start the program under xvfb-run");
-        let stdout = child.stdout.take().expect("piped stdout");
-        let (sender, lines) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if sender.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        let first = lines
-            .recv_timeout(RUN_LIMIT)
-            .expect("the wrapper names the display");
-        let mut words = first.split_whitespace();
-        assert_eq!(words.next(), Some("display"), "{first}");
-        let display = words.next().expect("a display").to_string();
-        let authority = words.next().unwrap_or_default().to_string();
-        Running {
-            child,
-            lines,
-            seen: Vec::new(),
-            display,
-            authority,
-            title,
-        }
-    }
-
-    /// Waits for a line `wanted` accepts, recording every line on the way;
-    /// answers it.
-    fn wait_until(
-        &mut self,
-        what: &str,
-        started: Instant,
-        wanted: impl Fn(&str) -> bool,
-    ) -> String {
-        loop {
-            let left = RUN_LIMIT.saturating_sub(started.elapsed());
-            match self.lines.recv_timeout(left) {
-                Ok(line) => {
-                    let found = wanted(&line);
-                    self.seen.push(line.clone());
-                    if found {
-                        return line;
-                    }
-                }
-                Err(_) => {
-                    let _ = self.child.kill();
-                    let stderr = self.stderr();
-                    panic!(
-                        "the program never printed {what}; it printed:\n{}\n--- stderr\n{stderr}",
-                        self.seen.join("\n")
-                    );
-                }
-            }
-        }
-    }
-
-    fn wait_for(&mut self, wanted: &str, started: Instant) -> String {
-        self.wait_until(&format!("{wanted:?}"), started, |line| {
-            line.contains(wanted)
-        })
-    }
-
-    fn stderr(&mut self) -> String {
-        let mut text = String::new();
-        if let Some(mut stderr) = self.child.stderr.take() {
-            let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
-        }
-        text
-    }
-
-    /// Moves, presses, releases, turns the wheel, types or closes, through the
-    /// X server, and returns once the server has handled it.
-    fn inject(&self, injector: &Path, commands: &[&str]) {
-        let status = Command::new(injector)
-            .args(["--title", self.title])
-            .args(commands)
-            .env("DISPLAY", &self.display)
-            .env("XAUTHORITY", &self.authority)
-            .status()
-            .expect("run the injector");
-        assert!(status.success(), "injecting {commands:?} failed: {status}");
-    }
-
-    /// Waits for the program to exit: its code, every stdout line, stderr.
-    fn exit(mut self, started: Instant) -> (Option<i32>, Vec<String>, String) {
-        loop {
-            if let Some(status) = self.child.try_wait().expect("wait on the program") {
-                while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(5)) {
-                    self.seen.push(line);
-                }
-                let stderr = self.stderr();
-                return (status.code(), self.seen, stderr);
-            }
-            if started.elapsed() > RUN_LIMIT {
-                let _ = self.child.kill();
-                panic!(
-                    "the program did not exit; it printed:\n{}",
-                    self.seen.join("\n")
-                );
-            }
-            // A bounded poll of a process that has ALREADY been asked to end
-            // (the ordering is the output's, above): the interval only sets
-            // how soon the exit is noticed.
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
 /// The value of `name=` in a line.
 fn field<'line>(line: &'line str, name: &str) -> &'line str {
     line.split_whitespace()
@@ -355,6 +221,40 @@ fn assert_counter_frames(seen: &[String]) {
     assert_eq!(
         distinct, expected,
         "the frames are not the states the input produces:\n{report}"
+    );
+}
+
+/// N198: a run is `xvfb-run`, its `Xvfb` and the program, and the harness
+/// holds only the first; a test that failed with a run open left the other
+/// two alive (a `--smoke` list was found 73 minutes after a lane's run).
+/// `Running` starts the run in a process group of its own and its `Drop` ends
+/// the group and returns only when none of it is alive — so a test body that
+/// PANICS with a run open leaves nothing, by the harness's own sequencing:
+/// the unwinding drop has finished before `catch_unwind` returns.
+#[test]
+fn a_test_that_panics_with_a_run_open_leaves_no_process_of_it_behind() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let group = std::sync::atomic::AtomicU32::new(0);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // `sleep` stands for a program that would never end by itself.
+        let running = Running::start(Path::new("sleep"), &["600"], "none");
+        group.store(running.group(), std::sync::atomic::Ordering::SeqCst);
+        let live = support::xvfb::live_in_group(running.group());
+        assert!(
+            live.len() >= 2,
+            "the run is a group (xvfb-run, Xvfb, the program): {live:?}"
+        );
+        panic!("a test body failing with the run open");
+    }));
+    assert!(outcome.is_err(), "the body panicked");
+    let group = group.load(std::sync::atomic::Ordering::SeqCst);
+    assert_ne!(group, 0, "the run started");
+    assert_eq!(
+        support::xvfb::live_in_group(group),
+        Vec::<u32>::new(),
+        "a process of the run outlived the test"
     );
 }
 
@@ -488,6 +388,30 @@ fn the_counter_and_the_ten_thousand_row_list_run_end_to_end() {
         "{clicked}"
     );
     assert_eq!(field(&clicked, "moved="), "0", "{clicked}");
+    // The keys change the list: each a frame after its action, which the
+    // solver lays out from its cache — measuring a new row's texts alone, and
+    // nothing at all for a removal or a move.
+    for (key, action, rows, measures) in [
+        ("a", "add", "10001", true),
+        ("d", "remove", "10000", false),
+        ("m", "move", "10000", false),
+    ] {
+        running.inject(&injector, &["key", key]);
+        let frame = running.wait_until(&format!("a frame after {action}"), started, |line| {
+            line.starts_with("frame ") && field(line, "action=") == action
+        });
+        assert_eq!(field(&frame, "rows="), rows, "{frame}");
+        assert_eq!(field(&frame, "solved="), "true", "{frame}");
+        let measured: u32 = field(&frame, "measured=").parse().expect("a count");
+        if measures {
+            // The new row's two texts, each asked at the few widths a pass
+            // asks (the click's one text answered at most 12): the rows
+            // already there are answered from the solver's cache.
+            assert!((1..=24).contains(&measured), "{frame}");
+        } else {
+            assert_eq!(measured, 0, "{frame}");
+        }
+    }
     running.inject(&injector, &["close"]);
     let (code, seen, stderr) = running.exit(started);
     assert_eq!(

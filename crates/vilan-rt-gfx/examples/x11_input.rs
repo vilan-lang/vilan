@@ -9,7 +9,12 @@
 //! `move X Y` puts the pointer at device pixel `(X, Y)` of the window's
 //! inside, `press` and `release` are the left button, `wheel up N` and
 //! `wheel down N` turn the wheel N notches (buttons 4 and 5, pressed and
-//! released), `key NAME` presses and releases the key whose X keysym is
+//! released — and one notch scrolls TWO lines, 64 dp, in the window: XTEST's
+//! device has no scroll valuator, so its wheel buttons are not flagged as
+//! emulated, and `winit` 0.30's X11 backend turns both the press AND the
+//! release of an unflagged button 4 to 7 into a `MouseWheel` of one line; a
+//! real wheel on an XInput2 server scrolls by its valuator and its button
+//! events ARE flagged, so it moves 32 dp a notch), `key NAME` presses and releases the key whose X keysym is
 //! `NAME` (`Tab`, `Return`, `space`, `a`), with `shift+` in front holding
 //! Shift around it, and `close` sends the WM_DELETE_WINDOW message a window
 //! manager sends for its close button. Keys go to the window: it is given
