@@ -1,14 +1,14 @@
 first layout: offset=0 range=3199401.5 count=100000 built=0..21 rows=0..20 (21) elements=67
 the range and the viewport make the whole list: true
 wheel 96 down: offset=96 range=3199401.5 count=100000 built=1..24 rows=1..23 (23) elements=73
-reveal middle: offset=1599434 range=3199401.5 count=100000 built=49980..50003 rows=49980..50002 (23) elements=73
-pressed row 49995: offset=1599434 range=3199401.5 count=100000 built=49980..50003 rows=49980..50002 (23) elements=73
+reveal middle: offset=1599433.5 range=3199401.5 count=100000 built=49980..50003 rows=49980..50002 (23) elements=73
+pressed row 49995: offset=1599433.5 range=3199401.5 count=100000 built=49980..50003 rows=49980..50002 (23) elements=73
 row 49995: hpf
-another row changed: offset=1599434 range=3199401.5 count=100000 built=49980..50003 rows=49980..50002 (23) elements=73
-the program scrolled one row up: offset=1599402 range=3199401.5 count=100000 built=49979..50002 rows=49979..50001 (23) elements=73
-inserted at the top: offset=1599402 range=3199433.5 count=100001 built=49979..50002 rows=49978..50000 (23) elements=73
-row 49995: hpf same element=true
-released: offset=1599402 range=3199433.5 count=100001 built=49979..50002 rows=49978..50000 (23) elements=73
+another row changed: offset=1599433.5 range=3199401.5 count=100000 built=49980..50003 rows=49980..50002 (23) elements=73
+the program scrolled one row up: offset=1599401.5 range=3199401.5 count=100000 built=49979..50002 rows=49979..50001 (23) elements=73
+inserted at the top: offset=1599401.5 range=3199433.5 count=100001 built=49979..50002 rows=49978..50000 (23) elements=73
+row 49995: pf same element=true
+released: offset=1599401.5 range=3199433.5 count=100001 built=49979..50002 rows=49978..50000 (23) elements=73
 row 49995: hf clicks=49995
 tab x30: offset=1600265.5 range=3199433.5 count=100001 built=50006..50029 rows=50005..50027 (23) elements=73
 focused row 50025
@@ -24,3 +24,9 @@ reset to ten rows: offset=0 range=0 count=10 built=0..10 rows=0..9 (10) elements
 plain: rows=0..11 (12) elements=15
 plain odd: rows=1,3,5,7,9,11,13,15,17,19,21,23 (12) elements=15 count=250
 plain reveal 301: rows=279,281,283,285,287,289,291,293,295,297,299,301,303,305 (14) elements=17
+padded: offset=0 built=0..12 rows=0..11 (12) elements=15 focused=none
+padded, scrolled 100: offset=100 built=2..17 rows=2..16 (15) elements=18 focused=none
+padded, row 30 revealed: offset=440 built=19..34 rows=19..33 (15) elements=18 focused=none
+padded, row 2 pressed: offset=0 built=0..12 rows=0..11 (12) elements=15 focused=row 2
+padded, wheel 400 down: offset=400 built=17..32 rows=17..31 (15) elements=18 focused=none
+padded, wheel 400 back up: offset=0 built=0..12 rows=0..11 (12) elements=15 focused=none

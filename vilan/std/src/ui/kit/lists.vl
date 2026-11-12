@@ -27,6 +27,18 @@
 // TAB. Tab and Shift+Tab inside the list build one row more on that side before
 // the focus moves, so the focus never leaves a list that has more rows to give it;
 // Tab's reveal then scrolls to the row it focused, which moves the window.
+//
+// THE LIST'S OWN PADDING (`padding(..)` on the list, which is the scroll's) is read
+// with its height after each layout that resizes it: the rows built are the ones
+// the padding box shows (the scroll clips there, so a row in the padding shows
+// too), and `reveal` brings a row inside the content box.
+//
+// A FOCUSED ROW SCROLLED OUT of the window (by the wheel, the offset) is removed
+// like any row leaving it, and the focus goes with it: nothing is focused, keys go
+// to the root, and Tab starts again from the first focusable element. Keeping it
+// built would put one row outside the window's run, at its own place in the column,
+// which the window arithmetic (one run under one top padding) has no room for; and
+// a row's state belongs in the item.
 
 [platform("@process")] mod self;
 
@@ -58,6 +70,7 @@ import pkg::ui::{
 	each,
 	each_by,
 	scroll,
+	ui_node_number,
 };
 
 /// A list that builds only the rows near its viewport. See `virtual_list`. A
@@ -73,8 +86,11 @@ export struct VirtualList<T, K> {
 struct Span {
 	/// Rows built on each side of the ones the viewport shows.
 	overscan: usize,
-	/// The viewport's height, from its last layout, in dp.
+	/// The viewport's content height, and the list's own padding above and below
+	/// it, from its last layout, in dp.
 	viewport: f64,
+	padding_top: f64,
+	padding_bottom: f64,
 	/// How far the list is scrolled, in dp.
 	scrolled: f64,
 	/// One row more after (before) the window: Tab (Shift+Tab) inside the list,
@@ -165,8 +181,12 @@ impl Window<type T> {
 		let span = self.span.read();
 		let before = span.overscan + span.behind;
 		let after = span.overscan + span.ahead;
-		let visible_first = (span.scrolled / extent).floor().max(0.0).as_usize();
-		let visible_end = ((span.scrolled + span.viewport) / extent).ceil().max(0.0).as_usize();
+		// What the padding box shows, in the column's coordinates: the content box
+		// at the offset, and the padding on either side of it.
+		let shown_from = span.scrolled - span.padding_top;
+		let shown_to = span.scrolled + span.viewport + span.padding_bottom;
+		let visible_first = (shown_from / extent).floor().max(0.0).as_usize();
+		let visible_end = (shown_to / extent).ceil().max(0.0).as_usize();
 		mut last = visible_end + after;
 		if last > count {
 			last = count;
@@ -259,6 +279,8 @@ fun open_window<T>(extent: Dp): Window<T> {
 		span = Shared::new(Span {
 			overscan = 2,
 			viewport = 0.0,
+			padding_top = 0.0,
+			padding_bottom = 0.0,
 			scrolled = 0.0,
 			ahead = 0,
 			behind = 0,
@@ -305,8 +327,13 @@ fun finish<T, K>(window: Window<T>, key: |T| K): VirtualList<T, K> {
 		window.span.write().behind = 0;
 		window.refresh();
 	}));
-	let _sized = viewport.on_resize(|size: Size| {
-		window.span.write().viewport = size.height.value();
+	let _sized = viewport.on_resize(|_size: Size| {
+		// The content box and the list's own padding around it, from the layout
+		// that just ran.
+		let node = viewport.element().node;
+		window.span.write().padding_top = ui_node_number(node, 4);
+		window.span.write().viewport = ui_node_number(node, 5);
+		window.span.write().padding_bottom = ui_node_number(node, 6);
 		window.refresh();
 	});
 	// Tab inside the list: one row more on its side, built before the focus moves

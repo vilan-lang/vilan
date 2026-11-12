@@ -47,7 +47,11 @@
 //
 // EVENTS are attributes too (`on_click(|| ..)`, `on_key(|key| ..)`), delivered to
 // the element under the pointer (or holding the focus) and bubbling to its
-// ancestors that listen; `stop_event()` inside a handler ends that. Focus moves
+// ancestors that listen; `stop_event()` inside a handler ends that. A press
+// CAPTURES the pointer: until the button comes up, every move and the release go
+// to the element it landed on, wherever the pointer goes, so a drag keeps going
+// off the element and off the window (`Element::release_pointer` ends it early).
+// Focus moves
 // with Tab and Shift+Tab through the focusable elements in tree order, and Tab
 // scrolls the element it focuses into view.
 //
@@ -270,6 +274,14 @@ external fun ui_focus(node: Node): void;
 [extern("__ui_interaction")]
 external fun ui_interaction(node: Node): i32;
 
+/// How many presses in a row the last press was.
+[extern("__ui_click_count")]
+external fun ui_click_count(): i32;
+
+/// Ends the press (and the pointer's capture) held by `node` or inside it.
+[extern("__ui_release_pointer")]
+external fun ui_release_pointer(node: Node): void;
+
 /// While a resize handler runs: the size it reports, width (0) and height (1), in
 /// dp.
 [extern("__ui_resized")]
@@ -314,8 +326,11 @@ external fun ui_deliver(
 
 /// The element's box from its last layout, in dp: x (0), y (1), width (2),
 /// height (3).
+/// The element's box: x (0), y (1), width (2), height (3); down its padding box, the
+/// padding above its content box (4), the content box's height (5), the padding
+/// below it (6).
 [extern("__ui_node_number")]
-external fun ui_node_number(node: Node, which: i32): f64;
+export(in pkg) external fun ui_node_number(node: Node, which: i32): f64;
 
 /// Takes the outline of a root's tree; answers its length.
 [extern("__ui_outline")]
@@ -1010,7 +1025,18 @@ export impl Element {
 		ui_scroll_into_view(self.node);
 	}
 
-	/// Whether it is hovered, pressed and focused now.
+	/// Ends the press it (or an element inside it) holds, and with it the pointer's
+	/// capture: `pressed()` turns off, no click follows the release, and the rest
+	/// of the drag goes to whatever is under the pointer — what removing it would
+	/// do. A control that is disabled in the middle of a drag calls it. Nothing
+	/// when it holds no press.
+	fun release_pointer(self) {
+		ui_release_pointer(self.node);
+	}
+
+	/// Whether it is hovered, pressed and focused now. While the button is held
+	/// after a press on it, `pressed` stays on wherever the pointer goes, and
+	/// `hovered` says whether the pointer is over it.
 	fun interaction(self): Interaction {
 		let bits = ui_interaction(self.node);
 		Interaction { hovered = bits & 1 != 0, pressed = bits & 2 != 0, focused = bits & 4 != 0 }
@@ -1235,21 +1261,27 @@ export trait Attributes {
 	// turn (its signal writes settle as one wave), with tracking cleared (a
 	// handler is a callback, not a body) — the web UI's `on`, exactly. ---
 
-	/// The primary button went down on it (or inside it).
+	/// The primary button went down on it (or inside it). The element it went down
+	/// on takes the pointer's capture until the release: see `on_pointer_move`.
+	/// `click_count()` says whether it is a double or triple click.
 	fun on_press(self, handler: (|| void) context (turn_scope, tracking)): Self {
 		ui_on(self.element().node, 3, || turn(FlushPolicy::AtSuspension, || tracking
 			.clear(|| handler())));
 		self
 	}
 
-	/// The primary button came up over it (or inside it).
+	/// The primary button came up after going down on it (or inside it) — wherever
+	/// the pointer is then, inside the window or out of it (the capture). A release
+	/// with no press held in the tree (one that went down outside the window) goes
+	/// to the element under the pointer.
 	fun on_release(self, handler: (|| void) context (turn_scope, tracking)): Self {
 		ui_on(self.element().node, 4, || turn(FlushPolicy::AtSuspension, || tracking
 			.clear(|| handler())));
 		self
 	}
 
-	/// A press and its release, both on it (or inside it).
+	/// A press and its release, both on it (or inside it): released elsewhere, or
+	/// outside the window, it is no click.
 	fun on_click(self, handler: (|| void) context (turn_scope, tracking)): Self {
 		ui_on(self.element().node, 5, || turn(FlushPolicy::AtSuspension, || tracking
 			.clear(|| handler())));
@@ -1257,7 +1289,8 @@ export trait Attributes {
 	}
 
 	/// The pointer came over it. Does not bubble: each element the pointer comes
-	/// into hears its own.
+	/// into hears its own. It follows the pointer, not the capture: while a press
+	/// is held, the elements the pointer crosses still hear their enter and leave.
 	fun on_pointer_enter(self, handler: (|| void) context (turn_scope, tracking)): Self {
 		ui_on(self.element().node, 0, || turn(FlushPolicy::AtSuspension, || tracking
 			.clear(|| handler())));
@@ -1272,6 +1305,9 @@ export trait Attributes {
 	}
 
 	/// The pointer moved over it, to this point (dp from the window's top-left).
+	/// While the primary button is held after a press on it (or inside it), every
+	/// move comes here, off it and off the window too (the press captured the
+	/// pointer): a drag.
 	fun on_pointer_move(self, handler: (|Point| void) context (turn_scope, tracking)): Self {
 		ui_on(self.element().node, 2, || {
 			if current_event() is Some(Event::PointerMoved(let point)) {
@@ -1351,6 +1387,16 @@ export trait Attributes {
 		});
 		self
 	}
+}
+
+/// How many presses in a row the last press was: 1 for a single press, 2 for a
+/// double click, 3 for a triple click, and so on (0 before any). A press counts
+/// with the one before it when it lands on the same element within 4 dp of it and
+/// within half a second of it. Read it in `on_press`, `on_release` or `on_click`. A
+/// press the program delivers itself (`deliver`) carries no time: presses delivered
+/// at one place count up.
+export fun click_count(): usize {
+	ui_click_count().as_usize()
 }
 
 /// Inside an event handler: the event goes no further up the tree, and the

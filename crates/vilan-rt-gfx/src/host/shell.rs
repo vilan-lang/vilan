@@ -460,7 +460,17 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
                 let ((x, y), modifiers) =
                     super::with_window(id, |slot| (slot.pointer, slot.modifiers))
                         .unwrap_or_default();
-                self.queue(id, RawEvent::pointer_button(state, x, y, button, modifiers));
+                self.queue(
+                    id,
+                    RawEvent::pointer_button(
+                        state,
+                        x,
+                        y,
+                        button,
+                        modifiers,
+                        super::input::since_start(),
+                    ),
+                );
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let ((x, y), modifiers) =

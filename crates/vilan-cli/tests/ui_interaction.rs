@@ -30,10 +30,15 @@
 //! 4. native-ui.md P4's exit test, "a todo app with the look supplied by the
 //!    app": `vilan/examples/ui-todo`, on `std::ui::kit`. Its `--check` drives
 //!    the screen with no window — typing, the caret keys, a selection by
-//!    Shift and by a drag, graphemes, Enter, Tab, Space and clicks on the
-//!    checkboxes and the remove buttons — held to `tests/ui/todo-check.txt`
-//!    line for line (the same regeneration). Then in a window: a click
-//!    focuses the input, `m`, `i`, `l`, `k` type, Return adds the item, a
+//!    Shift and by a drag (off the input and out of the window: the press
+//!    captures the pointer), double and triple clicks, a drag past the
+//!    field's edge scrolling it, graphemes, Enter, Tab, Space and clicks on
+//!    the checkboxes and the remove buttons — held to
+//!    `tests/ui/todo-check.txt` line for line (the same regeneration). Then
+//!    in a window: a click focuses the input, `m`, `i`, `l`, `k` type, a
+//!    press at its left edge dragged out of the window and released there
+//!    selects all four (X11's implicit grab delivering the moves and the
+//!    release outside, winit passing them on), Return adds the item, a
 //!    click checks it off, a click on its remove button removes it, the close
 //!    button ends it with exit 0.
 //! 5. The virtual list (`vilan/examples/ui-virtual-list`, part P4's
@@ -188,6 +193,21 @@ fn centre(line: &str) -> (String, String) {
         .collect();
     (
         ((numbers[0] + numbers[2] / 2.0).round() as i64).to_string(),
+        ((numbers[1] + numbers[3] / 2.0).round() as i64).to_string(),
+    )
+}
+
+/// Four device pixels inside the left edge of `box <name> x y width height`,
+/// at its middle, at 100%.
+fn left_edge(line: &str) -> (String, String) {
+    let numbers: Vec<f64> = line
+        .split_whitespace()
+        .skip(2)
+        .take(4)
+        .map(|word| word.parse().expect("a number"))
+        .collect();
+    (
+        ((numbers[0] + 4.0).round() as i64).to_string(),
         ((numbers[1] + numbers[3] / 2.0).round() as i64).to_string(),
     )
 }
@@ -474,7 +494,16 @@ fn the_todo_list_on_the_kit_runs_end_to_end() {
     running.inject(&injector, &["move", &x, &y, "press", "release"]);
     running.wait_for("focus=input", started);
     running.inject(&injector, &["key", "m", "key", "i", "key", "l", "key", "k"]);
-    running.wait_for("draft=milk items=[] focus=input", started);
+    running.wait_for("draft=milk items=[] focus=input selection=4..4", started);
+    // Pointer capture through the X server: a press at the input's left
+    // edge, the pointer taken out of the window to its right, the release
+    // there — the moves and the release still reach the input, which
+    // selected the whole draft.
+    let (left, middle) = left_edge(&input);
+    running.inject(&injector, &["move", &left, &middle, "press"]);
+    running.wait_for("selection=0..0", started);
+    running.inject(&injector, &["move", "700", &middle, "release"]);
+    running.wait_for("draft=milk items=[] focus=input selection=0..4", started);
     running.inject(&injector, &["key", "Return"]);
     running.wait_for("draft= items=[[ ] milk]", started);
     let check = running.wait_for("box check-milk ", started);

@@ -13,7 +13,7 @@
 //! | kind | event | numbers | text |
 //! |---|---|---|---|
 //! | 0 | pointer moved | x, y | |
-//! | 1 | pointer pressed | x, y, button, modifiers | |
+//! | 1 | pointer pressed | x, y, button, modifiers, time | |
 //! | 2 | pointer released | x, y, button, modifiers | |
 //! | 3 | pointer left | | |
 //! | 4 | scrolled | x, y, delta x, delta y, modifiers | |
@@ -27,6 +27,9 @@
 //! Positions and sizes are dp (device pixels divided by the window's content
 //! scale, the same scale its frames are drawn at). A button is 0 left, 1
 //! right, 2 middle, 3 back, 4 forward, `5 + n` for winit's `Other(n)`.
+//! A press's time is milliseconds since the host started, stamped when the
+//! window system delivered it (presses in a row are counted by it); a press
+//! the program delivers itself (`std::ui::deliver`) carries 0.
 //! Modifiers are bits: 1 shift, 2 control, 4 alt, 8 meta (the Windows or
 //! Command key). A key is named as the web's `KeyboardEvent.key` names it:
 //! the character it types (`"a"`, `"A"`, `"1"`, and `" "` for the space bar),
@@ -78,18 +81,26 @@ impl RawEvent {
         RawEvent::new(POINTER_MOVED, &[x, y])
     }
 
+    /// `time`: a press's, in milliseconds ([`since_start`]); a release
+    /// carries none.
     pub(crate) fn pointer_button(
         state: ElementState,
         x: f64,
         y: f64,
         button: MouseButton,
         modifiers: ModifiersState,
+        time: f64,
     ) -> RawEvent {
-        let kind = match state {
-            ElementState::Pressed => POINTER_PRESSED,
-            ElementState::Released => POINTER_RELEASED,
-        };
-        RawEvent::new(kind, &[x, y, button_code(button), modifier_bits(modifiers)])
+        match state {
+            ElementState::Pressed => RawEvent::new(
+                POINTER_PRESSED,
+                &[x, y, button_code(button), modifier_bits(modifiers), time],
+            ),
+            ElementState::Released => RawEvent::new(
+                POINTER_RELEASED,
+                &[x, y, button_code(button), modifier_bits(modifiers)],
+            ),
+        }
     }
 
     pub(crate) fn pointer_left() -> RawEvent {
@@ -169,6 +180,16 @@ impl RawEvent {
     }
 }
 
+/// Milliseconds since the host first asked: a press's time.
+pub(crate) fn since_start() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        * 1000.0
+}
+
 fn button_code(button: MouseButton) -> f64 {
     match button {
         MouseButton::Left => 0.0,
@@ -241,6 +262,7 @@ mod tests {
                 2.0,
                 MouseButton::Left,
                 ModifiersState::empty(),
+                0.0,
             ),
         );
         enqueue(&mut queue, RawEvent::pointer_moved(3.0, 3.0));
@@ -268,9 +290,24 @@ mod tests {
             20.0,
             MouseButton::Other(3),
             modifiers,
+            1234.0,
         );
         assert_eq!(event.kind, POINTER_RELEASED);
-        assert_eq!(event.numbers, [10.0, 20.0, 8.0, 9.0, 0.0]);
+        assert_eq!(
+            event.numbers,
+            [10.0, 20.0, 8.0, 9.0, 0.0],
+            "a release has no time"
+        );
+        let press = RawEvent::pointer_button(
+            ElementState::Pressed,
+            10.0,
+            20.0,
+            MouseButton::Left,
+            modifiers,
+            1234.0,
+        );
+        assert_eq!(press.kind, POINTER_PRESSED);
+        assert_eq!(press.numbers, [10.0, 20.0, 0.0, 9.0, 1234.0]);
     }
 
     #[test]

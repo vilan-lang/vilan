@@ -55,6 +55,7 @@ fn events_are_read_one_at_a_time_through_the_three_externs() {
             40.0,
             MouseButton::Left,
             ModifiersState::CONTROL,
+            0.0,
         ),
     );
     queue(7, RawEvent::text_input("é".to_string()));

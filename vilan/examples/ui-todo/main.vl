@@ -6,13 +6,16 @@
 //
 // Modes, for the end-to-end test:
 //
-//   --smoke         a line per frame (the draft, the items, the focus) and the
+//   --smoke         a line per frame (the draft, the items, the focus, the
+//                   input's selection as anchor..caret) and the
 //                   boxes the test aims at: the input's after the first frame,
 //                   and an item's checkbox and remove button after the frame
 //                   that first shows it
 //   --check --font <ttf>
 //                   no window: the screen laid out and driven with `deliver` —
-//                   typing, the caret keys, a selection by Shift and by a drag,
+//                   typing, the caret keys, a selection by Shift and by a drag
+//                   (off the input and out of the window too), double and
+//                   triple clicks, a drag past the field's edge scrolling it,
 //                   graphemes, Enter, a click on a checkbox, Space on a focused
 //                   one, a click on a remove button — with the state each step
 //                   left printed
@@ -325,7 +328,8 @@ fun main() {
 		draw(frame, app.root);
 		frames.write() = frames.read() + 1;
 		let focus = if app.input.element().interaction().focused { "input" } else { "-" };
-		print(i"frame {frames.read()} draft={app.draft.get()} items={listing(app.items)} focus={focus}");
+		let selected = app.input.selection();
+		print(i"frame {frames.read()} draft={app.draft.get()} items={listing(app.items)} focus={focus} selection={selected.anchor}..{selected.caret}");
 		for entry in app.root.outline() {
 			let aimed = entry.label == "new item"
 				|| entry.label.starts_with("check ")
@@ -488,9 +492,9 @@ fun check(arguments: List<str>) {
 	key(KeyName::Char("a"), control);
 	key(KeyName::Delete, no);
 
-	// 4. The pointer: a press places the caret, Shift extends, a drag selects —
-	// while the pointer stays on the input (a move goes to the element under the
-	// pointer, so a drag that leaves the input stops extending there).
+	// 4. The pointer: a press places the caret, Shift extends, a drag selects — and
+	// keeps selecting off the input and out of the window, because the press
+	// captured the pointer: every move until the release goes to the input.
 	type_text("bread");
 	let bounds = input.element().bounds();
 	let middle = bounds.y + bounds.height / 2.0;
@@ -500,23 +504,84 @@ fun check(arguments: List<str>) {
 	report("press at the input's left edge");
 	click(Point::new(bounds.x + dp(33), middle), shift);
 	report("shift press inside the text");
+	let press = |at: Point| deliver(root, Event::PointerPressed(Pointer {
+		position = at,
+		button = Button::Left,
+		modifiers = no,
+	}));
+	let release = |at: Point| deliver(root, Event::PointerReleased(Pointer {
+		position = at,
+		button = Button::Left,
+		modifiers = no,
+	}));
 	let drag = |from: Point, to: Point| {
-		deliver(root, Event::PointerPressed(Pointer {
-			position = from,
-			button = Button::Left,
-			modifiers = no,
-		}));
+		press(from);
 		deliver(root, Event::PointerMoved(to));
-		deliver(root, Event::PointerReleased(Pointer {
-			position = to,
-			button = Button::Left,
-			modifiers = no,
-		}));
+		release(to);
 	};
 	drag(Point::new(inside, middle), Point::new(far, middle));
 	report("drag across");
-	drag(Point::new(inside, middle), Point::new(far, bounds.y + bounds.height + dp(40)));
-	report("drag off the input");
+	drag(Point::new(far, middle), Point::new(inside, bounds.y + bounds.height + dp(40)));
+	report("drag off the input, below it");
+	drag(Point::new(inside, middle), Point::new(dp(600), middle));
+	report("drag out of the window");
+
+	// A press the program delivers carries no time, so presses at one place count
+	// as in a row: a double click is two clicks there, and a click elsewhere on the
+	// input ends the run.
+	let elsewhere = Point::new(bounds.x + dp(150), middle);
+	let double_click = |at: Point| {
+		click(elsewhere, no);
+		click(at, no);
+		click(at, no);
+	};
+	key(KeyName::Char("a"), control);
+	type_text("milk and eggs");
+	double_click(Point::new(inside, middle));
+	report("double click on the first word");
+	double_click(Point::new(far, middle));
+	report("double click past the end: the last word");
+	click(Point::new(far, middle), no);
+	report("triple click");
+	// A drag from a double click extends by whole words, keeping the word.
+	click(elsewhere, no);
+	click(Point::new(inside, middle), no);
+	drag(Point::new(inside, middle), Point::new(far, middle));
+	report("double click on milk, drag to the end");
+	click(elsewhere, no);
+	click(Point::new(far, middle), no);
+	drag(Point::new(far, middle), Point::new(dp(-50), middle));
+	report("double click on eggs, drag out of the window to the left");
+	// A drag from a triple click changes nothing.
+	click(elsewhere, no);
+	click(Point::new(far, middle), no);
+	click(Point::new(far, middle), no);
+	drag(Point::new(far, middle), Point::new(inside, middle));
+	report("triple click, then a drag");
+
+	// Past the field's edge each move extends the selection one grapheme beyond
+	// what shows, and the caret's reveal at the next layout scrolls the field by
+	// it: a text wider than the field, a press at its start, then three moves to
+	// the right of the window, each laid out before the next.
+	key(KeyName::Char("a"), control);
+	type_text("a line of text long enough to be wider than the field it is typed in");
+	key(KeyName::Home, no);
+	report("a long line, home");
+	// One line, scrolled: the input is as tall as it was with "bread".
+	print(i"the long line keeps the input one line tall: {input.element().bounds().height.value() == bounds.height.value()}");
+	click(elsewhere, no);
+	press(Point::new(inside, middle));
+	let beyond = Point::new(dp(500), middle);
+	deliver(root, Event::PointerMoved(beyond));
+	report("past the right edge, once");
+	deliver(root, Event::PointerMoved(beyond));
+	report("past the right edge, twice");
+	deliver(root, Event::PointerMoved(beyond));
+	report("past the right edge, three times");
+	release(beyond);
+	report("released out of the window");
+	key(KeyName::Char("a"), control);
+	type_text("bread");
 
 	// 5. Enter adds the draft (and goes no further: the screen hears no key);
 	// a second item through the Add button.

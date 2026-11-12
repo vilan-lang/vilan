@@ -44,6 +44,7 @@ impl Element {
 	fun outline(self): List<OutlineEntry>     // every element in its tree, in paint order
 	fun focus(self)                           // gives it the focus
 	fun scroll_into_view(self)                // every scroll around it shows it
+	fun release_pointer(self)                 // ends a press held on it, and its capture
 	fun interaction(self): Interaction        // hovered, pressed, focused now
 }
 impl Element with Attributes                 // an Element takes every attribute too
@@ -336,7 +337,7 @@ under it out again.
 ```vilan,fragment
 enum Condition { Hovered, Pressed, Focused, WindowAtLeast(Dp), WindowBelow(Dp) }
 fun hovered(): Condition                    // the pointer over it, or over an element inside it
-fun pressed(): Condition                    // the primary button went down on it and is still down
+fun pressed(): Condition                    // the primary button went down on it and is still down, wherever the pointer is
 fun focused(): Condition                    // it holds the focus
 fun window_at_least(width: Dp): Condition
 fun window_below(width: Dp): Condition
@@ -377,11 +378,11 @@ a condition reaches the texts inside the element, as an unconditional one does.
 ```vilan,fragment
 trait Attributes {
 	fun on_press(self, handler: || void): Self                // the primary button went down on it
-	fun on_release(self, handler: || void): Self              // ... came up over it
+	fun on_release(self, handler: || void): Self              // ... came up, after going down on it
 	fun on_click(self, handler: || void): Self                // a press and its release, both on it
 	fun on_pointer_enter(self, handler: || void): Self        // does not bubble
 	fun on_pointer_leave(self, handler: || void): Self        // does not bubble
-	fun on_pointer_move(self, handler: |Point| void): Self
+	fun on_pointer_move(self, handler: |Point| void): Self    // over it, or anywhere while it holds the press
 	fun on_scroll(self, handler: |Scroll| void): Self
 	fun on_key(self, handler: |KeyPress| void): Self          // to the focused element
 	fun on_key_release(self, handler: |KeyPress| void): Self
@@ -391,6 +392,7 @@ trait Attributes {
 	fun on_resize(self, handler: |Size| void): Self           // laid out at a new size
 }
 fun stop_event()                                              // inside a handler
+fun click_count(): usize                                      // presses in a row: 2 a double click
 ```
 
 Events are attributes like any other (`<row on_click(|| count.set(0))>`). A
@@ -405,6 +407,33 @@ to the innermost element holding both where the press and the release landed.
 Press, release and click are the primary button's; positions are dp from the
 window's top-left corner. Each handler runs as one turn, as a web event does: its
 signal writes settle as one wave.
+
+A press CAPTURES the pointer. Until the button comes up, every pointer move and
+the release go to the element the press landed on — and bubble from there —
+wherever the pointer goes: off the element, and off the window (the window
+systems keep sending a held button's moves and its release to the window it went
+down in). So a drag keeps going: a text selection, a slider, a scrollbar's thumb.
+During the drag `pressed()` holds on that element and its ancestors wherever the
+pointer is, while `hovered()` stays where the pointer is, capture or not — so a
+look that means "pressed and still over it" asks for both — and `on_pointer_enter`
+and `on_pointer_leave` follow the pointer too. The wheel and the keys are not
+captured. The click is decided by where the release LANDS: back over the pressed
+element it clicks it, elsewhere it clicks the innermost element holding both, and
+outside the window it clicks nothing. A capture ends with the release; with the
+element (or an ancestor) being removed, which cancels the press: no click, and the
+rest of the drag goes to whatever is under the pointer; and with
+`release_pointer()`, which does the same on the program's word — a control
+disabled in the middle of a drag calls it.
+
+`click_count()` says how many presses in a row the last press was: 1, 2 for a
+double click, 3 for a triple click. A press counts with the one before it when it
+lands on the same element within 4 dp and half a second of it. A press the program
+delivers itself (`deliver`) carries no time, so presses delivered at one place
+count up.
+
+When content moves under a still pointer — a scroll the program moved, a reveal, a
+row removed or inserted — the hover follows at the next layout, with its enter
+and leave handlers, before the frame is painted.
 
 `on_resize` is not an input: it is told after a layout that gave the element a
 new size (its box, in dp) — the first layout, and every later one that changes
@@ -592,7 +621,10 @@ change. A change outside the window changes the column's height and builds
 nothing. A row that STAYS in the window is the same element through every change
 — a scroll, an insert above it, another row's change — so its hover, press and
 focus stay with it. A row that LEAVES is removed as a keyed row is: its owner is
-disposed and its handlers are dropped. **State a row must keep after it leaves
+disposed and its handlers are dropped — and a focused row the wheel scrolls out
+takes the focus with it (nothing is focused, and keys go to the root), because
+keeping it built would put one row outside the window's single run of rows.
+**State a row must keep after it leaves
 the window belongs in the item, or in the app's model, not in the row**: a text
 typed into it, whether it is expanded. The row is built again from its item when
 it comes back.
@@ -603,8 +635,13 @@ the turn; `reveal_key` finds the row by its key first. TAB never leaves a list
 that has more rows: Tab inside it builds one row more after the window before the
 focus moves (Shift+Tab one before), and Tab's reveal then scrolls to the row it
 focused, which moves the window on. At the list's real ends Tab goes on through
-the tab order as it does anywhere. A row scrolled out of the window by the wheel
-takes the focus with it.
+the tab order as it does anywhere.
+
+The list's own padding (`padding(..)` on the list) is read with its height after
+each layout that resizes it: the rows built are the ones its padding box shows
+(the scroll clips there, so a row in the padding shows too), and `reveal` brings
+a row inside the content box. A padding changed while the list keeps its size is
+read at the next resize.
 
 What it costs: a scroll step builds the rows that arrive and removes the ones that
 leave; the rows that stay do not move, so the solver places the column's few rows
@@ -716,7 +753,13 @@ that state from the same signal, `style(off.derive(|off: bool| if off { dim }
 else { look }))`, where a disabled look with no `hovered()` in it shows no hover.
 
 A **text input** edits its cell: every edit writes it, and a write from anywhere
-else is what it shows. A press places the caret and a drag selects; Left and
+else is what it shows. A press places the caret and a drag selects — off the
+input and out of the window too, the press having captured the pointer: past the
+field's left or right edge each pointer move extends the selection one grapheme
+beyond what shows, and the field scrolls by it. A double click selects the word
+under the pointer (a run of letters and digits, or of the other graphemes: a
+double click on a space selects the spaces) and a drag from it extends by whole
+words; a triple click selects everything. Left and
 Right move a grapheme (with Ctrl or Alt, a word), Home and End to the ends, each
 extending the selection with Shift; Backspace and Delete remove the selection,
 or a grapheme (with Ctrl or Alt, a word); Ctrl+A (or Cmd+A) selects everything;
@@ -772,7 +815,8 @@ main();
 ```
 
 Not in the kit yet: the clipboard (the window layer offers none), an input
-method's composition (the part after this one, P5), a double click selecting a
-word, a blinking caret (the caret is steady, so an idle window draws nothing),
-and a drag that leaves the input extending the selection there (a pointer move
-goes to the element under the pointer).
+method's composition (the part after this one, P5), and a blinking caret (the
+caret is steady, so an idle window draws nothing; a blink needs a timer in the
+host that stops while the window is unfocused). A drag held still past the
+field's edge does not keep scrolling: the field moves one grapheme per pointer
+move, with no timer.

@@ -466,7 +466,9 @@ The count's text follows its signal: a click writes the signal, the one text
 is laid out again, and the window draws one frame. The button's looks follow
 the pointer and the focus with no code of the app's: `hovered()`, `pressed()` and
 `focused()` are typed conditions the framework resolves from hit testing and the
-focus, and a change repaints the one element. Tab and Shift+Tab move the focus;
+focus, and a change repaints the one element. A press captures the pointer: until
+the release, `pressed()` holds and the moves and the release go to the element it
+landed on, even off the window. Tab and Shift+Tab move the focus;
 a `scroll` moves its child under the wheel without laying anything out.
 
 ### Lists and conditional children
@@ -600,7 +602,9 @@ main();
 
 The text input keeps a caret and a selection in grapheme clusters, scrolls a long
 text sideways to keep the caret in view, and stops the keys it uses from reaching
-the app's own shortcuts. `vilan/examples/ui-todo` is a todo list on the kit —
+the app's own shortcuts. A press captures the pointer, so a drag selection keeps
+extending off the input and out of the window (scrolling the field past its
+edge); a double click selects a word and a triple click everything. `vilan/examples/ui-todo` is a todo list on the kit —
 add an item with the input, check it off, remove it — with every colour, radius
 and spacing its own; its end-to-end test drives the screen with no window against
 a recorded listing (typing, selections, graphemes, Tab, Space) and then in a

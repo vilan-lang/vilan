@@ -24,9 +24,10 @@
 //! | Event | Target | Bubbles |
 //! |---|---|---|
 //! | pointer enter, leave | each element the pointer came into or left (an element and its ancestors are all under the pointer) | no |
-//! | pointer move | the element under the pointer | yes |
-//! | press, release | the element under the pointer, the primary button only | yes |
-//! | click | after a release, the innermost element holding both where the press and the release were | yes |
+//! | pointer move | the element under the pointer; while the button is down, the element that took the press (its capture) | yes |
+//! | press | the element under the pointer, the primary button only | yes |
+//! | release | the element that took the press (its capture), wherever the pointer is; the element under the pointer when no press in this tree is held | yes |
+//! | click | after a release, the innermost element holding both where the press and the release were; none when the release is outside the tree | yes |
 //! | scroll | the element under the pointer; the first `scroll` on the way up that can move takes it | yes, until a scroll moves |
 //! | key, key release, text | the focused element, or the root when nothing is | yes |
 //! | focus, blur | the element gaining or losing the focus | no |
@@ -36,6 +37,52 @@
 //! landed, and takes the focus away when there is none. Tab moves the focus
 //! to the next element of the tab order, Shift+Tab to the previous one,
 //! wrapping at the ends.
+//!
+//! # Pointer capture
+//!
+//! The press CAPTURES the pointer: the element it lands on (the innermost
+//! one, as every press's target is) receives every pointer move and the
+//! release until the button comes up, wherever the pointer goes — off the
+//! element, off the window — so a drag (a text selection, a slider, a
+//! scrollbar thumb) keeps going. It is IMPLICIT: every press captures, the
+//! web's and GPUI's rule, because what listens for the moves is decided by
+//! the ancestors the moves bubble to, which a press's target cannot know.
+//! During a capture:
+//!
+//! - `pressed` holds on the capturing element and its ancestors, wherever
+//!   the pointer is, until the release (the web's `:active`, GPUI's
+//!   `active`); `hovered` stays GEOMETRIC — the elements under the pointer,
+//!   capture or not — so a style that wants "pressed and still over it" (a
+//!   button that shows it will not click) asks for both.
+//! - Enter and leave follow the hover, so they follow the pointer, not the
+//!   capture: the capturing element hears its leave when the pointer goes
+//!   off it, and still hears every move.
+//! - The wheel and the keys are not captured.
+//! - The click is decided by where the release LANDS: the innermost element
+//!   holding both where the press and the release were, so a press dragged
+//!   off a button and released elsewhere does not click it, and a release
+//!   outside the window clicks nothing. The release itself goes to the
+//!   capture.
+//! - The pointer leaving the window ends nothing: the window systems keep
+//!   sending a held button's moves (outside positions) and its release to
+//!   the window it went down in.
+//!
+//! A capture ends with the release; with the capturing element (or an
+//! ancestor) being REMOVED, which cancels the press (no click, `pressed`
+//! off) and sends the rest of the drag — moves and the release — to
+//! whatever is under the pointer; and with [`UiTree::release_pointer`], the
+//! program's own release, which does the same (a control disabled mid-drag
+//! calls it). A press while a capture is held (a release the window system
+//! never reported) ends the old one first.
+//!
+//! # Presses in a row
+//!
+//! A press is counted with the presses before it ([`UiTree::click_count`]):
+//! one more than the last when it lands on the SAME element within
+//! [`MULTI_CLICK_DISTANCE`] dp of it and within [`MULTI_CLICK_TIME`] of
+//! it, by the time the press carries (stamped when the window system
+//! delivered it; a press the program delivers itself carries 0); otherwise
+//! 1. A double click is a count of 2, a triple click 3.
 //!
 //! # Hit testing
 //!
@@ -47,6 +94,7 @@
 //! row with no background still has a box).
 
 use std::rc::Rc;
+use std::time::Duration;
 
 use taffy::TraversePartialTree;
 
@@ -119,7 +167,12 @@ pub enum EventKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Input {
     PointerMoved(Point),
-    Pressed(Point),
+    /// `time` is when the window system delivered it, from any fixed origin
+    /// (the host's start): what presses in a row are counted by.
+    Pressed {
+        position: Point,
+        time: Duration,
+    },
     Released(Point),
     PointerLeft,
     /// `delta` as `std::gfx` reports it: positive means the content should
@@ -193,6 +246,24 @@ impl Route {
     }
 }
 
+/// The most time between two presses counted as in a row: the double
+/// click time Windows and macOS both default to.
+pub const MULTI_CLICK_TIME: Duration = Duration::from_millis(500);
+
+/// The farthest, in dp along either axis, a press may land from the last
+/// one and be counted with it (Windows' default double click rectangle is
+/// 4 pixels each way).
+pub const MULTI_CLICK_DISTANCE: f32 = 4.0;
+
+/// The last press: where, when, on what, and its count.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PressRecord {
+    position: Point,
+    time: Duration,
+    target: NodeId,
+    count: u32,
+}
+
 #[derive(Clone, Copy)]
 enum Flag {
     Hovered,
@@ -222,8 +293,60 @@ impl UiTree {
         self.hovered.filter(|node| self.is_alive(*node))
     }
 
+    /// The element holding the press, and with it the pointer's capture.
     pub fn pressed(&self) -> Option<NodeId> {
         self.pressed.filter(|node| self.is_alive(*node))
+    }
+
+    /// How many presses in a row the last press was (the module
+    /// documentation's rule): 1 for a single press, 2 for a double click; 0
+    /// before any press.
+    pub fn click_count(&self) -> u32 {
+        self.last_press.map_or(0, |press| press.count)
+    }
+
+    /// Ends the capture and the press held by `node` or an element inside it,
+    /// as removing it would: `pressed` goes off, no click follows the
+    /// release, and the rest of the drag goes to whatever is under the
+    /// pointer. Answers whether one was held.
+    pub fn release_pointer(&mut self, node: NodeId) -> bool {
+        let holds = self
+            .pressed()
+            .is_some_and(|pressed| pressed == node || self.is_ancestor(node, pressed));
+        if holds {
+            self.release_press();
+        }
+        holds
+    }
+
+    /// The capturing element when it is in `root`'s tree.
+    fn captured(&self, root: NodeId) -> Option<NodeId> {
+        self.chain_in(root, self.pressed).first().copied()
+    }
+
+    /// The press at `position` on `target` at `time`, counted with the last.
+    fn count_press(&mut self, position: Point, time: Duration, target: Option<NodeId>) {
+        let Some(target) = target else {
+            self.last_press = None;
+            return;
+        };
+        let in_a_row = self.last_press.is_some_and(|last| {
+            last.target == target
+                && time >= last.time
+                && time - last.time <= MULTI_CLICK_TIME
+                && (position.x - last.position.x).abs() <= MULTI_CLICK_DISTANCE
+                && (position.y - last.position.y).abs() <= MULTI_CLICK_DISTANCE
+        });
+        let count = match self.last_press {
+            Some(last) if in_a_row => last.count.saturating_add(1),
+            _ => 1,
+        };
+        self.last_press = Some(PressRecord {
+            position,
+            time,
+            target,
+            count,
+        });
     }
 
     pub fn interaction(&self, node: NodeId) -> Interaction {
@@ -429,22 +552,26 @@ impl UiTree {
         let mut route = Route::default();
         match input {
             Input::PointerMoved(position) => {
-                self.pointer = Some(*position);
+                self.point_at(root, *position);
                 let hit = self.hit(root, *position);
                 self.hover(root, hit, &mut route);
-                if let Some(hit) = hit {
-                    route.bubbling(self.bubble(hit, EventKind::PointerMove), None);
+                if let Some(target) = self.captured(root).or(hit) {
+                    route.bubbling(self.bubble(target, EventKind::PointerMove), None);
                 }
             }
             Input::PointerLeft => {
+                // The capture stays: a held button's moves and release still
+                // come (the module documentation).
                 self.pointer = None;
+                self.pointer_root = None;
                 self.hover(root, None, &mut route);
             }
-            Input::Pressed(position) => {
-                self.pointer = Some(*position);
+            Input::Pressed { position, time } => {
+                self.point_at(root, *position);
                 let hit = self.hit(root, *position);
                 self.hover(root, hit, &mut route);
                 self.release_press();
+                self.count_press(*position, *time, hit);
                 if let Some(hit) = hit {
                     for node in self.chain(hit) {
                         self.set_flag(node, Flag::Pressed, true);
@@ -463,21 +590,22 @@ impl UiTree {
                 }
             }
             Input::Released(position) => {
-                self.pointer = Some(*position);
+                self.point_at(root, *position);
                 let hit = self.hit(root, *position);
                 self.hover(root, hit, &mut route);
-                let pressed = self.pressed();
+                let captured = self.captured(root);
                 self.release_press();
-                if let Some(hit) = hit {
-                    route.bubbling(self.bubble(hit, EventKind::Release), None);
-                    let target = pressed.and_then(|pressed| self.common_ancestor(pressed, hit));
-                    if let Some(target) = target {
-                        route.bubbling(self.bubble(target, EventKind::Click), None);
-                    }
+                if let Some(target) = captured.or(hit) {
+                    route.bubbling(self.bubble(target, EventKind::Release), None);
+                }
+                if let (Some(pressed), Some(hit)) = (captured, hit)
+                    && let Some(target) = self.common_ancestor(pressed, hit)
+                {
+                    route.bubbling(self.bubble(target, EventKind::Click), None);
                 }
             }
             Input::Scrolled { position, delta } => {
-                self.pointer = Some(*position);
+                self.point_at(root, *position);
                 let hit = self.hit(root, *position);
                 self.hover(root, hit, &mut route);
                 if let Some(hit) = hit {
@@ -510,6 +638,34 @@ impl UiTree {
                 let target = self.key_target(root);
                 route.bubbling(self.bubble(target, EventKind::Text), None);
             }
+        }
+        route
+    }
+
+    fn point_at(&mut self, root: NodeId, position: Point) {
+        self.pointer = Some(position);
+        self.pointer_root = Some(root);
+    }
+
+    /// The hover again, when something moved under a still pointer since it
+    /// was last worked out (a box a layout moved, an offset, an element
+    /// removed): a hit test at the pointer's last position in `root`'s tree,
+    /// answering the leaves and enters it owes (not stoppable). The host
+    /// asks after every layout, so content that moves under the pointer —
+    /// a deferred reveal, a program's scroll, a row removed — updates the
+    /// hover in the same frame instead of at the next pointer move. Nothing
+    /// when nothing moved, or the pointer is not in `root`'s window.
+    pub fn refresh_hover(&mut self, root: NodeId) -> Route {
+        let mut route = Route::default();
+        if !std::mem::take(&mut self.hover_stale) {
+            return route;
+        }
+        if let (Some(pointer), Some(pointer_root)) = (self.pointer, self.pointer_root)
+            && pointer_root == root
+            && self.is_alive(root)
+        {
+            let hit = self.hit(root, pointer);
+            self.hover(root, hit, &mut route);
         }
         route
     }
@@ -627,6 +783,7 @@ impl UiTree {
                     .expect("a scroll")
                     .offset = offset;
                 self.offset_notices.push(parent);
+                self.hover_stale = true;
                 self.invalidate(parent);
                 moved = true;
             }

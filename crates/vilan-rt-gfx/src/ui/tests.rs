@@ -1327,6 +1327,20 @@ impl Recorder {
     }
 }
 
+/// A press at `position` at time 0: presses at one place count up, which
+/// changes nothing a pin without a count reads.
+fn press(position: Point) -> Input {
+    press_at(position, 0)
+}
+
+/// A press at `position`, `milliseconds` after the clock's origin.
+fn press_at(position: Point, milliseconds: u64) -> Input {
+    Input::Pressed {
+        position,
+        time: std::time::Duration::from_millis(milliseconds),
+    }
+}
+
 /// A root column holding a card holding a button, side by side with a
 /// second button: `(root, card, first, second)`.
 fn buttons(fixture: &mut Fixture) -> (NodeId, NodeId, NodeId, NodeId) {
@@ -1355,7 +1369,7 @@ fn an_event_reaches_its_target_first_then_each_listening_ancestor() {
     // `first` is at (10, 10) in the card at (0, 0).
     let at = Point::new(20.0, 20.0);
     assert_eq!(
-        recorder.route(&mut fixture, root, Input::Pressed(at)),
+        recorder.route(&mut fixture, root, press(at)),
         ["Press first", "Press card", "Press root"]
     );
     assert_eq!(
@@ -1364,7 +1378,7 @@ fn an_event_reaches_its_target_first_then_each_listening_ancestor() {
     );
     // Pressed on `first`, released on `second`: the click goes to the
     // innermost element holding both, the root.
-    recorder.route(&mut fixture, root, Input::Pressed(at));
+    recorder.route(&mut fixture, root, press(at));
     let second_at = Point::new(fixture.rect(second).0 + 5.0, 5.0);
     assert_eq!(
         recorder.route(&mut fixture, root, Input::Released(second_at)),
@@ -1511,7 +1525,7 @@ fn each_condition_applies_while_it_holds_and_repaints_its_element_alone() {
 
     // Pressed: held while the button is down, wherever the pointer goes.
     let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
-    fixture.tree.route(root, &Input::Pressed(on_second));
+    fixture.tree.route(root, &press(on_second));
     assert_eq!(background(&fixture, second), Some(red()));
     fixture
         .tree
@@ -1665,7 +1679,7 @@ fn a_press_focuses_the_nearest_focusable_and_keys_go_to_the_focus() {
     recorder.listen(&mut fixture, root, EventKind::Key, "root");
     // `first` is not focusable; its parent the card is.
     assert_eq!(
-        recorder.route(&mut fixture, root, Input::Pressed(Point::new(20.0, 20.0))),
+        recorder.route(&mut fixture, root, press(Point::new(20.0, 20.0))),
         ["Focus card"]
     );
     assert_eq!(fixture.tree.focused(), Some(card));
@@ -1685,7 +1699,7 @@ fn a_press_focuses_the_nearest_focusable_and_keys_go_to_the_focus() {
     // A press on nothing focusable takes the focus away.
     let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
     assert_eq!(
-        recorder.route(&mut fixture, root, Input::Pressed(on_second)),
+        recorder.route(&mut fixture, root, press(on_second)),
         ["Blur card"]
     );
     assert_eq!(fixture.tree.focused(), None);
@@ -1951,7 +1965,7 @@ fn a_moved_row_keeps_its_hover_press_and_focus_and_measures_nothing() {
     fixture.tree.set_tab_index(moving, Some(0));
     let (x, y, width, height) = fixture.rect(moving);
     let over = Point::new(x + width / 2.0, y + height / 2.0);
-    fixture.tree.route(column, &Input::Pressed(over));
+    fixture.tree.route(column, &press(over));
     let before = fixture.tree.interaction(moving);
     assert!(
         before.hovered && before.pressed && before.focused,
@@ -2001,7 +2015,7 @@ fn a_removed_row_takes_its_hover_press_focus_and_handlers_with_it() {
     recorder.listen(&mut fixture, column, EventKind::Click, "click column");
     let (x, y, width, height) = fixture.rect(going);
     let over = Point::new(x + width / 2.0, y + height / 2.0);
-    recorder.route(&mut fixture, column, Input::Pressed(over));
+    recorder.route(&mut fixture, column, press(over));
     assert_eq!(fixture.tree.focused(), Some(going));
     let handlers = fixture.tree.remove(going);
     assert_eq!(handlers.len(), 2, "the row's blur and its text's click");
@@ -2363,7 +2377,12 @@ fn a_point_finds_its_index_through_the_scroll_around_the_text() {
     let at = |fixture: &mut Fixture, x: f32| {
         fixture
             .tree
-            .text_index_at(node, Point::new(x, 8.0), &mut fixture.text)
+            .text_index_at(
+                node,
+                Point::new(x, 8.0),
+                IndexRule::Nearest,
+                &mut fixture.text,
+            )
             .unwrap()
     };
     assert_eq!(at(&mut fixture, 5.0 + 20.0), 3);
@@ -2654,4 +2673,452 @@ fn tab_onto_an_element_built_since_the_last_layout_reveals_it_after_the_next_lay
     // The fresh row at 180..210: its bottom at the viewport's.
     assert_eq!(fixture.tree.scroll_offset(scroll).unwrap().y, 110.0);
     assert!(!fixture.tree.reveal_pending());
+}
+
+// ------------------------------------------------------- pointer capture ---
+
+/// `buttons`, with every pointer event of `first`, `second`, `card` and the
+/// root recorded.
+fn captured_buttons(fixture: &mut Fixture) -> (Recorder, NodeId, NodeId, NodeId, NodeId) {
+    let (root, card, first, second) = buttons(fixture);
+    let recorder = Recorder::new();
+    for (node, name) in [
+        (root, "root"),
+        (card, "card"),
+        (first, "first"),
+        (second, "second"),
+    ] {
+        for kind in [
+            EventKind::PointerEnter,
+            EventKind::PointerLeave,
+            EventKind::PointerMove,
+            EventKind::Release,
+            EventKind::Click,
+        ] {
+            recorder.listen(fixture, node, kind, name);
+        }
+    }
+    (recorder, root, card, first, second)
+}
+
+/// The press captures the pointer: every move and the release go to the
+/// element it landed on (bubbling from there), wherever the pointer goes —
+/// over another element, outside the root. Enter and leave follow the
+/// pointer; `pressed` holds on the capturing chain until the release while
+/// `hovered` is geometric; a release outside the tree clicks nothing.
+#[test]
+fn a_press_captures_the_pointer_until_the_release_wherever_it_goes() {
+    let mut fixture = Fixture::new();
+    let (recorder, root, card, first, second) = captured_buttons(&mut fixture);
+    let on_first = Point::new(20.0, 20.0);
+    recorder.route(&mut fixture, root, Input::PointerMoved(on_first));
+    recorder.route(&mut fixture, root, press(on_first));
+    assert_eq!(fixture.tree.pressed(), Some(first));
+    let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerMoved(on_second)),
+        [
+            "PointerLeave first",
+            "PointerLeave card",
+            "PointerEnter second",
+            "PointerMove first",
+            "PointerMove card",
+            "PointerMove root"
+        ],
+        "the hover follows the pointer, the move goes to the capture"
+    );
+    for (node, pressed, hovered) in [
+        (first, true, false),
+        (card, true, false),
+        (root, true, true),
+        (second, false, true),
+    ] {
+        let state = fixture.tree.interaction(node);
+        assert_eq!((state.pressed, state.hovered), (pressed, hovered));
+    }
+    // Off the root (the window keeps sending a held button's moves).
+    let outside = Point::new(-40.0, 500.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerMoved(outside)),
+        [
+            "PointerLeave second",
+            "PointerLeave root",
+            "PointerMove first",
+            "PointerMove card",
+            "PointerMove root"
+        ]
+    );
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(outside)),
+        ["Release first", "Release card", "Release root"],
+        "the release goes to the capture, and outside it is no click"
+    );
+    assert_eq!(fixture.tree.pressed(), None);
+    assert!(!fixture.tree.interaction(first).pressed);
+    // The capture is over: a move goes to what is under the pointer again.
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerMoved(on_second)),
+        [
+            "PointerEnter root",
+            "PointerEnter second",
+            "PointerMove second",
+            "PointerMove root"
+        ]
+    );
+}
+
+/// A release back over the pressed element clicks it; a release over
+/// another one clicks the innermost element holding both — the release
+/// itself going to the capture either way.
+#[test]
+fn the_click_is_decided_by_where_the_release_lands() {
+    let mut fixture = Fixture::new();
+    let (recorder, root, _, _, second) = captured_buttons(&mut fixture);
+    let on_first = Point::new(20.0, 20.0);
+    let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    recorder.route(&mut fixture, root, press(on_first));
+    recorder.route(&mut fixture, root, Input::PointerMoved(on_second));
+    recorder.route(&mut fixture, root, Input::PointerMoved(on_first));
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(on_first)),
+        [
+            "Release first",
+            "Release card",
+            "Release root",
+            "Click first",
+            "Click card",
+            "Click root"
+        ]
+    );
+    recorder.route(&mut fixture, root, press(on_first));
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(on_second)),
+        [
+            "PointerLeave first",
+            "PointerLeave card",
+            "PointerEnter second",
+            "Release first",
+            "Release card",
+            "Release root",
+            "Click root"
+        ]
+    );
+}
+
+/// The pointer leaving the window ends no capture: the hover empties, and
+/// the moves and the release that follow still reach the capture.
+#[test]
+fn the_pointer_leaving_the_window_keeps_the_capture() {
+    let mut fixture = Fixture::new();
+    let (recorder, root, _, first, _) = captured_buttons(&mut fixture);
+    let on_first = Point::new(20.0, 20.0);
+    recorder.route(&mut fixture, root, Input::PointerMoved(on_first));
+    recorder.route(&mut fixture, root, press(on_first));
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerLeft),
+        [
+            "PointerLeave first",
+            "PointerLeave card",
+            "PointerLeave root"
+        ]
+    );
+    assert_eq!(fixture.tree.pressed(), Some(first));
+    let outside = Point::new(900.0, 20.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerMoved(outside)),
+        ["PointerMove first", "PointerMove card", "PointerMove root"]
+    );
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(outside)),
+        ["Release first", "Release card", "Release root"]
+    );
+}
+
+/// Removing the capturing element (or an ancestor of it) ends the capture
+/// and cancels the press: the rest of the drag goes to whatever is under
+/// the pointer, as with no press held, and nothing clicks.
+#[test]
+fn removing_the_capturing_element_ends_the_capture_and_its_click() {
+    let mut fixture = Fixture::new();
+    let (recorder, root, card, first, second) = captured_buttons(&mut fixture);
+    let on_first = Point::new(20.0, 20.0);
+    recorder.route(&mut fixture, root, Input::PointerMoved(on_first));
+    recorder.route(&mut fixture, root, press(on_first));
+    drop(fixture.tree.remove(card));
+    assert_eq!(fixture.tree.pressed(), None);
+    assert!(!fixture.tree.interaction(first).pressed);
+    fixture.layout(root, 300.0, 100.0);
+    let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    let moved = recorder.route(&mut fixture, root, Input::PointerMoved(on_second));
+    assert_eq!(
+        moved.last().map(String::as_str),
+        Some("PointerMove root"),
+        "{moved:?}"
+    );
+    assert!(
+        moved.contains(&"PointerMove second".to_string()),
+        "{moved:?}"
+    );
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(on_second)),
+        ["Release second", "Release root"],
+        "a release with no press held goes to what is under the pointer, and clicks nothing"
+    );
+}
+
+/// The program's own release (`Element::release_pointer`, which a control
+/// disabled mid-drag calls) does what removal does, for the element holding
+/// the press or any ancestor of it; for another element it does nothing.
+#[test]
+fn releasing_the_pointer_ends_the_capture_held_inside_the_element() {
+    let mut fixture = Fixture::new();
+    let (recorder, root, card, first, second) = captured_buttons(&mut fixture);
+    let on_first = Point::new(20.0, 20.0);
+    recorder.route(&mut fixture, root, press(on_first));
+    assert!(!fixture.tree.release_pointer(second));
+    assert_eq!(fixture.tree.pressed(), Some(first));
+    assert!(fixture.tree.release_pointer(card));
+    assert_eq!(fixture.tree.pressed(), None);
+    assert!(!fixture.tree.interaction(first).pressed);
+    assert!(!fixture.tree.interaction(card).pressed);
+    assert!(
+        !fixture.tree.release_pointer(card),
+        "nothing left to release"
+    );
+    let on_second = Point::new(fixture.rect(second).0 + 5.0, 5.0);
+    let moved = recorder.route(&mut fixture, root, Input::PointerMoved(on_second));
+    assert!(
+        moved.contains(&"PointerMove second".to_string()),
+        "{moved:?}"
+    );
+    assert!(
+        !moved.contains(&"PointerMove first".to_string()),
+        "{moved:?}"
+    );
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::Released(on_first)),
+        [
+            "PointerLeave second",
+            "PointerEnter card",
+            "PointerEnter first",
+            "Release first",
+            "Release card",
+            "Release root"
+        ],
+        "released back over it: no click, the press was let go"
+    );
+}
+
+/// A press counts with the one before it while it lands on the same element,
+/// within the distance and the time of it; by the time the input carries.
+#[test]
+fn presses_in_a_row_are_counted_by_element_place_and_time() {
+    let mut fixture = Fixture::new();
+    let (root, _, _, second) = buttons(&mut fixture);
+    let at = Point::new(20.0, 20.0);
+    let count = |fixture: &mut Fixture, input: Input| {
+        fixture.tree.route(root, &input);
+        fixture.tree.route(root, &Input::Released(at));
+        fixture.tree.click_count()
+    };
+    assert_eq!(fixture.tree.click_count(), 0, "before any press");
+    assert_eq!(count(&mut fixture, press_at(at, 1000)), 1);
+    assert_eq!(count(&mut fixture, press_at(at, 1300)), 2);
+    // Within the distance, each axis, and the time of the LAST press.
+    let near = Point::new(at.x + MULTI_CLICK_DISTANCE, at.y - MULTI_CLICK_DISTANCE);
+    assert_eq!(count(&mut fixture, press_at(near, 1700)), 3);
+    assert_eq!(
+        count(&mut fixture, press_at(near, 2200)),
+        4,
+        "exactly the time"
+    );
+    assert_eq!(count(&mut fixture, press_at(near, 2701)), 1, "too late");
+    let far = Point::new(near.x + MULTI_CLICK_DISTANCE + 0.5, near.y);
+    assert_eq!(count(&mut fixture, press_at(far, 2800)), 1, "too far");
+    let on_second = Point::new(fixture.rect(second).0 + 1.0, 5.0);
+    let next_to_it = Point::new(fixture.rect(second).0 - 1.0, 5.0);
+    assert_eq!(count(&mut fixture, press_at(next_to_it, 3000)), 1);
+    assert_eq!(
+        count(&mut fixture, press_at(on_second, 3100)),
+        1,
+        "near enough, but on another element"
+    );
+    assert_eq!(count(&mut fixture, press_at(on_second, 3200)), 2);
+    // A press outside the tree counts nothing, and breaks the run.
+    assert_eq!(
+        count(&mut fixture, press_at(Point::new(-50.0, 5.0), 3300)),
+        0
+    );
+    assert_eq!(count(&mut fixture, press_at(on_second, 3400)), 1);
+    // A clock that went backwards (another source of times) starts again.
+    assert_eq!(count(&mut fixture, press_at(on_second, 100)), 1);
+}
+
+/// Content that moves under a still pointer moves the hover at the next
+/// layout (`refresh_hover`, which the host asks after each one): a deferred
+/// reveal (F174), a program's scroll, a removed row — with the leaves and
+/// enters owed, and nothing when nothing moved.
+#[test]
+fn content_moving_under_a_still_pointer_moves_the_hover_after_the_layout() {
+    let mut fixture = Fixture::new();
+    let (root, scroll, rows) = scrolled_rows(&mut fixture, 6);
+    let column = fixture.tree.children(scroll)[0];
+    let recorder = Recorder::new();
+    for (index, row) in rows.iter().enumerate() {
+        recorder.listen(
+            &mut fixture,
+            *row,
+            EventKind::PointerEnter,
+            &format!("row {index}"),
+        );
+        recorder.listen(
+            &mut fixture,
+            *row,
+            EventKind::PointerLeave,
+            &format!("row {index}"),
+        );
+    }
+    let refresh = |fixture: &mut Fixture| {
+        let route = fixture.tree.refresh_hover(root);
+        recorder.run(fixture, root, route);
+        std::mem::take(&mut *recorder.log.borrow_mut())
+    };
+    // The pointer over row 1 (30..60), still.
+    let pointer = Point::new(10.0, 45.0);
+    assert_eq!(
+        recorder.route(&mut fixture, root, Input::PointerMoved(pointer)),
+        ["PointerEnter row 1"]
+    );
+    assert!(refresh(&mut fixture).is_empty(), "nothing moved");
+    // A reveal left for the next layout: a row built since the last one.
+    let fresh = fixture.block(50.0, 30.0);
+    fixture.add(column, &[fresh]);
+    assert!(!fixture.tree.reveal_when_laid_out(fresh));
+    fixture.layout(root, 200.0, 300.0);
+    // The fresh row at 180..210, its bottom at the viewport's: offset 110,
+    // so the pointer is over 155 in the column: row 5.
+    assert_eq!(fixture.tree.scroll_offset(scroll).unwrap().y, 110.0);
+    assert_eq!(
+        refresh(&mut fixture),
+        ["PointerLeave row 1", "PointerEnter row 5"]
+    );
+    assert!(fixture.tree.interaction(rows[5]).hovered);
+    // The program's own scroll.
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 0.0))
+        .unwrap();
+    fixture.layout(root, 200.0, 300.0);
+    assert_eq!(
+        refresh(&mut fixture),
+        ["PointerLeave row 5", "PointerEnter row 1"]
+    );
+    // Row 1 removed: row 2 moves into its place under the pointer (the
+    // removed row is told nothing: its handlers went with it).
+    drop(fixture.tree.remove(rows[1]));
+    fixture.layout(root, 200.0, 300.0);
+    assert_eq!(refresh(&mut fixture), ["PointerEnter row 2"]);
+    // The pointer gone from the window: nothing to work out.
+    recorder.route(&mut fixture, root, Input::PointerLeft);
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 30.0))
+        .unwrap();
+    fixture.layout(root, 200.0, 300.0);
+    assert!(refresh(&mut fixture).is_empty());
+}
+
+/// A drag's index: the nearest edge across the part of the field that
+/// shows; past its right or left edge, one grapheme beyond the one at that
+/// edge — so each move extends one grapheme further, and the caret's reveal
+/// scrolls the field by it.
+#[test]
+fn a_drag_past_the_fields_edge_lands_one_grapheme_beyond_what_shows() {
+    let mut fixture = Fixture::new();
+    // 6 dp a character; the field shows 30 dp (five characters) from x 5.
+    let (root, scroll, node) = scrolled_field(&mut fixture, "abcdefghij");
+    let at = |fixture: &mut Fixture, x: f32, rule: IndexRule| {
+        fixture
+            .tree
+            .text_index_at(node, Point::new(x, 8.0), rule, &mut fixture.text)
+            .unwrap()
+    };
+    // Inside: the nearest edge, as a press's.
+    assert_eq!(at(&mut fixture, 5.0 + 20.0, IndexRule::Drag), 3);
+    // Past the right edge (35): the first index out from it whose caret does
+    // not show whole — 5, whose caret stands at the edge — however far past;
+    // where a press's rule answers the end.
+    assert_eq!(at(&mut fixture, 36.0, IndexRule::Drag), 5);
+    assert_eq!(at(&mut fixture, 400.0, IndexRule::Drag), 5);
+    assert_eq!(at(&mut fixture, 400.0, IndexRule::Nearest), 10);
+    // Past the left edge at the start: nothing before it.
+    assert_eq!(at(&mut fixture, -40.0, IndexRule::Drag), 0);
+    // A drag held past the right edge: each move puts the caret there, the
+    // layout reveals it, and the next move lands one grapheme further, the
+    // field scrolling with it.
+    let mut offsets = Vec::new();
+    for expected in [5, 6, 7, 8] {
+        let index = at(&mut fixture, 400.0, IndexRule::Drag);
+        assert_eq!(index, expected);
+        fixture.tree.text_edit(node, index, 0, true).unwrap();
+        fixture.layout(root, 300.0, 300.0);
+        offsets.push(fixture.tree.scroll_offset(scroll).unwrap().x);
+    }
+    assert!(
+        offsets.windows(2).all(|pair| pair[1] > pair[0]) && offsets[0] > 0.0,
+        "{offsets:?}"
+    );
+    // Past the left edge with the start scrolled away: one before the first
+    // index that shows.
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(30.0, 0.0))
+        .unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    assert_eq!(at(&mut fixture, 5.0, IndexRule::Drag), 5);
+    assert_eq!(at(&mut fixture, -40.0, IndexRule::Drag), 4);
+    // A text that shows whole: past either edge, its end.
+    let (_, _, short) = scrolled_field(&mut fixture, "ab");
+    for (x, expected) in [(400.0, 2), (-40.0, 0)] {
+        let index = fixture
+            .tree
+            .text_index_at(
+                short,
+                Point::new(x, 8.0),
+                IndexRule::Drag,
+                &mut fixture.text,
+            )
+            .unwrap();
+        assert_eq!(index, expected);
+    }
+    // The grapheme under a point, and its word.
+    let (_, _, words) = scrolled_field(&mut fixture, "ab cd");
+    let under = fixture
+        .tree
+        .text_index_at(
+            words,
+            Point::new(5.0 + 11.0, 8.0),
+            IndexRule::Under,
+            &mut fixture.text,
+        )
+        .unwrap();
+    assert_eq!(under, 1, "the right half of b is b");
+    let word = |fixture: &mut Fixture, index: usize, end: bool| {
+        fixture
+            .tree
+            .text_word(words, index, end, &mut fixture.text)
+            .unwrap()
+    };
+    assert_eq!(
+        (word(&mut fixture, 1, false), word(&mut fixture, 1, true)),
+        (0, 2)
+    );
+    assert_eq!(
+        (word(&mut fixture, 2, false), word(&mut fixture, 2, true)),
+        (2, 3)
+    );
+    assert_eq!(
+        (word(&mut fixture, 5, false), word(&mut fixture, 5, true)),
+        (3, 5)
+    );
 }

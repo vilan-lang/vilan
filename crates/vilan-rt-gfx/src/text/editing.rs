@@ -128,18 +128,7 @@ impl EditingGeometry {
     /// The caret position nearest `point` (dp from the layout's top-left):
     /// on the line nearest its y, the grapheme edge nearest its x.
     pub(crate) fn index_at(&self, point: Point) -> usize {
-        let line = self
-            .lines
-            .iter()
-            .enumerate()
-            .min_by(|(_, first), (_, second)| {
-                distance(point.y, first.top, first.top + first.height).total_cmp(&distance(
-                    point.y,
-                    second.top,
-                    second.top + second.height,
-                ))
-            })
-            .map_or(0, |(line, _)| line);
+        let line = self.nearest_line(point.y);
         let nearest = self
             .graphemes
             .iter()
@@ -153,13 +142,7 @@ impl EditingGeometry {
             });
         let Some(grapheme) = nearest else {
             // An empty line: the end of the text before it.
-            return self
-                .graphemes
-                .iter()
-                .filter(|grapheme| grapheme.line < line)
-                .map(|grapheme| grapheme.end)
-                .max()
-                .unwrap_or(0);
+            return self.end_before_line(line);
         };
         let left_half = point.x < grapheme.x + grapheme.width / 2.0;
         if left_half != grapheme.rtl {
@@ -167,6 +150,75 @@ impl EditingGeometry {
         } else {
             grapheme.end
         }
+    }
+
+    /// The start of the grapheme UNDER `point` (dp from the layout's
+    /// top-left): on the line nearest its y, the grapheme nearest its x —
+    /// where [`index_at`](Self::index_at) answers the nearer EDGE. What a
+    /// double click selects the word of. The end of an empty line's text
+    /// before it, and 0 for an empty text.
+    pub(crate) fn grapheme_at(&self, point: Point) -> usize {
+        let line = self.nearest_line(point.y);
+        self.graphemes
+            .iter()
+            .filter(|grapheme| grapheme.line == line)
+            .min_by(|first, second| {
+                distance(point.x, first.x, first.x + first.width).total_cmp(&distance(
+                    point.x,
+                    second.x,
+                    second.x + second.width,
+                ))
+            })
+            .map_or_else(|| self.end_before_line(line), |grapheme| grapheme.start)
+    }
+
+    /// The run of graphemes of one kind — word graphemes (a letter or a digit
+    /// first) or the others — around the grapheme starting at `index` (the
+    /// last grapheme when `index` is the end of the text), as `start..end`:
+    /// what a double click selects. An empty text answers `index..index`.
+    pub(crate) fn word_around(&self, index: usize) -> (usize, usize) {
+        let index = self.snap(index);
+        let logical = self.logical();
+        let Some(mut first) = logical
+            .iter()
+            .position(|grapheme| grapheme.start == index)
+            .or_else(|| logical.len().checked_sub(1))
+        else {
+            return (index, index);
+        };
+        let word = logical[first].word;
+        let mut last = first;
+        while first > 0 && logical[first - 1].word == word {
+            first -= 1;
+        }
+        while last + 1 < logical.len() && logical[last + 1].word == word {
+            last += 1;
+        }
+        (logical[first].start, logical[last].end)
+    }
+
+    fn nearest_line(&self, y: f32) -> usize {
+        self.lines
+            .iter()
+            .enumerate()
+            .min_by(|(_, first), (_, second)| {
+                distance(y, first.top, first.top + first.height).total_cmp(&distance(
+                    y,
+                    second.top,
+                    second.top + second.height,
+                ))
+            })
+            .map_or(0, |(line, _)| line)
+    }
+
+    /// The end of the text before `line`: where an empty line's caret goes.
+    fn end_before_line(&self, line: usize) -> usize {
+        self.graphemes
+            .iter()
+            .filter(|grapheme| grapheme.line < line)
+            .map(|grapheme| grapheme.end)
+            .max()
+            .unwrap_or(0)
     }
 
     /// The next (`forward`) or previous grapheme boundary from `index`; with
@@ -362,6 +414,36 @@ mod tests {
         // From inside "cd": its start.
         assert_eq!(geometry.step(7, false, true), 6);
         assert_eq!(geometry.step(0, false, true), 0);
+    }
+
+    #[test]
+    fn a_word_is_the_run_of_one_kind_around_the_grapheme_under_a_point() {
+        let geometry = latin();
+        // "ab cd": the right half of "b" is still "b", whose word is "ab";
+        // where `index_at` would answer the edge after it.
+        assert_eq!(geometry.grapheme_at(Point::new(25.0, 10.0)), 1);
+        assert_eq!(geometry.index_at(Point::new(25.0, 10.0)), 5);
+        assert_eq!(geometry.word_around(1), (0, 5));
+        // Inside the four-byte grapheme: its start, so its word.
+        assert_eq!(geometry.word_around(3), (0, 5));
+        // The space is a run of its own.
+        assert_eq!(geometry.grapheme_at(Point::new(32.0, 10.0)), 5);
+        assert_eq!(geometry.word_around(5), (5, 6));
+        assert_eq!(geometry.word_around(6), (6, 8));
+        // Past the end: the last grapheme, so the last word.
+        assert_eq!(geometry.grapheme_at(Point::new(90.0, 10.0)), 7);
+        assert_eq!(geometry.word_around(8), (6, 8));
+        // Nothing to select in an empty text.
+        let empty = EditingGeometry {
+            text_len: 0,
+            graphemes: Vec::new(),
+            lines: vec![LineBox {
+                top: 0.0,
+                height: 20.0,
+            }],
+        };
+        assert_eq!(empty.grapheme_at(Point::new(5.0, 5.0)), 0);
+        assert_eq!(empty.word_around(0), (0, 0));
     }
 
     #[test]

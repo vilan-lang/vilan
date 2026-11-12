@@ -65,7 +65,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use taffy::NodeId;
 use vilan_rt::{Js, Json, Str, panic_with, str_new};
@@ -76,9 +76,9 @@ use crate::geometry::{Corners, Edges, Point, Size};
 use crate::scene::Image;
 use crate::text::FontFamily;
 use crate::ui::{
-    Align, Anchor, Condition, DropShadow, ElementKind, EventKind, Fit, Handler, Input, Justify,
-    Length, OutlineEntry, PassStats, Role, Route, ScrollAxis, SizeProperty, StyleFields, UiError,
-    UiTree,
+    Align, Anchor, Condition, DropShadow, ElementKind, EventKind, Fit, Handler, IndexRule, Input,
+    Justify, Length, OutlineEntry, PassStats, Role, Route, ScrollAxis, SizeProperty, StyleFields,
+    UiError, UiTree,
 };
 use crate::units::Units;
 
@@ -595,13 +595,46 @@ pub fn text_edit_look(
     });
 }
 
-/// `__ui_text_index_at(node, x, y)` — the UTF-16 index in an edited text
-/// nearest the point (dp from the window's top-left, as an event gives it).
-pub fn text_index_at(node: &Node, x: f64, y: f64) -> i32 {
+/// `__ui_text_index_at(node, x, y, rule)` — the UTF-16 index in an edited
+/// text the point (dp from the window's top-left, as an event gives it)
+/// lands on: 0 the nearest grapheme edge (a press), 1 the start of the
+/// grapheme under it (a double click's), 2 a drag's (one grapheme past the
+/// edge of what shows when the point is beyond it; `IndexRule`).
+pub fn text_index_at(node: &Node, x: f64, y: f64, rule: i32) -> i32 {
     let point = Point::new(x as f32, y as f32);
-    let index =
-        with_tree(|tree| with_text(|text| or_fail(tree.text_index_at(node.id(), point, text))));
+    let rule = code(
+        &[IndexRule::Nearest, IndexRule::Under, IndexRule::Drag],
+        f64::from(rule),
+        "text index rule",
+    );
+    let index = with_tree(|tree| {
+        with_text(|text| or_fail(tree.text_index_at(node.id(), point, rule, text)))
+    });
     i32::try_from(index).unwrap_or(i32::MAX)
+}
+
+/// `__ui_text_word(node, index, end)` — the start (or with `end`, the end)
+/// of the word around UTF-16 `index` of an edited text: the run of word
+/// graphemes, or of the others, that the grapheme there is in.
+pub fn text_word(node: &Node, index: i32, end: bool) -> i32 {
+    let found = with_tree(|tree| {
+        with_text(|text| or_fail(tree.text_word(node.id(), index_of(index), end, text)))
+    });
+    i32::try_from(found).unwrap_or(i32::MAX)
+}
+
+/// `__ui_click_count()` — how many presses in a row the last press was (1
+/// a single press, 2 a double click; 0 before any).
+pub fn click_count() -> i32 {
+    with_tree(|tree| i32::try_from(tree.click_count()).unwrap_or(i32::MAX))
+}
+
+/// `__ui_release_pointer(node)` — ends the press (and the capture) the
+/// element or one inside it holds: no click follows it.
+pub fn release_pointer(node: &Node) {
+    change(node, |tree, id| {
+        tree.release_pointer(id);
+    });
 }
 
 /// `__ui_text_step(node, index, forward, word)` — the UTF-16 index of the
@@ -800,6 +833,9 @@ pub fn layout(root: &Node, width: f64, height: f64, scale_factor: f64) {
         stats.moved += pass.moved;
         let laid_out = with_tree(|tree| tree.generations().0);
         notify_offsets();
+        // Content that moved under a still pointer moves the hover now.
+        let hover = with_tree(|tree| tree.refresh_hover(id));
+        run_route(id, hover);
         for (handler, size) in with_tree(UiTree::take_resize_notices) {
             RESIZED.with(|resized| resized.set(size));
             handler.call();
@@ -904,7 +940,10 @@ pub fn frame_number(window: u32, which: i32) -> f64 {
 pub(crate) fn dispatch(root: &Node, raw: &RawEvent) {
     let input = match raw.kind {
         raw_input::POINTER_MOVED => Input::PointerMoved(position(raw)),
-        raw_input::POINTER_PRESSED if raw.numbers[2] == 0.0 => Input::Pressed(position(raw)),
+        raw_input::POINTER_PRESSED if raw.numbers[2] == 0.0 => Input::Pressed {
+            position: position(raw),
+            time: Duration::from_secs_f64(raw.numbers[4].max(0.0) / 1000.0),
+        },
         raw_input::POINTER_RELEASED if raw.numbers[2] == 0.0 => Input::Released(position(raw)),
         raw_input::POINTER_LEFT => Input::PointerLeft,
         raw_input::SCROLLED => Input::Scrolled {
@@ -978,14 +1017,19 @@ pub fn deliver(root: &Node, kind: i32, a: f64, b: f64, c: f64, d: f64, e: f64, t
 }
 
 /// `__ui_node_number(node, which)` — the element's box from the last layout,
-/// in dp: x (0), y (1), width (2), height (3).
+/// in dp: x (0), y (1), width (2), height (3); and down the part its children
+/// are drawn in (its padding box): the padding above its content box (4), the
+/// content box's height (5), the padding below it (6).
 pub fn node_number(node: &Node, which: i32) -> f64 {
-    let bounds = with_tree(|tree| tree.bounds(node.id()));
+    let (bounds, inner) = with_tree(|tree| (tree.bounds(node.id()), tree.inner_box(node.id())));
     f64::from(match which {
         0 => bounds.left(),
         1 => bounds.top(),
         2 => bounds.size.width,
         3 => bounds.size.height,
+        4 => inner.padding_top,
+        5 => inner.content_height,
+        6 => inner.padding_bottom,
         _ => panic_with(&format!("{which} is not a `std::ui` box number")),
     })
 }
