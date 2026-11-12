@@ -9890,8 +9890,8 @@ fn ui_r9_a_reactive_child_is_a_value_a_helper_can_answer() {
 /// signal-bound attributes, a keyed list and a conditional can be built at the
 /// top of `main`, with no owner, and checks. (`MaybeSignal` would check here
 /// too since B737, but the native backend mints a context parameter per
-/// FUNCTION, not per instance — F36 — and refuses every static `.gap(dp(8))`
-/// reached from code with no owner; `native_differential`'s F36 pin holds
+/// FUNCTION, not per instance — F168 — and refuses every static `.gap(dp(8))`
+/// reached from code with no owner; `native_differential`'s F168 pin holds
 /// that gap.)
 #[test]
 fn ui_r9_a_bound_tree_needs_no_owner_at_the_top_of_main() {

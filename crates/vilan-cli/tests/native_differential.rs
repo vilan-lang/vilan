@@ -1772,7 +1772,7 @@ fn a_cell_around_a_bare_none_is_typed_by_its_annotation_on_both_backends() {
     }
 }
 
-/// F36, the reason `std::ui` keeps `Bindable` rather than `std::reactive`'s
+/// F168, the reason `std::ui` keeps `Bindable` rather than `std::reactive`'s
 /// `MaybeSignal` (the R9 lane's item 2): the context pass mints a hidden
 /// `Owner` parameter on a FUNCTION when one candidate of a dispatch inside it
 /// reads the owner — `MaybeSignal`'s reactive arm does — so the instance a
@@ -1781,10 +1781,10 @@ fn a_cell_around_a_bare_none_is_typed_by_its_annotation_on_both_backends() {
 /// program; JavaScript passes `undefined`; the native emitter refuses the call
 /// by name. Un-ignore when instances carry their own context needs.
 #[test]
-#[ignore = "F36: a static MaybeSignal argument reached through a generic function is refused natively"]
-fn f36_a_static_maybe_signal_through_a_generic_needs_no_owner_on_both_backends() {
+#[ignore = "F168: a static MaybeSignal argument reached through a generic function is refused natively"]
+fn f168_a_static_maybe_signal_through_a_generic_needs_no_owner_on_both_backends() {
     let staged = stage();
-    let file = "native_probe_f36_static_maybe_signal.vl";
+    let file = "native_probe_f168_static_maybe_signal.vl";
     std::fs::write(
         staged.join(file),
         concat!(

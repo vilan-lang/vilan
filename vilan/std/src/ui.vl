@@ -337,10 +337,10 @@ external fun ui_outline_text(index: i32, which: i32): str;
 /// Why not `MaybeSignal` itself (re-asked once B737 let the checker resolve a
 /// trait default's dispatch per call site): its reactive arm REQUIRES an owner,
 /// and the native backend mints a context parameter per FUNCTION, not per
-/// instance (F36) — every attribute method, and every function reaching one,
+/// instance (F168) — every attribute method, and every function reaching one,
 /// would declare an `Owner`, and a static `.gap(dp(8))` reached from code with no
 /// owner is refused natively though it checks. Every program would build its tree
-/// under `comp`. When F36 is gone the two can be one trait, and the remaining
+/// under `comp`. When F168 is gone the two can be one trait, and the remaining
 /// difference — a binding with no owner refused, instead of kept by its source — is
 /// the owner's call.
 export trait Bindable<T> {
