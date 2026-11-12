@@ -220,6 +220,20 @@ pub fn dispatch_fallbacks() -> Vec<(Id, Vec<Id>)> {
     FALLBACK_SITES.with(|sites| sites.borrow().clone())
 }
 
+/// The impls a selection of `member` under the bound `traits` reads, as
+/// indices into `program.implementations` in declaration order — the answer
+/// of M203's index ([`MemberImpls`]), the face its pins compare against a
+/// scan of every impl.
+pub fn impls_a_selection_reads(program: &Program, member: &str, traits: &[Id]) -> Vec<usize> {
+    program.member_impls().readable(member, traits).into_owned()
+}
+
+/// The impls that list `trait_id` in their `with` clause, as
+/// [`impls_a_selection_reads`]' index answers it.
+pub fn impls_implementing(program: &Program, trait_id: Id) -> Vec<usize> {
+    program.member_impls().implementing(trait_id).to_vec()
+}
+
 /// Empties this thread's [`dispatch_fallbacks`].
 pub fn reset_dispatch_fallbacks() {
     FALLBACK_SITES.with(|sites| sites.borrow_mut().clear());
@@ -336,9 +350,11 @@ fn trait_member_candidates(
     {
         candidates.push(declaration_id);
     }
-    for implementation in &program.implementations {
-        if implementation.trait_ids.contains(&trait_id)
-            && let Some(&member_id) = implementation.declarations.get(name)
+    // M203: the impls that list the trait, from the index, in declaration
+    // order — where every impl of the program was tested per call.
+    for &index in program.member_impls().implementing(trait_id) {
+        let implementation = &program.implementations[index];
+        if let Some(&member_id) = implementation.declarations.get(name)
             && scope.is_none_or(|file| {
                 program
                     .impl_admission
@@ -479,6 +495,90 @@ pub fn impl_members_for_bound(
 /// subject type, member, bound traits).
 pub(crate) type BoundSelectionKey = (Option<SourceId>, Type, String, Vec<Id>);
 
+/// The impls a selection of `member` under `traits` can read (M203): an impl
+/// that declares `member`, has a trait that declares it, or has one of
+/// `traits` among its own — [`impl_members_for_bound`]'s first filter,
+/// answered from two indices into `implementations` built once per program
+/// instead of tested against every impl per selection.
+#[derive(Debug)]
+pub(crate) struct MemberImpls {
+    /// Per member name, the impls that declare it or have a trait that does,
+    /// in declaration order.
+    /// (Owned names: a borrowed key would make `Program` invariant in its
+    /// source lifetime, which it is not.)
+    by_member: HashMap<Box<str>, Vec<usize>>,
+    /// Per trait, the impls that list it in their `with` clause, in
+    /// declaration order.
+    by_trait: HashMap<Id, Vec<usize>>,
+}
+
+impl MemberImpls {
+    pub(crate) fn build(program: &Program) -> Self {
+        let mut by_member: HashMap<Box<str>, Vec<usize>> = HashMap::default();
+        let mut by_trait: HashMap<Id, Vec<usize>> = HashMap::default();
+        // Indices arrive in increasing order, so a list already holding this
+        // impl ends with it.
+        let push = |list: &mut Vec<usize>, index: usize| {
+            if list.last() != Some(&index) {
+                list.push(index);
+            }
+        };
+        // The name is copied only the first time it is seen.
+        let push_member =
+            |by_member: &mut HashMap<Box<str>, Vec<usize>>, name: &str, index: usize| {
+                match by_member.get_mut(name) {
+                    Some(list) => push(list, index),
+                    None => {
+                        by_member.insert(Box::from(name), vec![index]);
+                    }
+                }
+            };
+        for (index, implementation) in program.implementations.iter().enumerate() {
+            for name in implementation.declarations.keys() {
+                push_member(&mut by_member, name, index);
+            }
+            for trait_id in &implementation.trait_ids {
+                push(by_trait.entry(*trait_id).or_default(), index);
+                if let Some(trait_) = program.traits.get(trait_id) {
+                    for name in trait_.declarations.keys() {
+                        push_member(&mut by_member, name, index);
+                    }
+                }
+            }
+        }
+        Self {
+            by_member,
+            by_trait,
+        }
+    }
+
+    /// The impls that list `trait_id` in their `with` clause, in declaration
+    /// order.
+    fn implementing(&self, trait_id: Id) -> &[usize] {
+        self.by_trait.get(&trait_id).map_or(&[], Vec::as_slice)
+    }
+
+    /// The impls a selection of `member` under `traits` reads, in
+    /// declaration order.
+    fn readable(&self, member: &str, traits: &[Id]) -> std::borrow::Cow<'_, [usize]> {
+        let by_member = self.by_member.get(member).map_or(&[][..], Vec::as_slice);
+        let mut by_traits = traits
+            .iter()
+            .filter_map(|trait_id| self.by_trait.get(trait_id))
+            .peekable();
+        if by_traits.peek().is_none() {
+            return std::borrow::Cow::Borrowed(by_member);
+        }
+        let mut readable: Vec<usize> = by_member.to_vec();
+        for list in by_traits {
+            readable.extend_from_slice(list);
+        }
+        readable.sort_unstable();
+        readable.dedup();
+        std::borrow::Cow::Owned(readable)
+    }
+}
+
 /// [`impl_members_for_bound`]'s selection itself.
 fn impl_members_for_bound_uncached(
     program: &Program,
@@ -495,30 +595,27 @@ fn impl_members_for_bound_uncached(
         (Type::Struct(a, _), Type::Struct(b, _)) | (Type::Enum(a, _), Type::Enum(b, _)) => a == b,
         (a, b) => a == b,
     };
-    let mut matching: Vec<&crate::analyzer::Implementation> = program
-        .implementations
+    // M103: the impls this selection can READ, before the subject test that
+    // costs a recursive bound proof per blanket impl. A matching impl
+    // contributes to the answer in exactly two ways: a member it declares
+    // under `member`'s name, or one its traits declare (the inherited defaults
+    // below) — and, through `traits`, it decides whether the narrowing below
+    // finds anything. An impl that does none of the three changes nothing
+    // whether it matches or not, so it is never asked. The answer is the same
+    // list in the same order; what moves is the count of `subject_applies`
+    // calls, which grew with every blanket impl std added (maps-45's map and
+    // set operators took a kolt `check` from 24.3G instructions to 29.1G, 7.0G
+    // of it here).
+    //
+    // M203: and those impls come from an index rather than a scan. Testing
+    // every impl's member and traits was most of an unmemoized selection
+    // (a string hash per block, std's hundreds of blocks), and M203's
+    // per-call-site dispatch entries ask for more selections than before.
+    // The index answers the same predicate in declaration order.
+    let readable = program.member_impls().readable(member, traits);
+    let mut matching: Vec<&crate::analyzer::Implementation> = readable
         .iter()
-        // M103: the impls this selection can READ, before the subject test
-        // that costs a recursive bound proof per blanket impl. A matching impl
-        // contributes to the answer in exactly two ways: a member it declares
-        // under `member`'s name, or one its traits declare (the inherited
-        // defaults below) — and, through `traits`, it decides whether the
-        // narrowing below finds anything. An impl that does none of the three
-        // changes nothing whether it matches or not, so it is never asked. The
-        // answer is the same list in the same order; what moves is the count
-        // of `subject_applies` calls, which grew with every blanket impl std
-        // added (maps-45's map and set operators took a kolt `check` from
-        // 24.3G instructions to 29.1G, 7.0G of it here).
-        .filter(|implementation| {
-            implementation.declarations.contains_key(member)
-                || implementation.trait_ids.iter().any(|trait_id| {
-                    traits.contains(trait_id)
-                        || program
-                            .traits
-                            .get(trait_id)
-                            .is_some_and(|trait_| trait_.declarations.contains_key(member))
-                })
-        })
+        .map(|index| &program.implementations[*index])
         // B318 S4: the per-importer namespace, applied BEFORE the subject test,
         // which costs a bound proof — the one that says whether this file may
         // see the block at all. M147: after the member filter above, not
@@ -716,27 +813,44 @@ fn resolve_through(
 /// functions are taken as values, and every function's incoming calls — from
 /// graph nodes and from top-level code. A function of the program and the
 /// graph it is asked with, never of the sites.
-struct RefineIndex {
+///
+/// The context pass reads the same incoming calls for its own walk-back, so
+/// it builds this once and hands it over ([`refined_edges_over`]) where the
+/// refinement used to rebuild it beside the pass's own copy (M203).
+pub(crate) struct RefineIndex {
     /// The functions whose entries cannot be enumerated because they are
-    /// taken as a value (called indirectly).
+    /// taken as a value (called indirectly): every function some entity names
+    /// outside the subject of a wired call ([`Self::value_taken`]).
     value_taken: HashSet<Id>,
     /// Incoming direct calls per function: (calling node, call).
-    incoming_calls: HashMap<Id, Vec<(Id, Id)>>,
+    pub(crate) incoming_calls: HashMap<Id, Vec<(Id, Id)>>,
     /// Incoming calls per function from code no graph node owns.
-    top_level_incoming: HashMap<Id, Vec<Id>>,
+    pub(crate) top_level_incoming: HashMap<Id, Vec<Id>>,
     /// Every call some graph node makes — what tells a top-level call from a
     /// node's.
-    node_owned_calls: HashSet<Id>,
+    pub(crate) node_owned_calls: HashSet<Id>,
+    /// Whether every call the graph lists is listed once, under one node. Then
+    /// no call repeats in `incoming_calls` — and none of them is top-level,
+    /// whose calls are each listed once by construction — so a level's direct
+    /// and top-level entries are distinct calls.
+    calls_owned_once: bool,
 }
 
 impl RefineIndex {
     fn build(program: &Program, graph: &CallGraph) -> Self {
+        Self::with_value_taken(program, graph, Self::value_taken(program))
+    }
+
+    /// The functions some entity names as a VALUE: an `Expr::Local` naming
+    /// a function that is not the subject of a call in `function_calls`.
+    /// (The context pass answers it from its own scan of the entity map.)
+    fn value_taken(program: &Program) -> HashSet<Id> {
         let call_subject_entities: HashSet<Id> = program
             .function_calls
             .values()
             .map(|call| call.subject_id)
             .collect();
-        let value_taken: HashSet<Id> = program
+        program
             .entity_map
             .iter()
             .filter_map(|(entity_id, expr)| match expr {
@@ -748,12 +862,23 @@ impl RefineIndex {
                 }
                 _ => None,
             })
-            .collect();
+            .collect()
+    }
+
+    /// The index over `graph`, with `value_taken` as [`Self::value_taken`]
+    /// answers it — a caller that scanned the entity map already passes its
+    /// answer in.
+    pub(crate) fn with_value_taken(
+        program: &Program,
+        graph: &CallGraph,
+        value_taken: HashSet<Id>,
+    ) -> Self {
         let mut node_owned_calls: HashSet<Id> = HashSet::default();
+        let mut calls_owned_once = true;
         let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
         for node in graph.nodes() {
             for call in graph.calls_of(node.id()) {
-                node_owned_calls.insert(call.call_id);
+                calls_owned_once &= node_owned_calls.insert(call.call_id);
                 if let CallTarget::Function(target) = call.target {
                     incoming_calls
                         .entry(target)
@@ -779,6 +904,7 @@ impl RefineIndex {
             incoming_calls,
             top_level_incoming,
             node_owned_calls,
+            calls_owned_once,
         }
     }
 }
@@ -831,29 +957,51 @@ impl DispatchEntries {
             }
         }
 
-        let call_of_subject: HashMap<Id, Id> = program
-            .function_calls
-            .iter()
-            .map(|(call_id, call)| (call.subject_id, *call_id))
-            .collect();
+        // Every dispatch record outside the listed sites, as the call it
+        // belongs to: itself (a method call, a `for` loop's `next`, an
+        // operator) or the call its subject heads. A record whose own key the
+        // sites account for is passed over first (M203), which leaves the
+        // subject-keyed ones to map to their calls — almost none, so the
+        // `function_calls` scan that maps them is usually skipped outright.
+        let mut unlisted_calls: Vec<Id> = Vec::new();
+        let mut unlisted_subjects: Vec<Id> = Vec::new();
+        for &key in program
+            .generic_dispatch
+            .keys()
+            .chain(program.dyn_method_calls.keys())
+            .chain(program.concat_render_dispatch.keys())
+        {
+            if accounted.contains(&key) {
+                continue;
+            }
+            if program.function_calls.contains_key(&key) {
+                unlisted_calls.push(key);
+            } else {
+                unlisted_subjects.push(key);
+            }
+        }
+        if !unlisted_subjects.is_empty() {
+            // The LAST call with each subject, as a map collected over every
+            // call answers.
+            let subjects: HashSet<Id> = unlisted_subjects.iter().copied().collect();
+            let mut call_of_subject: HashMap<Id, Id> = HashMap::default();
+            for (call_id, call) in &program.function_calls {
+                if subjects.contains(&call.subject_id) {
+                    call_of_subject.insert(call.subject_id, *call_id);
+                }
+            }
+            unlisted_calls.extend(
+                unlisted_subjects
+                    .iter()
+                    .map(|subject| call_of_subject.get(subject).copied().unwrap_or(*subject)),
+            );
+        }
         // `candidates_of` is O(traits x implementations) and a function of
         // (the asking file's scope, the name) alone.
         let mut name_candidates: HashMap<(Option<SourceId>, &str), Vec<Id>> = HashMap::default();
         let mut unenumerable: HashSet<Id> = HashSet::default();
-        let record_keys = program
-            .generic_dispatch
-            .keys()
-            .chain(program.dyn_method_calls.keys())
-            .chain(program.concat_render_dispatch.keys());
-        for &key in record_keys {
-            // The call the record belongs to: itself (a method call, a `for`
-            // loop's `next`, an operator) or the call its subject heads.
-            let call = if program.function_calls.contains_key(&key) {
-                key
-            } else {
-                call_of_subject.get(&key).copied().unwrap_or(key)
-            };
-            if accounted.contains(&key) || accounted.contains(&call) {
+        for call in unlisted_calls {
+            if accounted.contains(&call) {
                 continue;
             }
             let name = match program.dyn_method_calls.get(&call) {
@@ -915,7 +1063,21 @@ pub fn refined_edges(
     sites: &[DispatchSite],
 ) -> Vec<RefinedEdge> {
     let started = crate::PhaseClock::now();
-    let edges = refined_edges_timed(program, graph, sites);
+    let edges = refined_edges_timed(program, graph, sites, None);
+    REFINE_TIME.with(|time| time.set(time.get() + started.elapsed()));
+    edges
+}
+
+/// [`refined_edges`] over an index the caller built for `program` and
+/// `graph` — the same edges, without building the index again.
+pub(crate) fn refined_edges_over(
+    program: &Program,
+    graph: &CallGraph,
+    sites: &[DispatchSite],
+    index: &RefineIndex,
+) -> Vec<RefinedEdge> {
+    let started = crate::PhaseClock::now();
+    let edges = refined_edges_timed(program, graph, sites, Some(index));
     REFINE_TIME.with(|time| time.set(time.get() + started.elapsed()));
     edges
 }
@@ -925,13 +1087,21 @@ fn refined_edges_timed(
     program: &Program,
     graph: &CallGraph,
     sites: &[DispatchSite],
+    given: Option<&RefineIndex>,
 ) -> Vec<RefinedEdge> {
     // Most programs dispatch nothing; skip the program-wide scans then.
     if sites.is_empty() {
         return Vec::new();
     }
-    let index = RefineIndex::build(program, graph);
-    let dispatch_entries = DispatchEntries::build(program, sites, &index);
+    let built;
+    let index = match given {
+        Some(index) => index,
+        None => {
+            built = RefineIndex::build(program, graph);
+            &built
+        }
+    };
+    let dispatch_entries = DispatchEntries::build(program, sites, index);
     let mut bound_site_selections: HashMap<usize, Option<HashSet<Id>>> = HashMap::default();
 
     let mut edges: Vec<RefinedEdge> = Vec::new();
@@ -1072,20 +1242,24 @@ fn refined_edges_timed(
         let mut visited: HashSet<(Id, TypeId, Rc<[Id]>)> = HashSet::default();
         let mut walk: Vec<(Id, TypeId, Rc<[Id]>)> = vec![(root, constraint, Rc::from(path))];
         let mut fell_back_at_site = false;
+        // Per-level scratch, reused across the walk's levels.
+        let mut dispatched: Vec<(RefinedCaller, Id, bool)> = Vec::new();
+        let mut entered_at: HashSet<Id> = HashSet::default();
         let mut site_fallback = |edges: &mut Vec<RefinedEdge>| {
             if !std::mem::replace(&mut fell_back_at_site, true) {
                 union_fallback(edges);
             }
         };
-        while let Some((function, constraint, via)) = walk.pop() {
-            if visited.contains(&(function, constraint, via.clone())) {
+        while let Some(level) = walk.pop() {
+            if visited.contains(&level) {
                 continue;
             }
             if visited.len() >= MAX_LEVELS {
                 site_fallback(&mut edges);
                 break;
             }
-            visited.insert((function, constraint, via.clone()));
+            let (function, constraint, via) = level.clone();
+            visited.insert(level);
             if index.value_taken.contains(&function)
                 || dispatch_entries.unenumerable.contains(&function)
             {
@@ -1109,33 +1283,41 @@ fn refined_edges_timed(
                 .into_iter()
                 .flatten()
                 .map(|call| (RefinedCaller::TopLevel, *call, false));
-            let dispatched: Vec<(RefinedCaller, Id, bool)> = dispatch_entries
-                .enumerated
-                .get(&function)
-                .into_iter()
-                .flatten()
-                .filter(|site_index| {
-                    bound_site_selections
-                        .entry(**site_index)
-                        .or_insert_with(|| {
-                            bound_site_selection(
-                                program,
-                                graph,
-                                &index,
-                                &dispatch_entries,
-                                sites,
-                                **site_index,
-                            )
-                        })
-                        .as_ref()
-                        .is_none_or(|selection| selection.contains(&function))
-                })
-                .map(|site_index| (sites[*site_index].owner, sites[*site_index].call, true))
-                .collect();
-            let mut entered_at: HashSet<Id> = HashSet::default();
-            for (caller, entry_call, through_dispatch) in direct.chain(top_level).chain(dispatched)
+            dispatched.clear();
+            dispatched.extend(
+                dispatch_entries
+                    .enumerated
+                    .get(&function)
+                    .into_iter()
+                    .flatten()
+                    .filter(|site_index| {
+                        bound_site_selections
+                            .entry(**site_index)
+                            .or_insert_with(|| {
+                                bound_site_selection(
+                                    program,
+                                    graph,
+                                    index,
+                                    &dispatch_entries,
+                                    sites,
+                                    **site_index,
+                                )
+                            })
+                            .as_ref()
+                            .is_none_or(|selection| selection.contains(&function))
+                    })
+                    .map(|site_index| (sites[*site_index].owner, sites[*site_index].call, true)),
+            );
+            // A call is entered once. Direct and top-level entries cannot
+            // repeat one when no call has two owners in the graph
+            // (`RefineIndex::calls_owned_once`), so a level without dispatch
+            // entries — nearly every level — skips the set (M203).
+            let check_repeats = !dispatched.is_empty() || !index.calls_owned_once;
+            entered_at.clear();
+            for (caller, entry_call, through_dispatch) in
+                direct.chain(top_level).chain(dispatched.iter().copied())
             {
-                if !entered_at.insert(entry_call) {
+                if check_repeats && !entered_at.insert(entry_call) {
                     continue;
                 }
                 let bindings = program.method_call_substitution.get(&entry_call);
@@ -1251,9 +1433,56 @@ fn bound_site_selection(
         return None;
     };
     let root = extend_hand_off_path(program, graph, &mut Vec::new(), owner)?;
+    let types = instantiation_types(
+        program,
+        graph,
+        index,
+        dispatch_entries,
+        sites,
+        root,
+        constraint,
+    )?;
     let constraint_traits = bound_traits(program, constraint);
     let file = program.admitting_file(site.call);
     let mut selection: HashSet<Id> = HashSet::default();
+    for resolved in types {
+        let selected = impl_members_for_bound(program, file, resolved, member, &constraint_traits);
+        if selected.is_empty() {
+            return None;
+        }
+        selection.extend(selected);
+    }
+    Some(selection)
+}
+
+/// The types `constraint` is instantiated with across every entry of
+/// `root` — forwarded through callers' own parameters, as
+/// [`bound_site_selection`] reads them — one id per distinct RESOLVED type,
+/// or `None` when some entry does not say (an unenumerable level, an opaque
+/// binding, a forwarding level no function encloses, an id with no resolved
+/// type).
+///
+/// M203: a bounded site in a generic std body is entered once per call of
+/// that body, program-wide (genapp:46: 56,552 entries over its four
+/// refinements), for a handful of distinct types, and each entry used to run
+/// a selection — building [`impl_members_for_bound`]'s owned memo key (a
+/// `Type` clone, the member, the traits) to read an answer it already had.
+/// Keeping one id per resolved `Type` is exact for the reason `refined_edges`'
+/// `selection_memo` is: [`impl_members_for_bound`] reads the id only through
+/// its resolved type, and within one site the file, the member and the
+/// traits are fixed. Walking first and selecting after also skips every
+/// selection of a site the walk answers `None` for.
+fn instantiation_types(
+    program: &Program,
+    graph: &CallGraph,
+    index: &RefineIndex,
+    dispatch_entries: &DispatchEntries,
+    sites: &[DispatchSite],
+    root: Id,
+    constraint: TypeId,
+) -> Option<Vec<TypeId>> {
+    let mut types: Vec<TypeId> = Vec::new();
+    let mut seen: HashSet<&Type> = HashSet::default();
     let mut visited: HashSet<(Id, TypeId)> = HashSet::default();
     let mut walk: Vec<(Id, TypeId)> = vec![(root, constraint)];
     while let Some((function, constraint)) = walk.pop() {
@@ -1287,12 +1516,11 @@ fn bound_site_selection(
             let bindings = program.method_call_substitution.get(&entry_call);
             match resolve_through(program, bindings, constraint) {
                 Resolution::Concrete(resolved) => {
-                    let selected =
-                        impl_members_for_bound(program, file, resolved, member, &constraint_traits);
-                    if selected.is_empty() {
-                        return None;
+                    // An id with no resolved type selects nothing, which is
+                    // `impl_members_for_bound`'s own answer for it.
+                    if seen.insert(program.type_id_to_type_map.get(&resolved)?) {
+                        types.push(resolved);
                     }
-                    selection.extend(selected);
                 }
                 Resolution::Parameter(parameter) => {
                     let RefinedCaller::Node(node) = caller else {
@@ -1305,5 +1533,5 @@ fn bound_site_selection(
             }
         }
     }
-    Some(selection)
+    Some(types)
 }

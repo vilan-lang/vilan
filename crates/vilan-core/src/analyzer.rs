@@ -79430,6 +79430,10 @@ pub struct Program<'src> {
     /// every pass that refines dispatch (M97). Derived data, like the graph.
     bound_selection_memo:
         std::sync::Mutex<HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>,
+    /// The impls each [`crate::dispatch_refine::impl_members_for_bound`]
+    /// selection can read, by member name and by trait (M203). Derived data,
+    /// like the graph.
+    member_impls: std::sync::OnceLock<crate::dispatch_refine::MemberImpls>,
     /// [`crate::impl_select`]'s answers — which impls apply to a type (M98),
     /// the bound proofs under them and the arguments a type provides a trait at
     /// (M111). Derived data, like the graph.
@@ -79989,6 +79993,12 @@ impl<'src> Program<'src> {
         self.receiver_dispatch_memo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`crate::dispatch_refine::MemberImpls`], built on first use.
+    pub(crate) fn member_impls(&self) -> &crate::dispatch_refine::MemberImpls {
+        self.member_impls
+            .get_or_init(|| crate::dispatch_refine::MemberImpls::build(self))
     }
 
     /// [`crate::dispatch_refine::impl_members_for_bound`]'s memo (M97). A
@@ -94503,6 +94513,7 @@ fn analyze_over_world<'src>(
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
         bound_selection_memo: std::sync::Mutex::default(),
+        member_impls: std::sync::OnceLock::new(),
         selection_memos: crate::impl_select::SelectionMemos::default(),
         trait_subject_memo: std::sync::Mutex::default(),
         trait_method_memo: std::sync::Mutex::default(),
