@@ -457,7 +457,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 305,
+        total, 310,
         "the total number of `Shared` construction sites in std changed"
     );
 
