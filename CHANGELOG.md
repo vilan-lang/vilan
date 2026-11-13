@@ -35,6 +35,11 @@ written down.
 
 ---
 
+<!-- family: feature -->
+**`std::ui::kit::virtual_list` takes rows of differing heights, and lists past four million dp (F174).** `virtual_list(source, estimated(dp(48)), key, render)` (and `virtual_list_by`) lays each row out at its own height: a built row is measured when it lays out at a new size, the rows not yet built are guessed at the measured rows' mean (the estimate until one is measured), and where a row starts and which row an offset falls in are answered in O(log n) by two Fenwick trees kept in step with a `ListCell`'s operations and a plain signal's whole lists (heights carried over by key). What the viewport shows does not jump: the offset is anchored in the same layout to the first row whose top edge is in the viewport (the row that followed a removed anchor keeps its place; the top stays the top and the end stays the end), and `reveal`/`reveal_key` of a row never measured end with that row's top or bottom edge where `reveal` meant it once it is measured. A list taller than 4,194,304 dp lays its column out relative to a base kept in `f64`, so ten million rows of 32 dp scroll, click and meet to the pixel, fixed or estimated. New: `estimated`, `RowExtent`, `VirtualList::scrolled`, `range`, `row_top`, `row_at`, `FrameTimes::passes`. A fixed extent's behaviour is unchanged. Also fixed natively: a literal handed to a closure value took the call's result type (`half(3)` with `half: |i32| f64` emitted `3.0f64`).
+
+---
+
 <!-- family: fix -->
 **Native: `ListCell::peek`, `HashMapCell::peek`, `HashSetCell::peek` and `Weak::get` build (B739).** The native backend refused the `WeakGet` intrinsic by name, so every `peek` was a JavaScript-only read. `weak.get()` is now a view of the cell's value, not a copy: the cell is pinned and its value lent for the statement that reads the view (a `match` subject's whole match), and a write of the cell inside that extent is the runtime's reentrancy stop, as a read inside `update` is. `vilan/examples/ui-virtual-list` reads its list in place with `peek` again.
 

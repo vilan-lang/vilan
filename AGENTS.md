@@ -195,7 +195,12 @@ Rust workspace, seventeen crates, plus the language's own tree:
   a cell of its items); what it needed from the host is `on_resize` (told after a layout, and
   `__ui_layout` lays out again when a handler changed the tree), an offset kept unclamped while
   a layout is pending (`ScrollState::measured_at`), and Tab's reveal of an element with no box
-  yet waiting for the next layout (`pending_reveal`). POINTER CAPTURE (F172, `ui/input.rs`'s
+  yet waiting for the next layout (`pending_reveal`). Its ESTIMATED form (F174) measures each
+  built row by its solver height before snapping (`__ui_node_number(node, 7)`), keeps the heights
+  in `ui/kit/heights.vl` (two Fenwick trees, unmeasured rows at the measured mean), anchors the
+  offset by `lists.vl`'s `Hold` rule, and past 4,194,304 dp lays the column out relative to a base
+  kept in `f64` so no box carries a large `f32`; its exit test is the example's `--varied` mode
+  (`tests/ui/virtual-list-varied-check.txt`). POINTER CAPTURE (F172, `ui/input.rs`'s
   module doc is the rule): the press's target (`UiTree::pressed`) gets every move and the release
   until the button comes up; `pressed` holds on its chain, `hovered` stays geometric, the click is
   decided by where the release lands; removal and `release_pointer` end it. Presses in a row are

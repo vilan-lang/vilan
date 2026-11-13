@@ -8,6 +8,7 @@
 #   vilan run --backend rust . -- --smoke                a line per frame
 #   vilan run --backend rust . -- --check --font <ttf>   the tree without a window
 #   vilan run --backend rust . -- --measure --font <ttf> its costs without a window
+#   vilan run --backend rust . -- --varied               rows of differing heights
 #
 # The window needs a GPU adapter (any Vulkan, Metal, DirectX 12 or OpenGL
 # driver, or Mesa's software Vulkan) and, on Linux, an X11 or Wayland session.

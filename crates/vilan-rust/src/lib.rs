@@ -16315,14 +16315,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .map(|type_id| self.concrete(type_id))
             .and_then(|type_id| self.type_entry(&type_id))
             .cloned();
-        let views = match callee {
+        let views = match &callee {
             // F119: a binding of a function ITEM's own type (`let b = bump;`)
             // calls the item's closure, whose parameters take the item's
             // receiving forms ([`Self::function_item_type`]).
             Some(Type::Function(function_id)) => self
                 .program
                 .functions
-                .get(&function_id)
+                .get(function_id)
                 .map(|function| function.parameters.clone())
                 .unwrap_or_default()
                 .iter()
@@ -16335,8 +16335,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     }
                 })
                 .collect(),
-            Some(type_) => self.program.closure_parameter_views(&type_),
+            Some(type_) => self.program.closure_parameter_views(type_),
             None => Vec::new(),
+        };
+        // Each argument is rendered against ITS parameter's type, never the
+        // expectation around the call: `let x = half(3)` with `half: |i32|
+        // f64` emitted `half(3.0f64)` — the literal took the call's `f64`
+        // result type — and rustc refused it.
+        let parameter_types: Vec<TypeId> = match &callee {
+            Some(Type::Closure(parameters, _, _, _)) => parameters.clone(),
+            _ => Vec::new(),
         };
         // F?1 (Order 53, F129's order through a closure VALUE): a copy out of a
         // captured binding's cell that a later argument may write is taken
@@ -16367,19 +16375,24 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.program.entity_map.get(argument),
                 Some(Expr::Reference(_, _))
             );
+            let saved_expected =
+                std::mem::replace(&mut self.expected_type, parameter_types.get(index).copied());
             let text = match views.get(index).copied().flatten() {
-                Some(_) if already_a_reference => self.expression(*argument, depth)?,
-                Some(true) => {
-                    let place = self.mutable_place(*argument, depth)?;
-                    if self.names_a_mutable_loan(*argument) {
-                        format!("&mut *{place}")
-                    } else {
-                        format!("&mut {place}")
+                Some(_) if already_a_reference => self.expression(*argument, depth),
+                Some(true) => match self.mutable_place(*argument, depth) {
+                    Ok(place) if self.names_a_mutable_loan(*argument) => {
+                        Ok(format!("&mut *{place}"))
                     }
-                }
-                Some(false) => format!("&{}", self.expression(*argument, depth)?),
-                None => self.consumed_value_of(*argument, depth)?,
+                    Ok(place) => Ok(format!("&mut {place}")),
+                    Err(error) => Err(error),
+                },
+                Some(false) => self
+                    .expression(*argument, depth)
+                    .map(|text| format!("&{text}")),
+                None => self.consumed_value_of(*argument, depth),
             };
+            self.expected_type = saved_expected;
+            let text = text?;
             if defers_a_copy[index] {
                 let name = format!("__copied{index}");
                 let _ = write!(deferred_copies, "let {name} = {text}; ");

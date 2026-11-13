@@ -2316,6 +2316,9 @@ export struct FrameTimes {
 	moved: i32,
 	/// Elements whose scene was rebuilt.
 	rebuilt: i32,
+	/// Layout passes the last layout ran: 1, and one more each time its resize and
+	/// offset handlers changed the tree (8 at most).
+	passes: i32,
 }
 
 /// The last layout and paint, and `window`'s last draw.
@@ -2329,6 +2332,7 @@ export fun last_frame(window: Window): FrameTimes {
 		measured = ui_frame_number(id, 4).as_i32(),
 		moved = ui_frame_number(id, 5).as_i32(),
 		rebuilt = ui_frame_number(id, 6).as_i32(),
+		passes = ui_frame_number(id, 7).as_i32(),
 	}
 }
 

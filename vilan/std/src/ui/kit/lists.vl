@@ -3,14 +3,14 @@
 // viewport, however long its source is.
 //
 // THE SHAPE. A `scroll` over one column. The column is as tall as every row would
-// be (the count times the row extent), so the scroll's range — and a scrollbar
-// drawn from it — is the whole list's; its top padding is the height of the rows
-// above the window, so the rows it holds sit where they would in the whole list.
-// The rows it holds are the WINDOW: the rows the viewport shows, and `overscan`
-// more on each side. They are an ordinary keyed run (`each`, or `each_by`) over the
-// window's items, so a row that stays in the window is the same element — its
-// hover, press and focus stay with it — and a row that leaves is removed, its owner
-// disposed and its handlers dropped, as any keyed row is.
+// be, so the scroll's range — and a scrollbar drawn from it — is the whole list's;
+// its top padding is the height of the rows above the window, so the rows it holds
+// sit where they would in the whole list. The rows it holds are the WINDOW: the
+// rows the viewport shows, and `overscan` more on each side. They are an ordinary
+// keyed run (`each`, or `each_by`) over the window's items, so a row that stays in
+// the window is the same element — its hover, press and focus stay with it — and a
+// row that leaves is removed, its owner disposed and its handlers dropped, as any
+// keyed row is.
 //
 // WHAT MOVES THE WINDOW: the offset (the wheel, Tab's reveal, `reveal`, the
 // program's own offset cell), the viewport's height (`on_resize`, told after a
@@ -19,10 +19,28 @@
 // a source without one (a `SignalCell<List<T>>`) by its whole list per change. An
 // op outside the window changes the column's height and nothing else.
 //
-// THE EXTENT is fixed and given by the app, in dp: every row is laid out at that
-// height (`height(extent)` on the element the render answers). That is what makes
-// the window arithmetic — which rows the offset shows, where row `i` is — exact and
-// free of layout, for a list of any length.
+// THE EXTENT, FIXED (a `Dp`): every row is laid out at that height (`height(..)`
+// on the element the render answers). The window arithmetic — which rows the
+// offset shows, where row `i` is — is then exact and free of layout, for a list of
+// any length.
+//
+// THE EXTENT, ESTIMATED (`estimated(..)`): rows lay out at their own height, and
+// each built row is measured (a resize notice per row, its height as the solver
+// gave it). `RowHeights` (`heights.vl`) keeps a height per measured row and an
+// estimate for the rest, and answers where a row starts and which row an offset
+// falls in, in O(log n). A measured height that differs from what was assumed, or a
+// change of the source above the viewport, would move what the viewport shows; the
+// list ANCHORS instead (see `Hold`): it moves the offset in the same layout so the
+// anchor row's top edge stays where it was on the screen.
+//
+// POSITIONS PAST `rebase_limit()` dp: the host lays boxes out in `f32`, which past
+// about four million dp cannot place a row to the pixel (and past 268 million not
+// to 32 dp). So the column's coordinates are relative to a BASE, a logical offset
+// the list keeps in `f64`: the rows above the base are not in the column at all,
+// the column's top padding is the rows between the base and the window, and the
+// scroll's own offset is the logical one minus the base. The base moves in steps of
+// `rebase_step()` as the window moves, so the column's numbers stay under four
+// steps. Below the limit the base is 0 and the column is the whole list, as it was.
 //
 // TAB. Tab and Shift+Tab inside the list build one row more on that side before
 // the focus moves, so the focus never leaves a list that has more rows to give it;
@@ -46,6 +64,8 @@ import pkg::compare::PartialEq;
 import pkg::debug::{ Location, caller };
 import pkg::gfx::{ Dp, KeyName, KeyPress, Point, Size, dp };
 import pkg::hash::Hashable;
+import pkg::hash_map::HashMap;
+import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::delta::{ CollInstance, live_ops };
 import pkg::reactive::{
 	RowFeed,
@@ -59,6 +79,7 @@ import pkg::reactive::{
 	subscriber_of,
 };
 import pkg::shared::Shared;
+import pkg::ui::kit::heights::{ RowHeights, row_heights };
 import pkg::ui::{
 	Attributes,
 	Child,
@@ -78,8 +99,51 @@ import pkg::ui::{
 /// `height`, `style`, `label` ...), and it is placed as any element is.
 export struct VirtualList<T, K> {
 	scroll: ScrollElement,
-	window: Window<T>,
-	key: |T| K,
+	window: Window<T, K>,
+}
+
+/// How tall a virtual list's rows are: a `Dp` (every row exactly that tall) or
+/// `estimated(..)` (each row its own height, measured when it is built).
+export trait RowExtent {
+	/// The height in dp, and whether every row is exactly that tall.
+	fun row_extent(self): (f64, bool);
+}
+
+export impl Dp with RowExtent {
+	fun row_extent(self): (f64, bool) {
+		(self.value(), true)
+	}
+}
+
+/// A row height that is a guess: see `estimated`.
+export struct Estimated {
+	extent: Dp,
+}
+
+export impl Estimated with RowExtent {
+	fun row_extent(self): (f64, bool) {
+		(self.extent.value(), false)
+	}
+}
+
+/// Rows of differing heights, guessed at `extent` each until they are measured:
+/// `virtual_list(source, estimated(dp(48)), key, render)`. A row lays out at its
+/// own height; once some rows are measured, the others are guessed at the measured
+/// rows' mean.
+export fun estimated(extent: Dp): Estimated {
+	Estimated { extent }
+}
+
+/// The total height past which the column's coordinates are relative to a base (the
+/// module comment): 2^22 dp, where an `f32` position's step reaches half a dp.
+fun rebase_limit(): f64 {
+	4194304.0
+}
+
+/// How far the base moves at a time, 2^18 dp: the column's coordinates stay under
+/// four of these, where an `f32` position's step is a sixteenth of a dp.
+fun rebase_step(): f64 {
+	262144.0
 }
 
 /// Where the window stands: the numbers the list's changes read and write.
@@ -91,7 +155,8 @@ struct Span {
 	viewport: f64,
 	padding_top: f64,
 	padding_bottom: f64,
-	/// How far the list is scrolled, in dp.
+	/// How far the list is scrolled, in dp: the LOGICAL offset, from the whole
+	/// list's top (the scroll's own offset is this minus `base`).
 	scrolled: f64,
 	/// One row more after (before) the window: Tab (Shift+Tab) inside the list,
 	/// until the offset next moves.
@@ -101,43 +166,190 @@ struct Span {
 	first: usize,
 	last: usize,
 	stale: bool,
-	/// The column's top padding and height as last set, in dp.
+	/// The column's top padding and height as last set, in dp (in the column's
+	/// coordinates, which start at `base`).
 	top: f64,
 	total: f64,
+	/// The logical offset of the column's top: 0 unless the list is taller than
+	/// `rebase_limit()`.
+	base: f64,
+	/// A `reveal` of row `revealed` still being held (estimated rows only): while
+	/// the rows it built are measured for the first time, each measurement puts the
+	/// row where the reveal put it — its top edge at the viewport's top
+	/// (`reveal_edge` 1), its bottom edge at the viewport's bottom (2), or, when
+	/// the reveal did not scroll (0), wherever it shows whole moving as little as
+	/// it takes. Any other change ends it: the offset moved by the wheel or the
+	/// program, an operation of the source, a measured row measured again.
+	revealing: bool,
+	revealed: usize,
+	reveal_edge: i32,
 }
 
 /// What a virtual list keeps between changes, shared by every copy of the list and
 /// by the handlers that change it.
-struct Window<T> {
+struct Window<T, K> {
 	/// The source's items, kept in step with its ops.
 	items: Shared<List<T>>,
 	span: Shared<Span>,
-	/// Every row's height, in dp.
+	/// Every row's height in dp (`exact`), or the estimate for a row not measured.
 	extent: f64,
-	/// The scroll's offset, bound both ways.
+	exact: bool,
+	/// The rows' heights, measured and estimated (not used when `exact`).
+	heights: Shared<RowHeights>,
+	key: |T| K,
+	/// The scroll's own offset, bound both ways: in the column's coordinates.
 	offset: SignalCell<Point>,
+	/// The logical offset, written whenever it moves: what `VirtualList::offset`
+	/// binds.
+	scrolled: SignalCell<Point>,
 	/// The window's items: the keyed run the column holds reads them.
 	shown: SignalCell<List<T>>,
 	column: Column,
 }
 
-impl Window<type T> {
-	/// Applies one of the source's ops to the kept items, and marks the window
-	/// stale when the op changed what it shows: a splice before its end (a splice
-	/// above it moves every row in it), a change in place inside it, any reset or
-	/// move.
-	fun apply(self, op: SeqOp<T>) {
+/// The ANCHOR, taken before a change and restored after it (estimated rows only).
+///
+/// THE RULE. At the very top (offset 0) there is no anchor: the list stays at the
+/// top, so a row inserted there shows. At the very bottom (the offset at its range,
+/// the list taller than the viewport) the anchor is the bottom edge: the list stays
+/// scrolled to its end. Otherwise the anchor is the first row whose top edge is
+/// inside the viewport — or, when no row starts inside it, the row across its top
+/// edge — and after the change that row's top edge is where it was on the screen.
+/// When the change removes the anchor, the row that followed it (or, at the end,
+/// the one before) takes its place and keeps ITS position on the screen. A row the
+/// source moves carries the anchor with it. A whole new list (a plain signal's
+/// change) finds the anchor again by its key, or keeps its index when the key is
+/// gone. A `reveal` still being held then puts its row where the reveal put it
+/// (`Span::revealing`).
+struct Hold {
+	top: bool,
+	bottom: bool,
+	anchor: usize,
+	/// The anchor's top edge on the screen: its position less the offset, in dp.
+	edge: f64,
+}
+
+impl Window<type T, type K: PartialEq + Hashable> {
+	/// Where row `index` starts, in dp from the whole list's top (`index` may be the
+	/// count: the whole list's height).
+	fun top_of(self, index: usize): f64 {
+		if self.exact {
+			index.as_f64() * self.extent
+		} else {
+			self.heights.write().top(index)
+		}
+	}
+
+	/// The whole list's height.
+	fun whole(self): f64 {
+		if self.exact {
+			self.items.write().len().as_f64() * self.extent
+		} else {
+			self.heights.write().total()
+		}
+	}
+
+	/// The row the logical offset `at` falls in, by the extent or the heights (the
+	/// last row for an offset past the end).
+	fun row_at(self, at: f64): usize {
+		let count = self.items.write().len();
+		if self.exact {
+			let index = (at / self.extent).floor().max(0.0).as_usize();
+			if count > 0 && index >= count {
+				count - 1
+			} else {
+				index
+			}
+		} else {
+			self.heights.write().index_at(at)
+		}
+	}
+
+	/// The anchor before a change (`Hold`'s rule); nothing to hold for exact rows.
+	fun hold(self): Hold {
+		let span = self.span.read();
+		let scrolled = span.scrolled;
+		let view = span.viewport;
+		let count = self.items.write().len();
+		if self.exact || count == 0 || scrolled <= 0.0 {
+			ret Hold { top = true, bottom = false, anchor = 0, edge = 0.0 };
+		}
+		let range = self.whole() - view;
+		if view > 0.0 && range > 0.0 && scrolled >= range - 0.5 {
+			ret Hold { top = false, bottom = true, anchor = 0, edge = 0.0 };
+		}
+		mut anchor = self.row_at(scrolled);
+		if view > 0.0
+			&& self.top_of(anchor) < scrolled
+			&& anchor + 1 < count
+			&& self.top_of(anchor + 1) < scrolled + view {
+			anchor += 1;
+		}
+		Hold { top = false, bottom = false, anchor, edge = self.top_of(anchor) - scrolled }
+	}
+
+	/// A splice of the source moves the anchor (before the rows change): the rule's
+	/// case for a removed anchor reads the rows as they still are.
+	fun hold_splice(self, held: Hold, at: usize, removed: usize, inserted: usize): Hold {
+		if held.top || held.bottom {
+			ret held;
+		}
+		let anchor = held.anchor;
+		if at + removed <= anchor {
+			ret Hold {
+				top = false,
+				bottom = false,
+				anchor = anchor - removed + inserted,
+				edge = held.edge,
+			};
+		}
+		if at > anchor {
+			ret held;
+		}
+		let count = self.items.write().len();
+		let anchor_top = self.top_of(anchor);
+		if at + removed < count {
+			// The row after the removed run keeps its place on the screen.
+			let edge = held.edge + self.top_of(at + removed) - anchor_top;
+			Hold { top = false, bottom = false, anchor = at + inserted, edge }
+		} else if inserted > 0 {
+			// Nothing followed: the first inserted row starts where the run did.
+			let edge = held.edge + self.top_of(at) - anchor_top;
+			Hold { top = false, bottom = false, anchor = at, edge }
+		} else if at > 0 {
+			let edge = held.edge + self.top_of(at - 1) - anchor_top;
+			Hold { top = false, bottom = false, anchor = at - 1, edge }
+		} else {
+			Hold { top = true, bottom = false, anchor = 0, edge = 0.0 }
+		}
+	}
+
+	/// Applies one of the source's ops to the kept items (and heights), and marks
+	/// the window stale when the op changed what it shows: a splice before its end
+	/// (a splice above it moves every row in it), a change in place inside it, any
+	/// reset or move. Answers the anchor, moved with the rows.
+	fun apply(self, op: SeqOp<T>, held: Hold): Hold {
+		mut hold = held;
+		self.span.write().revealing = false;
 		match op {
 			SeqOp::Splice(let at, let removed, let inserted) => {
+				if !self.exact {
+					hold = self.hold_splice(held, at, removed.len(), inserted.len());
+				}
 				mut taken = 0;
 				for taken < removed.len() {
 					let _gone = self.items.write().remove(at);
 					taken += 1;
 				}
+				mut unmeasured: List<f64> = [];
 				mut offset = 0;
 				for item in inserted {
 					self.items.write().insert(at + offset, item);
+					unmeasured.push(-1.0);
 					offset += 1;
+				}
+				if !self.exact {
+					self.heights.write().splice(at, removed.len(), unmeasured);
 				}
 				if at < self.span.read().last {
 					self.span.write().stale = true;
@@ -151,10 +363,17 @@ impl Window<type T> {
 				}
 			},
 			SeqOp::Reset(let items) => {
+				if !self.exact {
+					hold = self.reset_heights(held, items);
+				}
 				self.items.write() = items;
 				self.span.write().stale = true;
 			},
 			SeqOp::Move(let from, let count, let to) => {
+				if !self.exact {
+					hold.anchor = moved_index(held.anchor, from, count, to);
+					self.heights.write().move_rows(from, count, to);
+				}
 				mut lifted: List<T> = [];
 				mut taken = 0;
 				for taken < count {
@@ -169,24 +388,198 @@ impl Window<type T> {
 				self.span.write().stale = true;
 			},
 		}
+		hold
+	}
+
+	/// A whole new list: the heights measured for a key carry over to the new row
+	/// of that key, and the anchor is found again by its key (or keeps its index).
+	/// A held reveal ends.
+	fun reset_heights(self, held: Hold, items: List<T>): Hold {
+		let count = self.items.write().len();
+		mut known: HashMap<K, f64> = HashMap::new();
+		mut index: usize = 0;
+		for index < count {
+			if self.heights.write().known(index) {
+				let height = self.heights.write().height(index);
+				known.insert((self.key)(self.items.write()[index]), height);
+			}
+			index += 1;
+		}
+		let anchored: Option<K> = if held.top || held.bottom || held.anchor >= count {
+			None
+		} else {
+			Some((self.key)(self.items.write()[held.anchor]))
+		};
+		mut anchor = held.anchor;
+		mut found = false;
+		mut fresh: List<f64> = [];
+		index = 0;
+		for item in items {
+			let key = (self.key)(item);
+			match known.get(key) {
+				Some(let height) => fresh.push(height),
+				None => fresh.push(-1.0),
+			}
+			if !found {
+				match anchored {
+					Some(let wanted) => {
+						if key == wanted {
+							anchor = index;
+							found = true;
+						}
+					},
+					None => {},
+				}
+			}
+			index += 1;
+		}
+		self.heights.write().reset(fresh);
+		self.span.write().revealing = false;
+		if !held.top && !held.bottom && items.len() == 0 {
+			ret Hold { top = true, bottom = false, anchor = 0, edge = 0.0 };
+		}
+		if !found && anchor >= items.len() && items.len() > 0 {
+			anchor = items.len() - 1;
+		}
+		Hold { top = held.top, bottom = held.bottom, anchor, edge = held.edge }
+	}
+
+	/// The offset after a change, from the anchor taken before it (`Hold`'s rule),
+	/// then a held reveal's correction; clamped into the range once the viewport is
+	/// known.
+	fun restore(self, held: Hold) {
+		if self.exact {
+			ret;
+		}
+		let count = self.items.write().len();
+		let span = self.span.read();
+		let view = span.viewport;
+		let whole = self.whole();
+		mut scrolled = span.scrolled;
+		if count == 0 {
+			scrolled = 0.0;
+		} else if held.bottom {
+			scrolled = whole - view;
+		} else if !held.top {
+			let anchor = if held.anchor >= count { count - 1 } else { held.anchor };
+			scrolled = self.top_of(anchor) - held.edge;
+		}
+		if span.revealing && span.revealed < count {
+			let start = self.top_of(span.revealed);
+			let end = self.top_of(span.revealed + 1);
+			scrolled = if span.reveal_edge == 1 || (span.reveal_edge == 2 && end - start > view) {
+				start
+			} else if span.reveal_edge == 2 {
+				end - view
+			} else {
+				self.reveal_offset(span.revealed, scrolled)
+			};
+		}
+		if view > 0.0 && scrolled > whole - view {
+			scrolled = whole - view;
+		}
+		if scrolled < 0.0 {
+			scrolled = 0.0;
+		}
+		self.span.write().scrolled = scrolled;
+	}
+
+	/// The offset that shows row `index` whole, moving as little as it takes from
+	/// `scrolled`: its top at the viewport's top when it is above or taller than
+	/// the viewport (or the viewport is not known yet), its bottom at the
+	/// viewport's bottom when it is below, and `scrolled` when it shows already.
+	fun reveal_offset(self, index: usize, scrolled: f64): f64 {
+		let start = self.top_of(index);
+		let end = self.top_of(index + 1);
+		let view = self.span.read().viewport;
+		if view <= 0.0 || start < scrolled || end - start > view {
+			start
+		} else if end > scrolled + view {
+			end - view
+		} else {
+			scrolled
+		}
+	}
+
+	/// Row `item`'s element was laid out at a new size: its height (the solver's,
+	/// before snapping) recorded, and the offset anchored.
+	fun measure(self, item: T, element: Element) {
+		let key = (self.key)(item);
+		let span = self.span.read();
+		mut index = span.first;
+		mut found = false;
+		for !found && index < span.last {
+			if (self.key)(self.items.write()[index]) == key {
+				found = true;
+			} else {
+				index += 1;
+			}
+		}
+		if !found {
+			ret;
+		}
+		let height = ui_node_number(element.node, 7);
+		let known = self.heights.write().known(index);
+		let was = self.heights.write().height(index);
+		if known && (was - height).abs() < 0.001 {
+			ret;
+		}
+		if known {
+			// A row measured again (its content changed): not the reveal's own
+			// correction any more.
+			self.span.write().revealing = false;
+		}
+		let held = self.hold();
+		self.heights.write().set(index, height);
+		self.restore(held);
+		self.refresh();
+	}
+
+	/// The element `render` answered for an item, made a row: its height set to the
+	/// extent, or measured whenever it lays out at a new size.
+	fun row(self, element: Element, item: || T): Element {
+		if self.exact {
+			ret element.height(dp(self.extent));
+		}
+		// Never shrunk to fit: the column's height is the rows' (estimated) sum,
+		// which a built row may outgrow before it is measured.
+		element.shrink(0.0).on_resize(|_size: Size| self.measure(item(), element))
+	}
+
+	/// The offset moved by the program or the person (the wheel, Tab's reveal, the
+	/// app's cell, `reveal`): the window follows it, and Tab's extra row is let go.
+	fun scroll_to(self, scrolled: f64) {
+		self.span.write().scrolled = scrolled;
+		self.span.write().ahead = 0;
+		self.span.write().behind = 0;
+		self.refresh();
 	}
 
 	/// Brings the column in step with the offset, the viewport and the items: the
 	/// window's rows (shown again only when the window moved or its items changed),
 	/// the padding above them and the column's height (each set only when it
-	/// changed, so a scroll inside the window lays nothing out).
+	/// changed, so a scroll inside the window lays nothing out), then the scroll's
+	/// own offset and the logical one.
 	fun refresh(self) {
 		let count = self.items.write().len();
 		let extent = self.extent;
 		let span = self.span.read();
 		let before = span.overscan + span.behind;
 		let after = span.overscan + span.ahead;
-		// What the padding box shows, in the column's coordinates: the content box
-		// at the offset, and the padding on either side of it.
+		// What the padding box shows, in the whole list's coordinates: the content
+		// box at the offset, and the padding on either side of it.
 		let shown_from = span.scrolled - span.padding_top;
 		let shown_to = span.scrolled + span.viewport + span.padding_bottom;
-		let visible_first = (shown_from / extent).floor().max(0.0).as_usize();
-		let visible_end = (shown_to / extent).ceil().max(0.0).as_usize();
+		let (visible_first, visible_end) = if self.exact {
+			(
+				(shown_from / extent).floor().max(0.0).as_usize(),
+				(shown_to / extent).ceil().max(0.0).as_usize()
+			)
+		} else {
+			let first_shown = self.heights.write().index_at(shown_from.max(0.0));
+			let end_shown = self.heights.write().rows_above(shown_to);
+			(first_shown, end_shown)
+		};
 		mut last = visible_end + after;
 		if last > count {
 			last = count;
@@ -210,71 +603,115 @@ impl Window<type T> {
 		// Assistive technology hears the rows built as items `first ..` of the
 		// whole list, not as a list of a few.
 		let _items = self.column.items_shown(first, count);
-		let top = first.as_f64() * extent;
+		let whole = self.whole();
+		let first_top = self.top_of(first);
+		mut base = span.base;
+		if whole <= rebase_limit() {
+			base = 0.0;
+		} else if first_top < base || first_top - base >= 2.0 * rebase_step() {
+			base = ((first_top / rebase_step()).floor() - 1.0).max(0.0) * rebase_step();
+		}
+		self.span.write().base = base;
+		let top = first_top - base;
 		if top != span.top {
 			self.span.write().top = top;
 			let _column = self.column.padding_top(dp(top));
 		}
-		let total = count.as_f64() * extent;
+		let total = if whole <= rebase_limit() {
+			whole
+		} else {
+			(whole - base).min(4.0 * rebase_step())
+		};
 		if total != span.total {
 			self.span.write().total = total;
 			let _column = self.column.height(dp(total));
 		}
+		self.publish();
+	}
+
+	/// The scroll's own offset and the logical one, set to the span's when they
+	/// differ. The scroll's offset follows after the column changed (a layout is
+	/// pending, so it is kept as asked until that layout clamps it).
+	fun publish(self) {
+		let span = self.span.read();
+		let local = span.scrolled - span.base;
+		if self.offset.get().y.value() != local {
+			self.offset.set(Point::new(dp(0), dp(local)));
+		}
+		if self.scrolled.get().y.value() != span.scrolled {
+			self.scrolled.set(Point::new(dp(0), dp(span.scrolled)));
+		}
+	}
+}
+
+/// Where a row at `index` is after `count` rows at `from` move to `to` (an index in
+/// the list without them).
+fun moved_index(index: usize, from: usize, count: usize, to: usize): usize {
+	if index >= from && index < from + count {
+		ret to + (index - from);
+	}
+	let without = if index < from { index } else { index - count };
+	if without < to {
+		without
+	} else {
+		without + count
 	}
 }
 
 /// A KEYED list of `source`'s items that builds only the rows near its viewport:
-/// each row is the element `render` builds for its item, under an owner of its own,
-/// laid out at `extent` tall. `source` and `key` are `each`'s — a `ListCell`
-/// (followed by its ops), a `SignalCell<List<T>>`, any list source or collection
-/// pipe, and the key that keeps a row the same row when the list changes — and so
-/// is what a change keeps: a row whose key stays in the window and whose item is
-/// equal is the same element (its hover, press and focus with it), one whose item
-/// changed is built again, and one that leaves the window is removed.
+/// each row is the element `render` builds for its item, under an owner of its own.
+/// `source` and `key` are `each`'s — a `ListCell` (followed by its ops), a
+/// `SignalCell<List<T>>`, any list source or collection pipe, and the key that
+/// keeps a row the same row when the list changes — and so is what a change keeps:
+/// a row whose key stays in the window and whose item is equal is the same element
+/// (its hover, press and focus with it), one whose item changed is built again, and
+/// one that leaves the window is removed.
+///
+/// `extent` is how tall the rows are: a `Dp` lays every row out at that height
+/// (gaps included: give the space between rows as padding inside the row), and
+/// `estimated(dp(..))` lets each row take its own height, measured when it is
+/// built, with the list keeping what the viewport shows still while estimates are
+/// corrected (see `Hold` in the source, and the book's virtual list section).
 ///
 /// A list of 100,000 rows holds the twenty or so the viewport shows, `overscan` on
 /// each side (2 until set); the scroll's range is still the whole list's. State a
 /// row must keep after it leaves the window — a text typed into it, whether it is
 /// expanded — belongs in the item (or the app's model), not in the row: the row is
 /// built again when it comes back.
-///
-/// The extent is every row's height, gaps included: give the space between rows as
-/// padding inside the row.
 [track_caller]
-export fun virtual_list<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(
+export fun virtual_list<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child, E: RowExtent>(
 	own source: S,
-	extent: Dp,
+	extent: E,
 	key: sync |T| K,
 	render: (sync |T| C) context owner_scope,
 ): VirtualList<T, K> {
-	let window: Window<T> = open_window(extent);
-	window.column.child(each(window.shown, key, |item: T| render(item)
-		.into_element()
-		.height(extent)));
+	let window: Window<T, K> = open_window(extent.row_extent(), key);
+	window.column.child(each(window.shown, key, |item: T| window
+		.row(render(item).into_element(), || item)));
 	follow_source(window, source.open_rows(), caller());
-	finish(window, key)
+	finish(window)
 }
 
 /// `virtual_list`, with every row handed a CELL holding its item (`each_by`'s
 /// rule): a row whose key stays in the window is never built again — a changed item
 /// is written into its cell. Its items need no equality.
 [track_caller]
-export fun virtual_list_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(
+export fun virtual_list_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child, E: RowExtent>(
 	own source: S,
-	extent: Dp,
+	extent: E,
 	key: sync |T| K,
 	render: (sync |SignalCell<T>| C) context owner_scope,
 ): VirtualList<T, K> {
-	let window: Window<T> = open_window(extent);
-	window.column.child(each_by(window.shown, key, |cell: SignalCell<T>| render(cell)
-		.into_element()
-		.height(extent)));
+	let window: Window<T, K> = open_window(extent.row_extent(), key);
+	window.column.child(each_by(window.shown, key, |cell: SignalCell<T>| window
+		.row(render(cell).into_element(), || cell.get())));
 	follow_source(window, source.open_rows(), caller());
-	finish(window, key)
+	finish(window)
 }
 
 /// The list's state and its column, before any row.
-fun open_window<T>(extent: Dp): Window<T> {
+fun open_window<T, K>(extent: (f64, bool), key: |T| K): Window<T, K> {
+	let (height, exact) = extent;
 	let empty: List<T> = [];
 	let none: List<T> = [];
 	Window {
@@ -292,9 +729,17 @@ fun open_window<T>(extent: Dp): Window<T> {
 			stale = false,
 			top = 0.0,
 			total = 0.0,
+			base = 0.0,
+			revealing = false,
+			revealed = 0,
+			reveal_edge = 0,
 		}),
-		extent = extent.value().max(1.0),
+		extent = height.max(1.0),
+		exact,
+		heights = Shared::new(row_heights(0, height.max(1.0))),
+		key,
 		offset = Signal::new(Point::new(dp(0), dp(0))),
+		scrolled = Signal::new(Point::new(dp(0), dp(0))),
 		shown = Signal::new(none),
 		// Its height is the whole list's, and it never shrinks to the viewport (a
 		// scroll's child would, to its content: CSS's flex rule, min-height auto).
@@ -303,13 +748,20 @@ fun open_window<T>(extent: Dp): Window<T> {
 }
 
 /// The source, followed — `place_rows`' subscription in `std::ui`, into the kept
-/// items: its ops are applied, then the window is brought in step once per drain.
-fun follow_source<T>(window: Window<T>, instance: CollInstance<T>, site: Location) {
+/// items: its ops are applied (the anchor held across them), then the window is
+/// brought in step once per drain.
+fun follow_source<T, K: PartialEq + Hashable>(
+	window: Window<T, K>,
+	instance: CollInstance<T>,
+	site: Location,
+) {
 	let drain = instance.drain;
 	let run = subscriber_of(|| {
+		mut held = window.hold();
 		for op in live_ops(drain()) {
-			window.apply(op);
+			held = window.apply(op, held);
 		}
+		window.restore(held);
 		window.refresh();
 	}, false);
 	place_subscriber(run.id, site);
@@ -317,26 +769,37 @@ fun follow_source<T>(window: Window<T>, instance: CollInstance<T>, site: Locatio
 	also_releasing(handle, instance.release);
 	let _owned = register_with_owner(handle);
 	window.items.write() = (instance.snapshot)();
+	if !window.exact {
+		window.heights.write() = row_heights(window.items.write().len(), window.extent);
+	}
 	window.span.write().stale = true;
 }
 
 /// The scroll around the column, and what moves the window: the offset, the
 /// viewport's height, Tab.
-fun finish<T, K>(window: Window<T>, key: |T| K): VirtualList<T, K> {
+fun finish<T, K: PartialEq + Hashable>(window: Window<T, K>): VirtualList<T, K> {
 	let viewport = scroll().offset(window.offset).child(window.column);
 	let _followed = register_with_owner(window.offset.sub(|point: Point| {
-		window.span.write().scrolled = point.y.value();
-		window.span.write().ahead = 0;
-		window.span.write().behind = 0;
-		window.refresh();
+		// The list's own writes come back here: only a move it did not make (the
+		// wheel, Tab's reveal, a clamp) is the person's, and lets a held reveal go.
+		let span = window.span.read();
+		let scrolled = span.base + point.y.value();
+		if scrolled == span.scrolled {
+			ret;
+		}
+		window.span.write().revealing = false;
+		window.scroll_to(scrolled);
 	}));
+	window.refresh();
 	let _sized = viewport.on_resize(|_size: Size| {
 		// The content box and the list's own padding around it, from the layout
 		// that just ran.
 		let node = viewport.element().node;
+		let held = window.hold();
 		window.span.write().padding_top = ui_node_number(node, 4);
 		window.span.write().viewport = ui_node_number(node, 5);
 		window.span.write().padding_bottom = ui_node_number(node, 6);
+		window.restore(held);
 		window.refresh();
 	});
 	// Tab inside the list: one row more on its side, built before the focus moves
@@ -355,10 +818,10 @@ fun finish<T, K>(window: Window<T>, key: |T| K): VirtualList<T, K> {
 			_ => {},
 		}
 	});
-	VirtualList { scroll = viewport, window, key }
+	VirtualList { scroll = viewport, window }
 }
 
-export impl VirtualList<type T, type K: PartialEq> {
+export impl VirtualList<type T, type K: PartialEq + Hashable> {
 	/// Rows built on each side of the ones the viewport shows (2 until set): what a
 	/// scroll step finds ready, and what Tab moves into. 0 builds only what shows.
 	fun overscan(self, rows: usize): VirtualList<T, K> {
@@ -369,16 +832,17 @@ export impl VirtualList<type T, type K: PartialEq> {
 
 	/// Binds how far the list is scrolled to `cell`, both ways, as
 	/// `ScrollElement::offset` does: the cell's value (now and at every write)
-	/// scrolls it, and the wheel, Tab, `reveal` and a clamp write the cell.
+	/// scrolls it, and the wheel, Tab, `reveal`, a clamp and the list's anchoring
+	/// write the cell. In dp from the whole list's top, however long it is.
 	fun offset(self, cell: SignalCell<Point>): VirtualList<T, K> {
-		let inner = self.window.offset;
+		let window = self.window;
 		let _inward = register_with_owner(cell.sub(|point: Point| {
-			let held = inner.get();
-			if held.x.value() != point.x.value() || held.y.value() != point.y.value() {
-				inner.set(point);
+			if point.y.value() != window.span.read().scrolled {
+				window.span.write().revealing = false;
+				window.scroll_to(point.y.value());
 			}
 		}));
-		let _outward = register_with_owner(inner.sub(|point: Point| {
+		let _outward = register_with_owner(window.scrolled.sub(|point: Point| {
 			let held = cell.get();
 			if held.x.value() != point.x.value() || held.y.value() != point.y.value() {
 				cell.set(point);
@@ -387,8 +851,9 @@ export impl VirtualList<type T, type K: PartialEq> {
 		self
 	}
 
-	/// The `scroll` underneath: its `range()` is the whole list's, `scrolled()`
-	/// how far it is.
+	/// The `scroll` underneath. Its `range()` is the whole list's and `scrolled()`
+	/// how far it is while the list is under 4,194,304 dp tall; past that they are
+	/// in the column's coordinates (see `scrolled` and `range` here).
 	fun viewport(self): ScrollElement {
 		self.scroll
 	}
@@ -404,28 +869,63 @@ export impl VirtualList<type T, type K: PartialEq> {
 		(span.first, span.last)
 	}
 
+	/// How far the list is scrolled, in dp from the whole list's top.
+	fun scrolled(self): Dp {
+		dp(self.window.span.read().scrolled)
+	}
+
+	/// The largest offset: the whole list's height (rows not measured counted at
+	/// the estimate) less the viewport's, from the last layout.
+	fun range(self): Dp {
+		dp((self.window.whole() - self.window.span.read().viewport).max(0.0))
+	}
+
+	/// Where row `index` starts, in dp from the whole list's top: exact for a fixed
+	/// extent, measured and estimated rows summed for an estimated one.
+	fun row_top(self, index: usize): Dp {
+		dp(self.window.top_of(index))
+	}
+
+	/// The row at `offset` dp from the whole list's top (the last row past its end;
+	/// `None` for an empty list).
+	fun row_at(self, offset: Dp): Option<usize> {
+		if self.window.items.write().len() == 0 {
+			None
+		} else {
+			Some(self.window.row_at(offset.value()))
+		}
+	}
+
 	/// Scrolls as little as it takes to show row `index` whole — not at all when it
 	/// shows already — and builds it (at the end of the turn, inside one). From the
-	/// row extent, so it needs no layout: a row added in the same turn can be
-	/// revealed. An index past the end does nothing.
+	/// row extent (or the heights known, and the estimate), so it needs no layout: a
+	/// row added in the same turn can be revealed. With estimated rows the reveal is
+	/// HELD while the rows it builds are measured for the first time: its row ends
+	/// with its top edge at the viewport's top when it came from above the viewport,
+	/// its bottom edge at the viewport's bottom when it came from below, however
+	/// wrong the estimate was. The next change of another kind (the wheel, an
+	/// operation of the source, a row measured again) ends the hold. An index past
+	/// the end does nothing.
 	fun reveal(self, index: usize) {
 		let window = self.window;
 		if index >= window.items.write().len() {
 			ret;
 		}
-		let start = index.as_f64() * window.extent;
-		let end = start + window.extent;
-		let view = window.span.read().viewport;
 		let scrolled = window.span.read().scrolled;
-		let wanted = if view <= 0.0 || start < scrolled || window.extent > view {
-			start
-		} else if end > scrolled + view {
-			end - view
-		} else {
-			scrolled
-		};
+		let wanted = window.reveal_offset(index, scrolled);
+		if !window.exact {
+			window.span.write().revealing = true;
+			window.span.write().revealed = index;
+			window.span.write().reveal_edge = if wanted == scrolled {
+				0
+			} else if wanted == window.top_of(index) {
+				1
+			} else {
+				2
+			};
+		}
 		if wanted != scrolled {
-			window.offset.set(Point::new(dp(0), dp(wanted)));
+			window.scroll_to(wanted);
 		}
 	}
 
@@ -435,7 +935,7 @@ export impl VirtualList<type T, type K: PartialEq> {
 		let count = self.window.items.write().len();
 		mut at: usize = 0;
 		for at < count {
-			if (self.key)(self.window.items.write()[at]) == key {
+			if (self.window.key)(self.window.items.write()[at]) == key {
 				self.reveal(at);
 				ret true;
 			}

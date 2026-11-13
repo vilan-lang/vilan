@@ -674,6 +674,8 @@ std/ui.md h2 focus
 std/ui.md h2 scrolling
 std/ui.md h2 lists-and-conditional-children
 std/ui.md h2 a-virtual-list
+std/ui.md h3 rows-of-differing-heights
+std/ui.md h3 positions-past-four-million-dp
 std/ui.md h2 showing-it
 std/ui.md h2 components-stduikit
 std/ui.md h2 accessibility

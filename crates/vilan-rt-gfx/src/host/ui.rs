@@ -115,6 +115,8 @@ struct FrameRecord {
     layout_us: f64,
     paint_us: f64,
     stats: PassStats,
+    /// The layout passes the last `__ui_layout` ran, 1 to [`LAYOUT_ROUNDS`].
+    passes: usize,
 }
 
 impl FrameRecord {
@@ -127,6 +129,7 @@ impl FrameRecord {
             moved: 0,
             rebuilt: 0,
         },
+        passes: 0,
     };
 }
 
@@ -835,7 +838,9 @@ pub fn layout(root: &Node, width: f64, height: f64, scale_factor: f64) {
     let size = Size::new(width as f32, height as f32);
     let started = Instant::now();
     let mut stats = PassStats::default();
+    let mut passes = 0;
     for _ in 0..LAYOUT_ROUNDS {
+        passes += 1;
         let pass = with_tree(|tree| {
             with_text(|text| {
                 or_fail(tree.layout(id, size, units, text).map(|_| ()));
@@ -863,6 +868,7 @@ pub fn layout(root: &Node, width: f64, height: f64, scale_factor: f64) {
         let mut record = last.get();
         record.layout_us = took;
         record.stats = stats;
+        record.passes = passes;
         last.set(record);
     });
 }
@@ -934,7 +940,8 @@ fn draw_mounted(root: &Node) {
 /// its layout time (0), its paint time (1) and window `window`'s draw time —
 /// encoding, submitting and presenting — of the last frame it presented (2),
 /// all in microseconds; whether the solver ran (3), the leaves it measured
-/// (4), the boxes that moved (5), the element scenes rebuilt (6).
+/// (4), the boxes that moved (5), the element scenes rebuilt (6), the layout
+/// passes it took (7).
 pub fn frame_number(window: u32, which: i32) -> f64 {
     let record = LAST_FRAME.with(Cell::get);
     match which {
@@ -945,6 +952,7 @@ pub fn frame_number(window: u32, which: i32) -> f64 {
         4 => record.stats.measured as f64,
         5 => record.stats.moved as f64,
         6 => record.stats.rebuilt as f64,
+        7 => record.passes as f64,
         _ => panic_with(&format!("{which} is not a `std::ui` frame number")),
     }
 }
@@ -1033,9 +1041,16 @@ pub fn deliver(root: &Node, kind: i32, a: f64, b: f64, c: f64, d: f64, e: f64, t
 /// `__ui_node_number(node, which)` — the element's box from the last layout,
 /// in dp: x (0), y (1), width (2), height (3); and down the part its children
 /// are drawn in (its padding box): the padding above its content box (4), the
-/// content box's height (5), the padding below it (6).
+/// content box's height (5), the padding below it (6); and its height as the
+/// solver gave it, before snapping (7): what a box below it is placed by.
 pub fn node_number(node: &Node, which: i32) -> f64 {
-    let (bounds, inner) = with_tree(|tree| (tree.bounds(node.id()), tree.inner_box(node.id())));
+    let (bounds, inner, solved) = with_tree(|tree| {
+        (
+            tree.bounds(node.id()),
+            tree.inner_box(node.id()),
+            tree.solved_size(node.id()),
+        )
+    });
     f64::from(match which {
         0 => bounds.left(),
         1 => bounds.top(),
@@ -1044,6 +1059,7 @@ pub fn node_number(node: &Node, which: i32) -> f64 {
         4 => inner.padding_top,
         5 => inner.content_height,
         6 => inner.padding_bottom,
+        7 => solved.height,
         _ => panic_with(&format!("{which} is not a `std::ui` box number")),
     })
 }

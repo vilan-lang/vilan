@@ -2426,6 +2426,14 @@ impl UiTree {
         self.data(node).bounds
     }
 
+    /// The element's size as the solver gave it in its last layout, in dp,
+    /// before snapping: what the boxes after it in its parent are placed by
+    /// (a snapped size depends on where the box sits).
+    pub fn solved_size(&self, node: NodeId) -> Size {
+        let size = self.taffy.layout(node).expect("a laid-out element").size;
+        Size::new(size.width, size.height)
+    }
+
     /// The part of the element its children are drawn in, from its last
     /// layout — its padding box (a clipping element's clip) — down its
     /// height: the content box and the padding above and below it.
