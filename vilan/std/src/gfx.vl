@@ -31,6 +31,9 @@
 // Closing the LAST window stops the program the way SIGTERM does: servers stop
 // accepting and drain, the event loop ends, `main` returns, exit code 0.
 //
+// The system clipboard's TEXT is `clipboard_text()` and `set_clipboard_text(..)`
+// (F173), through the `arboard` crate on the host's side.
+//
 // Not here yet (native-ui.md section 8): paths and icons, more than one window,
 // rotation, text editing, input methods, publishing accessibility. Shared code
 // never names this module (D4).
@@ -269,6 +272,13 @@ external fun gfx_offscreen(
 	alpha: f64,
 	draw: || void,
 ): Result<Bytes, str>;
+
+/// The clipboard's text, answered from the host's clipboard thread (F173).
+[extern("__gfx_clipboard_text")]
+async external fun gfx_clipboard_text(): Option<str>;
+
+[extern("__gfx_set_clipboard_text")]
+external fun gfx_set_clipboard_text(text: str): void;
 
 // --- Lengths -------------------------------------------------------------------
 
@@ -944,6 +954,22 @@ fun current_frame(): Frame {
 		size = Size { width = dp(gfx_frame_number(1)), height = dp(gfx_frame_number(2)) },
 		scale_factor = gfx_frame_number(3),
 	}
+}
+
+// --- The clipboard -------------------------------------------------------------
+
+/// The system clipboard's text: `None` when it holds no text, when there is no
+/// clipboard to reach (no display), or when the program holding the text does not
+/// answer within four seconds. Async: on X11 the text is another program's, and
+/// asking it never stops the window.
+export fun clipboard_text(): Option<str> {
+	gfx_clipboard_text()
+}
+
+/// Makes `text` the system clipboard's text, after every clipboard read and write
+/// made before. Returns at once; nothing happens where there is no clipboard.
+export fun set_clipboard_text(text: str) {
+	gfx_set_clipboard_text(text);
 }
 
 // --- Input ---------------------------------------------------------------------

@@ -23,6 +23,12 @@
 //! server has handled every one of them when it exits. The display is
 //! `DISPLAY` (and `XAUTHORITY`), as for any X client.
 //!
+//!     x11_input clipboard read
+//!     x11_input clipboard own "some text"
+//!
+//! reads or owns the CLIPBOARD selection as another X client does (the
+//! `clipboard` module below; no window is needed, and `--title` is ignored).
+//!
 //! Used by the compiler's `std::gfx` end-to-end test
 //! (`crates/vilan-cli/tests/gfx_window.rs`), which builds it from here.
 
@@ -50,7 +56,7 @@ mod x11 {
     };
     use x11rb::protocol::xtest::ConnectionExt as _;
 
-    type Failure = Box<dyn std::error::Error>;
+    pub type Failure = Box<dyn std::error::Error>;
 
     const KEY_PRESS: u8 = 2;
     const KEY_RELEASE: u8 = 3;
@@ -70,6 +76,9 @@ mod x11 {
         while let Some(word) = words.next() {
             match word.as_str() {
                 "--title" => title = Some(words.next().ok_or("--title needs a value")?.clone()),
+                "clipboard" => {
+                    return super::clipboard::run(&connection, root, words.as_slice());
+                }
                 "move" => {
                     let x: i16 = words.next().ok_or("move needs X")?.parse()?;
                     let y: i16 = words.next().ok_or("move needs Y")?.parse()?;
@@ -230,7 +239,7 @@ mod x11 {
             .ok_or_else(|| format!("no key types keysym {symbol:#x}").into())
     }
 
-    fn atom(connection: &impl Connection, name: &[u8]) -> Result<Atom, Failure> {
+    pub fn atom(connection: &impl Connection, name: &[u8]) -> Result<Atom, Failure> {
         Ok(connection.intern_atom(false, name)?.reply()?.atom)
     }
 
@@ -259,5 +268,178 @@ mod x11 {
             }
         }
         Err(format!("no viewable window titled {title:?}").into())
+    }
+}
+
+/// `clipboard read` and `clipboard own TEXT`: the CLIPBOARD selection as
+/// another X client sees it, for the `std::gfx` clipboard's end-to-end test
+/// (F173). `read` asks the selection's owner for its text as `UTF8_STRING`
+/// and prints `clipboard TEXT`, or `clipboard none` when nobody owns it or
+/// the owner has no text. `own TEXT` takes the selection, prints `owned`, and
+/// serves `TEXT` (and the `TARGETS` it offers) until it has handed the text
+/// over once, then exits. Each gives up after half a minute with an error,
+/// so a peer that never answers fails the test instead of hanging it. Only
+/// ever run under `xvfb-run`: the selection is that private server's.
+#[cfg(target_os = "linux")]
+mod clipboard {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use x11rb::connection::Connection;
+    use x11rb::protocol::Event;
+    use x11rb::protocol::xproto::{
+        Atom, AtomEnum, ConnectionExt, CreateWindowAux, EventMask, PropMode,
+        SELECTION_NOTIFY_EVENT, SelectionNotifyEvent, Window, WindowClass,
+    };
+    use x11rb::wrapper::ConnectionExt as _;
+
+    use super::x11::{Failure, atom};
+
+    /// How long a run may wait for its peer before it is a failure.
+    const LIMIT: Duration = Duration::from_secs(30);
+
+    pub fn run(
+        connection: &impl Connection,
+        root: Window,
+        words: &[String],
+    ) -> Result<(), Failure> {
+        std::thread::spawn(|| {
+            std::thread::sleep(LIMIT);
+            eprintln!("x11_input: the clipboard's peer did not answer in {LIMIT:?}");
+            std::process::exit(2);
+        });
+        let window = connection.generate_id()?;
+        connection.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )?;
+        let atoms = Atoms {
+            clipboard: atom(connection, b"CLIPBOARD")?,
+            utf8: atom(connection, b"UTF8_STRING")?,
+            targets: atom(connection, b"TARGETS")?,
+            property: atom(connection, b"VILAN_X11_INPUT_PASTE")?,
+        };
+        match words {
+            [read] if read == "read" => self::read(connection, window, &atoms),
+            [own, text] if own == "own" => self::own(connection, window, &atoms, text),
+            other => Err(format!("clipboard read, or clipboard own TEXT, not {other:?}").into()),
+        }
+    }
+
+    struct Atoms {
+        clipboard: Atom,
+        utf8: Atom,
+        targets: Atom,
+        property: Atom,
+    }
+
+    fn read(connection: &impl Connection, window: Window, atoms: &Atoms) -> Result<(), Failure> {
+        connection.convert_selection(
+            window,
+            atoms.clipboard,
+            atoms.utf8,
+            atoms.property,
+            x11rb::CURRENT_TIME,
+        )?;
+        connection.flush()?;
+        loop {
+            if let Event::SelectionNotify(notify) = connection.wait_for_event()?
+                && notify.requestor == window
+            {
+                if notify.property == x11rb::NONE {
+                    println!("clipboard none");
+                } else {
+                    let reply = connection
+                        .get_property(true, window, atoms.property, AtomEnum::ANY, 0, 1 << 20)?
+                        .reply()?;
+                    println!("clipboard {}", String::from_utf8_lossy(&reply.value));
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    fn own(
+        connection: &impl Connection,
+        window: Window,
+        atoms: &Atoms,
+        text: &str,
+    ) -> Result<(), Failure> {
+        connection.set_selection_owner(window, atoms.clipboard, x11rb::CURRENT_TIME)?;
+        if connection
+            .get_selection_owner(atoms.clipboard)?
+            .reply()?
+            .owner
+            != window
+        {
+            return Err("the server did not give this client the clipboard".into());
+        }
+        println!("owned");
+        std::io::stdout().flush()?;
+        loop {
+            match connection.wait_for_event()? {
+                Event::SelectionRequest(request) => {
+                    // An obsolete requestor names no property: the target is it.
+                    let property = if request.property == x11rb::NONE {
+                        request.target
+                    } else {
+                        request.property
+                    };
+                    let mut served = false;
+                    let answered = if request.target == atoms.targets {
+                        connection.change_property32(
+                            PropMode::REPLACE,
+                            request.requestor,
+                            property,
+                            AtomEnum::ATOM,
+                            &[atoms.targets, atoms.utf8],
+                        )?;
+                        property
+                    } else if request.target == atoms.utf8 {
+                        connection.change_property8(
+                            PropMode::REPLACE,
+                            request.requestor,
+                            property,
+                            atoms.utf8,
+                            text.as_bytes(),
+                        )?;
+                        served = true;
+                        property
+                    } else {
+                        x11rb::NONE
+                    };
+                    let notify = SelectionNotifyEvent {
+                        response_type: SELECTION_NOTIFY_EVENT,
+                        sequence: 0,
+                        time: request.time,
+                        requestor: request.requestor,
+                        selection: request.selection,
+                        target: request.target,
+                        property: answered,
+                    };
+                    connection.send_event(false, request.requestor, EventMask::NO_EVENT, notify)?;
+                    // A round trip: the server has handled the property and the
+                    // notice before this client can exit. Leaving straight
+                    // after a flush lost them in about half of the runs.
+                    connection.get_input_focus()?.reply()?;
+                    if served {
+                        return Ok(());
+                    }
+                }
+                Event::SelectionClear(_) => {
+                    return Err("another client took the clipboard before it was read".into());
+                }
+                _ => {}
+            }
+        }
     }
 }

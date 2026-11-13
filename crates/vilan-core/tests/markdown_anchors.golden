@@ -471,6 +471,7 @@ std/gfx.md h2 text
 std/gfx.md h2 textures
 std/gfx.md h2 windows
 std/gfx.md h2 events
+std/gfx.md h2 the-clipboard
 std/gfx.md h2 how-a-gpu-program-ends
 std/gfx.md h2 offscreen
 std/gfx.md h2 not-here-yet

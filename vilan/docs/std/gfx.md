@@ -257,6 +257,44 @@ element's handler, the window event that reached the element (which is how
 `std::ui` tree mounted routes each event into the tree first, then hands it to
 its own event callback, if it has one.
 
+## The clipboard
+
+```vilan,fragment
+fun clipboard_text(): Option<str>        // async; None: no text, no clipboard, or no answer
+fun set_clipboard_text(text: str)        // returns at once
+```
+
+The system clipboard's text, read and written. `clipboard_text` is `async`: on
+X11 the text belongs to whichever program copied it, and reading it is a
+question to that program, so the answer reaches yours in a later turn and the
+window never stops for it. It is `None` when the clipboard holds no text (an
+image, say), when there is no clipboard to reach (no display: a `--check` run, a
+CI machine), and when the program holding the text does not answer within four
+seconds. `set_clipboard_text` hands the text over and returns; where there is no
+clipboard it does nothing. Reads and writes keep their order, so a read after a
+write answers what was written, unless another program copied something since.
+
+On X11 — and on Wayland, where the clipboard is reached through XWayland — the
+text a program copied is served BY that program, for as long as it runs; when it
+ends, the desktop's clipboard manager (if one runs) is offered the text, so a copy
+can outlive it. Windows and macOS keep the text themselves. Text only: no images,
+no rich text. Cut, copy and paste in `std::ui::kit`'s inputs are built on these
+two functions.
+
+```vilan,native
+import std::gfx::{ clipboard_text, set_clipboard_text };
+import std::io::print;
+
+fun main() {
+	set_clipboard_text("copied from vilan");
+	match clipboard_text() {
+		Some(let text) => print(i"the clipboard holds: {text}"),
+		None => print("no clipboard here"),
+	}
+}
+main();
+```
+
 ## How a GPU program ends
 
 Closing the **last** window — by hand, or with `Window::close` — stops the

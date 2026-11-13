@@ -18914,6 +18914,9 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__gfx_texture_from_rgba", "texture_from_rgba", &[2]),
         ("__gfx_texture_size", "texture_size", &[0]),
         ("__gfx_offscreen", "offscreen", &[]),
+        // F173: the system clipboard's text.
+        ("__gfx_clipboard_text", "clipboard::text", &[]),
+        ("__gfx_set_clipboard_text", "clipboard::set_text", &[0]),
         // native-ui.md P2: `std::ui` (`vilan/std/src/ui.vl`), the element
         // tree in `vilan_rt_gfx::host::ui`. An element crosses as its
         // `Node` handle, which the functions read and so take by reference.

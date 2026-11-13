@@ -24,7 +24,14 @@
 //! 8. the example's scene drawn OFFSCREEN through the same surface
 //!    (`--golden`, no display needed: it also runs the program with no window
 //!    system) matches its golden images at 100% and 150% within one per
-//!    channel.
+//!    channel;
+//! 9. the system clipboard's text (F173), with no window: the example's
+//!    `--clipboard` copies a text and reads it back; another X client (the
+//!    injector's `clipboard read`) reads it from the program, through
+//!    `arboard`'s own connection and serving thread; that client then takes
+//!    the clipboard (`clipboard own`) and the program reads ITS text; and with
+//!    no display at all the program says so and ends. Only under `xvfb-run`:
+//!    the clipboard is that private server's, never the session's.
 //!
 //! Frames on change only: every frame after the first must show something
 //! the frame before it did not (an X server may expose a new window once more,
@@ -148,6 +155,18 @@ fn build_example() -> PathBuf {
         std::fs::copy(example.join(file), staged.join(file)).expect("copy the example");
     }
     build_native(&staged, "main")
+}
+
+/// The example staged under its own name, so a second test builds it beside
+/// [`build_example`]'s without sharing a staging directory.
+fn build_example_as(entry: &str) -> PathBuf {
+    let staged = scratch().join(entry);
+    let _ = std::fs::remove_dir_all(&staged);
+    std::fs::create_dir_all(&staged).expect("stage the example");
+    let example = repository_root().join("vilan/examples/gfx");
+    std::fs::copy(example.join("vilan.toml"), staged.join("vilan.toml")).expect("its manifest");
+    std::fs::copy(example.join("main.vl"), staged.join(format!("{entry}.vl"))).expect("its source");
+    build_native(&staged, entry)
 }
 
 /// A program whose frame callback fails, built beside the example.
@@ -388,5 +407,51 @@ fn the_gfx_example_draws_on_change_counts_a_click_and_ends_cleanly() {
         reported.matches("the frame callback failed").count(),
         1,
         "the failure is reported once:\n{reported}"
+    );
+}
+
+/// F173 (item 9 above): the system clipboard's text, for real, between the program and
+/// another X client on a private X server; and cleanly nothing with no
+/// display. Each step waits for the line its predecessor caused.
+#[test]
+fn the_clipboard_round_trips_with_another_x_client_and_is_absent_without_a_display() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let binary = build_example_as("clipboard");
+    let injector = build_injector();
+
+    // No display: no clipboard, no panic, no wait.
+    let alone = Command::new(&binary)
+        .arg("--clipboard")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("WAYLAND_SOCKET")
+        .output()
+        .expect("run the clipboard mode");
+    let said = String::from_utf8_lossy(&alone.stdout).to_string();
+    assert!(
+        alone.status.success() && said.lines().any(|line| line == "no clipboard"),
+        "with no display:\n{said}{}",
+        String::from_utf8_lossy(&alone.stderr)
+    );
+
+    let started = Instant::now();
+    let mut running = Running::start(&binary, &["--clipboard"], "none");
+    running.wait_for("clipboard own: copied by vilan", started);
+    running.wait_for("clipboard waiting", started);
+    // Another client reads what the program copied: served by the program.
+    let read = running.inject_output(&injector, &["clipboard", "read"]);
+    assert_eq!(read.trim(), "clipboard copied by vilan");
+    // That client copies: the program reads its text.
+    let owned = running.inject_output(&injector, &["clipboard", "own", "copied by the injector"]);
+    assert_eq!(owned.trim(), "owned");
+    running.wait_for("clipboard pasted: copied by the injector", started);
+    let (code, seen, stderr) = running.exit(started);
+    assert_eq!(
+        code,
+        Some(0),
+        "the clipboard mode ended with {code:?}:\n{}\n--- stderr\n{stderr}",
+        seen.join("\n")
     );
 }
