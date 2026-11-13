@@ -1079,3 +1079,220 @@ fn m203_a_function_called_only_with_the_wrong_arity_elsewhere_keeps_the_fallback
         .join()
         .expect("worker panicked");
 }
+
+// --- B740: a hidden parameter's FLAVOUR is the function's, so it is bare only
+// where every entry into the function has a value to hand. ---
+//
+// One strict candidate of a dispatch made the parameter strict for every
+// instance of the generic and for the safe candidates beside it, and a caller
+// with no context handed such a node nothing: JavaScript read `undefined`, and
+// the safe read answered `Some(undefined)`. A node now holds the bare value
+// only when it is strict AND covered; every other needy node holds the
+// `Option` (`None` from a caller without the context), and a strict read in a
+// covered `Option` holder unwraps.
+
+/// The flavour of each hidden parameter of every function named `name`, in
+/// source order: `true` for `Option<T>`, `false` for the bare value.
+fn hidden_parameter_flavours(source: &str, name: &str) -> Vec<bool> {
+    let source = source.to_string();
+    let name = name.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            assert!(
+                errors.is_empty(),
+                "expected a clean analysis, got: {:#?}",
+                errors.iter().map(|error| &error.msg).collect::<Vec<_>>()
+            );
+            let program = program.expect("a program");
+            let mut functions: Vec<(usize, Vec<bool>)> = program
+                .functions
+                .iter()
+                .filter(|(id, function)| {
+                    function.name == name && program.span_map.contains_key(*id)
+                })
+                .map(|(id, function)| {
+                    let flavours = function
+                        .parameters
+                        .iter()
+                        .filter(|parameter| {
+                            program.context_hidden_parameters.contains_key(*parameter)
+                        })
+                        .map(|parameter| {
+                            program
+                                .context_optional_hidden_parameters
+                                .contains(parameter)
+                        })
+                        .collect();
+                    (program.span_map[id].start, flavours)
+                })
+                .collect();
+            functions.sort_unstable_by_key(|(start, _)| *start);
+            functions
+                .into_iter()
+                .flat_map(|(_, flavours)| flavours)
+                .collect()
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the analysis thread")
+}
+
+/// A trait with a SAFE reader (`str`) and a STRICT one (`i32`) of a user
+/// context, a generic dispatching through it, and `main` writing `body`.
+fn depth_notes(body: &str) -> String {
+    format!(
+        "import std::context::Context;
+
+let depth_context: Context<i32> = Context::new();
+
+trait Note {{
+\tfun note(self);
+}}
+
+impl str with Note {{
+\tfun note(self) {{
+\t\tmatch depth_context.get_safe() {{
+\t\t\tSome(let depth) => print(i\"{{self}} at depth {{depth}}\"),
+\t\t\tNone => print(i\"{{self}} without depth\"),
+\t\t}}
+\t}}
+}}
+
+impl i32 with Note {{
+\tfun note(self) {{
+\t\tprint(i\"{{self}} at depth {{depth_context.get()}}\");
+\t}}
+}}
+
+fun noted<V: Note>(value: V) {{
+\tvalue.note();
+}}
+
+fun main() {{
+{body}
+}}
+"
+    )
+}
+
+#[test]
+fn b740_a_safe_read_behind_a_strict_candidate_answers_none_without_the_context() {
+    assert_compiles_and_runs(
+        &depth_notes(
+            "    noted(\"top\");
+    depth_context.run(1, || {
+        noted(\"inside\");
+        noted(2);
+    });",
+        ),
+        "top without depth\ninside at depth 1\n2 at depth 1\n",
+    );
+}
+
+#[test]
+fn b740_a_safe_candidate_called_directly_without_the_context_answers_none() {
+    // No generic instance is reached without the context here: the safe
+    // candidate itself is, by a direct call from `main`. It is a candidate of
+    // the mixed site in `noted` all the same.
+    assert_compiles_and_runs(
+        &depth_notes(
+            "    \"direct\".note();
+    depth_context.run(3, || {
+        \"direct inside\".note();
+        noted(4);
+    });",
+        ),
+        "direct without depth\ndirect inside at depth 3\n4 at depth 3\n",
+    );
+}
+
+#[test]
+fn b740_a_generic_reached_without_the_context_holds_an_option() {
+    // `noted` is reached from `main`: its parameter, and with it every
+    // needy candidate of its site, holds the `Option` — the strict `i32` one
+    // too, which is covered (only `run` reaches its instance) and unwraps.
+    let source = depth_notes(
+        "    noted(\"top\");
+    depth_context.run(1, || noted(2));",
+    );
+    assert_eq!(hidden_parameter_flavours(&source, "noted"), vec![true]);
+    assert_eq!(hidden_parameter_flavours(&source, "note"), vec![true, true]);
+}
+
+#[test]
+fn b740_a_generic_every_entry_of_which_holds_the_context_stays_bare() {
+    // The shape the rule must not move: every call of `noted` sits under
+    // `run`, so `noted` and the site's candidates are covered and keep the
+    // bare value — the safe `str` one included (a mixed site promotes it).
+    let source = depth_notes(
+        "    depth_context.run(1, || {
+        noted(\"inside\");
+        noted(2);
+    });",
+    );
+    assert_eq!(hidden_parameter_flavours(&source, "noted"), vec![false]);
+    assert_eq!(
+        hidden_parameter_flavours(&source, "note"),
+        vec![false, false]
+    );
+}
+
+#[test]
+fn b740_a_demoted_holder_unwraps_for_a_bare_callee_and_an_injected_call() {
+    // The strict candidate is demoted to the `Option` by the site in `noted`;
+    // what it hands a strict helper (a direct call) and the closure it was
+    // given (an injected call) is the unwrapped value.
+    assert_compiles_and_runs(
+        "import std::context::Context;
+
+let depth_context: Context<i32> = Context::new();
+
+trait Note {
+\tfun note(self, body: (sync || void) context depth_context);
+}
+
+impl str with Note {
+\tfun note(self, body: (sync || void) context depth_context) {
+\t\tmatch depth_context.get_safe() {
+\t\t\tSome(let depth) => print(i\"{self} at depth {depth}\"),
+\t\t\tNone => print(i\"{self} without depth\"),
+\t\t}
+\t}
+}
+
+fun helper(value: i32) {
+\tprint(i\"{value} helped at depth {depth_context.get()}\");
+}
+
+impl i32 with Note {
+\tfun note(self, body: (sync || void) context depth_context) {
+\t\thelper(self);
+\t\tbody();
+\t}
+}
+
+fun noted<V: Note>(value: V) {
+\tvalue.note(|| print(i\"body at depth {depth_context.get()}\"));
+}
+
+fun main() {
+\tnoted(\"top\");
+\tdepth_context.run(1, || {
+\t\tnoted(\"inside\");
+\t\tnoted(2);
+\t});
+}
+",
+        "top without depth\ninside at depth 1\n2 helped at depth 1\nbody at depth 1\n",
+    );
+}

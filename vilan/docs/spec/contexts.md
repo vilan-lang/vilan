@@ -90,6 +90,14 @@ function whose only demands are safe reads is safe. One function may be
 strict for one context and safe for another. Each context threads
 independently.
 
+What a function *carries* is decided per function, by its entries: it
+carries the bare `T` only when every path into it passes through a
+`run`. A generic whose dispatch can select a strict read for one
+instance and a safe read for another, called both under a `run` and
+without one, carries `Option<T>`: its safe reads answer `None` where the
+caller had no `run`, and its strict reads, which coverage proved are
+reached only under one, read the `Some`.
+
 ## 8.3 Coverage
 
 For every strict read, the compiler checks, over the whole call graph,

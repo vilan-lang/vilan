@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**A safe context read behind a strict dispatch candidate answers `None` without the context (B740).** A hidden context parameter's flavour is decided per function, and one strict candidate of a dispatch (an impl that reads the context with `get()`) made it strict for the whole generic and for every candidate of the same site, the safe ones (`get_safe()`) included. A caller with no such context then handed it nothing, and JavaScript output was WRONG: in `fun noted<V: Note>(own value: V) { value.note(); }` with one impl reading `owner_scope.get_safe()` and another `owner_scope.get()`, `noted("top")` from code with no owner, or a direct `"top".note()` from there, printed the `Some` arm (the read was `Some(undefined)`), where it now prints the `None` arm; natively the call was refused although the checker accepted it. A function now holds the bare value only when every entry into it has one (it is strict and covered); every other function holds the `Option`, a caller without the context passes `None`, and a strict read in a covered `Option` holder unwraps it. This holds for any context (the owner, `turn_scope`, or a program's own), through a forwarding generic, a trait default and its override, a bounded receiver, and a closure, and natively alike. Programs whose generics are reached only with the context are unchanged.
+
+---
+
+<!-- family: fix -->
 **Native: `ListCell::peek`, `HashMapCell::peek`, `HashSetCell::peek` and `Weak::get` build (B739).** The native backend refused the `WeakGet` intrinsic by name, so every `peek` was a JavaScript-only read. `weak.get()` is now a view of the cell's value, not a copy: the cell is pinned and its value lent for the statement that reads the view (a `match` subject's whole match), and a write of the cell inside that extent is the runtime's reentrancy stop, as a read inside `update` is. `vilan/examples/ui-virtual-list` reads its list in place with `peek` again.
 
 ---

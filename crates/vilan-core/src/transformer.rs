@@ -7655,6 +7655,20 @@ impl<'src> Transformer<'src> {
             return Some(hoisted.clone());
         }
         let entity = self.program.entity_map.get(&id).unwrap();
+        // B740: a read of an `Option`-flavoured hidden context parameter that
+        // stands where the bare value is wanted takes the `Some`'s payload —
+        // `[0, value]`, slot 1. The context pass records one only where every
+        // entry handed `Some`.
+        if self.program.context_unwrapped_reads.contains(&id)
+            && let Expr::Local(parameter) = entity
+        {
+            let parameter = *parameter;
+            self.referenced_globals.insert(parameter);
+            return Some(js::Node::PropertyIndex(
+                Box::new(js::Node::Local(self.ng.name_for(parameter))),
+                Box::new(js::Node::Number("1".to_string(), None)),
+            ));
+        }
 
         Some(match entity {
             Expr::Error => unreachable!(),

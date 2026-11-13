@@ -436,6 +436,7 @@ impl ContextLog {
                 ThreadForm::Param { owner } => (owner.id(), 0),
                 ThreadForm::WrapSome { owner } => (owner.id(), 1),
                 ThreadForm::NoneLiteral => (Id(0), 2),
+                ThreadForm::Unwrap { owner } => (owner.id(), 3),
             }
         };
         let mut rows: Vec<(u8, Id, Id, Id, u8)> = Vec::new();
@@ -449,9 +450,9 @@ impl ContextLog {
                 rows.push((1, closure, context, provider, 0));
             }
         }
-        for &(call_id, context, owner, wrap_some) in &plan.gets {
+        for &(call_id, context, owner, form) in &plan.gets {
             if cold(call_id) {
-                rows.push((2, call_id, context, owner.id(), u8::from(wrap_some)));
+                rows.push((2, call_id, context, owner.id(), form as u8));
             }
         }
         for &(call_id, context, ref form) in &plan.thread_calls {
@@ -532,13 +533,28 @@ struct ClearSite {
 
 /// How a threaded call site obtains one context's argument: the caller's
 /// own parameter (bare or already-`Option`), that parameter `Some`-wrapped
-/// (the covered→safe boundary), or a literal `None` (an entry point with no
-/// value — a top-level call, or the inlined entry `main`).
+/// (a bare holder supplying an `Option` one), that parameter UNWRAPPED (an
+/// `Option` holder supplying a bare one — B740: only a covered holder, whose
+/// `Option` is `Some` wherever the call runs), or a literal `None` (an entry
+/// point with no value — a top-level call, or the inlined entry `main`).
 #[derive(Clone, Copy)]
 enum ThreadForm {
     Param { owner: Node },
     WrapSome { owner: Node },
     NoneLiteral,
+    Unwrap { owner: Node },
+}
+
+/// How a rewritten `get()`/`get_safe()` reads its holder's parameter: as it
+/// is (a strict read of a bare holder, a safe read of an `Option` one),
+/// `Some`-wrapped (a safe read of a bare holder), or unwrapped (a strict read
+/// of an `Option` holder — B740: the holder is covered, so it holds `Some`).
+/// The discriminants are the mutation log's form codes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadForm {
+    AsIs = 0,
+    WrapSome = 1,
+    Unwrap = 2,
 }
 
 /// The rewrite to apply once analysis succeeds. Node ids are sorted/owned so the
@@ -561,9 +577,8 @@ struct Plan {
     /// parameter rather than taking its own.
     captures: Vec<(Id, Id, Id)>,
     /// `get()`/`get_safe()` calls to replace with a read of the in-scope
-    /// parameter; `wrap_some` marks a safe read inside a STRICT holder, whose
-    /// bare value must be `Some`-wrapped.
-    gets: Vec<(Id, Id, Node, bool)>,
+    /// parameter, and how the read takes it ([`ReadForm`]).
+    gets: Vec<(Id, Id, Node, ReadForm)>,
     /// Calls to needs-context functions, to thread one context's argument
     /// into, as `(call, context, form)`. ONE channel for every append, built
     /// context-by-context, so a call site's arguments accumulate in
@@ -3723,17 +3738,16 @@ fn analyze(
         // A body-less declaration has no callers and no body, so joining
         // `needs` here — after the propagation, the coverage fixpoint and every
         // refusal above — changes nothing but its own parameter list: it
-        // takes the hidden parameter, BARE when a member of its union reads
-        // the context strictly, so the slot can hand each implementation the
-        // value the call through the object threaded. ---
+        // takes the hidden parameter, BARE when a member of its union holds
+        // the value bare (settled below), so the slot can hand each
+        // implementation the value the call through the object threaded. ---
+        let mut slot_declarations: Vec<(Id, &Vec<Id>)> = Vec::new();
         for (declaration, union) in &object_slot_unions {
             if needs.contains(declaration) || !union.iter().any(|member| needs.contains(member)) {
                 continue;
             }
             needs.insert(*declaration);
-            if union.iter().any(|member| strict.contains(member)) {
-                strict.insert(*declaration);
-            }
+            slot_declarations.push((*declaration, union));
         }
 
         // --- Record the rewrite for this context. ---
@@ -3799,18 +3813,98 @@ fn analyze(
         for &id in &param_nodes {
             provider_of.entry(id).or_insert(id);
         }
-        // A parameter holds the BARE value when its provider is strict or a
-        // `run` closure (which `run` hands the bare value); otherwise it
-        // holds `Option<T>`.
-        // B482: a literal that can reach a cleared position holds the
-        // `Option`, whatever its provider would otherwise say.
-        let holds_bare = |node: Id| -> bool {
+
+        // --- B740: the parameter's FLAVOUR — whether it holds the bare value
+        // or `Option<T>` — is decided per FUNCTION, and every caller of one
+        // function hands it one form. `strict` is the wrong answer to that
+        // question: it is the DEMAND (some read below needs the value) and it
+        // climbs to every caller, including one that has no value to hand —
+        // a generic whose strict candidate is reached only from code with an
+        // owner, instantiated again from code without one (the coverage
+        // refinement, B737, rightly accepts that), or a safe candidate
+        // promoted strict by a mixed dispatch site and called from `main`.
+        // Such a node received NOTHING where a bare value was declared: JS
+        // read `undefined` and its safe reads answered `Some(undefined)`, and
+        // the native emitter refused the call the checker had accepted.
+        //
+        // The rule: a node holds the bare value only when EVERY entry into it
+        // has one to hand — it is strict and COVERED (`bound`, the fixpoint
+        // above, over the refined edges). Every other needy node holds the
+        // `Option`, and its callers hand it `None` where they have no value.
+        // A strict read in an `Option` holder unwraps, and that is sound
+        // because an `Option` holder that READS strictly is covered: a strict
+        // read, an injected call or a direct call to a bare callee in an
+        // uncovered node was refused above (the callee of a direct call from
+        // an uncovered caller is itself uncovered, or declares the context
+        // and refuses the call at its boundary), so the unwrap only ever
+        // runs where every entry handed `Some`.
+        let mut bare: HashSet<Id> = strict
+            .iter()
+            .copied()
+            .filter(|id| bound.contains(id))
+            .collect();
+        // A node with no value source at all: the inlined entry `main`, a
+        // `clear` body, or a closure rooted at one.
+        let has_source = |node: Id| !none_rooted.contains(&node);
+        let node_bare = |bare: &HashSet<Id>, node: Id| -> bool {
             provider_of
                 .get(&node)
                 .filter(|provider| !cleared_literals.contains_key(provider))
-                .map(|provider| strict.contains(provider) || run_closure_ids.contains(provider))
-                .unwrap_or(false)
+                .is_some_and(|provider| {
+                    bare.contains(provider) || run_closure_ids.contains(provider)
+                })
         };
+        // One dispatch call passes ONE argument whichever candidate it lands
+        // on (JS dispatches through a single call), so its needy candidates
+        // must agree on the flavour, and a caller that holds the `Option`
+        // can hand a bare candidate nothing it is sure of. Either way the
+        // bare candidates are DEMOTED to the `Option` (their strict reads
+        // unwrap, which is sound: each is covered, so every entry into it
+        // carries a value). Demotion changes the flavour of the sites inside
+        // the demoted node, so this runs to a fixpoint; it only ever removes,
+        // so it ends. A caller with no value source at all is left alone: a
+        // bare candidate of its site is covered, so the site never selects
+        // it, and the site hands `None` to the `Option` holders it can reach.
+        loop {
+            let mut demoted = false;
+            for (caller, _call_id, candidates) in &dispatch_sites {
+                if !needs.contains(caller) || !has_source(*caller) {
+                    continue;
+                }
+                let needy = || {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|candidate| needs.contains(candidate))
+                };
+                let any_bare = needy().any(|candidate| bare.contains(&candidate));
+                if !any_bare {
+                    continue;
+                }
+                let all_bare = needy().all(|candidate| bare.contains(&candidate));
+                if all_bare && node_bare(&bare, *caller) {
+                    continue;
+                }
+                for candidate in needy() {
+                    demoted |= bare.remove(&candidate);
+                }
+            }
+            if !demoted {
+                break;
+            }
+        }
+        // B617: the slot's declaration is bare when a member of its union is.
+        for (declaration, union) in &slot_declarations {
+            if union.iter().any(|member| bare.contains(member)) {
+                bare.insert(*declaration);
+            }
+        }
+        // A parameter holds the BARE value when its provider does (above) or
+        // is a `run` closure (which `run` hands the bare value); otherwise it
+        // holds `Option<T>`.
+        // B482: a literal that can reach a cleared position holds the
+        // `Option`, whatever its provider would otherwise say.
+        let holds_bare = |node: Id| -> bool { node_bare(&bare, node) };
         // F23: the flavour rides along with the node, so `apply` can record it
         // against the parameter it is about to mint. The iteration order is
         // the set's own, unchanged — it is what decides the order the hidden
@@ -3827,11 +3921,16 @@ fn analyze(
                 plan.none_gets.push(get.call_id);
                 continue;
             }
-            // A safe read of a BARE holder wraps; everything else reads the
-            // parameter as-is (bare for strict gets, `Option` for safe reads
-            // in safe holders).
-            let wrap_some = get.safe && holds_bare(get.owner.id());
-            plan.gets.push((get.call_id, context, get.owner, wrap_some));
+            // A safe read of a BARE holder wraps, and a strict read of an
+            // `Option` holder unwraps (B740: the holder is covered, so its
+            // `Option` is `Some` wherever the read runs); the other two read
+            // the parameter as-is.
+            let form = match (get.safe, holds_bare(get.owner.id())) {
+                (true, true) => ReadForm::WrapSome,
+                (false, false) => ReadForm::Unwrap,
+                (true, false) | (false, true) => ReadForm::AsIs,
+            };
+            plan.gets.push((get.call_id, context, get.owner, form));
         }
 
         // Spawn registration: a spawn whose owner has a value source reads it
@@ -3852,10 +3951,23 @@ fn analyze(
         // needs-context function — direct calls, and dispatch sites whose
         // candidate callees include a needy one (B14; a candidate that does
         // not need the value ignores the extra trailing argument). The
-        // argument form follows the flavors: bare→bare and Option→Option
-        // pass the parameter through; a BARE holder supplying a SAFE callee
-        // `Some`-wraps (the covered→safe boundary). Safe→strict cannot occur
-        // (strictness propagated to the caller).
+        // argument form follows the flavours (`bare`, above): bare→bare and
+        // Option→Option pass the parameter through; a BARE holder supplying
+        // an `Option` callee `Some`-wraps; an `Option` holder supplying a
+        // bare callee unwraps (B740 — only a covered holder does, so its
+        // `Option` is `Some`). A node with no value source hands an `Option`
+        // callee `None`, and a bare one nothing: a bare callee is covered, so
+        // no call from such a node reaches it.
+        let form_between = |caller: Id, owner: Node, callee_bare: bool| -> Option<ThreadForm> {
+            if !has_source(caller) {
+                return (!callee_bare).then_some(ThreadForm::NoneLiteral);
+            }
+            Some(match (holds_bare(caller), callee_bare) {
+                (true, true) | (false, false) => ThreadForm::Param { owner },
+                (true, false) => ThreadForm::WrapSome { owner },
+                (false, true) => ThreadForm::Unwrap { owner },
+            })
+        };
         for &node_id in &needs {
             let Some(&owner) = node_of.get(&node_id) else {
                 continue;
@@ -3863,25 +3975,8 @@ fn analyze(
             for call in graph.calls_of(node_id) {
                 if let CallTarget::Function(callee) = call.target
                     && needs.contains(&callee)
+                    && let Some(form) = form_between(node_id, owner, bare.contains(&callee))
                 {
-                    if none_rooted.contains(&node_id) {
-                        // No value here: safe callees get `None` (a
-                        // strict callee under a None root already
-                        // fenced).
-                        if !strict.contains(&callee) {
-                            plan.thread_calls.push((
-                                call.call_id,
-                                context,
-                                ThreadForm::NoneLiteral,
-                            ));
-                        }
-                        continue;
-                    }
-                    let form = if !strict.contains(&callee) && holds_bare(node_id) {
-                        ThreadForm::WrapSome { owner }
-                    } else {
-                        ThreadForm::Param { owner }
-                    };
                     plan.thread_calls.push((call.call_id, context, form));
                 }
             }
@@ -3890,36 +3985,28 @@ fn analyze(
             if !needs.contains(caller) {
                 continue;
             }
-            let needy: Vec<Id> = candidates
+            let mut needy = candidates
                 .iter()
                 .copied()
                 .filter(|candidate| needs.contains(candidate))
-                .collect();
-            if needy.is_empty() {
+                .peekable();
+            if needy.peek().is_none() {
                 continue;
             }
             let Some(&owner) = node_of.get(caller) else {
                 continue;
             };
-            // Mixed flavors were promoted away: needy candidates are now all
-            // strict or all safe.
-            let callee_safe = needy.iter().all(|id| !strict.contains(id));
-            if none_rooted.contains(caller) {
-                if callee_safe {
-                    plan.thread_calls
-                        .push((*call_id, context, ThreadForm::NoneLiteral));
-                }
-                continue;
+            // A caller with a value source sees needy candidates of ONE
+            // flavour (the demotion above). One with none may see both, and
+            // reaches only the `Option` holders among them.
+            let callee_bare = needy.all(|id| bare.contains(&id));
+            if let Some(form) = form_between(*caller, owner, callee_bare) {
+                plan.thread_calls.push((*call_id, context, form));
             }
-            let form = if callee_safe && holds_bare(*caller) {
-                ThreadForm::WrapSome { owner }
-            } else {
-                ThreadForm::Param { owner }
-            };
-            plan.thread_calls.push((*call_id, context, form));
         }
         // Calls through injected closures: the caller's value rides as the
-        // deferred trailing argument (the bare channel).
+        // deferred trailing argument (the bare channel) — unwrapped from an
+        // `Option` holder (B740: a demoted one, covered).
         //
         // B482: a call through a CLEARED position hands an `Option` — `None`
         // under the `clear`, the caller's bare value `Some`-wrapped elsewhere
@@ -3930,10 +4017,12 @@ fn analyze(
                 .is_some_and(|carrier| carrier_cleared(*carrier));
             let form = if cleared_calls.contains(call_id) {
                 ThreadForm::NoneLiteral
-            } else if through_cleared && holds_bare(owner.id()) {
-                ThreadForm::WrapSome { owner: *owner }
             } else {
-                ThreadForm::Param { owner: *owner }
+                match (through_cleared, holds_bare(owner.id())) {
+                    (true, true) => ThreadForm::WrapSome { owner: *owner },
+                    (false, false) => ThreadForm::Unwrap { owner: *owner },
+                    (true, false) | (false, true) => ThreadForm::Param { owner: *owner },
+                }
             };
             plan.thread_calls.push((*call_id, context, form));
         }
@@ -3955,9 +4044,9 @@ fn analyze(
             plan.cleared_types
                 .extend(cleared_types.into_iter().map(|type_id| (type_id, context)));
         }
-        // Top-level calls to safe functions: the entry point with no value —
-        // a literal `None` rides along. (Top-level calls to STRICT functions
-        // already failed the fence.)
+        // Top-level calls to `Option` holders: the entry point with no value
+        // — a literal `None` rides along. (A bare callee is covered, so no
+        // top-level call reaches it.)
         for (&call_id, function_call) in &program.function_calls {
             if owned_call_ids.contains(&call_id) {
                 continue;
@@ -3965,7 +4054,7 @@ fn analyze(
             let Some(target) = local_target(program, function_call.subject_id) else {
                 continue;
             };
-            if needs.contains(&target) && !strict.contains(&target) {
+            if needs.contains(&target) && !bare.contains(&target) {
                 plan.thread_calls
                     .push((call_id, context, ThreadForm::NoneLiteral));
             }
@@ -4291,7 +4380,7 @@ struct MintCounts {
 #[derive(Default)]
 struct Deferred {
     spawns: Vec<(Id, Id, Node, bool)>,
-    gets: Vec<(Id, Id, Node, bool)>,
+    gets: Vec<(Id, Id, Node, ReadForm)>,
     thread_calls: Vec<(Id, Id, ThreadForm)>,
 }
 
@@ -4386,24 +4475,26 @@ fn wrap_in_some(program: &mut Program, minting: &mut Minting, plan: &Plan, param
 
 /// `get()` becomes a read of the in-scope parameter; a safe read of a BARE
 /// holder becomes `Some(parameter)` (the get's own call entity is rewritten
-/// into the wrap, its method records purged like `run`'s). A row whose owner
+/// into the wrap, its method records purged like `run`'s), and a strict read
+/// of an `Option` holder a read the backends unwrap
+/// (`Program::context_unwrapped_reads`, B740). A row whose owner
 /// has no parameter yet goes to `defer` when one is given.
 fn rewrite_gets(
     program: &mut Program,
     minting: &mut Minting,
     plan: &Plan,
-    rows: &[(Id, Id, Node, bool)],
-    mut defer: Option<&mut Vec<(Id, Id, Node, bool)>>,
+    rows: &[(Id, Id, Node, ReadForm)],
+    mut defer: Option<&mut Vec<(Id, Id, Node, ReadForm)>>,
 ) {
     for &row in rows {
-        let (call_id, context, owner, wrap_some) = row;
+        let (call_id, context, owner, form) = row;
         let Some(&parameter) = minting.source.get(&(context, owner.id())) else {
             if let Some(defer) = defer.as_deref_mut() {
                 defer.push(row);
             }
             continue;
         };
-        if wrap_some {
+        if form == ReadForm::WrapSome {
             let some_variant = plan
                 .some_variant
                 .expect("safe sites resolved the Option variants");
@@ -4431,6 +4522,9 @@ fn rewrite_gets(
             program.generic_dispatch.remove(&call_id);
         } else {
             program.entity_map.insert(call_id, Expr::Local(parameter));
+            if form == ReadForm::Unwrap {
+                program.context_unwrapped_reads.insert(call_id);
+            }
         }
     }
 }
@@ -4504,6 +4598,21 @@ fn thread_arguments(
                     continue;
                 };
                 wrap_in_some(program, minting, plan, parameter)
+            }
+            ThreadForm::Unwrap { owner } => {
+                let Some(parameter) = owner_parameter(minting, owner) else {
+                    if let Some(defer) = defer.as_deref_mut() {
+                        defer.push(row);
+                        deferred_calls.insert(call_id);
+                    }
+                    continue;
+                };
+                // Its own entity, never the shared pass-through (M137): the
+                // unwrap is recorded against the read entity.
+                let reference = minting.fresh();
+                program.entity_map.insert(reference, Expr::Local(parameter));
+                program.context_unwrapped_reads.insert(reference);
+                reference
             }
             ThreadForm::NoneLiteral => {
                 if deferred_calls.contains(&call_id) {
