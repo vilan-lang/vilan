@@ -184,8 +184,23 @@ impl TextLayout {
         Some(self.data.editing.as_ref()?.word_around(index))
     }
 
+    /// The start (or with `end`, the last caret position) of the visual line
+    /// byte `index` is on. See `editing.rs` for which line that is.
+    pub fn line_end(&self, index: usize, end: bool) -> Option<usize> {
+        Some(self.data.editing.as_ref()?.line_end(index, end))
+    }
+
+    /// The caret position (a byte index) `lines` visual lines below byte
+    /// `index`'s (above, when negative) nearest `goal_x` dp from the
+    /// layout's left; the text's start past the first line, its end past
+    /// the last.
+    pub fn vertical(&self, index: usize, goal_x: f32, lines: isize) -> Option<usize> {
+        Some(self.data.editing.as_ref()?.vertical(index, goal_x, lines))
+    }
+
     /// The rectangles the graphemes between byte indices `from` and `to`
-    /// cover, merged where they touch on a line.
+    /// cover, merged where they touch on a line (a hard line break covers a
+    /// small extent at its line's end).
     pub fn selection(&self, from: usize, to: usize) -> Option<Vec<Rect>> {
         Some(self.data.editing.as_ref()?.selection(from, to))
     }
@@ -226,21 +241,34 @@ pub(crate) enum GlyphContent {
     Color(Vec<u8>),
 }
 
+/// How a paragraph is shaped beyond its style and width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Shaping {
+    /// For display only.
+    Plain,
+    /// Recording where each grapheme is (`editing.rs`), wrapping only
+    /// between words (a single-line field's text never wraps in practice).
+    Edited,
+    /// [`Edited`](Shaping::Edited), and a word longer than its line breaks
+    /// where it must instead of running out of the box (a text area's).
+    EditedBreakingWords,
+}
+
 /// The interface a text stack implements (R15). See the module documentation.
 pub(crate) trait TextEngine: Send {
     /// Registers every face in `data` (a TrueType/OpenType file or
     /// collection), answering the family names it added.
     fn register_font(&mut self, data: Vec<u8>) -> Vec<String>;
 
-    /// Shapes `text` in `style`, wrapping at `max_width` dp when given, and
-    /// with `editing` records where each grapheme is (`editing.rs`). The
+    /// Shapes `text` in `style`, wrapping at `max_width` dp when given, as
+    /// `shaping` asks (`editing.rs`'s geometry recorded, words broken). The
     /// answer's `system` field is filled by the caller.
     fn shape(
         &mut self,
         text: &str,
         style: &TextStyle,
         max_width: Option<f32>,
-        editing: bool,
+        shaping: Shaping,
     ) -> LayoutData;
 
     /// Rasterises one glyph. `None` when the font cannot produce it (an id
@@ -310,7 +338,7 @@ impl TextSystem {
 
     /// Shapes `text` in `style` on one line, or wrapped at `max_width` dp.
     pub fn layout(&mut self, text: &str, style: &TextStyle, max_width: Option<f32>) -> TextLayout {
-        self.shape(text, style, max_width, false)
+        self.shape(text, style, max_width, Shaping::Plain)
     }
 
     /// [`layout`](TextSystem::layout), recording where each grapheme is: the
@@ -321,7 +349,18 @@ impl TextSystem {
         style: &TextStyle,
         max_width: Option<f32>,
     ) -> TextLayout {
-        self.shape(text, style, max_width, true)
+        self.shape(text, style, max_width, Shaping::Edited)
+    }
+
+    /// [`editable_layout`](TextSystem::editable_layout), with a word longer
+    /// than its line broken where it must (a multi-line field's wrapping).
+    pub fn editable_layout_breaking_words(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        max_width: Option<f32>,
+    ) -> TextLayout {
+        self.shape(text, style, max_width, Shaping::EditedBreakingWords)
     }
 
     fn shape(
@@ -329,9 +368,9 @@ impl TextSystem {
         text: &str,
         style: &TextStyle,
         max_width: Option<f32>,
-        editing: bool,
+        shaping: Shaping,
     ) -> TextLayout {
-        let mut data = self.engine.shape(text, style, max_width, editing);
+        let mut data = self.engine.shape(text, style, max_width, shaping);
         data.system = self.id;
         TextLayout {
             data: Arc::new(data),

@@ -15,7 +15,7 @@
 //! release of an unflagged button 4 to 7 into a `MouseWheel` of one line; a
 //! real wheel on an XInput2 server scrolls by its valuator and its button
 //! events ARE flagged, so it moves 32 dp a notch), `key NAME` presses and releases the key whose X keysym is
-//! `NAME` (`Tab`, `Return`, `space`, `a`), with `shift+` in front holding
+//! `NAME` (`Tab`, `Return`, `Up`, `space`, `a`), with `shift+` in front holding
 //! Shift around it, and `close` sends the WM_DELETE_WINDOW message a window
 //! manager sends for its close button. Keys go to the window: it is given
 //! the input focus first, as a window manager gives it on a click. The
@@ -208,6 +208,8 @@ mod x11 {
             "Tab" => 0xff09,
             "Return" => 0xff0d,
             "Escape" => 0xff1b,
+            "Up" => 0xff52,
+            "Down" => 0xff54,
             "space" => 0x20,
             single if single.len() == 1 && single.is_ascii() => u32::from(single.as_bytes()[0]),
             other => return Err(format!("no keysym {other:?} here").into()),

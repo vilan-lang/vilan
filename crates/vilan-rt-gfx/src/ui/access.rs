@@ -18,7 +18,7 @@
 //! | Element | Published as |
 //! |---|---|
 //! | a marker | never (it is a place, not an element) |
-//! | any element with a role | that role (`Role::TextField` is a text input, `Role::Checkbox` a check box) |
+//! | any element with a role | that role (`Role::TextField` is a text input, `Role::TextArea` a multi-line one, `Role::Checkbox` a check box) |
 //! | a text, no role | a label whose value is its text (what a platform reads as a label's name; a labelled text keeps its label too) |
 //! | an image, no role | an image when it has a label; left out (decorative) when it has none |
 //! | a scroll | a scroll view, with its offset and range |
@@ -31,7 +31,12 @@
 //! nothing inside them is published (ARIA's "children presentational"). A
 //! text input is a leaf too, with one text run: its value is its edited
 //! text, its placeholder any other text inside it, and its selection is the
-//! edited text's caret and anchor, in graphemes.
+//! edited text's caret and anchor, in graphemes. A multi-line one
+//! (`Role::TextArea`) has a text run per VISUAL line, as `accesskit` reads
+//! runs: each line's text (a hard line break included at the end of the
+//! line it ends, one character), and its selection is a run and a grapheme
+//! in it — the line an index at a soft wrap is on is the lower one
+//! (`text/editing.rs`).
 //!
 //! # Coordinates
 //!
@@ -48,7 +53,10 @@
 //! An element's id is its tree id, which stays the same for the element's
 //! life and is never reused for another (the solver's ids carry a version);
 //! the window node is id 0, which no element has. A text input's run uses the
-//! edited text's id (that element is never published itself).
+//! edited text's id (that element is never published itself); a text area's
+//! first line's run does too, and its later lines' runs use that id's slot
+//! with an EVEN version (2 for the second line, 4 for the third, ...), which
+//! no element's id has ([`run_id`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -279,18 +287,16 @@ impl UiTree {
         (edited, others)
     }
 
-    /// An edited text's graphemes, as its last painted layout records them:
-    /// none before its first layout.
+    /// An edited text's graphemes, as its layout at its laid-out width
+    /// records them: none before its first layout.
     fn editing_geometry(&self, node: NodeId) -> Option<&EditingGeometry> {
         let Content::Text(content) = &self.data(node).content else {
             return None;
         };
         content
-            .shaped
-            .iter()
-            .find(|shaped| shaped.constraint == content.painted_at)
-            .or(content.shaped.first())
-            .and_then(|shaped| shaped.layout.data.editing.as_ref())
+            .kept_for(content.laid_out_at)
+            .or(content.shaped.first().map(|shaped| &shaped.layout))
+            .and_then(|layout| layout.data.editing.as_ref())
     }
 
     /// Where `node`'s box is inside `outer` (an ancestor): its laid-out box
@@ -312,17 +318,31 @@ impl UiTree {
     }
 }
 
-/// The UTF-16 index `unit` of `text` as an index into `graphemes` (logical
-/// order): how many graphemes start before it.
-fn grapheme_index(text: &str, graphemes: &[(usize, usize, f32, f32)], unit: usize) -> usize {
+/// One character of a text run (`accesskit`'s "character", our grapheme):
+/// its bytes, its left edge and advance, and its visual line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RunCharacter {
+    start: usize,
+    end: usize,
+    x: f32,
+    width: f32,
+    line: usize,
+}
+
+/// The UTF-16 index `unit` of `text` as an index into `characters` (logical
+/// order): how many characters start before it.
+fn grapheme_index(text: &str, characters: &[RunCharacter], unit: usize) -> usize {
     let byte = super::byte_of_unit(text, unit);
-    graphemes.iter().filter(|(start, ..)| *start < byte).count()
+    characters
+        .iter()
+        .filter(|character| character.start < byte)
+        .count()
 }
 
 /// `geometry`'s graphemes in logical order, one entry each (a grapheme a
-/// font change split is two boxes: joined): start, end, left edge, advance.
-fn logical_graphemes(geometry: &EditingGeometry) -> Vec<(usize, usize, f32, f32)> {
-    let mut graphemes: Vec<(usize, usize, f32, f32)> = Vec::new();
+/// font change split is two boxes: joined).
+fn logical_graphemes(geometry: &EditingGeometry) -> Vec<RunCharacter> {
+    let mut characters: Vec<RunCharacter> = Vec::new();
     let mut boxes: Vec<_> = geometry.graphemes.iter().collect();
     boxes.sort_by(|first, second| {
         (first.start, first.x)
@@ -330,15 +350,52 @@ fn logical_graphemes(geometry: &EditingGeometry) -> Vec<(usize, usize, f32, f32)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     for grapheme in boxes {
-        match graphemes.last_mut() {
-            Some(last) if last.0 == grapheme.start => {
-                last.1 = last.1.max(grapheme.end);
-                last.3 += grapheme.width;
+        match characters.last_mut() {
+            Some(last) if last.start == grapheme.start => {
+                last.end = last.end.max(grapheme.end);
+                last.width += grapheme.width;
             }
-            _ => graphemes.push((grapheme.start, grapheme.end, grapheme.x, grapheme.width)),
+            _ => characters.push(RunCharacter {
+                start: grapheme.start,
+                end: grapheme.end,
+                x: grapheme.x,
+                width: grapheme.width,
+                line: grapheme.line,
+            }),
         }
     }
-    graphemes
+    characters
+}
+
+/// The id of a text area's run for visual line `line` of its edited text
+/// `edited`: the edited text's own id for the first line, and for a later
+/// one the same slot with the even version `2 * line` (an element's version
+/// is odd, so no element has it; see the module documentation).
+fn run_id(edited: NodeId, line: usize) -> AccessId {
+    if line == 0 {
+        return access_id(edited);
+    }
+    let slot = u64::from(edited) & 0xffff_ffff;
+    let version = (2 * line as u64) & 0xffff_fffe;
+    AccessId((version << 32) | slot)
+}
+
+/// A text position in a text area's runs: the run of the line `byte` is on
+/// (`text/editing.rs`'s rule), and the characters of that line before it.
+fn line_position(
+    edited: NodeId,
+    geometry: &EditingGeometry,
+    characters: &[RunCharacter],
+    byte: usize,
+) -> TextPosition {
+    let line = geometry.line_of(byte);
+    TextPosition {
+        node: run_id(edited, line),
+        character_index: characters
+            .iter()
+            .filter(|character| character.line == line && character.start < byte)
+            .count(),
+    }
 }
 
 /// The role an element is published with, or none (left out), when its
@@ -353,6 +410,7 @@ fn published_role(tree: &UiTree, node: NodeId, in_list: bool) -> Option<AccessRo
         Role::Button => Some(AccessRole::Button),
         Role::Link => Some(AccessRole::Link),
         Role::TextField => Some(AccessRole::TextInput),
+        Role::TextArea => Some(AccessRole::MultilineTextInput),
         Role::Checkbox => Some(AccessRole::CheckBox),
         Role::List => Some(AccessRole::List),
         Role::ListItem => Some(AccessRole::ListItem),
@@ -446,11 +504,11 @@ impl Build<'_> {
                     }
                 }
             }
-        } else if role == AccessRole::TextInput {
+        } else if matches!(role, AccessRole::TextInput | AccessRole::MultilineTextInput) {
             if let Some(label) = label {
                 published.set_label(label);
             }
-            self.text_input(node, &mut published, &mut children);
+            self.text_input(node, role, &mut published, &mut children);
         } else {
             match (&data.content, label) {
                 // A label's text is its value: what the platform reads as
@@ -539,11 +597,12 @@ impl Build<'_> {
         }
     }
 
-    /// A text input's value, placeholder, run and selection (see the module
-    /// documentation).
+    /// A text input's value, placeholder, runs and selection (see the module
+    /// documentation): one run, or one per visual line for a multi-line one.
     fn text_input(
         &mut self,
         node: NodeId,
+        role: AccessRole,
         published: &mut AccessNode,
         children: &mut Vec<AccessId>,
     ) {
@@ -565,40 +624,89 @@ impl Build<'_> {
         let Some(geometry) = tree.editing_geometry(edited) else {
             return;
         };
-        let graphemes = logical_graphemes(geometry);
-        let mut run = AccessNode::new(AccessRole::TextRun);
-        run.set_value(text);
-        let lengths: Vec<u8> = graphemes
-            .iter()
-            .map(|(start, end, _, _)| u8::try_from(end - start).unwrap_or(u8::MAX))
-            .collect();
-        run.set_character_lengths(lengths);
-        run.set_character_positions(
-            graphemes
-                .iter()
-                .map(|(_, _, x, _)| *x)
-                .collect::<Vec<f32>>(),
-        );
-        run.set_character_widths(
-            graphemes
-                .iter()
-                .map(|(_, _, _, width)| *width)
-                .collect::<Vec<f32>>(),
-        );
+        let characters = logical_graphemes(geometry);
         let data = tree.data(edited);
         let content_box = tree.box_inside(edited, node);
-        run.set_bounds(access_rect(Rect::new(
+        let content = Rect::new(
             content_box.left() + data.content_offset.x,
             content_box.top() + data.content_offset.y,
             data.content_size.width,
             data.content_size.height,
-        )));
+        );
+        let multiline = role == AccessRole::MultilineTextInput;
+        // One run of every character, or one per visual line.
+        let runs: Vec<(AccessId, &[RunCharacter], Rect)> = if multiline {
+            let mut runs = Vec::with_capacity(geometry.lines.len());
+            let mut first = 0;
+            for (line, line_box) in geometry.lines.iter().enumerate() {
+                let count = characters[first..]
+                    .iter()
+                    .take_while(|character| character.line == line)
+                    .count();
+                runs.push((
+                    run_id(edited, line),
+                    &characters[first..first + count],
+                    Rect::new(
+                        content.left(),
+                        content.top() + line_box.top,
+                        content.size.width,
+                        line_box.height,
+                    ),
+                ));
+                first += count;
+            }
+            runs
+        } else {
+            vec![(access_id(edited), &characters[..], content)]
+        };
+        for (id, run_characters, bounds) in runs {
+            let mut run = AccessNode::new(AccessRole::TextRun);
+            let value = match (run_characters.first(), run_characters.last()) {
+                (Some(first), Some(last)) => text.get(first.start..last.end).unwrap_or(""),
+                _ => "",
+            };
+            run.set_value(if multiline { value } else { text });
+            run.set_character_lengths(
+                run_characters
+                    .iter()
+                    .map(|character| {
+                        u8::try_from(character.end - character.start).unwrap_or(u8::MAX)
+                    })
+                    .collect::<Vec<u8>>(),
+            );
+            run.set_character_positions(
+                run_characters
+                    .iter()
+                    .map(|character| character.x)
+                    .collect::<Vec<f32>>(),
+            );
+            run.set_character_widths(
+                run_characters
+                    .iter()
+                    .map(|character| character.width)
+                    .collect::<Vec<f32>>(),
+            );
+            run.set_bounds(access_rect(bounds));
+            children.push(id);
+            self.nodes.push((id, run));
+        }
         if let Content::Text(content) = &data.content
             && let Some(editing) = &content.editing
         {
-            let position = |unit: usize| TextPosition {
-                node: access_id(edited),
-                character_index: grapheme_index(text, &graphemes, unit),
+            let position = |unit: usize| {
+                if multiline {
+                    line_position(
+                        edited,
+                        geometry,
+                        &characters,
+                        super::byte_of_unit(text, unit),
+                    )
+                } else {
+                    TextPosition {
+                        node: access_id(edited),
+                        character_index: grapheme_index(text, &characters, unit),
+                    }
+                }
             };
             published.set_text_selection(TextSelection {
                 anchor: position(editing.anchor),
@@ -606,8 +714,6 @@ impl Build<'_> {
             });
             published.add_action(Action::SetTextSelection);
         }
-        children.push(access_id(edited));
-        self.nodes.push((access_id(edited), run));
     }
 }
 
@@ -721,10 +827,28 @@ pub fn access_listing(tree: &AccessTree, include_window: bool) -> String {
             listing.push_str(&format!(" graphemes={}", node.character_lengths().len()));
         }
         if let Some(selection) = node.text_selection() {
-            listing.push_str(&format!(
-                " selection={}..{}",
-                selection.anchor.character_index, selection.focus.character_index
-            ));
+            if node.role() == AccessRole::MultilineTextInput {
+                // A run per line: the line (its run's place), then the
+                // character in it.
+                let at = |position: TextPosition| {
+                    let line = node
+                        .children()
+                        .iter()
+                        .position(|child| *child == position.node)
+                        .map_or_else(|| "?".to_string(), |line| line.to_string());
+                    format!("{line}:{}", position.character_index)
+                };
+                listing.push_str(&format!(
+                    " selection={}..{}",
+                    at(selection.anchor),
+                    at(selection.focus)
+                ));
+            } else {
+                listing.push_str(&format!(
+                    " selection={}..{}",
+                    selection.anchor.character_index, selection.focus.character_index
+                ));
+            }
         }
         let actions: Vec<&str> = [
             (Action::Click, "click"),
@@ -816,7 +940,7 @@ impl UiTree {
                 Vec::new()
             }
         };
-        let editable = data.role == Role::TextField && !disabled;
+        let editable = matches!(data.role, Role::TextField | Role::TextArea) && !disabled;
         match (request.action, &request.data) {
             (Action::Focus, _) if focusable => vec![AccessStep::Focus(node)],
             (Action::Click, _)
@@ -858,19 +982,47 @@ impl UiTree {
                 let Some(edited) = edited else {
                     return Vec::new();
                 };
-                let run = access_id(edited);
-                if selection.anchor.node != run || selection.focus.node != run {
+                let Some(geometry) = self.editing_geometry(edited) else {
                     return Vec::new();
-                }
-                let count = self
-                    .editing_geometry(edited)
-                    .map_or(0, |geometry| logical_graphemes(geometry).len());
-                let anchor = selection.anchor.character_index.min(count);
-                let focus = selection.focus.character_index.min(count);
-                // Home, then one grapheme at a time: to the anchor, then
-                // with Shift to the focus — the caret keys a person uses.
+                };
+                let characters = logical_graphemes(geometry);
+                let multiline = data.role == Role::TextArea;
+                // A position as a count of characters from the text's start:
+                // in a text area's run, the characters of the lines before
+                // it first.
+                let offset = |position: &TextPosition| -> Option<usize> {
+                    if !multiline {
+                        return (position.node == access_id(edited))
+                            .then(|| position.character_index.min(characters.len()));
+                    }
+                    let line = (0..geometry.lines.len())
+                        .find(|line| run_id(edited, *line) == position.node)?;
+                    let before = characters
+                        .iter()
+                        .filter(|character| character.line < line)
+                        .count();
+                    let on_line = characters
+                        .iter()
+                        .filter(|character| character.line == line)
+                        .count();
+                    Some(before + position.character_index.min(on_line))
+                };
+                let (Some(anchor), Some(focus)) =
+                    (offset(&selection.anchor), offset(&selection.focus))
+                else {
+                    return Vec::new();
+                };
+                // The text's start (Home; Ctrl+Home in a text area, where
+                // Home is the line's), then one grapheme at a time: to the
+                // anchor, then with Shift to the focus — the caret keys a
+                // person uses.
                 let mut steps = focus_first();
-                steps.push(key("Home", true, false));
+                steps.push(AccessStep::Key {
+                    name: "Home",
+                    named: true,
+                    shift: false,
+                    control: multiline,
+                });
                 steps.extend((0..anchor).map(|_| key("ArrowRight", true, false)));
                 if focus > anchor {
                     steps.extend((anchor..focus).map(|_| key("ArrowRight", true, true)));

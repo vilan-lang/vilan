@@ -401,6 +401,117 @@ fn a_text_input_publishes_its_value_its_graphemes_and_its_selection() {
     assert_eq!(selection.anchor.node, access_id(edited));
 }
 
+/// A multi-line text field over "ab", a break, "cd": its edited text.
+fn text_area(fixture: &mut Fixture) -> (NodeId, NodeId, NodeId) {
+    let root = fixture.element(ElementKind::Column);
+    let field = fixture.sized(ElementKind::Row, 300.0, 60.0);
+    fixture.tree.set_role(field, Role::TextArea);
+    fixture.tree.set_label(field, "notes");
+    fixture.tree.set_tab_index(field, Some(0));
+    let edited = fixture.text("ab\ncd");
+    fixture.tree.text_edit(edited, 4, 1, true).unwrap();
+    fixture.tree.text_multiline(edited).unwrap();
+    fixture.add(field, &[edited]);
+    fixture.add(root, &[field]);
+    fixture.layout(root);
+    (root, field, edited)
+}
+
+#[test]
+fn a_text_area_publishes_a_run_a_line_and_its_selection_as_a_line_and_a_grapheme() {
+    let mut fixture = Fixture::new();
+    let (root, field, edited) = text_area(&mut fixture);
+    let tree = fixture.tree.access_tree(Some(root), window(1.0));
+    let published = node_of(&tree, field);
+    assert_eq!(published.role(), AccessRole::MultilineTextInput);
+    assert_eq!(published.value(), Some("ab\ncd"));
+    let second = run_id(edited, 1);
+    assert_eq!(published.children(), &[access_id(edited), second]);
+    assert_ne!(second, access_id(edited));
+    assert_ne!(second, WINDOW_NODE);
+    let first = node_of(&tree, edited);
+    assert_eq!(first.value(), Some("ab\n"));
+    assert_eq!(first.character_lengths(), &[1, 1, 1]);
+    let (_, lower) = tree
+        .nodes
+        .iter()
+        .find(|(id, _)| *id == second)
+        .expect("the second line's run");
+    assert_eq!(lower.value(), Some("cd"));
+    assert_eq!(lower.character_lengths(), &[1, 1]);
+    // Each run is its line's box: the second 12.5 dp (14 dp at 1.25) lower.
+    let top = |node: &AccessNode| node.bounds().expect("bounds").y0;
+    assert!(top(lower) > top(first));
+    // Anchor after "a" on the first line, the caret after "c" on the second.
+    let selection = published.text_selection().expect("a selection");
+    assert_eq!(
+        (selection.anchor.node, selection.anchor.character_index),
+        (access_id(edited), 1)
+    );
+    assert_eq!(
+        (selection.focus.node, selection.focus.character_index),
+        (second, 1)
+    );
+    let listing = fixture.listing(root);
+    assert!(
+        listing.contains("MultilineTextInput \"notes\" value=\"ab\\ncd\" selection=0:1..1:1"),
+        "{listing}"
+    );
+}
+
+#[test]
+fn set_text_selection_in_a_text_area_starts_from_the_texts_start_with_ctrl_home() {
+    let mut fixture = Fixture::new();
+    let (root, field, edited) = text_area(&mut fixture);
+    fixture.tree.focus(Some(field));
+    let steps = fixture.tree.plan_access_action(
+        root,
+        &request(
+            Action::SetTextSelection,
+            field,
+            Some(ActionData::SetTextSelection(TextSelection {
+                // The start of "cd" (after "ab" and its break: three
+                // graphemes in), then back to after "a".
+                anchor: TextPosition {
+                    node: run_id(edited, 1),
+                    character_index: 0,
+                },
+                focus: TextPosition {
+                    node: access_id(edited),
+                    character_index: 1,
+                },
+            })),
+        ),
+    );
+    let keys: Vec<String> = steps
+        .iter()
+        .map(|step| match step {
+            AccessStep::Key {
+                name,
+                shift,
+                control,
+                ..
+            } => format!(
+                "{}{}{name}",
+                if *control { "^" } else { "" },
+                if *shift { "+" } else { "" }
+            ),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "^Home",
+            "ArrowRight",
+            "ArrowRight",
+            "ArrowRight",
+            "+ArrowLeft",
+            "+ArrowLeft"
+        ]
+    );
+}
+
 // ---------------------------------------------------------- publishing ---
 
 #[test]
@@ -711,32 +822,39 @@ fn an_action_outside_the_tree_or_on_the_window_plans_nothing() {
 #[test]
 fn graphemes_are_listed_once_each_in_text_order() {
     use crate::text::editing::{GraphemeBox, LineBox};
-    let grapheme = |start: usize, end: usize, x: f32, width: f32| GraphemeBox {
-        start,
-        end,
-        x,
-        width,
-        line: 0,
-        rtl: false,
-        word: true,
+    let grapheme = |start: usize, end: usize, x: f32, width: f32| {
+        GraphemeBox::placed(start..end, x, width, 0, false)
     };
-    let geometry = EditingGeometry {
-        text_len: 7,
+    let geometry = EditingGeometry::new(
+        "abcdefg",
         // Visual order: the last grapheme drawn first (right to left), and
         // the first one split in two by a font change.
-        graphemes: vec![
+        vec![
             grapheme(5, 7, 0.0, 6.0),
             grapheme(0, 3, 6.0, 4.0),
             grapheme(0, 3, 10.0, 2.0),
             grapheme(3, 5, 12.0, 6.0),
         ],
-        lines: vec![LineBox {
+        vec![LineBox {
             top: 0.0,
             height: 10.0,
+            start: 0,
+            end: 7,
         }],
+    );
+    let character = |start: usize, end: usize, x: f32, width: f32| RunCharacter {
+        start,
+        end,
+        x,
+        width,
+        line: 0,
     };
     assert_eq!(
         logical_graphemes(&geometry),
-        vec![(0, 3, 6.0, 6.0), (3, 5, 12.0, 6.0), (5, 7, 0.0, 6.0)]
+        vec![
+            character(0, 3, 6.0, 6.0),
+            character(3, 5, 12.0, 6.0),
+            character(5, 7, 0.0, 6.0)
+        ]
     );
 }

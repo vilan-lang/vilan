@@ -1,0 +1,183 @@
+// `std::ui::kit`'s text area (native-ui.md P5, text editing): a multi-line editor
+// bound both ways to a `str` signal.
+//
+// THE SHAPE. A focusable column (the app's look, its padding, its width and HEIGHT)
+// around a vertical `scroll` that clips and moves the text, around a stack of the
+// text and, while the value is empty, the placeholder. The text wraps at the
+// scroll's width (a word longer than a line breaks where it must) and the scroll
+// keeps the caret in view. The caret, the selection, the pointer and undo are the
+// kit's editor (`editing.vl`), shared with the single-line input; its head says how
+// indices count, which line an index at a soft wrap is on, and how undo coalesces.
+//
+// THE KEYS: everything the single-line input does (`inputs.vl`), except that Home
+// and End go to the ends of the VISUAL line (with Ctrl or Cmd, of the text), and:
+// Enter types a line break ("\n"); Ctrl+Enter (Cmd+Enter) runs `on_submit`; Up and
+// Down move a visual line toward the goal x (see `editing.vl`), from the first line
+// Up goes to the text's start and from the last Down to its end; Page Up and Page
+// Down move as many lines as the viewport shows and scroll it by as much as the
+// caret moved; each extends the selection with Shift. Tab is left to the focus.
+//
+// THE POINTER: a press places the caret, a drag extends the selection — past the
+// top or bottom of what shows each move extends it one line further and the caret's
+// reveal scrolls by it; a double click selects a word, a triple click the PARAGRAPH
+// (from one line break to the next, the break included), and a drag from either
+// extends by whole words or paragraphs.
+//
+// A selection is painted a box a visual line, and a selected line break as a small
+// extent at its line's end. For assistive technology it is a multi-line text field
+// (`Role::TextArea`), its text a run per visual line.
+//
+// Not here, as for the input: the clipboard, an input method's composition, a
+// blinking caret, and a drag held still past the edge scrolling on its own (F176).
+// Nor tabs and indentation as an editor feature: Tab moves the focus.
+
+[platform("@process")] mod self;
+
+import pkg::gfx::{ Color, Dp, KeyPress, Point, dp };
+import pkg::option::Option::Some;
+import pkg::reactive::{ Signal, SignalCell, turn_scope };
+import pkg::ui::kit::editing::{ Editor, Selection };
+import pkg::ui::{
+	Attributes,
+	Bindable,
+	Child,
+	Element,
+	Role,
+	ScrollElement,
+	Style,
+	column,
+	scroll,
+	stack,
+	stop_event,
+	style,
+	text,
+	when,
+};
+
+/// A multi-line text editor. See `text_area(..)`.
+export struct TextArea {
+	element: Element,
+	editor: Editor,
+	viewport: ScrollElement,
+	placeholder: SignalCell<str>,
+	placeholder_look: SignalCell<Style>,
+}
+
+/// A multi-line text editor over `value`: what it shows is the cell's value, line
+/// breaks and all, and every edit writes the cell. Its role is `Role::TextArea`;
+/// its look, its size and its label are the app's (`style`, `padding`, `width`,
+/// `height`, `label`), and so are the caret's and the selection's colours (`caret`,
+/// `selection_color`), which otherwise follow the text's. The text style it
+/// inherits, or is given with `style`, is the text's.
+///
+/// The text wraps at the area's width and scrolls up and down inside the height the
+/// app gives it, keeping the caret in view; with no height it grows with its text.
+/// The caret and the selection show while it has the focus.
+export fun text_area(value: SignalCell<str>): TextArea {
+	let placeholder: SignalCell<str> = Signal::new("");
+	let placeholder_look: SignalCell<Style> = Signal::new(style());
+	let offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
+	let field = text().child(value);
+	let empty = value.derive(|now: str| now.is_empty());
+	let viewport = scroll()
+		.grow(1.0)
+		.offset(offset)
+		.child(stack()
+			.child(when(empty, || text().style(placeholder_look).child(placeholder)))
+			.child(field));
+	let shell = column().role(Role::TextArea).focusable().child(viewport);
+	let editor = Editor::new(
+		value,
+		field.element.node,
+		shell.element(),
+		true,
+		Some(viewport),
+		Some(offset),
+	);
+	editor.wire();
+	TextArea { element = shell.element(), editor, viewport, placeholder, placeholder_look }
+}
+
+export impl TextArea with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl TextArea with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl TextArea {
+	/// What it shows while its value is empty: a `str`, or a signal of one.
+	fun placeholder<V: Bindable<str>>(self, own placeholder: V): TextArea {
+		let cell = self.placeholder;
+		placeholder.bind(|now: str| cell.set(now));
+		self
+	}
+
+	/// The placeholder's style (over the text style it inherits): a `Style`, or a
+	/// signal of one.
+	fun placeholder_style<V: Bindable<Style>>(self, own look: V): TextArea {
+		let cell = self.placeholder_look;
+		look.bind(|now: Style| cell.set(now));
+		self
+	}
+
+	/// The caret's colour and width.
+	fun caret(self, color: Color, width: Dp): TextArea {
+		self.editor.set_caret_look(color, width);
+		self
+	}
+
+	/// The selection's colour (drawn under the selected text, and as a small extent
+	/// for a selected line break).
+	fun selection_color(self, color: Color): TextArea {
+		self.editor.set_selection_color(color);
+		self
+	}
+
+	/// Ctrl+Enter (Cmd+Enter), while it has the focus, runs `handler` with the
+	/// value (and goes no further up the tree). Enter alone types a line break.
+	fun on_submit(self, handler: (|str| void) context turn_scope): TextArea {
+		let editor = self.editor;
+		self.on_key(|key: KeyPress| {
+			if editor.submits(key) {
+				handler(editor.value.get());
+				stop_event();
+			}
+		})
+	}
+
+	/// Disabled while `disabled` (a `bool`, or a signal of one) holds: no edit, no
+	/// caret, and Tab and a press pass it by.
+	fun disabled<V: Bindable<bool>>(self, own disabled: V): TextArea {
+		let editor = self.editor;
+		disabled.bind(|value: bool| editor.set_disabled(value));
+		self
+	}
+
+	/// Whether it is disabled now.
+	fun is_disabled(self): bool {
+		self.editor.is_disabled()
+	}
+
+	/// The selection now (both ends at the caret when nothing is selected), kept
+	/// within the value.
+	fun selection(self): Selection {
+		self.editor.selection()
+	}
+
+	/// Selects from `anchor` to `caret` (kept within the value; the tree moves an
+	/// index inside a grapheme to its start when it draws it).
+	fun select(self, anchor: usize, caret: usize) {
+		self.editor.select(anchor, caret);
+	}
+
+	/// How far its text is scrolled up now (and left: always 0, the text wraps).
+	fun scrolled(self): Point {
+		self.viewport.scrolled()
+	}
+}

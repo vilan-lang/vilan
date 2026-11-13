@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use fontique::{Blob, Collection, CollectionOptions, GenericFamily, SourceCache};
 use parley::{
     Alignment, AlignmentOptions, FontContext, FontData, FontStyle, FontWeight, Layout,
-    LayoutContext, LineHeight, PositionedLayoutItem, StyleProperty,
+    LayoutContext, LineHeight, OverflowWrap, PositionedLayoutItem, StyleProperty,
 };
 use swash::scale::image::Content;
 use swash::scale::{Render, ScaleContext, Source, StrikeWith};
@@ -13,8 +13,8 @@ use swash::zeno::{Angle, Format, Transform, Vector};
 
 use super::editing::{EditingGeometry, GraphemeBox, LineBox};
 use super::{
-    FontFamily, GlyphContent, LayoutData, RasterizedGlyph, ShapedGlyph, ShapedRun, TextEngine,
-    TextStyle,
+    FontFamily, GlyphContent, LayoutData, RasterizedGlyph, ShapedGlyph, ShapedRun, Shaping,
+    TextEngine, TextStyle,
 };
 use crate::geometry::Size;
 
@@ -108,15 +108,20 @@ impl ParleyEngine {
 
 /// Where each grapheme of `layout` is (`editing.rs`): parley's clusters are
 /// graphemes (intersected with its runs), and each line's glyph runs carry
-/// their clusters in visual order from the run's offset.
+/// their clusters in visual order from the run's offset. What each grapheme
+/// is, and the line breaks of lines parley draws no cluster for, are
+/// `EditingGeometry::new`'s.
 fn editing_geometry(layout: &Layout<()>, text: &str, style: &TextStyle) -> EditingGeometry {
     let mut graphemes = Vec::new();
     let mut lines = Vec::new();
     for (index, line) in layout.lines().enumerate() {
         let metrics = line.metrics();
+        let bytes = line.text_range();
         lines.push(LineBox {
             top: metrics.block_min_coord,
             height: metrics.block_max_coord - metrics.block_min_coord,
+            start: bytes.start,
+            end: bytes.end,
         });
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
@@ -124,20 +129,13 @@ fn editing_geometry(layout: &Layout<()>, text: &str, style: &TextStyle) -> Editi
             };
             let mut x = glyph_run.offset();
             for cluster in glyph_run.run().visual_clusters() {
-                let range = cluster.text_range();
-                let word = text
-                    .get(range.clone())
-                    .and_then(|grapheme| grapheme.chars().next())
-                    .is_some_and(char::is_alphanumeric);
-                graphemes.push(GraphemeBox {
-                    start: range.start,
-                    end: range.end,
+                graphemes.push(GraphemeBox::placed(
+                    cluster.text_range(),
                     x,
-                    width: cluster.advance(),
-                    line: index,
-                    rtl: cluster.is_rtl(),
-                    word,
-                });
+                    cluster.advance(),
+                    index,
+                    cluster.is_rtl(),
+                ));
                 x += cluster.advance();
             }
         }
@@ -148,13 +146,11 @@ fn editing_geometry(layout: &Layout<()>, text: &str, style: &TextStyle) -> Editi
         lines.push(LineBox {
             top: 0.0,
             height: style.size * style.line_height,
+            start: 0,
+            end: text.len(),
         });
     }
-    EditingGeometry {
-        text_len: text.len(),
-        graphemes,
-        lines,
-    }
+    EditingGeometry::new(text, graphemes, lines)
 }
 
 fn family_property(family: &FontFamily) -> parley::FontFamily<'static> {
@@ -196,7 +192,7 @@ impl TextEngine for ParleyEngine {
         text: &str,
         style: &TextStyle,
         max_width: Option<f32>,
-        editing: bool,
+        shaping: Shaping,
     ) -> LayoutData {
         // Scale 1 and NO quantisation: positions stay fractional dp, so the
         // renderer can place them on any device grid (the module's header).
@@ -214,6 +210,9 @@ impl TextEngine for ParleyEngine {
         } else {
             FontStyle::Normal
         }));
+        if shaping == Shaping::EditedBreakingWords {
+            builder.push_default(StyleProperty::OverflowWrap(OverflowWrap::BreakWord));
+        }
         let mut layout: Layout<()> = builder.build(text);
         layout.break_all_lines(max_width);
         layout.align(Alignment::Start, AlignmentOptions::default());
@@ -249,7 +248,7 @@ impl TextEngine for ParleyEngine {
             line_count,
             first_baseline: layout.first_baseline().unwrap_or(0.0),
             runs,
-            editing: editing.then(|| editing_geometry(&layout, text, style)),
+            editing: (shaping != Shaping::Plain).then(|| editing_geometry(&layout, text, style)),
         }
     }
 

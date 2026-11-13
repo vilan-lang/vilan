@@ -19004,6 +19004,12 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_text_index_at", "ui::text_index_at", &[0]),
         ("__ui_text_step", "ui::text_step", &[0]),
         ("__ui_text_word", "ui::text_word", &[0]),
+        // P5: `std::ui::kit`'s text area (`ui/kit/text_areas.vl`): the ends
+        // of a visual line, the index a line above or below, the caret's box.
+        ("__ui_text_multiline", "ui::text_multiline", &[0]),
+        ("__ui_text_line_end", "ui::text_line_end", &[0]),
+        ("__ui_text_vertical", "ui::text_vertical", &[0]),
+        ("__ui_text_caret_number", "ui::text_caret_number", &[0]),
         // P4's virtual list: a resize handler reads the size it is told.
         ("__ui_resized", "ui::resized", &[]),
         // F172: pointer capture and presses in a row.

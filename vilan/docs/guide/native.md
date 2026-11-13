@@ -567,8 +567,8 @@ keyboard, and holds every frame to "only on change".
 ### Components
 
 `std::ui::kit` is components with behaviour and no look: `button(content,
-on_click)`, `checkbox(cell)` over a `bool` signal, and `text_input(cell)` over a
-`str` signal. Each is built from the elements above and takes every attribute an
+on_click)`, `checkbox(cell)` over a `bool` signal, `text_input(cell)` over a
+`str` signal, and `text_area(cell)`, its multi-line form. Each is built from the elements above and takes every attribute an
 element does, so the app supplies its look exactly as it does a row's — `style`,
 `padding`, `gap`, the conditions — and the kit supplies the focus, the pointer,
 the keys and the role:
@@ -609,6 +609,41 @@ add an item with the input, check it off, remove it — with every colour, radiu
 and spacing its own; its end-to-end test drives the screen with no window against
 a recorded listing (typing, selections, graphemes, Tab, Space) and then in a
 window through the X server.
+
+A text area edits many lines: give it a height and it scrolls inside it, its text
+wrapping at its width.
+
+```vilan,native
+import std::gfx::{ Window, dp };
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::kit::text_area;
+import std::ui::{ column, mount, text };
+
+fun main() {
+	let window = match Window::builder().title("Notes").size(dp(360), dp(260)).open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let note: SignalCell<str> = Signal::new("");
+	let saved: SignalCell<str> = Signal::new("");
+	mount(window, <column padding(dp(16)) gap(dp(8))>
+		{text_area(note).placeholder("Write here").height(dp(160)).padding(dp(6)).on_submit(|now: str| saved.set(now))}
+		<text>{saved.derive(|now: str| i"{now.len()} units saved")}</text>
+	</column>);
+}
+main();
+```
+
+Enter types a line break and Ctrl+Enter submits; Up and Down move by visual line
+and come back to the column they started from; Home and End go to the ends of
+the visual line, Page Up and Page Down by the viewport; a triple click selects a
+paragraph. Both inputs undo with Ctrl+Z and redo with Ctrl+Shift+Z or Ctrl+Y,
+typing coalesced into one change until the caret moves.
+`vilan/examples/ui-notes` is a notes pad on it, tested the same two ways.
 
 ### Accessibility
 

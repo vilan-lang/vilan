@@ -2601,6 +2601,201 @@ fn caret_questions_to_a_text_not_edited_or_not_a_text_are_refused() {
     );
 }
 
+// ---------------------------------------------------- multi-line editing ---
+//
+// `std::ui::kit`'s text area (P5): an edited text marked multi-line
+// (`UiTree::text_multiline`), wrapping at its width. Noto Mono at 10 dp with
+// 12 dp lines, as above: a grapheme is 6.001 dp wide, so five fit in 30.005.
+
+/// [`edited`], multi-line, in a column `width` dp wide: `(column, text)`.
+fn multiline(fixture: &mut Fixture, text: &str, width: f32) -> (NodeId, NodeId) {
+    let column = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(column, SizeProperty::Width, Length::Dp(width))
+        .unwrap();
+    let node = edited(fixture, text, 0, false);
+    fixture.tree.text_multiline(node).unwrap();
+    fixture.add(column, &[node]);
+    fixture.layout(column, 300.0, 300.0);
+    (column, node)
+}
+
+#[test]
+fn an_edited_text_wraps_at_its_width_less_the_carets_room() {
+    let mut fixture = Fixture::new();
+    // "abcde" is 30.005 dp: in 31 dp, less the 1 dp caret, it does not fit,
+    // and "e" goes to a second line — where its paint, which shapes at the
+    // same 30 dp, draws it.
+    let (_, node) = multiline(&mut fixture, "abcde", 31.0);
+    assert_eq!(fixture.rect(node).3, 24.0);
+    // In 32 dp it fits on one.
+    let (_, node) = multiline(&mut fixture, "abcde", 32.0);
+    assert_eq!(fixture.rect(node).3, 12.0);
+}
+
+#[test]
+fn a_multi_line_text_breaks_a_word_longer_than_its_line_and_a_one_line_one_does_not() {
+    let mut fixture = Fixture::new();
+    let (_, node) = multiline(&mut fixture, "abcdefghij", 32.0);
+    assert_eq!(fixture.rect(node).3, 24.0, "two lines of five");
+    let column = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(column, SizeProperty::Width, Length::Dp(32.0))
+        .unwrap();
+    let single = edited(&mut fixture, "abcdefghij", 0, false);
+    fixture.add(column, &[single]);
+    fixture.layout(column, 300.0, 300.0);
+    assert_eq!(fixture.rect(single).3, 12.0, "between words only: one line");
+}
+
+#[test]
+fn line_ends_and_vertical_moves_count_utf16_units_through_the_tree() {
+    let mut fixture = Fixture::new();
+    // "é" (e and a combining acute: two units, one grapheme) "bcd", a
+    // break, "xy", a break, "longer": units e 0, accent 1, b 2, c 3, d 4,
+    // break 5, x 6, y 7, break 8, l 9 ...
+    let (_, node) = multiline(&mut fixture, "e\u{301}bcd\nxy\nlonger", 200.0);
+    let tree = &mut fixture.tree;
+    let text = &mut fixture.text;
+    let caret = tree.text_caret_box(node, 4, text).unwrap();
+    assert_eq!(caret.top(), 0.0);
+    assert_eq!(caret.size.height, 12.0);
+    let goal = caret.left();
+    assert!((goal - 18.0).abs() < 0.01, "{goal}");
+    // Down to the short line: its end, before its break; down again: the
+    // same x in "longer"; two lines up: back to the goal.
+    assert_eq!(tree.text_vertical(node, 4, goal, 1, text).unwrap(), 8);
+    assert_eq!(tree.text_vertical(node, 8, goal, 1, text).unwrap(), 12);
+    assert_eq!(tree.text_vertical(node, 12, goal, -2, text).unwrap(), 4);
+    assert_eq!(tree.text_vertical(node, 4, goal, -1, text).unwrap(), 0);
+    assert_eq!(tree.text_vertical(node, 12, goal, 1, text).unwrap(), 15);
+    assert_eq!(tree.text_line_end(node, 7, false, text).unwrap(), 6);
+    assert_eq!(tree.text_line_end(node, 7, true, text).unwrap(), 8);
+    assert_eq!(tree.text_line_end(node, 1, true, text).unwrap(), 5);
+    assert_eq!(tree.text_line_end(node, 10, true, text).unwrap(), 15);
+    assert_eq!(
+        tree.text_vertical(node, 4, f32::NAN, 1, text),
+        Err(UiError::NotFinite("a goal x"))
+    );
+}
+
+#[test]
+fn a_caret_at_a_soft_wrap_is_drawn_at_the_start_of_the_lower_line_and_a_selection_a_box_a_line() {
+    let mut fixture = Fixture::new();
+    // In 32 dp (31 for the text): "abcd " and "efgh".
+    let (column, node) = multiline(&mut fixture, "abcd efgh", 32.0);
+    assert_eq!(fixture.rect(node).3, 24.0);
+    // The wrap point, index 5: the lower line's start.
+    fixture.tree.text_edit(node, 5, 5, true).unwrap();
+    fixture.layout(column, 300.0, 300.0);
+    assert_eq!(
+        edited_paint(&mut fixture, column),
+        ["text", "rect 0.0 12.0 1.0 12.0"]
+    );
+    // "cd " and "ef" selected: one box on each line, the caret after "f".
+    fixture.tree.text_edit(node, 7, 2, true).unwrap();
+    fixture.layout(column, 300.0, 300.0);
+    assert_eq!(
+        edited_paint(&mut fixture, column),
+        [
+            "rect 12.0 0.0 18.0 12.0",
+            "rect 0.0 12.0 12.0 12.0",
+            "text",
+            "rect 12.0 12.0 1.0 12.0"
+        ]
+    );
+}
+
+#[test]
+fn caret_questions_answer_from_the_laid_out_width_before_any_paint() {
+    let mut fixture = Fixture::new();
+    // Laid out and never painted (a window-less `--check`): "abcd " and
+    // "efgh" are two lines already, so Down from the start reaches "e".
+    let (_, node) = multiline(&mut fixture, "abcd efgh", 32.0);
+    assert_eq!(
+        fixture
+            .tree
+            .text_vertical(node, 0, 0.0, 1, &mut fixture.text)
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        fixture
+            .tree
+            .text_line_end(node, 0, true, &mut fixture.text)
+            .unwrap(),
+        4
+    );
+}
+
+/// A vertical scroll two lines (24 dp) tall over a five-line multi-line
+/// text, inside a stack with 5 dp of padding: `(root, scroll, text)`.
+fn scrolled_area(fixture: &mut Fixture) -> (NodeId, NodeId, NodeId) {
+    let scroll = fixture.element(ElementKind::Scroll);
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Width, Length::Dp(100.0))
+        .unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Height, Length::Dp(24.0))
+        .unwrap();
+    let node = edited(fixture, "l1\nl2\nl3\nl4\nl5", 0, false);
+    fixture.tree.text_multiline(node).unwrap();
+    fixture.add(scroll, &[node]);
+    let root = fixture.element(ElementKind::Stack);
+    fixture.tree.set_padding(root, Edges::all(5.0)).unwrap();
+    fixture.add(root, &[scroll]);
+    fixture.layout(root, 300.0, 300.0);
+    (root, scroll, node)
+}
+
+#[test]
+fn a_drag_past_the_bottom_or_top_lands_one_line_beyond_what_shows() {
+    let mut fixture = Fixture::new();
+    let (root, scroll, node) = scrolled_area(&mut fixture);
+    let drag = |fixture: &mut Fixture, y: f32| {
+        fixture
+            .tree
+            .text_index_at(
+                node,
+                Point::new(8.0, y),
+                IndexRule::DragLines,
+                &mut fixture.text,
+            )
+            .unwrap()
+    };
+    // Lines 0 and 1 show (y 5..29): below them, line 2's start ("l3" at 6).
+    assert_eq!(drag(&mut fixture, 100.0), 6);
+    // Its reveal scrolls one line; the next move lands on line 3.
+    fixture.tree.text_edit(node, 6, 0, true).unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    assert_eq!(
+        fixture.tree.scroll_offset(scroll),
+        Some(Point::new(0.0, 12.0))
+    );
+    assert_eq!(drag(&mut fixture, 100.0), 9);
+    // Above, line 0 (scrolled away) at the pointer's x.
+    assert_eq!(drag(&mut fixture, -40.0), 0);
+    // Level with what shows, the plain rule: the point's own index (y 20
+    // is line 2's now, x 8 the start of "l3").
+    assert_eq!(drag(&mut fixture, 20.0), 6);
+    // Past the last line, in a text that shows whole: its end.
+    let (_, short) = multiline(&mut fixture, "ab\ncd", 100.0);
+    let end = fixture
+        .tree
+        .text_index_at(
+            short,
+            Point::new(1.0, 500.0),
+            IndexRule::DragLines,
+            &mut fixture.text,
+        )
+        .unwrap();
+    assert_eq!(end, 5);
+}
+
 // ------------------------------------------------- sizes and stale boxes ---
 //
 // Part P4's virtual list reads its viewport's height after a layout (a resize

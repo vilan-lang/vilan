@@ -69,6 +69,18 @@
 //!    the reason, where AT-SPI's bus launcher or `gdbus` is missing, whatever
 //!    `VILAN_REQUIRE_GFX` says.
 //!
+//! 7. native-ui.md P5, text editing: `vilan/examples/ui-notes`, a notes pad on
+//!    `std::ui::kit::text_area`. Its `--check`, with no window, held to
+//!    `tests/ui/notes-check.txt` (regenerated the same way): typing and
+//!    Enter, Up and Down keeping a goal column across lines of different
+//!    lengths, Home and End at a soft wrap (the caret's line read from the
+//!    accessibility listing's selection), Shift over lines, a drag past the
+//!    bottom edge, double and triple clicks, Page Down, undo and redo,
+//!    Ctrl+Enter and the lock. Then in a window: a click focuses the area,
+//!    `a`, `b`, Return, `c`, `d` type two lines, Up goes to the end of the
+//!    first (the goal column), `x` types there — the program's own line
+//!    shows `abx\ncd` — and the close button ends it with exit 0.
+//!
 //! Ordering comes from the programs' lines — each injection waits for the
 //! line its predecessor caused — never from a sleep. No assertion reads a
 //! time: the frame times the programs print are for a person (the report's
@@ -667,6 +679,55 @@ fn the_virtual_list_of_differing_heights_anchors_and_a_click_lands_on_its_row() 
         Some(0),
         "closing the list ended it with {code:?}:\n{}\n--- stderr\n{stderr}",
         seen.join("\n")
+    );
+}
+
+#[test]
+fn the_notes_pad_on_the_kits_text_area_runs_end_to_end() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let notes = build_example("ui-notes", "notes");
+
+    // 1. With no window: the text area's behaviour, recorded.
+    let listed = assert_check_listing(&notes, "notes-check.txt");
+    assert!(
+        listed.contains("down again: the goal column comes back"),
+        "{listed}"
+    );
+
+    // 2. In a window, by pointer and keyboard: two lines, Up, a letter typed
+    // at the goal column.
+    let injector = build_injector();
+    let started = Instant::now();
+    let mut running = Running::start(&notes, &["--smoke"], "vilan ui notes");
+    running.wait_for("frame 1 ", started);
+    let area = running.wait_for("box notes ", started);
+    let (x, y) = centre(&area);
+    running.inject(&injector, &["move", &x, &y, "press", "release"]);
+    running.wait_for("focus=notes", started);
+    running.inject(
+        &injector,
+        &[
+            "key", "a", "key", "b", "key", "Return", "key", "c", "key", "d",
+        ],
+    );
+    running.wait_for("note=ab\\ncd selection=5..5 focus=notes", started);
+    running.inject(&injector, &["key", "Up"]);
+    running.wait_for("note=ab\\ncd selection=2..2 focus=notes", started);
+    running.inject(&injector, &["key", "x"]);
+    running.wait_for("note=abx\\ncd selection=3..3 focus=notes", started);
+    running.inject(&injector, &["close"]);
+    let (code, seen, stderr) = running.exit(started);
+    let report = format!("{}\n--- stderr\n{stderr}", seen.join("\n"));
+    assert!(
+        seen.iter().any(|line| line.starts_with("close requested")),
+        "the close request never reached the program:\n{report}"
+    );
+    assert_eq!(
+        code,
+        Some(0),
+        "closing the notes pad ended it with {code:?}:\n{report}"
     );
 }
 

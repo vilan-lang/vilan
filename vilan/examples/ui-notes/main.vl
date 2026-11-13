@@ -1,0 +1,535 @@
+// A notes pad on `std::ui::kit`'s text area (native-ui.md part P5, text editing):
+// a title (a single-line text input), a multi-line note bound to a signal, a
+// button that locks both (disabled), and a line counting what the note holds. The kit gives the area its
+// behaviour — focus, the pointer, the keys, the caret, wrapping, scrolling, undo —
+// and nothing else: every colour, radius and spacing below is this program's.
+//
+// Modes, for the end-to-end test:
+//
+//   --smoke         a line per frame (the note with its line breaks as `\n`, the
+//                   area's selection as anchor..caret, the focus) and, after the
+//                   first frame, the area's box the test aims at
+//   --check --font <ttf>
+//                   no window: the screen laid out and driven with `deliver` —
+//                   undo and redo in the title (a single-line input on the same
+//                   editor), typing and Enter in the note, the caret moved by visual line with its goal
+//                   column across lines of different lengths, Home and End at a
+//                   soft wrap (the caret's line, by the accessibility listing),
+//                   Shift selection over lines, a drag past the bottom edge, double
+//                   and triple clicks, Page Down, undo and redo, Ctrl+Enter, the
+//                   lock — with the state each step left printed
+
+import std::display::Display;
+import std::fs::read_bytes;
+import std::gfx::{
+	Border,
+	Button,
+	Color,
+	Event,
+	FontFamily,
+	Frame,
+	KeyName,
+	KeyPress,
+	Modifiers,
+	Point,
+	Pointer,
+	Size,
+	Window,
+	dp,
+	register_font,
+};
+import std::io::print;
+import std::process::{ args, exit };
+import std::range::Range;
+import std::reactive::{ Signal, SignalCell };
+import std::shared::Shared;
+import std::ui::kit::{ TextArea, TextInput, button, text_area, text_input };
+import std::ui::{
+	Align,
+	Element,
+	Style,
+	column,
+	deliver,
+	draw,
+	focused,
+	hovered,
+	layout,
+	mount,
+	pressed,
+	row,
+	style,
+	text,
+};
+
+// --- The app's look: the kit has none -------------------------------------------
+
+fun ink(): Color {
+	Color::rgb(32, 34, 44)
+}
+
+fun accent(): Color {
+	Color::rgb(46, 104, 220)
+}
+
+fun screen_look(font: str): Style {
+	let base = if font == "" { style() } else { style().font(FontFamily::Named(font)) };
+	base.background(Color::rgb(246, 246, 242)).text_color(ink()).text_size(dp(15))
+}
+
+fun area_look(locked: bool): Style {
+	if locked {
+		ret style()
+			.background(Color::rgb(236, 236, 232))
+			.text_color(Color::rgb(130, 132, 140))
+			.radius(dp(6))
+			.border(Border::all(dp(1), Color::rgb(210, 212, 216)));
+	}
+	style()
+		.background(Color::white())
+		.radius(dp(6))
+		.border(Border::all(dp(1), Color::rgb(190, 192, 200)))
+		.when(hovered(), |look: Style| look.border(Border::all(dp(1), Color::rgb(140, 144, 160))))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), accent())))
+}
+
+fun button_look(): Style {
+	style()
+		.background(accent())
+		.text_color(Color::white())
+		.radius(dp(6))
+		.border(Border::all(dp(2), accent()))
+		.when(hovered(), |look: Style| look.background(Color::rgb(70, 126, 240)))
+		.when(pressed(), |look: Style| look.background(Color::rgb(30, 80, 190)))
+		.when(focused(), |look: Style| look.border(Border::all(dp(2), Color::rgb(255, 196, 60))))
+}
+
+// --- The screen ------------------------------------------------------------------
+
+/// How many lines a note has: its line breaks, and one.
+fun line_count(note: str): usize {
+	note.split("\n").len()
+}
+
+/// What the program holds: the note, the lock, and the area.
+struct Notes {
+	title: SignalCell<str>,
+	note: SignalCell<str>,
+	locked: SignalCell<bool>,
+	heading: TextInput,
+	area: TextArea,
+	root: Element,
+}
+
+fun notes(font: str, log: |str| void): Notes {
+	let title: SignalCell<str> = Signal::new("");
+	let note: SignalCell<str> = Signal::new("");
+	let locked: SignalCell<bool> = Signal::new(false);
+	let area = text_area(note)
+		.placeholder("Write something")
+		.placeholder_style(style().text_color(Color::rgb(150, 152, 160)))
+		.caret(accent(), dp(2))
+		.selection_color(Color::rgba(46, 104, 220, 0.25))
+		.label("notes")
+		.height(dp(150))
+		.padding(dp(10))
+		.style(locked.derive(area_look))
+		.disabled(locked)
+		.on_submit(|now: str| log(i"submit {line_count(now)} lines"));
+	// The title: a single-line input on the same editor (undo too); Enter in it
+	// moves on to the note.
+	let heading = text_input(title)
+		.placeholder("Title")
+		.placeholder_style(style().text_color(Color::rgb(150, 152, 160)))
+		.caret(accent(), dp(2))
+		.label("title")
+		.padding_x(dp(10))
+		.padding_y(dp(8))
+		.style(locked.derive(area_look))
+		.disabled(locked)
+		.on_submit(|_: str| area.element().focus());
+	let lock = button(
+		text().child(locked.derive(|on: bool| if on { "Unlock" } else { "Lock" })),
+		|| {
+			locked.set(!locked.get());
+		},
+	)
+		.label("lock")
+		.padding_x(dp(16))
+		.padding_y(dp(8))
+		.style(button_look());
+	let count = note.derive(|now: str| i"{line_count(now)} lines, {now.len()} units");
+	// The screen hears every key nothing below it stopped: the area stops the keys
+	// it acts on and the keys that type, so a key reaching here while it has the
+	// focus is one it left alone (Tab, say).
+	let root = <column
+		padding(dp(20))
+		gap(dp(12))
+		style(screen_look(font))
+		label("notes pad")
+		on_key(|key: KeyPress| log("screen key"))
+	>
+		<text style(style().text_size(dp(22)).weight(700))>"Notes"</text>
+		{heading}
+		{area}
+		<row gap(dp(12)) align(Align::Center)>
+			{lock}
+			<text label("count")>{count}</text>
+		</row>
+	</column>.element();
+	Notes { title, note, locked, heading, area, root }
+}
+
+/// The note on one line: each line break as `\n`.
+fun shown(note: str): str {
+	note.replace("\n", "\\n")
+}
+
+fun main() {
+	let arguments = args();
+	if arguments.contains("--check") {
+		check(arguments);
+		ret;
+	}
+	let smoke = arguments.contains("--smoke");
+	let window = match Window::builder().title("vilan ui notes").size(dp(420), dp(420)).open() {
+		Ok(let window) => window,
+		// No display, no GPU: say why.
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let log = |line: str| {
+		if smoke {
+			print(line);
+		}
+	};
+	let app = notes("", log);
+	mount(window, app.root);
+	if !smoke {
+		ret;
+	}
+	// Smoke mode: the same frames, through a frame callback of the program's own
+	// so each can be reported, with the box the test aims at.
+	let frames: Shared<i32> = Shared::new(0);
+	window.on_frame(|frame: Frame| {
+		draw(frame, app.root);
+		frames.write() = frames.read() + 1;
+		let focus = if app.area.element().interaction().focused { "notes" } else { "-" };
+		let selected = app.area.selection();
+		print(i"frame {frames.read()} note={shown(app.note.get())} selection={selected.anchor}..{selected.caret} focus={focus}");
+		if frames.read() == 1 {
+			let bounds = app.area.element().bounds();
+			print(i"box notes {bounds.x.value()} {bounds.y.value()} {bounds.width.value()} {bounds.height.value()}");
+		}
+	});
+	window.on_event(|event: Event| {
+		match event {
+			Event::CloseRequested => print(i"close requested after {frames.read()} frames"),
+			_ => {},
+		}
+	});
+}
+
+// --- Check mode: the tree, with no window --------------------------------------------
+
+fun check(arguments: List<str>) {
+	let font = match register_font(read_bytes(after(arguments, "--font"))) {
+		Ok(let families) => families[0],
+		Err(let reason) => {
+			print(i"font: {reason}");
+			exit(2);
+			""
+		},
+	};
+	let size = Size::new(dp(420), dp(420));
+	let lines: Shared<List<str>> = Shared::new([]);
+	let log = |line: str| lines.write().push(line);
+	let app = notes(font, log);
+	let root = app.root;
+	let area = app.area;
+	layout(root, size, 1.0);
+	for entry in root.outline() {
+		if entry.label != "" {
+			print(i"{"  ".repeat(entry.depth)}{entry.kind} {entry.label} {entry.bounds.x.value()} {entry.bounds.y.value()} {entry.bounds.width.value()} {entry.bounds.height.value()}");
+		}
+	}
+
+	let report = |what: str| {
+		layout(root, size, 1.0);
+		let now = area.selection();
+		let focus = if area
+			.element()
+			.interaction().focused {
+			"notes"
+		} else if app.heading
+			.element()
+			.interaction().focused {
+			"title"
+		} else {
+			"-"
+		};
+		print(i"{what}: title=\"{app.title.get()}\" note=\"{shown(app.note.get())}\" caret={now.caret} anchor={now.anchor} scrolled={area.scrolled().y.value()} focus={focus} log=[{lines.read().join(", ")}]");
+		lines.write() = [];
+	};
+	// What an assistive tool is told of the screen (native-ui.md P5): the area's
+	// text a run a visual line, and its selection as line:grapheme — which visual
+	// line the caret is on.
+	let tell = |what: str| {
+		layout(root, size, 1.0);
+		print(i"accessibility {what}:");
+		print(root.accessibility().trim());
+	};
+	let find = |label: str| {
+		mut found = Point::new(dp(-1), dp(-1));
+		for entry in root.outline() {
+			if entry.label == label {
+				found = Point::new(
+					entry.bounds.x + entry.bounds.width / 2.0,
+					entry.bounds.y + entry.bounds.height / 2.0,
+				);
+			}
+		}
+		found
+	};
+	let no = Modifiers { shift = false, control = false, alt = false, meta = false };
+	let shift = Modifiers { shift = true, control = false, alt = false, meta = false };
+	let control = Modifiers { shift = false, control = true, alt = false, meta = false };
+	let control_shift = Modifiers { shift = true, control = true, alt = false, meta = false };
+	let press = |at: Point| deliver(root, Event::PointerPressed(Pointer {
+		position = at,
+		button = Button::Left,
+		modifiers = no,
+	}));
+	let release = |at: Point| deliver(root, Event::PointerReleased(Pointer {
+		position = at,
+		button = Button::Left,
+		modifiers = no,
+	}));
+	let click = |at: Point| {
+		deliver(root, Event::PointerMoved(at));
+		press(at);
+		release(at);
+	};
+	let key = |name: KeyName, modifiers: Modifiers| deliver(root, Event::KeyPressed(KeyPress {
+		key = name,
+		repeat = false,
+		modifiers,
+	}));
+	// A printable key types: its key event, then its text, as a window sends them.
+	let type_text = |typed: str| {
+		key(KeyName::Char(typed), no);
+		deliver(root, Event::TextInput(typed));
+	};
+
+	// The placeholders, and the roles an assistive tool is told.
+	report("start");
+	tell("at the start");
+
+	// 1. The title, a single-line input on the same editor: typing is one change
+	// until the caret moves, a run of Backspace is one, Ctrl+Z and Ctrl+Y walk them
+	// back and forth; Enter moves on to the note.
+	click(find("title"));
+	type_text("groceries");
+	key(KeyName::Backspace, no);
+	key(KeyName::Backspace, no);
+	report("title typed, two backspaces");
+	key(KeyName::Char("z"), control);
+	report("undo in the title: the backspaces");
+	key(KeyName::Char("z"), control);
+	report("undo in the title: the typing");
+	key(KeyName::Char("y"), control);
+	report("redo in the title");
+	key(KeyName::Up, no);
+	report("up in the title: it bubbles");
+	key(KeyName::Enter, no);
+	report("enter in the title: the note has the focus");
+
+	// 2. Typing and Enter: three lines, the third longer than the area is wide, so
+	// it wraps.
+	type_text("first line");
+	key(KeyName::Enter, no);
+	type_text("second");
+	key(KeyName::Enter, no);
+	type_text("a third line, long enough to wrap past the right edge");
+	report("typed three lines");
+	tell("typed three lines");
+
+	// 3. Up and Down by visual line, toward the goal column: the end of "first
+	// line" (column 10), down to "second" (6 long: its end), down to the third
+	// line (column 10 again), up twice (column 10 of the first line).
+	key(KeyName::Home, control);
+	key(KeyName::End, no);
+	report("ctrl home, end");
+	key(KeyName::Down, no);
+	report("down to the short line");
+	key(KeyName::Down, no);
+	report("down again: the goal column comes back");
+	key(KeyName::Down, no);
+	report("down onto the wrapped part");
+	key(KeyName::Up, no);
+	key(KeyName::Up, no);
+	key(KeyName::Up, no);
+	report("up three times");
+	key(KeyName::Up, no);
+	report("up from the first line: the start");
+	key(KeyName::Down, no);
+	key(KeyName::Down, no);
+	key(KeyName::Down, no);
+	key(KeyName::Down, no);
+	report("down past the last line: the end");
+
+	// 4. A soft wrap: Home on the wrapped part goes to its start, the wrap point,
+	// whose caret is drawn at the start of the LOWER line (the listing's selection
+	// says line 3); Left from there is the upper line's last position, before the
+	// space it broke at (line 2); End on the upper line lands there too.
+	key(KeyName::Home, no);
+	report("home on the wrapped part");
+	tell("the caret at the wrap point");
+	key(KeyName::Left, no);
+	report("left: before the space");
+	tell("the caret before the space");
+	key(KeyName::Home, no);
+	key(KeyName::End, no);
+	report("home, end on the upper line");
+	// A click past the upper line's end lands there as well, never on the line
+	// below (the text starts 10 dp inside the area; its lines are 18.75 dp).
+	let bounds = area.element().bounds();
+	let line_y = |line: f64| bounds.y + dp(10.0 + 18.75 * line + 9.0);
+	key(KeyName::Home, control);
+	click(Point::new(bounds.x + bounds.width - dp(14), line_y(2.0)));
+	report("a click past the wrapped line's end");
+	tell("after the click past the end");
+
+	// 5. Shift extends over lines: from the start, down twice and to the end of
+	// that line.
+	key(KeyName::Home, control);
+	key(KeyName::Down, shift);
+	key(KeyName::Down, shift);
+	key(KeyName::End, shift);
+	report("shift down twice, shift end");
+	tell("a selection over three lines");
+	key(KeyName::Home, control_shift);
+	report("ctrl shift home");
+
+	// 6. More lines than the area shows: it scrolls to keep the caret in view.
+	key(KeyName::End, control);
+	for number in ["4", "5", "6", "7", "8", "9"] {
+		key(KeyName::Enter, no);
+		type_text(i"line {number}");
+	}
+	report("six more lines");
+	key(KeyName::Home, control);
+	report("ctrl home scrolls back");
+
+	// 7. A drag past the bottom edge: each move, laid out before the next, extends
+	// the selection a line beyond what shows, and the reveal scrolls by it.
+	let left = bounds.x + dp(14);
+	let first_line = bounds.y + dp(16);
+	let below = Point::new(left, bounds.y + bounds.height + dp(40));
+	press(Point::new(left, first_line));
+	report("press on the first line");
+	deliver(root, Event::PointerMoved(below));
+	report("past the bottom edge, once");
+	deliver(root, Event::PointerMoved(below));
+	report("past the bottom edge, twice");
+	deliver(root, Event::PointerMoved(below));
+	report("past the bottom edge, three times");
+	release(below);
+	report("released below");
+
+	// 8. Double and triple clicks: presses the program delivers carry no time, so
+	// presses at one place count as in a row (a click elsewhere ends the run). A
+	// double click selects a word; a triple click the paragraph, its line break
+	// included; a drag from a triple click extends by paragraphs.
+	key(KeyName::Home, control);
+	layout(root, size, 1.0);
+	let elsewhere = Point::new(bounds.x + dp(300), bounds.y + bounds.height - dp(8));
+	let on_first = Point::new(left + dp(30), first_line);
+	click(elsewhere);
+	click(on_first);
+	click(on_first);
+	report("double click on first");
+	click(on_first);
+	report("triple click: the paragraph");
+	click(elsewhere);
+	click(on_first);
+	click(on_first);
+	press(on_first);
+	deliver(root, Event::PointerMoved(Point::new(left, first_line + dp(20))));
+	release(Point::new(left, first_line + dp(20)));
+	report("triple click, drag a line down: two paragraphs");
+
+	// 9. Page Down: as many lines as the viewport shows, and the view scrolled by
+	// as much; Page Up back.
+	key(KeyName::Home, control);
+	key(KeyName::PageDown, no);
+	report("page down");
+	key(KeyName::PageDown, no);
+	report("page down again");
+	key(KeyName::PageUp, shift);
+	report("shift page up");
+
+	// 10. Undo and redo: typing is one change until the caret moves; Backspace
+	// runs are one; undo restores the selection before the change.
+	key(KeyName::End, control);
+	type_text("abc");
+	type_text("def");
+	report("typed abcdef");
+	key(KeyName::Backspace, no);
+	key(KeyName::Backspace, no);
+	report("backspace twice");
+	key(KeyName::Char("z"), control);
+	report("undo: the backspaces");
+	key(KeyName::Char("z"), control);
+	report("undo: the typing");
+	key(KeyName::Char("z"), control_shift);
+	report("redo: the typing");
+	key(KeyName::Char("y"), control);
+	report("redo: the backspaces");
+	key(KeyName::Home, no);
+	key(KeyName::Delete, no);
+	key(KeyName::Delete, no);
+	report("home, delete twice");
+	key(KeyName::Char("z"), control);
+	report("undo: both deletes");
+	key(KeyName::Char("a"), control);
+	type_text("x");
+	report("select all, type over it");
+	key(KeyName::Char("z"), control);
+	report("undo: everything back, everything selected");
+	// A write from outside ends the history: there is nothing to undo after it.
+	app.note.set("set by the app");
+	key(KeyName::Char("z"), control);
+	report("set from outside, then undo: nothing");
+
+	// 11. Ctrl+Enter submits (Enter alone types a line break).
+	key(KeyName::Enter, control);
+	report("ctrl enter");
+
+	// 12. The lock: disabled, the area ignores keys and typing, has no caret, and
+	// Tab passes it by.
+	click(find("lock"));
+	report("locked");
+	tell("locked");
+	click(find("notes"));
+	type_text("ignored");
+	report("typing while locked");
+	click(find("lock"));
+	click(find("notes"));
+	report("unlocked, focused");
+	tell("at the end");
+}
+
+fun after(arguments: List<str>, flag: str): str {
+	for index in Range::new(1, arguments.len().as_i32()) {
+		if arguments[(index - 1).as_usize()] == flag {
+			ret arguments[index.as_usize()];
+		}
+	}
+	print(i"{flag} needs a value");
+	exit(2);
+	""
+}
+
+main();

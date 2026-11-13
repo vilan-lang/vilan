@@ -296,6 +296,7 @@ pub fn set(node: &Node, property: i32, value: f64) {
                     Role::List,
                     Role::ListItem,
                     Role::Image,
+                    Role::TextArea,
                 ],
                 value,
                 "role",
@@ -606,11 +607,17 @@ pub fn text_edit_look(
 /// text the point (dp from the window's top-left, as an event gives it)
 /// lands on: 0 the nearest grapheme edge (a press), 1 the start of the
 /// grapheme under it (a double click's), 2 a drag's (one grapheme past the
-/// edge of what shows when the point is beyond it; `IndexRule`).
+/// edge of what shows when the point is beyond it), 3 a multi-line drag's
+/// (one line past the top or bottom of what shows; `IndexRule`).
 pub fn text_index_at(node: &Node, x: f64, y: f64, rule: i32) -> i32 {
     let point = Point::new(x as f32, y as f32);
     let rule = code(
-        &[IndexRule::Nearest, IndexRule::Under, IndexRule::Drag],
+        &[
+            IndexRule::Nearest,
+            IndexRule::Under,
+            IndexRule::Drag,
+            IndexRule::DragLines,
+        ],
         f64::from(rule),
         "text index rule",
     );
@@ -652,6 +659,46 @@ pub fn text_step(node: &Node, index: i32, forward: bool, word: bool) -> i32 {
         with_text(|text| or_fail(tree.text_step(node.id(), index_of(index), forward, word, text)))
     });
     i32::try_from(stepped).unwrap_or(i32::MAX)
+}
+
+/// `__ui_text_multiline(node)` — an edited text as a multi-line field's: a
+/// word longer than its line breaks where it must.
+pub fn text_multiline(node: &Node) {
+    change(node, |tree, id| or_fail(tree.text_multiline(id)));
+}
+
+/// `__ui_text_line_end(node, index, end)` — the UTF-16 index of the start
+/// (or with `end`, the last caret position) of the visual line `index` of an
+/// edited text is on.
+pub fn text_line_end(node: &Node, index: i32, end: bool) -> i32 {
+    let found = with_tree(|tree| {
+        with_text(|text| or_fail(tree.text_line_end(node.id(), index_of(index), end, text)))
+    });
+    i32::try_from(found).unwrap_or(i32::MAX)
+}
+
+/// `__ui_text_vertical(node, index, goal_x, lines)` — the UTF-16 index
+/// `lines` visual lines below `index`'s (above, when negative) nearest
+/// `goal_x` dp from the text's left.
+pub fn text_vertical(node: &Node, index: i32, goal_x: f64, lines: i32) -> i32 {
+    let lines = isize::try_from(lines).unwrap_or(0);
+    let found = with_tree(|tree| {
+        with_text(|text| {
+            or_fail(tree.text_vertical(node.id(), index_of(index), goal_x as f32, lines, text))
+        })
+    });
+    i32::try_from(found).unwrap_or(i32::MAX)
+}
+
+/// `__ui_text_caret_number(node, index, which)` — the caret's box at UTF-16
+/// `index` of an edited text, in dp from the text's top-left: 0 its x, 1 its
+/// line's top, 2 its line's height.
+pub fn text_caret_number(node: &Node, index: i32, which: i32) -> f64 {
+    let caret = with_tree(|tree| {
+        with_text(|text| or_fail(tree.text_caret_box(node.id(), index_of(index), text)))
+    });
+    let which = code(&[0, 1, 2], f64::from(which), "caret number");
+    f64::from([caret.left(), caret.top(), caret.size.height][which])
 }
 
 /// `__ui_set_texture(node, texture)` — an image element's picture.

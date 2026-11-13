@@ -10,11 +10,14 @@
 // One file per component under `ui/kit/`; this module declares and re-exports them,
 // one line each. A file is named in the PLURAL (`buttons.vl` for `button`): a
 // module and an item of one name in one module are ambiguous, and the analyzer
-// refuses the pair.
+// refuses the pair. `editing.vl` is the editor the text input and the text area
+// share; of it only `Selection` is public.
 
 [platform("@process")] mod self;
 
 export import pkg::ui::kit::buttons::*;
 export import pkg::ui::kit::checkboxes::*;
+export import pkg::ui::kit::editing::Selection;
 export import pkg::ui::kit::inputs::*;
 export import pkg::ui::kit::lists::*;
+export import pkg::ui::kit::text_areas::*;
