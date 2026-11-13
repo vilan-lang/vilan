@@ -180,6 +180,25 @@ impl Running {
         assert!(status.success(), "injecting {commands:?} failed: {status}");
     }
 
+    /// Runs the injector with `commands` against this run's display, as
+    /// [`Running::inject`] does, and answers what it printed.
+    pub fn inject_output(&self, injector: &Path, commands: &[&str]) -> String {
+        let output = Command::new(injector)
+            .args(["--title", &self.title])
+            .args(commands)
+            .env("DISPLAY", &self.display)
+            .env("XAUTHORITY", &self.authority)
+            .output()
+            .expect("run the injector");
+        assert!(
+            output.status.success(),
+            "injecting {commands:?} failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
     /// Waits for the program to exit: its code, every stdout line, stderr.
     pub fn exit(mut self, started: Instant) -> (Option<i32>, Vec<String>, String) {
         loop {

@@ -19,6 +19,9 @@
 //                           VILAN_REGENERATE_GFX_GOLDENS set, write it instead;
 //                           first print what `Path::from_svg` says of
 //                           malformed path data
+//   --clipboard             no window: copy a text to the system clipboard, read
+//                           it back, then wait for another program's copy and
+//                           print it (F173); with no display, say so and end
 
 import std::bytes::Bytes;
 import std::fs::{ read_bytes, write_bytes };
@@ -42,8 +45,10 @@ import std::gfx::{
 	TextStyle,
 	Underline,
 	Window,
+	clipboard_text,
 	dp,
 	register_font,
+	set_clipboard_text,
 };
 import std::image::{ Format, Image };
 import std::io::print;
@@ -151,6 +156,10 @@ fun main() {
 	let arguments = args();
 	if arguments.contains("--golden") {
 		golden(arguments);
+		ret;
+	}
+	if arguments.contains("--clipboard") {
+		clipboard_mode();
 		ret;
 	}
 	let smoke = arguments.contains("--smoke");
@@ -361,6 +370,41 @@ fun after(arguments: List<str>, flag: str): str {
 	print(i"{flag} needs a value");
 	exit(2);
 	""
+}
+
+// --- Clipboard mode: the system clipboard's text, with no window ---------------
+
+/// What this program copies, and what the test's X client reads back.
+fun copied(): str {
+	"copied by vilan"
+}
+
+fun clipboard_mode() {
+	set_clipboard_text(copied());
+	match clipboard_text() {
+		Some(let text) => print(i"clipboard own: {text}"),
+		None => {
+			// No display (or no clipboard): every read answers None.
+			print("no clipboard");
+			ret;
+		},
+	}
+	print("clipboard waiting");
+	// Another X client takes the clipboard (the test's injector): wait for its
+	// text, reading every 20 ms, for at most half a minute.
+	mut tries = 0;
+	for {
+		if tries >= 1500 {
+			print("clipboard: nothing pasted");
+			exit(1);
+		}
+		if clipboard_text() is Some(let text) && text != copied() {
+			print(i"clipboard pasted: {text}");
+			jump break;
+		}
+		sleep(20);
+		tries += 1;
+	}
 }
 
 main();

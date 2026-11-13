@@ -1,10 +1,10 @@
 # cargo-about config for THIS crate's notices (native-ui.md R11): the crate is
 # outside the compiler's workspace with a lockfile of its own, so its notices
 # are its own file. The accepted list is the compiler's (the root
-# `about.toml`), unchanged: every licence the GPU, window and text stack
-# carries is already on it, and a crate that would add one turns the `gfx` CI
-# leg (`scripts/ci-local.sh gfx`) red until it is accepted here BY NAME, with
-# its reason, as `vilan-rt-webview/about.toml` does for its two.
+# `about.toml`) plus ONE licence accepted here by name, with its reason
+# (BSL-1.0, below), as `vilan-rt-webview/about.toml` does for its two; a crate
+# that would add another turns the `gfx` CI leg (`scripts/ci-local.sh gfx`)
+# red until it is accepted here the same way.
 #
 #   cd crates/vilan-rt-gfx
 #   cargo about generate -c about.toml ../../about.hbs -o notices.txt
@@ -25,6 +25,12 @@ accepted = [
     "BSD-3-Clause",
     "Zlib",
     "CC0-1.0",
+    # F173 (`arboard`'s Windows half): `clipboard-win` and its `error-code` are
+    # the Boost Software License 1.0 alone, a permissive licence (OSI and FSF
+    # approved, no attribution in binaries required) outside the compiler's
+    # list. Accepted FOR NOW by the owner on 2026-11-13, for those two
+    # Windows-only packages; to be revisited under F181.
+    "BSL-1.0",
 ]
 # No `targets` filter, as the compiler's: the notices cover the WHOLE lockfile,
 # every platform's crates included.

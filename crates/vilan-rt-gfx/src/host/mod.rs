@@ -71,6 +71,7 @@
 //! not read: the text scale is 1. No input method (IME) composition.
 
 mod access;
+pub mod clipboard;
 mod input;
 mod paths;
 mod shell;
@@ -288,6 +289,7 @@ fn take_event_loop() -> Option<EventLoop<HostWake>> {
 /// synchronous `main`: the window system's loop, turning the executor's loop
 /// until it finishes. The owned loop when there is no window system.
 pub fn run_pending() {
+    let _clipboard = clipboard::ShutDownAfter;
     match take_event_loop() {
         Some(event_loop) => shell::run(event_loop, &vilan_rt::executor::turn),
         None => vilan_rt::executor::run_pending(),
@@ -299,6 +301,7 @@ pub fn run_pending() {
 /// it until the loop finishes, and the root's value. The owned loop when
 /// there is no window system.
 pub fn block_on<T: Clone + 'static>(body: impl Future<Output = T> + 'static) -> T {
+    let _clipboard = clipboard::ShutDownAfter;
     match take_event_loop() {
         Some(event_loop) => {
             let program = Program::start(body);
