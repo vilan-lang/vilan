@@ -1,7 +1,7 @@
 # Elements and layout
 
-`std::ui` builds a window's contents from six element kinds — `row`,
-`column`, `stack`, `text`, `image`, `scroll` — lays them out for you, and makes
+`std::ui` builds a window's contents from seven element kinds — `row`,
+`column`, `stack`, `text`, `image`, `icon`, `scroll` — lays them out for you, and makes
 them interactive: every box comes from the elements' gap, padding, size, grow,
 shrink, align, justify and anchor; a paragraph wraps to the width it is given;
 the element under the pointer or holding the focus hears the events it listens
@@ -37,6 +37,7 @@ here yet: grid layout, text editing beyond one line, and input methods.
 [element] fun stack(): Stack         // children on top of one another
 [element] fun text(): Text           // a paragraph
 [element] fun image(): ImageElement  // a texture in a box
+[element] fun icon(): IconElement    // a path in a square box, in the text's colour
 [element] fun scroll(): ScrollElement  // a clipped viewport over one child
 
 struct Element;            // an element of any kind
@@ -66,7 +67,7 @@ of the tree is fixed when you write it; the calls suit a tree built in a loop
 (`rows.child(..)` per item) or extended as a value. A bare attribute is a call
 with no arguments (`<row wrap focusable>`), static text is a quoted child, and a
 value is a hole (`{count}`); the [element syntax](../guide/ui.md#markup-or-chain)
-is the web UI's, and a file that imports none of these six functions keeps the
+is the web UI's, and a file that imports none of these seven functions keeps the
 web meaning of `<text>` and `<image>`.
 
 ```vilan,native
@@ -271,6 +272,95 @@ pixel a dp; given one side, it keeps the texture's aspect. `fit` says how the
 texture fills the box: inside it with the aspect kept (`Contain`, the default),
 covering it with the overflow clipped (`Cover`), stretched (`Fill`), or at its own
 size, centred and clipped (`None`). A style's radius rounds the picture.
+
+## Icons
+
+```vilan,fragment
+struct Icon { data: str, view_box: f64, paint: PathPaint }
+impl Icon {
+	fun new(data: str, view_box: f64, paint: PathPaint): Icon
+	fun stroked(data: str, view_box: f64, width: f64): Icon   // round joins and caps
+	fun filled(data: str, view_box: f64): Icon                // the non-zero rule
+}
+impl IconElement {
+	fun of<V: Bindable<Icon>>(self, icon: V): IconElement
+	fun size<V: Bindable<Dp>>(self, size: V): IconElement
+	fun color<V: Bindable<Color>>(self, color: V): IconElement
+}
+```
+
+An `Icon` is SVG path data in a square box (`view_box` units on a side, 24 for
+Lucide, Tabler or Heroicons), stroked or filled as
+[`std::gfx`'s paths](gfx.md#paths) are; an `icon` element draws one. It is drawn
+in the TEXT colour it inherits, as SVG's `currentColor`, so an icon in a white
+button is white and turns with the button's text when a hover changes it; `color`
+sets its own. It is square: `size` on a side, or else the text size it inherits,
+so an icon beside a label matches it. Its box measures as that square and is
+snapped to the device grid like any box; a box made larger — stretched across a
+column, or given a `width` — draws the icon at its side from the box's top-left
+corner, as a text draws its glyphs, so `size` is what sizes an icon. Its path is
+sharp at every size and scale (a coverage mask made at the size it is drawn at,
+shared by every icon of the same shape).
+
+```vilan,native
+import std::gfx::{ Color, Size, dp };
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::{ Align, Icon, Role, column, icon, layout, row, style, text };
+
+fun check(): Icon {
+	Icon::stroked("M20 6 9 17l-5-5", 24.0, 2.0)
+}
+
+fun chevron(open: bool): Icon {
+	if open {
+		Icon::stroked("m18 15-6-6-6 6", 24.0, 2.0)
+	} else {
+		Icon::stroked("m6 9 6 6 6-6", 24.0, 2.0)
+	}
+}
+
+fun main() {
+	let open: SignalCell<bool> = Signal::new(false);
+	let screen = <column gap(dp(8)) style(style().text_size(dp(15)))>
+		<row gap(dp(8)) align(Align::Center)>
+			<icon of(check()) />
+			<text>"Saved"</text>
+		</row>
+		<row gap(dp(6)) align(Align::Center) role(Role::Button) label("details")>
+			<text>"Details"</text>
+			<icon of(open.derive(chevron)) size(dp(18)) color(Color::rgb(46, 104, 220)) />
+		</row>
+		<icon of(check()) size(dp(24)) label("done") />
+	</column>.element();
+	layout(screen, Size::new(dp(320), dp(200)), 1.0);
+	for entry in screen.outline() {
+		print(i"{entry.kind} {entry.bounds.width.value()} x {entry.bounds.height.value()}");
+	}
+	print(screen.accessibility());
+}
+main();
+```
+
+`of`, `size` and `color` each take a value or a signal: the chevron above flips
+when `open` writes, and that repaints the icon alone — its box does not depend on
+its shape, so nothing is laid out again. An icon is **decorative** unless it has a
+`label`: an assistive tool is told nothing of it (the `Saved` row is read as its
+text, and the `Details` button by its label). Labelled, it is an image named by
+its label — the last icon above is `Image "done"`.
+
+Data that does not parse **fails the program** where the icon is given to an
+element (`of`), with the reason naming the byte, as `Path::from_svg`'s `Err`
+does: an icon's data is written in the program, or generated into it, so a typo
+is a mistake to see at once and never an icon that silently draws nothing. Each
+different data is parsed once however many icons show it. Path data that comes
+from outside the program is checked first with `Path::from_svg`.
+
+Std ships no icons, as it ships no look: an icon set is a package of functions
+answering `Icon` values (`lucide::check()`), generated from the set's SVG files.
+An icon font (`register_font` and a text run) works too, but names its icons by
+code point, aligns them by font metrics and says nothing to assistive
+technology; an `icon` is the route to take.
 
 ## Style
 
@@ -1060,6 +1150,7 @@ What is published, element by element:
 | any element with a `role` | that role |
 | a text | a label whose text the tool reads |
 | a labelled image | an image named by its label; an unlabelled one is decorative and left out |
+| a labelled icon | an image named by its label; an unlabelled one is decorative and left out, inside a list too |
 | a `scroll` | a scroll view, with its offset and range |
 | a labelled row, column or stack | a group named by its label |
 | a row, column or stack with no role and no label | nothing: its children hang from the element above it |

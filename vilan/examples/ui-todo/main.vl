@@ -1,8 +1,8 @@
 // A todo list on `std::ui::kit` (native-ui.md part P4's exit test): a text input
-// adds an item (Enter, or the Add button), a checkbox checks it off, a button
-// removes it. The kit gives each control its behaviour — focus, the pointer, the
-// keys, the caret — and nothing else: every colour, radius and spacing below is
-// this program's.
+// adds an item (Enter, or the Add button), a checkbox checks it off (its mark a
+// check icon, gfx-path.md S3), a button removes it. The kit gives each control
+// its behaviour — focus, the pointer, the keys, the caret — and nothing else:
+// every colour, radius and spacing below is this program's.
 //
 // Modes, for the end-to-end test:
 //
@@ -49,6 +49,7 @@ import std::ui::{
 	Align,
 	Anchor,
 	Element,
+	Icon,
 	Justify,
 	Length,
 	OutlineEntry,
@@ -59,6 +60,7 @@ import std::ui::{
 	each_by,
 	focused,
 	hovered,
+	icon,
 	layout,
 	mount,
 	pressed,
@@ -67,7 +69,6 @@ import std::ui::{
 	stack,
 	style,
 	text,
-	when,
 };
 
 /// One item: its id (its key), its title, and whether it is done — a cell, which
@@ -145,6 +146,22 @@ fun box_look(checked: bool): Style {
 	}
 }
 
+/// The check mark, Lucide's (ISC licence): an icon set's function, written out
+/// here (std ships no icons; a set is a package of these).
+fun check_mark(): Icon {
+	Icon::stroked("M20 6 9 17l-5-5", 24.0, 2.0)
+}
+
+/// The mark's colour: white on the filled box while checked, and none while not
+/// (the icon stays in the tree; a write repaints it alone).
+fun mark_color(checked: bool): Color {
+	if checked {
+		Color::white()
+	} else {
+		Color::rgba(0, 0, 0, 0.0)
+	}
+}
+
 /// The checkbox itself (around the box): ringed while it has the focus — the
 /// condition reads the focusable element's own state, so it is set here, not on
 /// the box inside it.
@@ -170,14 +187,12 @@ fun item_row(item: SignalCell<Item>, items: ListCell<Item>, log: |str| void): El
 		.style(check_look())
 		.align(Align::Center)
 		.child(<stack width(dp(18)) height(dp(18)) style(done.derive(box_look))>
-			{when(done, ||
-				<stack
-					anchor(Anchor::Center)
-					width(dp(8))
-					height(dp(8))
-					style(style().background(Color::white()).radius(dp(2)))
-				>
-				</stack>)}
+			<icon
+				anchor(Anchor::Center)
+				of(check_mark())
+				size(dp(14))
+				color(done.derive(mark_color))
+			/>
 		</stack>);
 	let remove = button("Remove", || {
 		log(i"remove {title}");
@@ -599,6 +614,15 @@ fun check(arguments: List<str>) {
 	click(find("add"), no);
 	report("add button");
 	tell("with two items");
+	// Each checkbox's mark is a check icon (gfx-path.md S3), in the tree whether
+	// checked or not: decorative, so the listing above says nothing of it.
+	mut marks = 0;
+	for entry in root.outline() {
+		if entry.kind == "icon" {
+			marks += 1;
+		}
+	}
+	print(i"check marks: {marks} icons");
 
 	// 6. The checkbox: Tab from the input passes the disabled Add button and
 	// reaches the first checkbox, and Space checks it; a click unchecks it.

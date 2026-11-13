@@ -2,7 +2,7 @@
 // draws, for a native program (native-ui.md parts P2 and P3; its section 9 RULED
 // 2026-11-10, its section 12 the element contract).
 //
-// Six element kinds carry every layout, and none has a look of its own:
+// Seven element kinds carry every layout, and none has a look of its own:
 //
 //   row, column   children in a line along x or y: gap, padding, grow, shrink,
 //                 align, justify, wrap (flexbox semantics, our vocabulary)
@@ -10,6 +10,8 @@
 //                 corner, the centre, or the whole stack
 //   text          a paragraph, wrapped to the width layout gives it
 //   image         a texture, drawn by its fit rule
+//   icon          a path in a square box, in the colour and at the size of the
+//                 text around it (gfx-path.md S3)
 //   scroll        a clipped viewport over its one child, moved by the wheel
 //
 // Everything else (a button, a card, a sidebar) is a function that answers these.
@@ -84,19 +86,23 @@ import pkg::gfx::{
 	Corners,
 	Dp,
 	Event,
+	FillRule,
 	FontFamily,
 	Frame,
 	KeyName,
 	KeyPress,
 	Modifiers,
+	PathPaint,
 	Point,
 	Rect,
 	Scroll,
 	Size,
+	Stroke,
 	Texture,
 	Window,
 	current_event,
 	dp,
+	path_paint_codes,
 };
 import pkg::hash::Hashable;
 import pkg::operators::Add;
@@ -136,7 +142,7 @@ import pkg::time::Duration;
 //   __ui_set property     0 grow, 1 shrink, 2 gap, 3 align, 4 justify, 5 wrap,
 //                         6 anchor, 7 role, 13 fit, 14..17 padding top, right,
 //                         bottom, left, 18 clip, 19 tab index, 20 scroll axis,
-//                         21 checked (-1 none), 22 disabled state
+//                         21 checked (-1 none), 22 disabled state, 23 icon size
 //   __ui_set_length       0 width, 1 height, 2 min width, 3 max width, 4 min
 //                         height, 5 max height; unit 0 auto, 1 dp, 2 fraction
 //   __ui_style_number     0 opacity, 1 text size, 2 line height, 3 weight,
@@ -149,7 +155,8 @@ import pkg::time::Duration;
 //                         release, 9 text, 10 focus, 11 blur, 12 resize,
 //                         13 window focus
 //   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll,
-//                         6 a region's marker (never laid out, painted or hit)
+//                         6 a region's marker (never laid out, painted or hit),
+//                         7 icon
 //
 // The enums' codes are their declaration order.
 
@@ -253,6 +260,20 @@ external fun ui_set_label(node: Node, label: str): void;
 
 [extern("__ui_set_texture")]
 external fun ui_set_texture(node: Node, texture: Texture): void;
+
+/// An icon's shape: its path data, its box, and its paint as `__gfx_path`'s
+/// numbers. Data that does not parse fails the program, naming the byte.
+[extern("__ui_set_icon")]
+external fun ui_set_icon(
+	node: Node,
+	data: str,
+	view_box: f64,
+	paint: i32,
+	rule_or_width: f64,
+	join: i32,
+	cap: i32,
+	miter_limit: f64,
+): void;
 
 [extern("__ui_add_child")]
 external fun ui_add_child(parent: Node, child: Node): void;
@@ -1827,6 +1848,106 @@ export impl ScrollElement {
 	/// How far its child reaches past it, from the last layout: the largest offset.
 	fun range(self): Size {
 		Size::new(dp(ui_offset(self.element.node, 2)), dp(ui_offset(self.element.node, 3)))
+	}
+}
+
+// --- Icons (gfx-path.md S3) -----------------------------------------------------
+
+/// What an `icon` draws: SVG path data in a square box `view_box` units on a side
+/// (24 for Lucide), from the data's origin, filled or stroked. A plain value: the
+/// data is parsed where it is first given to an `icon` (`of`), once per program for
+/// every icon of the same data, and drawn as `std::gfx` draws any `Path` (a
+/// coverage mask made once per size, shared by every icon of the same shape).
+///
+/// Data that does not parse FAILS THE PROGRAM there, with the reason naming the
+/// byte: an icon's data is written in the program (or generated into it), so bad
+/// data is a mistake to see at once, never an icon that silently draws nothing.
+/// Data from outside the program is checked first with `Path::from_svg`, which
+/// answers a `Result`. Icon sets are packages of functions that answer these
+/// (`lucide::check()`); std ships none.
+export struct Icon {
+	data: str,
+	view_box: f64,
+	paint: PathPaint,
+}
+
+export impl Icon {
+	/// `data` in a `view_box`-unit box, painted by `paint`.
+	fun new(data: str, view_box: f64, paint: PathPaint): Icon {
+		Icon { data, view_box, paint }
+	}
+
+	/// An outline icon (Lucide, Tabler, Feather, Heroicons outline): `data` stroked
+	/// `width` path units wide with round joins and caps.
+	fun stroked(data: str, view_box: f64, width: f64): Icon {
+		Icon { data, view_box, paint = PathPaint::Stroke(Stroke::new(width)) }
+	}
+
+	/// A solid icon (Material, Heroicons solid): `data` filled by the non-zero rule
+	/// (`Icon::new` with `PathPaint::Fill(FillRule::EvenOdd)` for the other).
+	fun filled(data: str, view_box: f64): Icon {
+		Icon { data, view_box, paint = PathPaint::Fill(FillRule::NonZero) }
+	}
+}
+
+/// A path in a square box. See `icon()`.
+export struct IconElement {
+	element: Element,
+}
+
+/// An icon: `of`'s shape, drawn in the inherited TEXT colour unless `color` sets
+/// one (as SVG's `currentColor`), and square, `size` on a side, or else the
+/// inherited text size, so an icon beside a label matches it. A box made larger
+/// (stretched, or given a width) draws it at its side from the box's top-left
+/// corner, as a text draws its glyphs. Decorative unless it has a `label`:
+/// unlabelled, an assistive tool is told nothing of it; labelled, it is an image
+/// named by its label.
+[element]
+export fun icon(): IconElement {
+	IconElement { element = new_element(7) }
+}
+
+export impl IconElement with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl IconElement with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl IconElement {
+	/// The shape it draws. A signal of one (a chevron that flips, a check that
+	/// comes and goes) repaints the icon alone: nothing is laid out again.
+	fun of<V: Bindable<Icon>>(self, own icon: V): IconElement {
+		let node = self.element.node;
+		icon.bind(|value: Icon| {
+			let (code, rule_or_width, join, cap, miter_limit) = path_paint_codes(value.paint);
+			ui_set_icon(node, value.data, value.view_box, code, rule_or_width, join, cap, miter_limit);
+		});
+		self
+	}
+
+	/// Its side. Unset, the text size it inherits.
+	fun size<V: Bindable<Dp>>(self, own size: V): IconElement {
+		let node = self.element.node;
+		size.bind(|value: Dp| ui_set(node, 23, value.value()));
+		self
+	}
+
+	/// Its colour, in place of the text colour it inherits: its own text colour,
+	/// so a `style` on it composes with this as with any style.
+	fun color<V: Bindable<Color>>(self, own color: V): IconElement {
+		let node = self.element.node;
+		let group = ui_style_group(node, -1);
+		color.bind(|value: Color| {
+			ui_style_group(node, group);
+			apply_style(node, group, style().text_color(value));
+		});
+		self
 	}
 }
 

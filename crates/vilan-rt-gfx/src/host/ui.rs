@@ -44,11 +44,13 @@
 //! | 20 scroll axis | 0 vertical, 1 horizontal, 2 both |
 //! | 21 checked | -1 none, 0 unchecked, 1 checked (published, P5) |
 //! | 22 disabled state | 0 or 1 (published, P5) |
+//! | 23 icon size | dp, on a side (gfx-path.md S3; unset, the inherited text size) |
 //!
 //! `__ui_set_length` properties: 0 width, 1 height, 2 min width, 3 max width,
 //! 4 min height, 5 max height; units 0 auto, 1 dp, 2 fraction of the parent.
 //! Element kinds: 0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll, 6 a
-//! marker (a region's place among its parent's children, never laid out).
+//! marker (a region's place among its parent's children, never laid out), 7
+//! an icon (its shape through `__ui_set_icon`, `ui/icons.rs`).
 //!
 //! Style fields go to a LAYER (`ui/style.rs`): `__ui_style_group` starts a
 //! group (-1 a new one, or the number of one to write again),
@@ -92,8 +94,10 @@ use crate::ui::{
 };
 use crate::units::Units;
 
+mod icons;
 mod timers;
 
+pub use icons::set_icon;
 pub use timers::{cancel_timer, timer};
 
 thread_local! {
@@ -232,6 +236,7 @@ pub fn node(kind: i32) -> Node {
             ElementKind::Image,
             ElementKind::Scroll,
             ElementKind::Marker,
+            ElementKind::Icon,
         ],
         f64::from(kind),
         "element kind",
@@ -349,6 +354,7 @@ pub fn set(node: &Node, property: i32, value: f64) {
         }
         21 => tree.set_checked(id, (value >= 0.0).then_some(value != 0.0)),
         22 => tree.set_disabled(id, value != 0.0),
+        23 => or_fail(tree.set_icon_size(id, Some(number))),
         _ => panic_with(&format!("{property} is not a `std::ui` property code")),
     });
 }
