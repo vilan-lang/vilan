@@ -680,6 +680,9 @@ pub struct NodeData {
     /// box that only moved may change size by a pixel without its scene
     /// changing.
     scene_reads_size: bool,
+    /// It, or an element around it, was removed for good ([`UiTree::remove`]):
+    /// what work finishing after the removal (a paste's answer) asks.
+    removed: bool,
 }
 
 impl NodeData {
@@ -723,6 +726,7 @@ impl NodeData {
             content_size: Size::default(),
             scene: None,
             scene_reads_size: false,
+            removed: false,
         }
     }
 }
@@ -1132,6 +1136,12 @@ impl UiTree {
         self.taffy.get_node_context(node).is_some()
     }
 
+    /// Whether `node` was removed for good, itself or with an element around
+    /// it (a freed one counts as removed).
+    pub fn is_removed(&self, node: NodeId) -> bool {
+        !self.is_alive(node) || self.data(node).removed
+    }
+
     fn data(&self, node: NodeId) -> &NodeData {
         self.taffy
             .get_node_context(node)
@@ -1360,6 +1370,7 @@ impl UiTree {
         let mut pending = vec![node];
         while let Some(current) = pending.pop() {
             let data = self.data_mut(current);
+            data.removed = true;
             handlers.extend(data.handlers.drain(..).map(|(_, handler)| handler));
             if let Some(scroll) = data.scroll.as_mut()
                 && let Some(handler) = scroll.on_offset.take()

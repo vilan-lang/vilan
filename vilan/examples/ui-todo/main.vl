@@ -20,7 +20,10 @@
 //                   one, a click on a remove button — with the state each step
 //                   left printed; then, on a stopped clock stepped by hand
 //                   (`advance_clock`), the caret's blink and a drag held past
-//                   the field's edge (F176), with the live timers counted
+//                   the field's edge (F176), with the live timers counted; and
+//                   cut, copy and paste on a clipboard held in memory
+//                   (`use_memory_clipboard`: with no display there is no system
+//                   clipboard)
 
 import std::display::Display;
 import std::fs::read_bytes;
@@ -38,8 +41,11 @@ import std::gfx::{
 	Pointer,
 	Size,
 	Window,
+	clipboard_text,
 	dp,
 	register_font,
+	set_clipboard_text,
+	use_memory_clipboard,
 };
 import std::io::print;
 import std::process::{ args, exit };
@@ -51,6 +57,7 @@ import std::ui::kit::{ TextInput, button, checkbox, text_input };
 import std::ui::{
 	Align,
 	Anchor,
+	Column,
 	Element,
 	Justify,
 	Length,
@@ -374,6 +381,8 @@ fun check(arguments: List<str>) {
 	// The timers' clock stops here: time passes for them only by `advance_clock`
 	// below, so no step depends on the machine's speed.
 	advance_clock(Duration::millis(0));
+	// No display, no system clipboard: one in memory, through the same host path.
+	use_memory_clipboard();
 	layout(root, size, 1.0);
 	for entry in root.outline() {
 		if entry.label != "" {
@@ -743,6 +752,110 @@ fun check(arguments: List<str>) {
 	let _held_on = input.disabled(false);
 	click(Point::new(dp(400), dp(470)), no);
 	blink("at the end");
+
+	// 10. The clipboard (F173): copy, cut and paste, each one change to undo.
+	// A paste's text arrives in a later turn; each report reads the clipboard too
+	// (`held_text`), which answers after the paste's own read (the clipboard keeps
+	// the order of its requests), so the paste has landed by the time it prints.
+	click(find("new item"), no);
+	key(KeyName::Char("a"), control);
+	type_text("milk and eggs");
+	key(KeyName::Home, no);
+	for _ in Range::new(0, 4) {
+		key(KeyName::Right, shift);
+	}
+	key(KeyName::Char("c"), control);
+	report(i"ctrl c: milk copied [clipboard {held_text()}]");
+	key(KeyName::End, no);
+	key(KeyName::Char("c"), control);
+	report(
+		i"ctrl c with nothing selected: nothing copied, the key goes on [clipboard {held_text()}]",
+	);
+	key(KeyName::Char(" "), no);
+	deliver(root, Event::TextInput(" "));
+	key(KeyName::Char("v"), control);
+	report(i"ctrl v at the end [clipboard {held_text()}]");
+	key(KeyName::Char("z"), control);
+	report(i"undo the paste [clipboard {held_text()}]");
+	key(KeyName::Home, no);
+	key(KeyName::Right, control_shift);
+	key(KeyName::Char("v"), control);
+	report(i"ctrl v over the selection (milk over milk) [clipboard {held_text()}]");
+	key(KeyName::Right, no);
+	key(KeyName::Right, control_shift);
+	key(KeyName::Right, shift);
+	key(KeyName::Char("x"), control);
+	report(i"ctrl x: and cut [clipboard {held_text()}]");
+	key(KeyName::Char("z"), control);
+	report(i"undo the cut [clipboard {held_text()}]");
+	key(KeyName::Char("y"), control);
+	report(i"redo the cut [clipboard {held_text()}]");
+	set_clipboard_text("two\nlines\r\nand\rthree");
+	key(KeyName::End, no);
+	key(KeyName::Insert, shift);
+	report(i"shift insert: line breaks pasted as spaces [clipboard {held_text()}]");
+	key(KeyName::Char("z"), control);
+	key(KeyName::Home, shift);
+	key(KeyName::Insert, control);
+	report(i"undo, select all, ctrl insert copies [clipboard {held_text()}]");
+	key(KeyName::End, no);
+	key(KeyName::Left, shift);
+	key(KeyName::Delete, shift);
+	report(i"shift delete cuts the last letter [clipboard {held_text()}]");
+	// Disabled before the answer arrives: the paste takes nothing.
+	key(KeyName::Char("v"), control);
+	let _off_pasting = input.disabled(true);
+	report(i"ctrl v, then disabled before the answer: nothing [clipboard {held_text()}]");
+	key(KeyName::Char("v"), control);
+	report(i"disabled: ctrl v does nothing [clipboard {held_text()}]");
+	let _on_pasting = input.disabled(false);
+	click(find("new item"), no);
+	key(KeyName::Char("v"), control);
+	report(i"enabled again: ctrl v [clipboard {held_text()}]");
+
+	// Removed for good before the answer arrives: the paste takes nothing.
+	let spare: SignalCell<str> = Signal::new("spare");
+	let showing: SignalCell<bool> = Signal::new(true);
+	let holder = spare_screen(spare, showing);
+	let holder_size = Size::new(dp(240), dp(60));
+	layout(holder, holder_size, 1.0);
+	let spot = Point::new(dp(20), dp(10));
+	deliver(holder, Event::PointerPressed(Pointer {
+		position = spot,
+		button = Button::Left,
+		modifiers = no,
+	}));
+	deliver(holder, Event::PointerReleased(Pointer {
+		position = spot,
+		button = Button::Left,
+		modifiers = no,
+	}));
+	deliver(holder, Event::KeyPressed(KeyPress {
+		key = KeyName::Char("v"),
+		repeat = false,
+		modifiers = control,
+	}));
+	showing.set(false);
+	let after_removal = clipboard_text();
+	print(i"ctrl v, then removed before the answer: spare=\"{spare.get()}\" (the clipboard still answers: {after_removal.is_some()})");
+}
+
+/// Check mode: the clipboard's text, quoted with its line breaks escaped, or `none`. (A top-level function,
+/// not a closure in `check`: the native backend emits a local closure that
+/// awaits as one it spawns, and then awaits its `()`.)
+fun held_text(): str {
+	match clipboard_text() {
+		Some(let text) => {
+			let shown = text.replace("\r", "\\r").replace("\n", "\\n");
+			i"\"{shown}\""
+		},
+		None => "none",
+	}
+}
+
+/// Check mode: a text input that a cell can take away (removed for good).
+fun spare_screen(spare: SignalCell<str>, showing: SignalCell<bool>): Column {
+	column().child(when(showing, || text_input(spare).width(dp(200)).padding(dp(4))))
 }
 
 fun after(arguments: List<str>, flag: str): str {

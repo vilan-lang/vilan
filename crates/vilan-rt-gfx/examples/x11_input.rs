@@ -15,8 +15,8 @@
 //! release of an unflagged button 4 to 7 into a `MouseWheel` of one line; a
 //! real wheel on an XInput2 server scrolls by its valuator and its button
 //! events ARE flagged, so it moves 32 dp a notch), `key NAME` presses and releases the key whose X keysym is
-//! `NAME` (`Tab`, `Return`, `Up`, `space`, `a`), with `shift+` in front holding
-//! Shift around it, and `close` sends the WM_DELETE_WINDOW message a window
+//! `NAME` (`Tab`, `Return`, `Up`, `End`, `space`, `a`), with `shift+` in front holding
+//! Shift around it and `ctrl+` Control (both: `ctrl+shift+`), and `close` sends the WM_DELETE_WINDOW message a window
 //! manager sends for its close button. Keys go to the window: it is given
 //! the input focus first, as a window manager gives it on a click. The
 //! commands run in order, and the program ends after a round trip, so the
@@ -98,11 +98,15 @@ mod x11 {
                 }
                 "key" => {
                     let name = words.next().ok_or("key needs a keysym name")?;
-                    let (shift, name) = match name.strip_prefix("shift+") {
+                    let (control, name) = match name.strip_prefix("ctrl+") {
                         Some(name) => (true, name),
                         None => (false, name.as_str()),
                     };
-                    commands.push(Command::Key(shift, keysym(name)?));
+                    let (shift, name) = match name.strip_prefix("shift+") {
+                        Some(name) => (true, name),
+                        None => (false, name),
+                    };
+                    commands.push(Command::Key(Held { shift, control }, keysym(name)?));
                 }
                 other => return Err(format!("unknown command {other:?}").into()),
             }
@@ -159,19 +163,21 @@ mod x11 {
                         connection.get_input_focus()?.reply()?;
                     }
                 }
-                Command::Key(shift, symbol) => {
+                Command::Key(held, symbol) => {
                     connection.set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)?;
                     let code = keycode(&connection, symbol)?;
-                    let shift_code = keycode(&connection, SHIFT_L)?;
-                    let mut sequence = Vec::new();
-                    if shift {
-                        sequence.push((KEY_PRESS, shift_code));
+                    let mut modifiers = Vec::new();
+                    if held.control {
+                        modifiers.push(keycode(&connection, CONTROL_L)?);
                     }
+                    if held.shift {
+                        modifiers.push(keycode(&connection, SHIFT_L)?);
+                    }
+                    let mut sequence: Vec<(u8, Keycode)> =
+                        modifiers.iter().map(|code| (KEY_PRESS, *code)).collect();
                     sequence.push((KEY_PRESS, code));
                     sequence.push((KEY_RELEASE, code));
-                    if shift {
-                        sequence.push((KEY_RELEASE, shift_code));
-                    }
+                    sequence.extend(modifiers.iter().rev().map(|code| (KEY_RELEASE, *code)));
                     for (kind, code) in sequence {
                         connection.xtest_fake_input(
                             kind,
@@ -204,12 +210,19 @@ mod x11 {
         Release,
         /// A wheel button and how many notches.
         Wheel(u8, u32),
-        /// Whether Shift is held, and the key's keysym.
-        Key(bool, u32),
+        /// The modifiers held around it, and the key's keysym.
+        Key(Held, u32),
         Close,
     }
 
+    /// The modifiers a `key` holds around its key.
+    struct Held {
+        shift: bool,
+        control: bool,
+    }
+
     const SHIFT_L: u32 = 0xffe1;
+    const CONTROL_L: u32 = 0xffe3;
 
     /// The keysyms the tests name: X's own spelling.
     fn keysym(name: &str) -> Result<u32, Failure> {
@@ -219,6 +232,7 @@ mod x11 {
             "Escape" => 0xff1b,
             "Up" => 0xff52,
             "Down" => 0xff54,
+            "End" => 0xff57,
             "space" => 0x20,
             single if single.len() == 1 && single.is_ascii() => u32::from(single.as_bytes()[0]),
             other => return Err(format!("no keysym {other:?} here").into()),

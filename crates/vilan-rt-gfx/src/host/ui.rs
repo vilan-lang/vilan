@@ -654,6 +654,13 @@ pub fn text_past_edge(node: &Node, x: f64, y: f64, lines: bool) -> f64 {
     }))
 }
 
+/// `__ui_removed(node)` — whether the element was removed for good (itself,
+/// or with an element around it): a paste whose answer arrives after that
+/// takes nothing.
+pub fn removed(node: &Node) -> bool {
+    with_tree(|tree| tree.is_removed(node.id()))
+}
+
 /// `__ui_text_caret_shown(node, shown)` — whether an edited text's caret is
 /// drawn (a blink's off half when not); it alone repaints.
 pub fn text_caret_shown(node: &Node, shown: bool) {

@@ -154,6 +154,7 @@ impl RawEvent {
         key.text = Some(name);
         let mut events = vec![key];
         if event.state == ElementState::Pressed
+            && RawEvent::types_text(modifiers)
             && let Some(text) = &event.text
             && !text.is_empty()
             && !text.chars().any(char::is_control)
@@ -161,6 +162,16 @@ impl RawEvent {
             events.push(RawEvent::text_input(text.to_string()));
         }
         events
+    }
+
+    /// Whether a key pressed with `modifiers` types its text. `winit`'s
+    /// `KeyEvent::text` leaves Ctrl out (Ctrl+A's is "a"), so without this
+    /// a shortcut typed its letter after acting on it: Ctrl+A selected all
+    /// and the "a" then replaced the selection. A key with Ctrl or the
+    /// Super (Cmd) key held types nothing, unless Alt is held too: Ctrl+Alt
+    /// is how Windows reports AltGr, which types characters on many layouts.
+    fn types_text(modifiers: ModifiersState) -> bool {
+        modifiers.alt_key() || !(modifiers.control_key() || modifiers.super_key())
     }
 
     pub(crate) fn text_input(text: String) -> RawEvent {
@@ -289,6 +300,24 @@ mod tests {
                 (POINTER_MOVED, 4.0, 5.0)
             ]
         );
+    }
+
+    /// A shortcut types nothing (Ctrl+A, Cmd+V), AltGr still types (Windows
+    /// reports it as Ctrl+Alt), and Shift and Alt alone type as ever.
+    #[test]
+    fn a_key_held_with_ctrl_or_super_types_nothing_unless_alt_is_held_too() {
+        use ModifiersState as M;
+        for (modifiers, types) in [
+            (M::empty(), true),
+            (M::SHIFT, true),
+            (M::ALT, true),
+            (M::CONTROL, false),
+            (M::CONTROL | M::SHIFT, false),
+            (M::SUPER, false),
+            (M::CONTROL | M::ALT, true),
+        ] {
+            assert_eq!(RawEvent::types_text(modifiers), types, "{modifiers:?}");
+        }
     }
 
     #[test]

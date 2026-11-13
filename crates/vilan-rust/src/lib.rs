@@ -18955,6 +18955,7 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         // F173: the system clipboard's text.
         ("__gfx_clipboard_text", "clipboard::text", &[]),
         ("__gfx_set_clipboard_text", "clipboard::set_text", &[0]),
+        ("__gfx_use_memory_clipboard", "clipboard::use_memory", &[]),
         // native-ui.md P2: `std::ui` (`vilan/std/src/ui.vl`), the element
         // tree in `vilan_rt_gfx::host::ui`. An element crosses as its
         // `Node` handle, which the functions read and so take by reference.
@@ -19032,6 +19033,8 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_text_past_edge", "ui::text_past_edge", &[0]),
         ("__ui_advance_clock", "ui::advance_clock", &[]),
         ("__ui_timer_count", "ui::timer_count", &[]),
+        // The kit's paste: whether an element was removed for good.
+        ("__ui_removed", "ui::removed", &[0]),
     ];
     FUNCTIONS
         .iter()

@@ -222,6 +222,9 @@ Rust workspace, seventeen crates, plus the language's own tree:
   `text_caret_shown`: a repaint of its chain, no layout) and a drag held past the edge;
   a `--check` listing STOPS the timers' clock with `ui::advance_clock` and steps it, so
   no listing reads the wall clock (`host/ui/timers.rs`, "A stopped clock").
+  Cut, copy and paste are the editor's too; a `--check` listing pastes through
+  `gfx::use_memory_clipboard` (an in-memory backend behind the same worker), never the
+  system's. A key with Ctrl or Super held types no text (`host/input.rs`'s `types_text`).
   THE CLIPBOARD (F173) is `host/clipboard.rs` over `arboard` (its only user), one object on a
   thread of its own; its xvfb proof is `gfx_window.rs`'s, through `x11_input clipboard`. Never run
   a clipboard-touching mode against the session's display: tests run it under `xvfb-run` only.

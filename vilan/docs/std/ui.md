@@ -974,7 +974,7 @@ system's focus, and shows again, its period started over, at every edit and
 caret move; a hidden caret never hides the selection. Anything else arms no
 timer: an unfocused input, a disabled one, a window in the background and a
 screen with no input focused wake for nothing, and a blink repaints the text
-alone, laying nothing out. their colours are the app's
+alone, laying nothing out. The caret's and the selection's colours are the app's
 (`caret`, `selection_color`), and otherwise follow the text colour. The keys the
 input acts on, and the keys that type, go no further up the tree, so a shortcut
 on an ancestor does not fire while the user types.
@@ -1057,10 +1057,21 @@ each; a new edit forgets what was undone. The value belongs to the app too, and 
 write from outside (clearing a draft after a submit) ends the history, since the
 recorded changes no longer describe the value.
 
-Not in the kit yet: the clipboard (the window layer offers none), and an input
-method's composition (an edit inserts committed text only; a preedit would be a
-run the edited text draws at the caret without the value holding it). Tabs and
-indentation are not an editor feature: Tab moves the focus.
+Cut, copy and paste are the same in both, over `std::gfx`'s clipboard. Ctrl+C
+(Cmd+C, Ctrl+Insert) copies the selection; Ctrl+X (Cmd+X, Shift+Delete) copies it
+and removes it as one change to undo; with nothing selected neither does anything,
+and the key goes on up the tree. Ctrl+V (Cmd+V, Shift+Insert) pastes: the
+clipboard's text arrives in a later turn, and goes in place of the selection as it
+is THEN, as one change; an input disabled or removed by the time it arrives takes
+nothing. A single-line input turns each line break in pasted text (CRLF, LF or
+CR) into a space; a text area turns each into the `"\n"` Enter types. A program
+that tests its copy and paste with no display, where there is no system
+clipboard, calls `std::gfx::use_memory_clipboard()` first.
+
+Not in the kit yet: an input method's composition (an edit inserts committed text
+only; a preedit would be a run the edited text draws at the caret without the
+value holding it). Tabs and indentation are not an editor feature: Tab moves the
+focus.
 
 ## Accessibility
 

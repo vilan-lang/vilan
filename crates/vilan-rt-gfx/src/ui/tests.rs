@@ -2232,6 +2232,26 @@ fn a_moved_row_keeps_its_hover_press_and_focus_and_measures_nothing() {
 /// caller's to drop, every one of the subtree's, the scroll's offset handler
 /// included.
 #[test]
+fn a_removed_row_and_everything_in_it_answer_removed_and_a_moved_one_does_not() {
+    let mut fixture = Fixture::new();
+    let (column, _) = list(&mut fixture, 4);
+    fixture.layout(column, 300.0, 400.0);
+    let rows = fixture.tree.children(column);
+    let (going, moving) = (rows[1], rows[3]);
+    let text = fixture.tree.children(going)[0];
+    assert!(!fixture.tree.is_removed(going));
+    fixture.tree.insert_before(rows[0], moving).unwrap();
+    assert!(!fixture.tree.is_removed(moving), "a move is not a removal");
+    drop(fixture.tree.remove(going));
+    assert!(
+        fixture.tree.is_removed(going),
+        "the row, held by the program"
+    );
+    assert!(fixture.tree.is_removed(text), "and what is inside it");
+    assert!(!fixture.tree.is_removed(column), "not its parent");
+}
+
+#[test]
 fn a_removed_row_takes_its_hover_press_focus_and_handlers_with_it() {
     let mut fixture = Fixture::new();
     let (column, _) = list(&mut fixture, 10);

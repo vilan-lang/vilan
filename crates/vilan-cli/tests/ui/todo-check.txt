@@ -137,3 +137,18 @@ held past the left edge: caret_shown=true timers=2
 disabled while held: caret_shown=false timers=0
 500 ms disabled: nothing moves: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=68 items=[] focus=input log=[]
 at the end: caret_shown=false timers=0
+ctrl c: milk copied [clipboard "milk"]: draft="milk and eggs" caret=4 anchor=0 items=[] focus=input log=[]
+ctrl c with nothing selected: nothing copied, the key goes on [clipboard "milk"]: draft="milk and eggs" caret=13 anchor=13 items=[] focus=input log=[screen key]
+ctrl v at the end [clipboard "milk"]: draft="milk and eggs milk" caret=18 anchor=18 items=[] focus=input log=[]
+undo the paste [clipboard "milk"]: draft="milk and eggs " caret=14 anchor=14 items=[] focus=input log=[]
+ctrl v over the selection (milk over milk) [clipboard "milk"]: draft="milk and eggs " caret=4 anchor=4 items=[] focus=input log=[]
+ctrl x: and cut [clipboard "and "]: draft="milk eggs " caret=5 anchor=5 items=[] focus=input log=[]
+undo the cut [clipboard "and "]: draft="milk and eggs " caret=9 anchor=5 items=[] focus=input log=[]
+redo the cut [clipboard "and "]: draft="milk eggs " caret=5 anchor=5 items=[] focus=input log=[]
+shift insert: line breaks pasted as spaces [clipboard "two\nlines\r\nand\rthree"]: draft="milk eggs two lines and three" caret=29 anchor=29 items=[] focus=input log=[]
+undo, select all, ctrl insert copies [clipboard "milk eggs "]: draft="milk eggs " caret=0 anchor=10 items=[] focus=input log=[]
+shift delete cuts the last letter [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[]
+ctrl v, then disabled before the answer: nothing [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[]
+disabled: ctrl v does nothing [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[screen key]
+enabled again: ctrl v [clipboard " "]: draft="milk eggs " caret=10 anchor=10 items=[] focus=input log=[]
+ctrl v, then removed before the answer: spare="spare" (the clipboard still answers: true)

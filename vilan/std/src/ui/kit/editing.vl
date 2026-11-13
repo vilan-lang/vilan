@@ -48,12 +48,31 @@
 // released (`release_pointer`, disabling), the element goes, or the caret reaches
 // the end of the text it is moving toward.
 //
-// THE CLIPBOARD is not here: Ctrl+C, Ctrl+X and Ctrl+V wait on the window layer's
-// clipboard (F173); `key`'s `CLIPBOARD SEAM` is where they go.
+// THE CLIPBOARD (F173; `std::gfx`'s `clipboard_text` and `set_clipboard_text`).
+// Copy (Ctrl+C or Ctrl+Insert; Cmd too) puts the selection on the clipboard; cut
+// (Ctrl+X or Shift+Delete) copies it and removes it as one change; with nothing
+// selected neither acts, and the key goes on up the tree. Paste (Ctrl+V or
+// Shift+Insert) asks the clipboard for its text — an answer that arrives in a later
+// turn — and inserts it at the selection AS IT IS THEN, as one change; an editor
+// disabled or removed for good by the time the answer arrives takes nothing, and so
+// does an answer of no text. On one line every line break in the pasted text (CRLF,
+// LF or CR) becomes a space; on many each becomes the "\n" Enter types (a CR left
+// in the value would be a line break of its own).
 
 [platform("@process")] mod self;
 
-import pkg::gfx::{ Color, Dp, Event, KeyName, KeyPress, Point, current_event, dp };
+import pkg::gfx::{
+	Color,
+	Dp,
+	Event,
+	KeyName,
+	KeyPress,
+	Point,
+	clipboard_text,
+	current_event,
+	dp,
+	set_clipboard_text,
+};
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::SignalCell;
 import pkg::shared::Shared;
@@ -140,6 +159,10 @@ external fun ui_text_caret_shown(node: Node, shown: bool): void;
 /// level with it.
 [extern("__ui_text_past_edge")]
 external fun ui_text_past_edge(node: Node, x: f64, y: f64, lines: bool): f64;
+
+/// Whether an element was removed for good, itself or with an element around it.
+[extern("__ui_removed")]
+external fun ui_removed(node: Node): bool;
 
 // --- The editor --------------------------------------------------------------------
 
@@ -829,7 +852,9 @@ impl Editor {
 				stop_event();
 			},
 			KeyName::Delete => {
-				if selected {
+				if modifiers.shift && !command && selected {
+					self.cut(start, end);
+				} else if selected {
 					self.replace(start, end, "", ChangeKind::Alone);
 				} else {
 					let to = self.step(now.caret, true, word);
@@ -837,12 +862,30 @@ impl Editor {
 				}
 				stop_event();
 			},
+			KeyName::Insert => {
+				if command && !modifiers.shift && selected {
+					self.copy(start, end);
+					stop_event();
+				} else if modifiers.shift && !command {
+					self.paste();
+					stop_event();
+				}
+			},
 			KeyName::Char(let typed) => {
-				// CLIPBOARD SEAM: Ctrl+C, Ctrl+X and Ctrl+V (Cmd too) go here,
-				// beside Ctrl+A, once the window layer has a clipboard (F173).
-				// Until then they fall through to the last arm and stop there,
-				// doing nothing.
-				if command && (typed == "a" || typed == "A") {
+				if command && (typed == "c" || typed == "C") {
+					if selected {
+						self.copy(start, end);
+						stop_event();
+					}
+				} else if command && (typed == "x" || typed == "X") {
+					if selected {
+						self.cut(start, end);
+						stop_event();
+					}
+				} else if command && (typed == "v" || typed == "V") {
+					self.paste();
+					stop_event();
+				} else if command && (typed == "a" || typed == "A") {
 					self.select(0, length);
 					stop_event();
 				} else if command && (typed == "z" || typed == "Z") {
@@ -862,6 +905,54 @@ impl Editor {
 			_ => {},
 		}
 	}
+}
+
+/// The clipboard's keys (see the head).
+impl Editor {
+	/// `from .. to` of the value onto the clipboard.
+	fun copy(self, from: usize, to: usize) {
+		set_clipboard_text(self.value.get().substring(from, to));
+	}
+
+	/// `from .. to` onto the clipboard, and out of the value as one change.
+	fun cut(self, from: usize, to: usize) {
+		self.copy(from, to);
+		self.replace(from, to, "", ChangeKind::Alone);
+	}
+
+	/// The clipboard's text, when it answers, in place of the selection then.
+	fun paste(self) {
+		let editor = self;
+		let _pasting = async {
+			if clipboard_text() is Some(let text) {
+				editor.take_pasted(text);
+			}
+		};
+	}
+
+	fun take_pasted(self, text: str) {
+		if self.off.read() || ui_removed(self.shell.node) {
+			ret;
+		}
+		let pasted = if self.multiline { line_feeds(text) } else { one_line(text) };
+		let now = self.selection();
+		self.replace(
+			now.anchor.min(now.caret),
+			now.anchor.max(now.caret),
+			pasted,
+			ChangeKind::Alone,
+		);
+	}
+}
+
+/// `text` on one line: each line break (CRLF, LF or CR) a space.
+fun one_line(text: str): str {
+	line_feeds(text).replace("\n", " ")
+}
+
+/// `text` with each line break (CRLF, LF or CR) a "\n".
+fun line_feeds(text: str): str {
+	text.replace("\r\n", "\n").replace("\r", "\n")
 }
 
 /// `last` and `next` as one change when `next` continues `last`'s run: typing right

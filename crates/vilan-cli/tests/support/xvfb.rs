@@ -180,6 +180,22 @@ impl Running {
         assert!(status.success(), "injecting {commands:?} failed: {status}");
     }
 
+    /// Starts the injector with `commands` against this run's display and
+    /// does NOT wait for it: for a command that serves until the program acts
+    /// (`clipboard own`). Its output is piped for the caller to read, and the
+    /// caller waits for it.
+    pub fn start_injector(&self, injector: &Path, commands: &[&str]) -> std::process::Child {
+        Command::new(injector)
+            .args(["--title", &self.title])
+            .args(commands)
+            .env("DISPLAY", &self.display)
+            .env("XAUTHORITY", &self.authority)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run the injector")
+    }
+
     /// Runs the injector with `commands` against this run's display, as
     /// [`Running::inject`] does, and answers what it printed.
     pub fn inject_output(&self, injector: &Path, commands: &[&str]) -> String {

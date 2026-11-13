@@ -20,7 +20,8 @@
 //                   lock — with the state each step left printed; then, on a
 //                   stopped clock stepped by hand (`advance_clock`), the caret's
 //                   blink and a drag held below the area (F176), with the live
-//                   timers counted
+//                   timers counted; and cut, copy and paste over lines on a
+//                   clipboard held in memory (`use_memory_clipboard`)
 
 import std::display::Display;
 import std::fs::read_bytes;
@@ -38,8 +39,11 @@ import std::gfx::{
 	Pointer,
 	Size,
 	Window,
+	clipboard_text,
 	dp,
 	register_font,
+	set_clipboard_text,
+	use_memory_clipboard,
 };
 import std::io::print;
 import std::process::{ args, exit };
@@ -257,6 +261,8 @@ fun check(arguments: List<str>) {
 	// The timers' clock stops here: time passes for them only by `advance_clock`
 	// below, so no step depends on the machine's speed.
 	advance_clock(Duration::millis(0));
+	// No display, no system clipboard: one in memory, through the same host path.
+	use_memory_clipboard();
 	layout(root, size, 1.0);
 	for entry in root.outline() {
 		if entry.label != "" {
@@ -597,6 +603,53 @@ fun check(arguments: List<str>) {
 	blink("released");
 	deliver(root, Event::FocusChanged(false));
 	blink("the window unfocused");
+
+	// 15. The clipboard (F173) in the area: a copy over lines, a paste that keeps
+	// its line breaks, a cut, each undone; the lock takes no paste. Each report
+	// reads the clipboard after the paste's own read, so the paste has landed.
+	app.note.set("one\ntwo\nthree");
+	click(find("notes"));
+	key(KeyName::Home, control);
+	report("three lines");
+	key(KeyName::Down, shift);
+	key(KeyName::End, shift);
+	key(KeyName::Char("c"), control);
+	report(i"two lines copied [clipboard {held_text()}]");
+	key(KeyName::End, control);
+	key(KeyName::Enter, no);
+	key(KeyName::Char("v"), control);
+	report(i"pasted at the end, its line break kept [clipboard {held_text()}]");
+	key(KeyName::Char("z"), control);
+	report(i"undo the paste [clipboard {held_text()}]");
+	set_clipboard_text("a\r\nb");
+	key(KeyName::Home, control);
+	key(KeyName::End, shift);
+	key(KeyName::Char("v"), control);
+	report(i"a CRLF paste over the first line: one line feed [clipboard {held_text()}]");
+	key(KeyName::Char("z"), control);
+	key(KeyName::Home, control);
+	key(KeyName::Down, shift);
+	key(KeyName::Char("x"), control);
+	report(i"the first line cut, its line break with it [clipboard {held_text()}]");
+	key(KeyName::Char("z"), control);
+	report(i"undo the cut [clipboard {held_text()}]");
+	key(KeyName::Char("v"), control);
+	click(find("lock"));
+	report(i"ctrl v, then locked before the answer: nothing [clipboard {held_text()}]");
+	click(find("lock"));
+}
+
+/// Check mode: the clipboard's text, quoted with its line breaks escaped, or `none`.
+/// (A top-level function, not a closure in `check`: the native backend emits a
+/// local closure that awaits as one it spawns, and then awaits its `()`.)
+fun held_text(): str {
+	match clipboard_text() {
+		Some(let text) => {
+			let shown = text.replace("\r", "\\r").replace("\n", "\\n");
+			i"\"{shown}\""
+		},
+		None => "none",
+	}
 }
 
 fun after(arguments: List<str>, flag: str): str {

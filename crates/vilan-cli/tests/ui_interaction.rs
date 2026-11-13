@@ -39,8 +39,13 @@
 //!    press at its left edge dragged out of the window and released there
 //!    selects all four (X11's implicit grab delivering the moves and the
 //!    release outside, winit passing them on), Return adds the item, a
-//!    click checks it off, a click on its remove button removes it, the close
-//!    button ends it with exit 0.
+//!    click checks it off, a click on its remove button removes it; then the
+//!    CLIPBOARD (F173) on the private server: Ctrl+C copies, Ctrl+V pastes
+//!    it back, another X client (`x11_input clipboard read`) reads the copy
+//!    from the program, and a paste takes what a client that owns the
+//!    clipboard (`clipboard own`) serves; the close button ends it with exit
+//!    0. The listing also records the blink and a held drag on a stopped
+//!    clock, and cut, copy and paste on an in-memory clipboard (F176, F173).
 //! 5. The virtual list (`vilan/examples/ui-virtual-list`, part P4's
 //!    `std::ui::kit::virtual_list_by` over 100,000 rows): its `--check`, with
 //!    no window, held to `tests/ui/virtual-list-check.txt` (regenerated the
@@ -628,6 +633,48 @@ fn the_todo_list_on_the_kit_runs_end_to_end() {
     let (x, y) = centre(&remove);
     running.inject(&injector, &["move", &x, &y, "press", "release"]);
     running.wait_for("items=[] ", started);
+
+    // 3. The clipboard (F173) through this private X server: Ctrl+C copies
+    // the selection, and a paste of it proves the copy reached the clipboard
+    // first (the clipboard keeps the order of its requests); then another X
+    // client reads it from the program, and a paste takes the text a client
+    // that owns the clipboard serves.
+    let (x, y) = centre(&input);
+    running.inject(&injector, &["move", &x, &y, "press", "release"]);
+    running.inject(&injector, &["key", "m", "key", "i", "key", "l", "key", "k"]);
+    running.wait_for("draft=milk items=[] focus=input selection=4..4", started);
+    running.inject(&injector, &["key", "ctrl+a", "key", "ctrl+c"]);
+    running.wait_for("draft=milk items=[] focus=input selection=0..4", started);
+    running.inject(&injector, &["key", "End", "key", "ctrl+v"]);
+    running.wait_for(
+        "draft=milkmilk items=[] focus=input selection=8..8",
+        started,
+    );
+    let read = running.inject_output(&injector, &["clipboard", "read"]);
+    assert_eq!(
+        read.trim(),
+        "clipboard milk",
+        "another client reads the copy"
+    );
+    let mut owner = running.start_injector(&injector, &["clipboard", "own", "eggs"]);
+    let mut owned = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(owner.stdout.as_mut().expect("its output")),
+        &mut owned,
+    )
+    .expect("the owner's first line");
+    assert_eq!(owned.trim(), "owned");
+    running.inject(&injector, &["key", "ctrl+v"]);
+    running.wait_for(
+        "draft=milkmilkeggs items=[] focus=input selection=12..12",
+        started,
+    );
+    let served = owner.wait_with_output().expect("the owner ends");
+    assert!(
+        served.status.success(),
+        "the owning client failed: {}",
+        String::from_utf8_lossy(&served.stderr)
+    );
     running.inject(&injector, &["close"]);
     let (code, seen, stderr) = running.exit(started);
     let report = format!("{}\n--- stderr\n{stderr}", seen.join("\n"));
