@@ -17,10 +17,12 @@
 #
 # OUTSIDE the compiler's workspace (R11), as `vilan-rt-webview` is: the root
 # `Cargo.toml` lists this directory under `exclude`, and the crate carries its
-# OWN `Cargo.lock`. Not for licences or advisories this time (every licence is
-# on the compiler's list and the audit passes) but for WEIGHT: the stack is
-# 307 packages in its lockfile (this crate, `vilan-rt` and `vilan-rt-poll`
-# among them) against the compiler's 191, and nobody building the compiler
+# OWN `Cargo.lock`. Not for advisories (the audit passes) but for WEIGHT, and
+# for one licence: the stack is 368 packages in its lockfile (this crate,
+# `vilan-rt` and `vilan-rt-poll` among them) against the compiler's 191, and
+# every licence is on the compiler's list but BSL-1.0, which `arboard`'s
+# Windows half (`clipboard-win`, `error-code`) carries and this crate's
+# `about.toml` accepts by name (F181); nobody building the compiler
 # should compile a GPU stack. Its own CI job (`scripts/ci-local.sh
 # gfx`, ci.yml's `gfx`) holds it to fmt, clippy, its tests (golden images and
 # the window proof REQUIRED there), `cargo audit --deny unsound` and its own
@@ -116,6 +118,16 @@ accesskit_winit = { version = "=0.34.2", default-features = false, features = [
     "async-io",
     "rwh_06",
 ] }
+# The system clipboard's TEXT (F173, RULED 2026-11-12: `arboard`, pinned,
+# behind `std::gfx`'s two clipboard functions so it stays replaceable;
+# `src/host/clipboard.rs` is the only file that names it). Default features
+# off: `image-data` would bring the `image` crate's PNG, TIFF and BMP codecs
+# for pictures nobody copies through this surface. X11 (and Wayland through
+# XWayland) is its own `x11rb` connection and serving thread; Windows is
+# `clipboard-win`; macOS is `NSPasteboard` through `objc2`. Wayland's
+# data-control protocol (`wayland-data-control`) is left out: see the module
+# doc of `src/host/clipboard.rs` for why.
+arboard = { version = "=3.7.0", default-features = false }
 # Instance data is uploaded as plain bytes.
 bytemuck = { version = "=1.25.2", features = ["derive"] }
 # Blocks on the adapter and device requests (wgpu's are futures).

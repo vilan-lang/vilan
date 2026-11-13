@@ -127,8 +127,10 @@ Rust workspace, seventeen crates, plus the language's own tree:
   signed distance in the shader, paint order by an overlap test, R14) into a `winit` window or
   an offscreen texture read back as RGBA; text shaped by `parley` and rasterised by `swash`
   behind a crate-private interface (R15) into a glyph atlas with mask and colour pages that
-  evicts. NOT a workspace member (R11: weight, 307 packages in its lockfile; every licence is on the
-  compiler's list and the audit is clean), so it keeps its own `Cargo.lock`, `about.toml` and
+  evicts. NOT a workspace member (R11: weight, 368 packages in its lockfile; the audit is clean, and
+  every licence is on the compiler's list but BSL-1.0, accepted in its own `about.toml` for
+  `arboard`'s two Windows-only packages `clipboard-win` and `error-code`, to revisit under F181),
+  so it keeps its own `Cargo.lock`, `about.toml` and
   `THIRD-PARTY-NOTICES.txt`, and `scripts/ci-local.sh gfx` (ci.yml's `gfx` job) runs its fmt,
   clippy, tests, audit and notices; the `windows` leg cross-lints it. LINKED BY USE: a program
   that reaches `std::gfx` (`vilan/std/src/gfx.vl`, every extern `__gfx_*`) names it in its
@@ -220,6 +222,9 @@ Rust workspace, seventeen crates, plus the language's own tree:
   `text_caret_shown`: a repaint of its chain, no layout) and a drag held past the edge;
   a `--check` listing STOPS the timers' clock with `ui::advance_clock` and steps it, so
   no listing reads the wall clock (`host/ui/timers.rs`, "A stopped clock").
+  THE CLIPBOARD (F173) is `host/clipboard.rs` over `arboard` (its only user), one object on a
+  thread of its own; its xvfb proof is `gfx_window.rs`'s, through `x11_input clipboard`. Never run
+  a clipboard-touching mode against the session's display: tests run it under `xvfb-run` only.
   ACCESSIBILITY (P5): `ui/access.rs` turns the tree into an `accesskit` tree (pure; pinned by
   `ui/access/tests.rs` and by the examples' `--check` listings through
   `Element::accessibility()`) and plans an assistive tool's action as the focus, reveal,
