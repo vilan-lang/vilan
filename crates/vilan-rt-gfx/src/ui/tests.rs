@@ -1953,6 +1953,151 @@ fn the_wheel_scrolls_the_innermost_scroll_that_can_move() {
     );
 }
 
+/// A `width` x `height` scroll along `axis` over `child`, in a stack laid
+/// out at 300 x 300: the scroll.
+fn scroll_over(
+    fixture: &mut Fixture,
+    axis: ScrollAxis,
+    width: f32,
+    height: f32,
+    child: NodeId,
+) -> NodeId {
+    let scroll = fixture.element(ElementKind::Scroll);
+    fixture.tree.set_scroll_axis(scroll, axis).unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Width, Length::Dp(width))
+        .unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Height, Length::Dp(height))
+        .unwrap();
+    fixture.add(scroll, &[child]);
+    let root = fixture.element(ElementKind::Stack);
+    fixture.add(root, &[scroll]);
+    fixture.layout(root, 300.0, 300.0);
+    scroll
+}
+
+/// F177 (RULED 2026-11-12): a scroll's one child never shrinks along the axis
+/// the scroll moves it on, whatever shrink factor the program gave it. A
+/// child whose size is set is the case flexbox shrinks by default: its
+/// automatic minimum is the smaller of that size and its content's (here
+/// none), so without the rule it is squeezed into the viewport.
+#[test]
+fn a_scrolls_child_keeps_its_size_along_each_axis_the_scroll_moves() {
+    // Vertical: as tall as it asks; across, stretched to the viewport.
+    let mut fixture = Fixture::new();
+    let tall = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(tall, SizeProperty::Height, Length::Dp(500.0))
+        .unwrap();
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Vertical, 100.0, 100.0, tall);
+    assert_eq!(fixture.rect(tall), (0.0, 0.0, 100.0, 500.0));
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(0.0, 400.0))
+    );
+
+    // Horizontal: as wide as it asks; across, stretched to the viewport.
+    let mut fixture = Fixture::new();
+    let wide = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(wide, SizeProperty::Width, Length::Dp(300.0))
+        .unwrap();
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Horizontal, 100.0, 80.0, wide);
+    assert_eq!(fixture.rect(wide), (0.0, 0.0, 300.0, 80.0));
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(200.0, 0.0))
+    );
+
+    // Both: its own size on both axes.
+    let mut fixture = Fixture::new();
+    let large = fixture.block(300.0, 500.0);
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Both, 100.0, 100.0, large);
+    assert_eq!(fixture.rect(large), (0.0, 0.0, 300.0, 500.0));
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(200.0, 400.0))
+    );
+}
+
+#[test]
+fn a_scrolls_child_shrinks_by_no_factor_the_program_gives_it() {
+    let mut fixture = Fixture::new();
+    let tall = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(tall, SizeProperty::Height, Length::Dp(500.0))
+        .unwrap();
+    fixture.tree.set_shrink(tall, 3.0).unwrap();
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Vertical, 100.0, 100.0, tall);
+    assert_eq!(fixture.rect(tall).3, 500.0, "set before it was placed");
+    fixture.tree.set_shrink(tall, 1.0).unwrap();
+    fixture.layout(fixture.tree.root_of(scroll), 300.0, 300.0);
+    assert_eq!(fixture.rect(tall).3, 500.0, "set while it is placed");
+    // Removed, it is the program's factor again: in a row it shrinks.
+    let removed = fixture.tree.remove(tall);
+    drop(removed);
+    let row = row(&mut fixture, 100.0, 600.0);
+    fixture
+        .tree
+        .set_size(tall, SizeProperty::Width, Length::Dp(300.0))
+        .unwrap();
+    fixture.add(row, &[tall]);
+    fixture.layout(row, 100.0, 600.0);
+    assert_eq!(
+        fixture.rect(tall).2,
+        100.0,
+        "a row's child shrinks as before"
+    );
+}
+
+/// The rule is along the scroll's axis only: across it a child still takes
+/// the viewport's size, so a paragraph in a vertical scroll wraps at its
+/// width, and one in a horizontal scroll keeps its one line.
+#[test]
+fn across_its_axis_a_scrolls_child_still_fits_the_viewport() {
+    let mut fixture = Fixture::new();
+    // Twenty-four characters at 10 dp: 144 dp on one line.
+    let paragraph = fixture.paragraph("aaaa bbbb cccc dddd eeee", 10.0);
+    scroll_over(&mut fixture, ScrollAxis::Vertical, 100.0, 100.0, paragraph);
+    let (_, _, width, height) = fixture.rect(paragraph);
+    assert_eq!(width, 100.0, "stretched across");
+    assert!(height > 20.0, "wrapped at the viewport's width: {height}");
+
+    let mut fixture = Fixture::new();
+    let paragraph = fixture.paragraph("aaaa bbbb cccc dddd eeee", 10.0);
+    let scroll = scroll_over(
+        &mut fixture,
+        ScrollAxis::Horizontal,
+        100.0,
+        100.0,
+        paragraph,
+    );
+    let (_, _, width, height) = fixture.rect(paragraph);
+    assert_eq!(
+        (width, height),
+        (144.0, 100.0),
+        "one line, stretched across"
+    );
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(44.0, 0.0))
+    );
+
+    // Both: the paragraph keeps its one line, and its own height.
+    let mut fixture = Fixture::new();
+    let paragraph = fixture.paragraph("aaaa bbbb cccc dddd eeee", 10.0);
+    scroll_over(&mut fixture, ScrollAxis::Both, 100.0, 100.0, paragraph);
+    let (_, _, width, height) = fixture.rect(paragraph);
+    assert_eq!(width, 144.0, "one line");
+    assert!(height < 20.0, "its own height: {height}");
+}
+
 // ------------------------------------------- inserting, removing, moving ---
 
 /// A row of the list's shape: a label and a value, as `list` builds them.

@@ -554,7 +554,10 @@ enum ScrollAxis { Vertical, Horizontal, Both }
 ```
 
 A `scroll` is a viewport over its one child. The child keeps its own size along
-the axis — a column of a thousand rows is as tall as its rows — and the scroll
+the axis — a column of a thousand rows is as tall as its rows, a paragraph in a
+horizontal scroll stays on one line — whatever `shrink` it was given; across the
+axis it is as wide (or as tall) as the viewport, and in a scroll along `Both` it
+keeps its own size both ways. The scroll
 asks for that size but takes what its parent gives it: its content never holds
 it open, so in a column it shrinks to the room left (give it a size, or `grow`
 it into the room, to fill it). The wheel moves the child, clamped to how far it reaches past the

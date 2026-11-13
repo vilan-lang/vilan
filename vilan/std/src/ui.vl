@@ -1675,9 +1675,10 @@ export fun image(): ImageElement {
 
 /// A viewport over its one child, clipped to its padding box, moved by the wheel
 /// along its `axis` (`ScrollAxis::Vertical` until set). The child keeps its own
-/// size along the axis — a column of a thousand rows is as tall as its rows — and
-/// the scroll asks for that size but takes what its parent gives it: its content
-/// never holds it open (give it a size, or `grow` it, to fill the room).
+/// size along the axis, whatever its `shrink` — a column of a thousand rows is as
+/// tall as its rows — and the scroll asks for that size but takes what its parent
+/// gives it: its content never holds it open (give it a size, or `grow` it, to fill
+/// the room).
 [element]
 export fun scroll(): ScrollElement {
 	ScrollElement { element = new_element(5) }

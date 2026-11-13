@@ -75,11 +75,9 @@ export fun text_input(value: SignalCell<str>): TextInput {
 	let shell = row().role(Role::TextField).focusable().child(scroll()
 		.axis(ScrollAxis::Horizontal)
 		.grow(1.0)
-		// Its own width, never the field's: a flex row's child shrinks to its
-		// longest word by default (CSS's rule), which would wrap a long value onto
-		// a second line instead of scrolling it.
+		// Its own width, never the field's: a scroll's child keeps its size along
+		// the axis it scrolls, so a long value stays on one line and scrolls.
 		.child(stack()
-			.shrink(0.0)
 			.child(when(empty, || text().style(placeholder_look).child(placeholder)))
 			.child(field)));
 	let editor = Editor::new(value, field.element.node, shell.element(), false, None, None);

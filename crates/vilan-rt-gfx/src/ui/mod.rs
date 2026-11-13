@@ -643,6 +643,9 @@ pub struct NodeData {
     /// focusable by a press or by the program only, 0 in tree order, a
     /// positive number before every 0, lowest first.
     tab_index: Option<i32>,
+    /// The shrink factor the program gave it (1 until set). The solver's is
+    /// this one, except in a scroll ([`UiTree::apply_shrink`]).
+    shrink: f32,
     interaction: Interaction,
     handlers: Vec<(EventKind, Handler)>,
     /// Whether a vilan handle to it is alive: an element is freed when it has
@@ -705,6 +708,7 @@ impl NodeData {
                 measured_at: None,
             }),
             tab_index: None,
+            shrink: 1.0,
             interaction: Interaction::default(),
             handlers: Vec::new(),
             handle: true,
@@ -925,39 +929,51 @@ fn anchor_alignment(anchor: Anchor) -> (AlignItems, AlignItems) {
     }
 }
 
-/// A scroll's flex arrangement for its axis: the child keeps its own size
-/// along every axis that scrolls (it never shrinks to the viewport), and
+/// A scroll's arrangement for its axis: the child keeps its own size along
+/// every axis that scrolls (it never shrinks to the viewport, F177), and
 /// fills the viewport across the axis that does not.
+///
+/// One axis: a flex line along it (stretching across), whose main axis is
+/// the one that scrolls, where the child's shrink factor is 0
+/// ([`UiTree::apply_shrink`]). Both axes: a grid of one cell as large as the
+/// child's largest content on each axis, so neither a set size nor a
+/// paragraph's line is fitted to the viewport (a flex line would fit the child
+/// across it, wrapping a paragraph at the viewport's width).
 fn scroll_style(style: &mut taffy::Style, axis: ScrollAxis) {
-    style.display = Display::Flex;
-    let (direction, align, overflow) = match axis {
-        ScrollAxis::Vertical => (
-            FlexDirection::Column,
-            AlignItems::STRETCH,
-            taffy::Point {
-                x: Overflow::Visible,
-                y: Overflow::Hidden,
-            },
-        ),
-        ScrollAxis::Horizontal => (
-            FlexDirection::Row,
-            AlignItems::STRETCH,
-            taffy::Point {
-                x: Overflow::Hidden,
-                y: Overflow::Visible,
-            },
-        ),
-        ScrollAxis::Both => (
-            FlexDirection::Column,
-            AlignItems::START,
-            taffy::Point {
-                x: Overflow::Hidden,
-                y: Overflow::Hidden,
-            },
-        ),
+    let overflow = match axis {
+        ScrollAxis::Vertical => taffy::Point {
+            x: Overflow::Visible,
+            y: Overflow::Hidden,
+        },
+        ScrollAxis::Horizontal => taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Visible,
+        },
+        ScrollAxis::Both => taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        },
     };
-    style.flex_direction = direction;
-    style.align_items = align;
+    match axis {
+        ScrollAxis::Vertical | ScrollAxis::Horizontal => {
+            style.display = Display::Flex;
+            style.flex_direction = if axis == ScrollAxis::Vertical {
+                FlexDirection::Column
+            } else {
+                FlexDirection::Row
+            };
+            style.align_items = AlignItems::STRETCH;
+            style.grid_template_columns = Vec::new();
+            style.grid_template_rows = Vec::new();
+        }
+        ScrollAxis::Both => {
+            style.display = Display::Grid;
+            style.grid_template_columns = vec![taffy::style_helpers::max_content()];
+            style.grid_template_rows = vec![taffy::style_helpers::max_content()];
+            style.justify_items = AlignItems::START;
+            style.align_items = AlignItems::START;
+        }
+    }
 
     // `Hidden`: the scroll's own smallest size is not its content's, so a
     // parent can make it smaller than what it shows; no scrollbar space.
@@ -1266,6 +1282,7 @@ impl UiTree {
     /// `child` was placed in `parent`: the parent is laid out and painted
     /// again, and the child's text style resolved from its new parent.
     fn placed(&mut self, parent: NodeId, child: NodeId) {
+        self.apply_shrink(child);
         self.dirty.push(parent);
         self.pending_text.push(child);
         self.invalidate(parent);
@@ -1354,7 +1371,10 @@ impl UiTree {
                 .expect("a child removed");
             self.dirty.push(parent);
             self.invalidate(parent);
-            if !self.data(node).handle {
+            if self.data(node).handle {
+                // Kept by the program: its own shrink factor again.
+                self.apply_shrink(node);
+            } else {
                 self.free(node);
             }
         }
@@ -1453,8 +1473,37 @@ impl UiTree {
     /// 0: never smaller than its content).
     pub fn set_shrink(&mut self, node: NodeId, shrink: f32) -> Result<(), UiError> {
         let shrink = finite(shrink, "a shrink factor")?.max(0.0);
-        self.update_style(node, |style| style.flex_shrink = shrink);
+        self.data_mut(node).shrink = shrink;
+        self.apply_shrink(node);
         Ok(())
+    }
+
+    /// Gives the solver `node`'s shrink factor: the program's, except that a
+    /// scroll's child never shrinks (F177, RULED 2026-11-12). A scroll is a
+    /// flex container whose main axis is always one it moves (`scroll_style`),
+    /// so a factor of 0 holds the child at its own size along that axis, and
+    /// only there: across it, the child still stretches to the viewport or
+    /// fits it. Run when the program sets the factor and whenever the element
+    /// is placed or taken out of a parent.
+    fn apply_shrink(&mut self, node: NodeId) {
+        let in_scroll = self
+            .taffy
+            .parent(node)
+            .is_some_and(|parent| self.kind(parent) == ElementKind::Scroll);
+        let shrink = if in_scroll {
+            0.0
+        } else {
+            self.data(node).shrink
+        };
+        if self
+            .taffy
+            .style(node)
+            .expect("an element's style")
+            .flex_shrink
+            != shrink
+        {
+            self.update_style(node, |style| style.flex_shrink = shrink);
+        }
     }
 
     pub fn set_padding(&mut self, node: NodeId, padding: Edges) -> Result<(), UiError> {
