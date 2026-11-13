@@ -450,6 +450,9 @@ struct Editing {
     anchor: usize,
     /// The caret and the selection are drawn (the input has the focus).
     active: bool,
+    /// The caret is in the shown half of its blink (F176: the kit's timer
+    /// flips it). Hiding it hides the caret alone, never the selection.
+    caret_shown: bool,
     /// The caret's colour (the text's when `None`) and width in dp.
     caret_color: Option<Color>,
     caret_width: f32,
@@ -467,6 +470,7 @@ impl Default for Editing {
             caret: 0,
             anchor: 0,
             active: false,
+            caret_shown: true,
             caret_color: None,
             caret_width: 1.0,
             selection_color: None,
@@ -650,6 +654,9 @@ pub struct NodeData {
     /// focusable by a press or by the program only, 0 in tree order, a
     /// positive number before every 0, lowest first.
     tab_index: Option<i32>,
+    /// The shrink factor the program gave it (1 until set). The solver's is
+    /// this one, except in a scroll ([`UiTree::apply_shrink`]).
+    shrink: f32,
     interaction: Interaction,
     handlers: Vec<(EventKind, Handler)>,
     /// Whether a vilan handle to it is alive: an element is freed when it has
@@ -680,6 +687,9 @@ pub struct NodeData {
     /// box that only moved may change size by a pixel without its scene
     /// changing.
     scene_reads_size: bool,
+    /// It, or an element around it, was removed for good ([`UiTree::remove`]):
+    /// what work finishing after the removal (a paste's answer) asks.
+    removed: bool,
 }
 
 impl NodeData {
@@ -713,6 +723,7 @@ impl NodeData {
                 measured_at: None,
             }),
             tab_index: None,
+            shrink: 1.0,
             interaction: Interaction::default(),
             handlers: Vec::new(),
             handle: true,
@@ -723,6 +734,7 @@ impl NodeData {
             content_size: Size::default(),
             scene: None,
             scene_reads_size: false,
+            removed: false,
         }
     }
 }
@@ -936,39 +948,51 @@ fn anchor_alignment(anchor: Anchor) -> (AlignItems, AlignItems) {
     }
 }
 
-/// A scroll's flex arrangement for its axis: the child keeps its own size
-/// along every axis that scrolls (it never shrinks to the viewport), and
+/// A scroll's arrangement for its axis: the child keeps its own size along
+/// every axis that scrolls (it never shrinks to the viewport, F177), and
 /// fills the viewport across the axis that does not.
+///
+/// One axis: a flex line along it (stretching across), whose main axis is
+/// the one that scrolls, where the child's shrink factor is 0
+/// ([`UiTree::apply_shrink`]). Both axes: a grid of one cell as large as the
+/// child's largest content on each axis, so neither a set size nor a
+/// paragraph's line is fitted to the viewport (a flex line would fit the child
+/// across it, wrapping a paragraph at the viewport's width).
 fn scroll_style(style: &mut taffy::Style, axis: ScrollAxis) {
-    style.display = Display::Flex;
-    let (direction, align, overflow) = match axis {
-        ScrollAxis::Vertical => (
-            FlexDirection::Column,
-            AlignItems::STRETCH,
-            taffy::Point {
-                x: Overflow::Visible,
-                y: Overflow::Hidden,
-            },
-        ),
-        ScrollAxis::Horizontal => (
-            FlexDirection::Row,
-            AlignItems::STRETCH,
-            taffy::Point {
-                x: Overflow::Hidden,
-                y: Overflow::Visible,
-            },
-        ),
-        ScrollAxis::Both => (
-            FlexDirection::Column,
-            AlignItems::START,
-            taffy::Point {
-                x: Overflow::Hidden,
-                y: Overflow::Hidden,
-            },
-        ),
+    let overflow = match axis {
+        ScrollAxis::Vertical => taffy::Point {
+            x: Overflow::Visible,
+            y: Overflow::Hidden,
+        },
+        ScrollAxis::Horizontal => taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Visible,
+        },
+        ScrollAxis::Both => taffy::Point {
+            x: Overflow::Hidden,
+            y: Overflow::Hidden,
+        },
     };
-    style.flex_direction = direction;
-    style.align_items = align;
+    match axis {
+        ScrollAxis::Vertical | ScrollAxis::Horizontal => {
+            style.display = Display::Flex;
+            style.flex_direction = if axis == ScrollAxis::Vertical {
+                FlexDirection::Column
+            } else {
+                FlexDirection::Row
+            };
+            style.align_items = AlignItems::STRETCH;
+            style.grid_template_columns = Vec::new();
+            style.grid_template_rows = Vec::new();
+        }
+        ScrollAxis::Both => {
+            style.display = Display::Grid;
+            style.grid_template_columns = vec![taffy::style_helpers::max_content()];
+            style.grid_template_rows = vec![taffy::style_helpers::max_content()];
+            style.justify_items = AlignItems::START;
+            style.align_items = AlignItems::START;
+        }
+    }
 
     // `Hidden`: the scroll's own smallest size is not its content's, so a
     // parent can make it smaller than what it shows; no scrollbar space.
@@ -1127,6 +1151,12 @@ impl UiTree {
         self.taffy.get_node_context(node).is_some()
     }
 
+    /// Whether `node` was removed for good, itself or with an element around
+    /// it (a freed one counts as removed).
+    pub fn is_removed(&self, node: NodeId) -> bool {
+        !self.is_alive(node) || self.data(node).removed
+    }
+
     fn data(&self, node: NodeId) -> &NodeData {
         self.taffy
             .get_node_context(node)
@@ -1281,6 +1311,7 @@ impl UiTree {
     /// `child` was placed in `parent`: the parent is laid out and painted
     /// again, and the child's text style resolved from its new parent.
     fn placed(&mut self, parent: NodeId, child: NodeId) {
+        self.apply_shrink(child);
         self.dirty.push(parent);
         self.pending_text.push(child);
         self.invalidate(parent);
@@ -1354,6 +1385,7 @@ impl UiTree {
         let mut pending = vec![node];
         while let Some(current) = pending.pop() {
             let data = self.data_mut(current);
+            data.removed = true;
             handlers.extend(data.handlers.drain(..).map(|(_, handler)| handler));
             if let Some(scroll) = data.scroll.as_mut()
                 && let Some(handler) = scroll.on_offset.take()
@@ -1369,7 +1401,10 @@ impl UiTree {
                 .expect("a child removed");
             self.dirty.push(parent);
             self.invalidate(parent);
-            if !self.data(node).handle {
+            if self.data(node).handle {
+                // Kept by the program: its own shrink factor again.
+                self.apply_shrink(node);
+            } else {
                 self.free(node);
             }
         }
@@ -1468,8 +1503,37 @@ impl UiTree {
     /// 0: never smaller than its content).
     pub fn set_shrink(&mut self, node: NodeId, shrink: f32) -> Result<(), UiError> {
         let shrink = finite(shrink, "a shrink factor")?.max(0.0);
-        self.update_style(node, |style| style.flex_shrink = shrink);
+        self.data_mut(node).shrink = shrink;
+        self.apply_shrink(node);
         Ok(())
+    }
+
+    /// Gives the solver `node`'s shrink factor: the program's, except that a
+    /// scroll's child never shrinks (F177, RULED 2026-11-12). A scroll is a
+    /// flex container whose main axis is always one it moves (`scroll_style`),
+    /// so a factor of 0 holds the child at its own size along that axis, and
+    /// only there: across it, the child still stretches to the viewport or
+    /// fits it. Run when the program sets the factor and whenever the element
+    /// is placed or taken out of a parent.
+    fn apply_shrink(&mut self, node: NodeId) {
+        let in_scroll = self
+            .taffy
+            .parent(node)
+            .is_some_and(|parent| self.kind(parent) == ElementKind::Scroll);
+        let shrink = if in_scroll {
+            0.0
+        } else {
+            self.data(node).shrink
+        };
+        if self
+            .taffy
+            .style(node)
+            .expect("an element's style")
+            .flex_shrink
+            != shrink
+        {
+            self.update_style(node, |style| style.flex_shrink = shrink);
+        }
     }
 
     pub fn set_padding(&mut self, node: NodeId, padding: Edges) -> Result<(), UiError> {
@@ -1866,6 +1930,19 @@ impl UiTree {
         Ok(())
     }
 
+    /// Whether an edited text's caret is drawn (F176, the blink's off half
+    /// when not): the text alone repaints, nothing is laid out, and its
+    /// selection is drawn either way. The same value again changes nothing.
+    pub fn text_caret_shown(&mut self, node: NodeId, shown: bool) -> Result<(), UiError> {
+        let content = self.text_content(node)?;
+        let editing = content.editing.as_mut().ok_or(UiError::NotEdited)?;
+        if editing.caret_shown != shown {
+            editing.caret_shown = shown;
+            self.invalidate(node);
+        }
+        Ok(())
+    }
+
     /// An edited text's caret colour (its text colour when `None`) and width
     /// in dp, and its selection's colour (its text colour at a quarter of
     /// its alpha when `None`).
@@ -1921,6 +1998,39 @@ impl UiTree {
         }
         let constraint = content.laid_out_at;
         Ok(content.shaped_for(constraint, text))
+    }
+
+    /// How far `point` (dp from its root's top-left corner, as the window
+    /// reports the pointer) lies past the part of an edited text that shows,
+    /// across its lines (x) or, with `lines`, down them (y): negative before
+    /// its left (top) edge, positive past its right (bottom) edge, 0 level
+    /// with it. How fast a drag held still out there scrolls (F176).
+    pub fn text_past_edge(&self, node: NodeId, point: Point, lines: bool) -> Result<f32, UiError> {
+        match &self.data(node).content {
+            Content::Text(TextContent {
+                editing: Some(_), ..
+            }) => {}
+            Content::Text(_) => return Err(UiError::NotEdited),
+            _ => {
+                return Err(UiError::WrongKind {
+                    property: "caret",
+                    kind: self.kind(node),
+                });
+            }
+        }
+        let shown = self.shown_on_screen(node);
+        let (at, before, after) = if lines {
+            (point.y, shown.top(), shown.bottom())
+        } else {
+            (point.x, shown.left(), shown.right())
+        };
+        Ok(if at < before {
+            at - before
+        } else if at > after {
+            at - after
+        } else {
+            0.0
+        })
     }
 
     /// The UTF-16 index in an edited text that `point` (dp from its root's
@@ -2959,6 +3069,9 @@ fn paint_edited(
         });
     }
     builder.text(layout, origin, color);
+    if !editing.caret_shown {
+        return;
+    }
     if let Some(caret) = layout.caret(caret, editing.caret_width) {
         let x = caret
             .left()

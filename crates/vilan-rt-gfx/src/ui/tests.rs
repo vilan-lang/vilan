@@ -1953,6 +1953,151 @@ fn the_wheel_scrolls_the_innermost_scroll_that_can_move() {
     );
 }
 
+/// A `width` x `height` scroll along `axis` over `child`, in a stack laid
+/// out at 300 x 300: the scroll.
+fn scroll_over(
+    fixture: &mut Fixture,
+    axis: ScrollAxis,
+    width: f32,
+    height: f32,
+    child: NodeId,
+) -> NodeId {
+    let scroll = fixture.element(ElementKind::Scroll);
+    fixture.tree.set_scroll_axis(scroll, axis).unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Width, Length::Dp(width))
+        .unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Height, Length::Dp(height))
+        .unwrap();
+    fixture.add(scroll, &[child]);
+    let root = fixture.element(ElementKind::Stack);
+    fixture.add(root, &[scroll]);
+    fixture.layout(root, 300.0, 300.0);
+    scroll
+}
+
+/// F177 (RULED 2026-11-12): a scroll's one child never shrinks along the axis
+/// the scroll moves it on, whatever shrink factor the program gave it. A
+/// child whose size is set is the case flexbox shrinks by default: its
+/// automatic minimum is the smaller of that size and its content's (here
+/// none), so without the rule it is squeezed into the viewport.
+#[test]
+fn a_scrolls_child_keeps_its_size_along_each_axis_the_scroll_moves() {
+    // Vertical: as tall as it asks; across, stretched to the viewport.
+    let mut fixture = Fixture::new();
+    let tall = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(tall, SizeProperty::Height, Length::Dp(500.0))
+        .unwrap();
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Vertical, 100.0, 100.0, tall);
+    assert_eq!(fixture.rect(tall), (0.0, 0.0, 100.0, 500.0));
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(0.0, 400.0))
+    );
+
+    // Horizontal: as wide as it asks; across, stretched to the viewport.
+    let mut fixture = Fixture::new();
+    let wide = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(wide, SizeProperty::Width, Length::Dp(300.0))
+        .unwrap();
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Horizontal, 100.0, 80.0, wide);
+    assert_eq!(fixture.rect(wide), (0.0, 0.0, 300.0, 80.0));
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(200.0, 0.0))
+    );
+
+    // Both: its own size on both axes.
+    let mut fixture = Fixture::new();
+    let large = fixture.block(300.0, 500.0);
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Both, 100.0, 100.0, large);
+    assert_eq!(fixture.rect(large), (0.0, 0.0, 300.0, 500.0));
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(200.0, 400.0))
+    );
+}
+
+#[test]
+fn a_scrolls_child_shrinks_by_no_factor_the_program_gives_it() {
+    let mut fixture = Fixture::new();
+    let tall = fixture.element(ElementKind::Column);
+    fixture
+        .tree
+        .set_size(tall, SizeProperty::Height, Length::Dp(500.0))
+        .unwrap();
+    fixture.tree.set_shrink(tall, 3.0).unwrap();
+    let scroll = scroll_over(&mut fixture, ScrollAxis::Vertical, 100.0, 100.0, tall);
+    assert_eq!(fixture.rect(tall).3, 500.0, "set before it was placed");
+    fixture.tree.set_shrink(tall, 1.0).unwrap();
+    fixture.layout(fixture.tree.root_of(scroll), 300.0, 300.0);
+    assert_eq!(fixture.rect(tall).3, 500.0, "set while it is placed");
+    // Removed, it is the program's factor again: in a row it shrinks.
+    let removed = fixture.tree.remove(tall);
+    drop(removed);
+    let row = row(&mut fixture, 100.0, 600.0);
+    fixture
+        .tree
+        .set_size(tall, SizeProperty::Width, Length::Dp(300.0))
+        .unwrap();
+    fixture.add(row, &[tall]);
+    fixture.layout(row, 100.0, 600.0);
+    assert_eq!(
+        fixture.rect(tall).2,
+        100.0,
+        "a row's child shrinks as before"
+    );
+}
+
+/// The rule is along the scroll's axis only: across it a child still takes
+/// the viewport's size, so a paragraph in a vertical scroll wraps at its
+/// width, and one in a horizontal scroll keeps its one line.
+#[test]
+fn across_its_axis_a_scrolls_child_still_fits_the_viewport() {
+    let mut fixture = Fixture::new();
+    // Twenty-four characters at 10 dp: 144 dp on one line.
+    let paragraph = fixture.paragraph("aaaa bbbb cccc dddd eeee", 10.0);
+    scroll_over(&mut fixture, ScrollAxis::Vertical, 100.0, 100.0, paragraph);
+    let (_, _, width, height) = fixture.rect(paragraph);
+    assert_eq!(width, 100.0, "stretched across");
+    assert!(height > 20.0, "wrapped at the viewport's width: {height}");
+
+    let mut fixture = Fixture::new();
+    let paragraph = fixture.paragraph("aaaa bbbb cccc dddd eeee", 10.0);
+    let scroll = scroll_over(
+        &mut fixture,
+        ScrollAxis::Horizontal,
+        100.0,
+        100.0,
+        paragraph,
+    );
+    let (_, _, width, height) = fixture.rect(paragraph);
+    assert_eq!(
+        (width, height),
+        (144.0, 100.0),
+        "one line, stretched across"
+    );
+    assert_eq!(
+        fixture.tree.scroll_range(scroll),
+        Some(Size::new(44.0, 0.0))
+    );
+
+    // Both: the paragraph keeps its one line, and its own height.
+    let mut fixture = Fixture::new();
+    let paragraph = fixture.paragraph("aaaa bbbb cccc dddd eeee", 10.0);
+    scroll_over(&mut fixture, ScrollAxis::Both, 100.0, 100.0, paragraph);
+    let (_, _, width, height) = fixture.rect(paragraph);
+    assert_eq!(width, 144.0, "one line");
+    assert!(height < 20.0, "its own height: {height}");
+}
+
 // ------------------------------------------- inserting, removing, moving ---
 
 /// A row of the list's shape: a label and a value, as `list` builds them.
@@ -2086,6 +2231,26 @@ fn a_moved_row_keeps_its_hover_press_and_focus_and_measures_nothing() {
 /// and the focus inside it is taken away with no blur — its handlers are the
 /// caller's to drop, every one of the subtree's, the scroll's offset handler
 /// included.
+#[test]
+fn a_removed_row_and_everything_in_it_answer_removed_and_a_moved_one_does_not() {
+    let mut fixture = Fixture::new();
+    let (column, _) = list(&mut fixture, 4);
+    fixture.layout(column, 300.0, 400.0);
+    let rows = fixture.tree.children(column);
+    let (going, moving) = (rows[1], rows[3]);
+    let text = fixture.tree.children(going)[0];
+    assert!(!fixture.tree.is_removed(going));
+    fixture.tree.insert_before(rows[0], moving).unwrap();
+    assert!(!fixture.tree.is_removed(moving), "a move is not a removal");
+    drop(fixture.tree.remove(going));
+    assert!(
+        fixture.tree.is_removed(going),
+        "the row, held by the program"
+    );
+    assert!(fixture.tree.is_removed(text), "and what is inside it");
+    assert!(!fixture.tree.is_removed(column), "not its parent");
+}
+
 #[test]
 fn a_removed_row_takes_its_hover_press_focus_and_handlers_with_it() {
     let mut fixture = Fixture::new();
@@ -2579,6 +2744,93 @@ fn a_focused_edited_text_paints_its_selection_under_and_its_caret_over_it() {
         ["text", "rect 24.0 0.0 2.0 12.0"]
     );
     assert_eq!(fixture.tree.last_pass().rebuilt, 2, "the text and the root");
+}
+
+/// F176: the blink's flip. The caret alone goes; the selection stays; nothing
+/// is laid out or measured, and only the text's scene chain is rebuilt. The
+/// same value again is no change at all, so a blink costs one repaint a flip.
+#[test]
+fn a_hidden_caret_repaints_the_text_alone_and_keeps_the_selection() {
+    let mut fixture = Fixture::new();
+    let root = fixture.element(ElementKind::Column);
+    let row = fixture.element(ElementKind::Row);
+    fixture.tree.set_align(root, Align::Start).unwrap();
+    let node = edited(&mut fixture, "abcd", 0, false);
+    let other = fixture.paragraph("other", 10.0);
+    fixture.add(row, &[node]);
+    fixture.add(root, &[row, other]);
+    fixture.tree.text_edit_look(node, None, 2.0, None).unwrap();
+    fixture.tree.text_edit(node, 3, 1, true).unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    let shown = edited_paint(&mut fixture, root);
+    assert_eq!(shown.len(), 4, "selection, text, caret, other: {shown:?}");
+
+    fixture.tree.text_caret_shown(node, false).unwrap();
+    assert!(!fixture.layout(root, 300.0, 300.0), "no solve");
+    assert_eq!(fixture.tree.last_pass().measured, 0);
+    assert_eq!(
+        edited_paint(&mut fixture, root),
+        [
+            "rect 6.0 0.0 12.0 12.0".to_string(),
+            "text".to_string(),
+            "text".to_string(),
+        ],
+        "the selection stays, the caret goes"
+    );
+    assert_eq!(
+        fixture.tree.last_pass().rebuilt,
+        3,
+        "the text, its row and the root"
+    );
+    // The same value again: nothing to repaint.
+    let generations = fixture.tree.generations();
+    fixture.tree.text_caret_shown(node, false).unwrap();
+    assert_eq!(fixture.tree.generations(), generations);
+    fixture.tree.text_caret_shown(node, true).unwrap();
+    assert!(!fixture.layout(root, 300.0, 300.0), "no solve");
+    assert_eq!(edited_paint(&mut fixture, root), shown);
+    // Only an edited text has a caret to hide.
+    assert_eq!(
+        fixture.tree.text_caret_shown(other, false),
+        Err(UiError::NotEdited)
+    );
+}
+
+/// F176: how far a point is past the part of an edited text that shows,
+/// along its lines (a scrolled field's left and right) and down them (a
+/// text area's top and bottom), through the scroll that clips it.
+#[test]
+fn a_point_past_the_edge_of_what_shows_is_measured_along_the_fields_axis() {
+    let mut fixture = Fixture::new();
+    // The root pads by 5: the 30 dp field shows x 5..35.
+    let (_, _, node) = scrolled_field(&mut fixture, "a line wider than the field");
+    let past = |fixture: &Fixture, x: f32, y: f32, lines: bool| {
+        fixture
+            .tree
+            .text_past_edge(node, Point::new(x, y), lines)
+            .unwrap()
+    };
+    assert_eq!(past(&fixture, 20.0, 10.0, false), 0.0, "level with it");
+    assert_eq!(
+        past(&fixture, 75.0, 10.0, false),
+        40.0,
+        "past the right edge"
+    );
+    assert_eq!(past(&fixture, -5.0, 10.0, false), -10.0, "before the left");
+    let (_, _, _, height) = fixture.rect(node);
+    assert_eq!(
+        past(&fixture, 20.0, 5.0 + height + 7.0, true),
+        7.0,
+        "below, down the lines"
+    );
+    assert_eq!(past(&fixture, 20.0, 1.0, true), -4.0, "above");
+    let plain = fixture.paragraph("plain", 10.0);
+    assert_eq!(
+        fixture
+            .tree
+            .text_past_edge(plain, Point::new(0.0, 0.0), false),
+        Err(UiError::NotEdited)
+    );
 }
 
 #[test]

@@ -137,3 +137,32 @@ Group "notes pad"
     TextRun value="set by the app" graphemes=14
   Button "lock" [click focus]
   Label "count" value="1 lines, 14 units"
+focused, in an unfocused window: caret_shown=true timers=0
+the window focused: caret_shown=true timers=1
+530 ms: off: caret_shown=false timers=1
+a line break typed: on: caret_shown=true timers=1
+530 ms: off: caret_shown=false timers=1
+up a line: on: caret_shown=true timers=1
+locked: caret_shown=false timers=0
+two seconds locked: no timer: caret_shown=false timers=0
+unlocked, focused: caret_shown=true timers=1
+sixteen lines, ctrl home: title="groceries" note="1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+held 10 dp below: title="groceries" note="1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16" caret=12 anchor=0 scrolled=1.25 focus=notes log=[]
+the edge timer beside the blink: caret_shown=true timers=2
+99 ms: no step yet: title="groceries" note="1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16" caret=12 anchor=0 scrolled=1.25 focus=notes log=[]
+100 ms: a line further: title="groceries" note="1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16" caret=14 anchor=0 scrolled=20 focus=notes log=[]
+90 dp below: title="groceries" note="1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16" caret=16 anchor=0 scrolled=38.75 focus=notes log=[]
+25 ms: a line further: title="groceries" note="1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16" caret=18 anchor=0 scrolled=57.5 focus=notes log=[]
+held until the end (7 steps): title="groceries" note="1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16" caret=38 anchor=0 scrolled=170 focus=notes log=[]
+the edge timer ended at the end: caret_shown=true timers=1
+held below again: caret_shown=true timers=2
+released: caret_shown=true timers=1
+the window unfocused: caret_shown=true timers=0
+three lines: title="groceries" note="one\ntwo\nthree" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+two lines copied [clipboard "one\ntwo"]: title="groceries" note="one\ntwo\nthree" caret=7 anchor=0 scrolled=0 focus=notes log=[]
+pasted at the end, its line break kept [clipboard "one\ntwo"]: title="groceries" note="one\ntwo\nthree\none\ntwo" caret=21 anchor=21 scrolled=0 focus=notes log=[]
+undo the paste [clipboard "one\ntwo"]: title="groceries" note="one\ntwo\nthree\n" caret=14 anchor=14 scrolled=0 focus=notes log=[]
+a CRLF paste over the first line: one line feed [clipboard "a\r\nb"]: title="groceries" note="a\nb\ntwo\nthree\n" caret=3 anchor=3 scrolled=0 focus=notes log=[]
+the first line cut, its line break with it [clipboard "one\n"]: title="groceries" note="two\nthree\n" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+undo the cut [clipboard "one\n"]: title="groceries" note="one\ntwo\nthree\n" caret=4 anchor=0 scrolled=0 focus=notes log=[]
+ctrl v, then locked before the answer: nothing [clipboard "one\n"]: title="groceries" note="one\ntwo\nthree\n" caret=4 anchor=0 scrolled=0 focus=- log=[]

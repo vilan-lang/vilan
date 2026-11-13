@@ -99,3 +99,57 @@ click check bread: draft="" caret=0 anchor=0 items=[[ ] bread, [ ] milk] focus=-
 click check milk: draft="" caret=0 anchor=0 items=[[ ] bread, [x] milk] focus=- log=[]
 remove milk: draft="" caret=0 anchor=0 items=[[ ] bread] focus=- log=[remove milk]
 remove bread: draft="" caret=0 anchor=0 items=[] focus=- log=[remove bread]
+nothing focused: caret_shown=false timers=0
+focused, in an unfocused window: caret_shown=true timers=0
+two seconds on: steady: caret_shown=true timers=0
+the window focused: caret_shown=true timers=1
+529 ms: caret_shown=true timers=1
+530 ms: off: caret_shown=false timers=1
+1060 ms: on: caret_shown=true timers=1
+1590 ms: off: caret_shown=false timers=1
+typed while off: on again: caret_shown=true timers=1
+529 ms after the edit: caret_shown=true timers=1
+530 ms after the edit: off: caret_shown=false timers=1
+a caret move: on again: caret_shown=true timers=1
+the window unfocused: caret_shown=true timers=0
+two seconds on: steady: caret_shown=true timers=0
+disabled: caret_shown=false timers=0
+enabled, focused again: caret_shown=true timers=1
+the focus taken away: caret_shown=false timers=0
+a long line again, home: draft="a line of text long enough to be wider than the field it is typed in" caret=0 anchor=0 items=[] focus=input log=[]
+held 10 dp past the right edge: draft="a line of text long enough to be wider than the field it is typed in" caret=33 anchor=0 items=[] focus=input log=[]
+the edge timer armed beside the blink: caret_shown=true timers=2
+99 ms: no step yet: draft="a line of text long enough to be wider than the field it is typed in" caret=33 anchor=0 items=[] focus=input log=[]
+100 ms: one step: draft="a line of text long enough to be wider than the field it is typed in" caret=34 anchor=0 items=[] focus=input log=[]
+200 ms: another: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=0 items=[] focus=input log=[]
+80 dp out: draft="a line of text long enough to be wider than the field it is typed in" caret=36 anchor=0 items=[] focus=input log=[]
+25 ms later: a step: draft="a line of text long enough to be wider than the field it is typed in" caret=37 anchor=0 items=[] focus=input log=[]
+50 ms: another: draft="a line of text long enough to be wider than the field it is typed in" caret=38 anchor=0 items=[] focus=input log=[]
+back inside: draft="a line of text long enough to be wider than the field it is typed in" caret=9 anchor=0 items=[] focus=input log=[]
+the edge timer gone: caret_shown=true timers=1
+500 ms inside: nothing moves: draft="a line of text long enough to be wider than the field it is typed in" caret=9 anchor=0 items=[] focus=input log=[]
+released past the edge: caret_shown=true timers=1
+500 ms after the release: nothing moves: draft="a line of text long enough to be wider than the field it is typed in" caret=39 anchor=0 items=[] focus=input log=[]
+home: draft="a line of text long enough to be wider than the field it is typed in" caret=0 anchor=0 items=[] focus=input log=[]
+held until the end (36 steps): draft="a line of text long enough to be wider than the field it is typed in" caret=68 anchor=0 items=[] focus=input log=[]
+the edge timer ended at the end: caret_shown=true timers=1
+end: draft="a line of text long enough to be wider than the field it is typed in" caret=68 anchor=68 items=[] focus=input log=[]
+held past the left edge: caret_shown=true timers=2
+disabled while held: caret_shown=false timers=0
+500 ms disabled: nothing moves: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=68 items=[] focus=input log=[]
+at the end: caret_shown=false timers=0
+ctrl c: milk copied [clipboard "milk"]: draft="milk and eggs" caret=4 anchor=0 items=[] focus=input log=[]
+ctrl c with nothing selected: nothing copied, the key goes on [clipboard "milk"]: draft="milk and eggs" caret=13 anchor=13 items=[] focus=input log=[screen key]
+ctrl v at the end [clipboard "milk"]: draft="milk and eggs milk" caret=18 anchor=18 items=[] focus=input log=[]
+undo the paste [clipboard "milk"]: draft="milk and eggs " caret=14 anchor=14 items=[] focus=input log=[]
+ctrl v over the selection (milk over milk) [clipboard "milk"]: draft="milk and eggs " caret=4 anchor=4 items=[] focus=input log=[]
+ctrl x: and cut [clipboard "and "]: draft="milk eggs " caret=5 anchor=5 items=[] focus=input log=[]
+undo the cut [clipboard "and "]: draft="milk and eggs " caret=9 anchor=5 items=[] focus=input log=[]
+redo the cut [clipboard "and "]: draft="milk eggs " caret=5 anchor=5 items=[] focus=input log=[]
+shift insert: line breaks pasted as spaces [clipboard "two\nlines\r\nand\rthree"]: draft="milk eggs two lines and three" caret=29 anchor=29 items=[] focus=input log=[]
+undo, select all, ctrl insert copies [clipboard "milk eggs "]: draft="milk eggs " caret=0 anchor=10 items=[] focus=input log=[]
+shift delete cuts the last letter [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[]
+ctrl v, then disabled before the answer: nothing [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[]
+disabled: ctrl v does nothing [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[screen key]
+enabled again: ctrl v [clipboard " "]: draft="milk eggs " caret=10 anchor=10 items=[] focus=input log=[]
+ctrl v, then removed before the answer: spare="spare" (the clipboard still answers: true)

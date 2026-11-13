@@ -205,6 +205,35 @@ pub(crate) fn use_for_tests(make: Make) {
     WORKER.with(|worker| *worker.borrow_mut() = Some(Worker::start(make)));
 }
 
+/// A clipboard held in the program's memory: what a program that tests
+/// itself with no display puts in the system's place
+/// (`__gfx_use_memory_clipboard`).
+struct Memory(Option<String>);
+
+impl ClipboardBackend for Memory {
+    fn text(&mut self) -> Result<Option<String>, String> {
+        Ok(self.0.clone())
+    }
+
+    fn set_text(&mut self, text: String) -> Result<(), String> {
+        self.0 = Some(text);
+        Ok(())
+    }
+}
+
+/// `__gfx_use_memory_clipboard()` — `std::gfx::use_memory_clipboard`: from
+/// now on the program's clipboard is an empty one in its own memory, behind
+/// the same worker, so reads and writes keep their order and a read still
+/// answers in a later turn; the system's clipboard is never touched again.
+/// For a program that tests its own copy and paste with no display (the kit
+/// examples' `--check` listings), where the system's would answer `None`.
+pub fn use_memory() {
+    let make: Make = Box::new(|| Ok(Box::new(Memory(None)) as Box<dyn ClipboardBackend>));
+    let old = WORKER.with(|worker| worker.borrow_mut().replace(Worker::start(make)));
+    // Its requests are done when it drops (`Worker`'s `Drop`).
+    drop(old);
+}
+
 /// `__gfx_clipboard_text()` — `std::gfx::clipboard_text`: the clipboard's
 /// text, or `None` (no text, no clipboard, or no answer from its owner in
 /// `arboard`'s four seconds). Async: the answer reaches the program in a

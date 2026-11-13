@@ -741,9 +741,9 @@ fun open_window<T, K>(extent: (f64, bool), key: |T| K): Window<T, K> {
 		offset = Signal::new(Point::new(dp(0), dp(0))),
 		scrolled = Signal::new(Point::new(dp(0), dp(0))),
 		shown = Signal::new(none),
-		// Its height is the whole list's, and it never shrinks to the viewport (a
-		// scroll's child would, to its content: CSS's flex rule, min-height auto).
-		column = column().role(Role::List).height(dp(0)).shrink(0.0),
+		// Its height is the whole list's (the scroll's child keeps it: it never
+		// shrinks to the viewport).
+		column = column().role(Role::List).height(dp(0)),
 	}
 }
 

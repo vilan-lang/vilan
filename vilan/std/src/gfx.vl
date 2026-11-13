@@ -330,6 +330,9 @@ async external fun gfx_clipboard_text(): Option<str>;
 [extern("__gfx_set_clipboard_text")]
 external fun gfx_set_clipboard_text(text: str): void;
 
+[extern("__gfx_use_memory_clipboard")]
+external fun gfx_use_memory_clipboard(): void;
+
 // --- Lengths -------------------------------------------------------------------
 
 /// A length in display pixels: the 8 of a design measured in pixels. One dp is one
@@ -1237,6 +1240,15 @@ export fun clipboard_text(): Option<str> {
 /// made before. Returns at once; nothing happens where there is no clipboard.
 export fun set_clipboard_text(text: str) {
 	gfx_set_clipboard_text(text);
+}
+
+/// For a program that tests its own copy and paste with no display: from now on its
+/// clipboard is an empty one held in its own memory, read and written in the same
+/// order and through the same asynchronous read as the system's, which is never
+/// touched again. With no display the system's clipboard answers `None`, so a test
+/// of a paste needs this one.
+export fun use_memory_clipboard() {
+	gfx_use_memory_clipboard();
 }
 
 // --- Input ---------------------------------------------------------------------

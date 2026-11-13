@@ -17,15 +17,20 @@
 // selection to it) and a drag while the button is down extends it — off the input
 // and off the window too (the press captured the pointer): past the field's left or
 // right edge each move extends the selection one grapheme beyond what shows, and
-// the caret's reveal scrolls the field by it. A double click selects the word under
+// the caret's reveal scrolls the field by it; held still out there, a timer keeps
+// stepping (`editing.vl`'s head). A double click selects the word under
 // the pointer (a run of word graphemes, or of the others: a double click on a space
 // selects the spaces), and a drag from it extends by whole words; a triple click
 // selects everything, and a drag from it changes nothing.
 //
-// Not here: the clipboard (the window layer has none yet), an input method's
-// composition (P5: the text carries no preedit run; see the docs), the caret
-// blinking (a blink needs a timer in the host that stops while the window is
-// unfocused; the caret is steady, so an idle window draws nothing).
+// The caret blinks while the input, its window and nothing else hold it still
+// (`editing.vl`'s head says when; no timer otherwise).
+//
+// Cut, copy and paste are the editor's (`editing.vl`'s head); a pasted line break
+// becomes a space here.
+//
+// Not here: an input method's composition (P5: the text carries no preedit run;
+// see the docs).
 
 [platform("@process")] mod self;
 
@@ -75,11 +80,9 @@ export fun text_input(value: SignalCell<str>): TextInput {
 	let shell = row().role(Role::TextField).focusable().child(scroll()
 		.axis(ScrollAxis::Horizontal)
 		.grow(1.0)
-		// Its own width, never the field's: a flex row's child shrinks to its
-		// longest word by default (CSS's rule), which would wrap a long value onto
-		// a second line instead of scrolling it.
+		// Its own width, never the field's: a scroll's child keeps its size along
+		// the axis it scrolls, so a long value stays on one line and scrolls.
 		.child(stack()
-			.shrink(0.0)
 			.child(when(empty, || text().style(placeholder_look).child(placeholder)))
 			.child(field)));
 	let editor = Editor::new(value, field.element.node, shell.element(), false, None, None);
@@ -150,6 +153,13 @@ export impl TextInput {
 	/// Whether it is disabled now.
 	fun is_disabled(self): bool {
 		self.editor.is_disabled()
+	}
+
+	/// Whether its caret is drawn now: it has the focus and is enabled, and the
+	/// caret is in the shown half of its blink. The caret blinks only while its
+	/// window has the focus too, and shows again at every edit and caret move.
+	fun caret_shown(self): bool {
+		self.editor.caret_shown()
 	}
 
 	/// The selection now (both ends at the caret when nothing is selected), kept

@@ -350,6 +350,7 @@ its own event callback, if it has one.
 ```vilan,fragment
 fun clipboard_text(): Option<str>        // async; None: no text, no clipboard, or no answer
 fun set_clipboard_text(text: str)        // returns at once
+fun use_memory_clipboard()               // a test's: one in the program's memory
 ```
 
 The system clipboard's text, read and written. `clipboard_text` is `async`: on
@@ -368,6 +369,12 @@ ends, the desktop's clipboard manager (if one runs) is offered the text, so a co
 can outlive it. Windows and macOS keep the text themselves. Text only: no images,
 no rich text. Cut, copy and paste in `std::ui::kit`'s inputs are built on these
 two functions.
+
+A program that tests its own copy and paste with no display (a `--check`
+listing), where the system's clipboard answers `None`, calls
+`use_memory_clipboard()` first: from then on its clipboard is an empty one held
+in its own memory, behind the same thread and the same asynchronous read, and the
+system's is never touched.
 
 ```vilan,native
 import std::gfx::{ clipboard_text, set_clipboard_text };

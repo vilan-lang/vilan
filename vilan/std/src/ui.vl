@@ -59,7 +59,9 @@
 //
 // TIMERS (F176) belong to an element as its handlers do: `after` and `every` run a
 // handler as one turn later, and a timer ends with its element's removal or its
-// `cancel`. The window's own focus is `window_focused()` and `on_window_focus`.
+// `cancel`. The window's own focus is `window_focused()` and `on_window_focus`. A
+// program driving its tree with `deliver` can stop the timers' clock and step it
+// (`advance_clock`), and count the live timers (`timer_count`).
 //
 // NATIVE ONLY, as `std::gfx` is: the JavaScript backend refuses a program that
 // reaches it, by name, when it builds; `vilan check` does not.
@@ -335,6 +337,15 @@ external fun ui_cancel_timer(id: f64): void;
 /// 1 when the window `node`'s tree is in has the system's focus, else 0.
 [extern("__ui_window_focused")]
 external fun ui_window_focused(node: Node): i32;
+
+/// Stops the timers' clock (at the first call) and moves it `by` ms, firing every
+/// timer due on the way, in order.
+[extern("__ui_advance_clock")]
+external fun ui_advance_clock(by: f64): void;
+
+/// How many element timers are live.
+[extern("__ui_timer_count")]
+external fun ui_timer_count(): i32;
 
 /// While a resize handler runs: the size it reports, width (0) and height (1), in
 /// dp.
@@ -1696,9 +1707,10 @@ export fun image(): ImageElement {
 
 /// A viewport over its one child, clipped to its padding box, moved by the wheel
 /// along its `axis` (`ScrollAxis::Vertical` until set). The child keeps its own
-/// size along the axis — a column of a thousand rows is as tall as its rows — and
-/// the scroll asks for that size but takes what its parent gives it: its content
-/// never holds it open (give it a size, or `grow` it, to fill the room).
+/// size along the axis, whatever its `shrink` — a column of a thousand rows is as
+/// tall as its rows — and the scroll asks for that size but takes what its parent
+/// gives it: its content never holds it open (give it a size, or `grow` it, to fill
+/// the room).
 [element]
 export fun scroll(): ScrollElement {
 	ScrollElement { element = new_element(5) }
@@ -2616,6 +2628,24 @@ export fun deliver<C: Child>(root: C, event: Event) {
 		),
 		_ => {},
 	}
+}
+
+/// For a program that drives its tree itself, as `deliver` does: STOPS the clock
+/// element timers keep (at the first call, at the time it is then) and moves it on
+/// by `by`, firing every timer due on the way — each at its own time, in order,
+/// as one turn, as they would fire in a window. From the first call on, time
+/// passes for the timers only by this call: no timer wakes the program by itself,
+/// and a timer left pending does not keep it running, so a test of a timer (a
+/// caret's blink, a drag that keeps scrolling) answers the same on any machine.
+export fun advance_clock(by: Duration) {
+	ui_advance_clock(by.as_millis().as_f64());
+}
+
+/// How many element timers are live in the program: none in a program at rest,
+/// which is what an idle window waking for nothing comes down to (a test of a
+/// component's idle cost reads it).
+export fun timer_count(): usize {
+	ui_timer_count().as_usize()
 }
 
 fun deliver_key(node: Node, kind: i32, key: KeyPress) {

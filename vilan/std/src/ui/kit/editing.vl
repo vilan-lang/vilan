@@ -29,16 +29,58 @@
 // what was undone. The value is the app's too, and a write to it from outside
 // (`draft.set("")` after a submit) ends the history: the changes no longer describe
 // the value, so undo forgets them rather than corrupt it.
+//
+// THE BLINK (F176). The caret blinks — `BLINK_MILLIS` shown, as long hidden — while
+// the editor has the focus, is enabled, and its window has the system's focus;
+// otherwise no timer is armed at all, so an idle window, a window in the background
+// and a program with no focused input wake for nothing. Every edit and every caret
+// move (`show`) and every change of those three conditions start it again from
+// shown, so the caret never goes out while the user acts. The flip is the edited
+// text's own flag in the host (`__ui_text_caret_shown`): it repaints the text's
+// scene and the chain above it, and lays nothing out. A hidden caret never hides
+// the selection.
+//
+// A DRAG HELD PAST THE EDGE (F176). A pointer move past the edge of what shows
+// (left or right on one line, above or below on many) extends the selection one
+// grapheme or line beyond it, as before; while the pointer stays out there the step
+// repeats on a timer, faster the further out it is (`edge_period`), until the
+// pointer comes back level with the text, the button comes up, the press is
+// released (`release_pointer`, disabling), the element goes, or the caret reaches
+// the end of the text it is moving toward.
+//
+// THE CLIPBOARD (F173; `std::gfx`'s `clipboard_text` and `set_clipboard_text`).
+// Copy (Ctrl+C or Ctrl+Insert; Cmd too) puts the selection on the clipboard; cut
+// (Ctrl+X or Shift+Delete) copies it and removes it as one change; with nothing
+// selected neither acts, and the key goes on up the tree. Paste (Ctrl+V or
+// Shift+Insert) asks the clipboard for its text — an answer that arrives in a later
+// turn — and inserts it at the selection AS IT IS THEN, as one change; an editor
+// disabled or removed for good by the time the answer arrives takes nothing, and so
+// does an answer of no text. On one line every line break in the pasted text (CRLF,
+// LF or CR) becomes a space; on many each becomes the "\n" Enter types (a CR left
+// in the value would be a line break of its own).
 
 [platform("@process")] mod self;
 
-import pkg::gfx::{ Color, Dp, Event, KeyName, KeyPress, Point, current_event, dp };
+import pkg::gfx::{
+	Color,
+	Dp,
+	Event,
+	KeyName,
+	KeyPress,
+	Point,
+	clipboard_text,
+	current_event,
+	dp,
+	set_clipboard_text,
+};
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::SignalCell;
 import pkg::shared::Shared;
+import pkg::time::Duration;
 import pkg::ui::{
 	Attributes,
 	Element,
+	ElementTimer,
 	Node,
 	ScrollElement,
 	click_count,
@@ -107,6 +149,21 @@ external fun ui_text_vertical(node: Node, index: i32, goal_x: f64, lines: i32): 
 [extern("__ui_text_caret_number")]
 external fun ui_text_caret_number(node: Node, index: i32, which: i32): f64;
 
+/// Whether the caret is drawn (the blink's off half when not): the text alone
+/// repaints.
+[extern("__ui_text_caret_shown")]
+external fun ui_text_caret_shown(node: Node, shown: bool): void;
+
+/// How far a point (dp from the window's top-left) lies past the part of the text
+/// that shows, along x (with `lines`, y): negative before it, positive after it, 0
+/// level with it.
+[extern("__ui_text_past_edge")]
+external fun ui_text_past_edge(node: Node, x: f64, y: f64, lines: bool): f64;
+
+/// Whether an element was removed for good, itself or with an element around it.
+[extern("__ui_removed")]
+external fun ui_removed(node: Node): bool;
+
 // --- The editor --------------------------------------------------------------------
 
 /// The two ends of a text input's or a text area's selection, as `str` counts
@@ -119,6 +176,9 @@ export struct Selection {
 
 /// How many changes the history keeps: the oldest goes first.
 let HISTORY_LIMIT: usize = 100;
+
+/// How long the blinking caret shows, and then how long it hides (see the head).
+let BLINK_MILLIS: i32 = 530;
 
 /// What made a change, for coalescing: typing, Backspace and Delete each merge with
 /// the change before them of their own kind; anything else stands alone.
@@ -176,6 +236,15 @@ export(in pkg) struct Editor {
 	undone: Shared<List<Change>>,
 	merging: Shared<bool>,
 	expected: Shared<str>,
+	/// The blink (see the head): its timer while it blinks, and whether the caret
+	/// is in its shown half.
+	blink: Shared<Option<ElementTimer>>,
+	caret_on: Shared<bool>,
+	/// A drag held past the edge (see the head): its timer, the timer's period in
+	/// ms (0 with none), and where the pointer last was.
+	edge: Shared<Option<ElementTimer>>,
+	edge_every: Shared<i32>,
+	held: Shared<Point>,
 }
 
 export(in pkg) impl Editor {
@@ -214,6 +283,11 @@ export(in pkg) impl Editor {
 			undone = Shared::new([]),
 			merging = Shared::new(false),
 			expected = Shared::new(value.get()),
+			blink = Shared::new(None),
+			caret_on = Shared::new(true),
+			edge = Shared::new(None),
+			edge_every = Shared::new(0),
+			held = Shared::new(Point::new(dp(0), dp(0))),
 		};
 		editor.show();
 		editor
@@ -246,6 +320,8 @@ export(in pkg) impl Editor {
 					editor.drag(point);
 				}
 			})
+			.on_release(|| editor.stop_edge())
+			.on_window_focus(|_focused: bool| editor.restart_blink())
 			.on_key(|key: KeyPress| editor.key(key))
 			.on_text(|typed: str| {
 				if editor.off.read() {
@@ -284,6 +360,7 @@ export(in pkg) impl Editor {
 		ui_set_focusable(self.shell.node, !value);
 		if value {
 			self.shell.release_pointer();
+			self.stop_edge();
 		}
 		let _published = self.shell.disabled_state(value);
 		self.show();
@@ -291,6 +368,12 @@ export(in pkg) impl Editor {
 
 	fun is_disabled(self): bool {
 		self.off.read()
+	}
+
+	/// Whether the caret is drawn now: shown (focused and enabled) and in the shown
+	/// half of its blink.
+	fun caret_shown(self): bool {
+		self.focused.read() && !self.off.read() && self.caret_on.read()
 	}
 
 	/// The selection now (both ends at the caret when nothing is selected), kept
@@ -314,7 +397,8 @@ export(in pkg) impl Editor {
 
 /// The editor's own steps.
 impl Editor {
-	/// Tells the tree where the caret and the selection are, and whether they show.
+	/// Tells the tree where the caret and the selection are, and whether they show;
+	/// the blink starts again from shown.
 	fun show(self) {
 		let now = self.selection();
 		ui_text_edit(
@@ -323,6 +407,28 @@ impl Editor {
 			now.anchor.as_i32(),
 			self.focused.read() && !self.off.read(),
 		);
+		self.restart_blink();
+	}
+
+	/// The caret shown, and blinking from now on if it should (see the head): with
+	/// the focus, enabled, in a focused window. Otherwise no timer is left armed.
+	fun restart_blink(self) {
+		if self.blink.read() is Some(let timer) {
+			timer.cancel();
+			self.blink.write() = None;
+		}
+		if !self.caret_on.read() {
+			self.caret_on.write() = true;
+			ui_text_caret_shown(self.field, true);
+		}
+		if self.focused.read() && !self.off.read() && self.shell.window_focused() {
+			let editor = self;
+			self.blink.write() = Some(self.shell.every(Duration::millis(BLINK_MILLIS.as_i53()), || {
+				let on = !editor.caret_on.read();
+				editor.caret_on.write() = on;
+				ui_text_caret_shown(editor.field, on);
+			}));
+		}
 	}
 
 	fun show_look(self) {
@@ -377,9 +483,69 @@ impl Editor {
 		}
 	}
 
-	/// The pointer at `point` while the press is held: the selection extended to it
-	/// by the press's unit.
+	/// The pointer moved to `point` while the press is held: the selection extended
+	/// to it, and kept extending while the pointer stays past the edge.
 	fun drag(self, point: Point) {
+		self.held.write() = point;
+		self.extend_to(point);
+		self.follow_edge(point);
+	}
+
+	/// Past the edge of what shows (and not yet at the end of the text that way):
+	/// the drag's step repeated by a timer at `edge_period`'s pace; level with the
+	/// text, no timer. A timer already at the pace is kept, phase and all.
+	fun follow_edge(self, point: Point) {
+		let past = ui_text_past_edge(self.field, point.x.value(), point.y.value(), self.multiline);
+		let every = edge_period(past);
+		let still = self.unit.read() >= 3 && !self.multiline;
+		if every == 0 || still || self.at_end(past) {
+			self.stop_edge();
+			ret;
+		}
+		if every == self.edge_every.read() {
+			ret;
+		}
+		self.stop_edge();
+		let editor = self;
+		self.edge_every.write() = every;
+		self.edge.write() = Some(self.shell
+			.every(Duration::millis(every.as_i53()), || editor.edge_step()));
+	}
+
+	/// The edge timer's step: the drag's step at the held point, as a move there
+	/// would make it; the timer ends once the press is over or the caret is at the
+	/// end it moves toward.
+	fun edge_step(self) {
+		if self.off.read() || !self.shell.interaction().pressed {
+			self.stop_edge();
+			ret;
+		}
+		let point = self.held.read();
+		self.extend_to(point);
+		if self.at_end(
+			ui_text_past_edge(self.field, point.x.value(), point.y.value(), self.multiline),
+		) {
+			self.stop_edge();
+		}
+	}
+
+	/// Whether the caret is at the end of the text that a point `past` the edge
+	/// moves it toward: the start before the edge, the end after it.
+	fun at_end(self, past: f64): bool {
+		let caret = self.caret.read();
+		(past < 0.0 && caret == 0) || (past > 0.0 && caret >= self.value.get().len())
+	}
+
+	fun stop_edge(self) {
+		if self.edge.read() is Some(let timer) {
+			timer.cancel();
+			self.edge.write() = None;
+		}
+		self.edge_every.write() = 0;
+	}
+
+	/// The selection extended to `point` by the press's unit.
+	fun extend_to(self, point: Point) {
 		let unit = self.unit.read();
 		if unit >= 3 && !self.multiline {
 			ret;
@@ -686,7 +852,9 @@ impl Editor {
 				stop_event();
 			},
 			KeyName::Delete => {
-				if selected {
+				if modifiers.shift && !command && selected {
+					self.cut(start, end);
+				} else if selected {
 					self.replace(start, end, "", ChangeKind::Alone);
 				} else {
 					let to = self.step(now.caret, true, word);
@@ -694,8 +862,30 @@ impl Editor {
 				}
 				stop_event();
 			},
+			KeyName::Insert => {
+				if command && !modifiers.shift && selected {
+					self.copy(start, end);
+					stop_event();
+				} else if modifiers.shift && !command {
+					self.paste();
+					stop_event();
+				}
+			},
 			KeyName::Char(let typed) => {
-				if command && (typed == "a" || typed == "A") {
+				if command && (typed == "c" || typed == "C") {
+					if selected {
+						self.copy(start, end);
+						stop_event();
+					}
+				} else if command && (typed == "x" || typed == "X") {
+					if selected {
+						self.cut(start, end);
+						stop_event();
+					}
+				} else if command && (typed == "v" || typed == "V") {
+					self.paste();
+					stop_event();
+				} else if command && (typed == "a" || typed == "A") {
 					self.select(0, length);
 					stop_event();
 				} else if command && (typed == "z" || typed == "Z") {
@@ -715,6 +905,54 @@ impl Editor {
 			_ => {},
 		}
 	}
+}
+
+/// The clipboard's keys (see the head).
+impl Editor {
+	/// `from .. to` of the value onto the clipboard.
+	fun copy(self, from: usize, to: usize) {
+		set_clipboard_text(self.value.get().substring(from, to));
+	}
+
+	/// `from .. to` onto the clipboard, and out of the value as one change.
+	fun cut(self, from: usize, to: usize) {
+		self.copy(from, to);
+		self.replace(from, to, "", ChangeKind::Alone);
+	}
+
+	/// The clipboard's text, when it answers, in place of the selection then.
+	fun paste(self) {
+		let editor = self;
+		let _pasting = async {
+			if clipboard_text() is Some(let text) {
+				editor.take_pasted(text);
+			}
+		};
+	}
+
+	fun take_pasted(self, text: str) {
+		if self.off.read() || ui_removed(self.shell.node) {
+			ret;
+		}
+		let pasted = if self.multiline { line_feeds(text) } else { one_line(text) };
+		let now = self.selection();
+		self.replace(
+			now.anchor.min(now.caret),
+			now.anchor.max(now.caret),
+			pasted,
+			ChangeKind::Alone,
+		);
+	}
+}
+
+/// `text` on one line: each line break (CRLF, LF or CR) a space.
+fun one_line(text: str): str {
+	line_feeds(text).replace("\n", " ")
+}
+
+/// `text` with each line break (CRLF, LF or CR) a "\n".
+fun line_feeds(text: str): str {
+	text.replace("\r\n", "\n").replace("\r", "\n")
 }
 
 /// `last` and `next` as one change when `next` continues `last`'s run: typing right
@@ -766,6 +1004,18 @@ fun merged(last: Change, next: Change): Option<Change> {
 		},
 		_ => None,
 	}
+}
+
+/// How often a drag held `past` the edge (dp, either side) steps, in ms: 100 within
+/// 25 dp of the edge, then 50, 33 and, from 75 dp out, 25 — ten steps a second more
+/// for each 25 dp, at most forty. 0 level with the text.
+fun edge_period(past: f64): i32 {
+	let distance = past.abs();
+	if distance == 0.0 {
+		ret 0;
+	}
+	let band = (distance / 25.0).floor().min(3.0) + 1.0;
+	(100.0 / band).round().as_i32()
 }
 
 /// A colour's channels, or a negative alpha for none.

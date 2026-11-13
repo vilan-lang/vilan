@@ -12,7 +12,7 @@ use vilan_rt::executor::{Finished, Turn, turn};
 use vilan_rt::str_new;
 
 use super::super::{Node, add_child, deliver, node, on, remove, window_focused};
-use super::{cancel_timer, covering_milliseconds, timer};
+use super::{advance_clock, cancel_timer, covering_milliseconds, timer, timer_count};
 use crate::host::input::FOCUS_CHANGED;
 use crate::host::shell::{deadline_reached, wait_for};
 
@@ -176,4 +176,50 @@ fn a_focus_change_is_told_to_every_listener_in_tree_order_and_read_back() {
     deliver(&root, FOCUS_CHANGED, 0.0, 0.0, 0.0, 0.0, 0.0, &str_new(""));
     assert_eq!(window_focused(&first), 0);
     assert_eq!(log.borrow().len(), 6);
+}
+
+/// A program that drives its tree itself stops the timers' clock and steps
+/// it: each timer fires at its own time on the way, in order, a repeating one
+/// at every period it crosses, a timer set by a handler on the way when it
+/// falls due by the end; and nothing is armed in the executor meanwhile, so
+/// no timer wakes the program or keeps it running.
+#[test]
+fn a_stopped_clock_fires_only_as_the_program_steps_it() {
+    let element = row();
+    let log: Rc<RefCell<Vec<String>>> = Rc::default();
+    advance_clock(0.0);
+    timer(&element, 530.0, 530.0, logging(&log, "blink"));
+    let chained = {
+        let log = Rc::clone(&log);
+        // On an element that outlives the handler: a timer on one the handler
+        // alone held would end with it.
+        let element = element.clone();
+        Rc::new(move || {
+            log.borrow_mut().push("once".to_string());
+            timer(&element, 0.0, -1.0, logging(&log, "set by once"));
+        })
+    };
+    timer(&element, 100.0, -1.0, chained);
+    assert_eq!(timer_count(), 2);
+    assert_eq!(
+        deadline_after_a_turn(),
+        None,
+        "stopped: nothing armed, nothing wakes"
+    );
+    advance_clock(99.0);
+    assert!(log.borrow().is_empty(), "not yet due");
+    advance_clock(1.0);
+    assert_eq!(*log.borrow(), ["once", "set by once"]);
+    advance_clock(429.0);
+    assert_eq!(log.borrow().len(), 2);
+    advance_clock(1.0);
+    assert_eq!(log.borrow().last().map(String::as_str), Some("blink"));
+    advance_clock(1060.0);
+    assert_eq!(
+        *log.borrow(),
+        ["once", "set by once", "blink", "blink", "blink"],
+        "every period crossed, none skipped"
+    );
+    assert_eq!(timer_count(), 1);
+    assert_eq!(deadline_after_a_turn(), None);
 }

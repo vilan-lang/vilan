@@ -30,8 +30,19 @@
 //! does: a repeating timer on an element that stays is a program that does
 //! not end by itself (a window's is ended by its close; a termination ends it
 //! whatever is armed).
+//!
+//! # A stopped clock
+//!
+//! A program that drives its tree itself (`deliver`, a `--check` listing) can
+//! STOP the timers' clock (`__ui_advance_clock`, `std::ui::advance_clock`):
+//! from its first call the clock moves only by that call, which steps it to
+//! each due time in turn and runs that time's pass, so what fires, and in
+//! which order, follows from the program alone, never from the machine's
+//! speed. While it is stopped no executor timer is armed: no timer wakes the
+//! program, and a timer left pending does not keep it running. Presses keep
+//! the host's clock (a delivered press carries no time anyway).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -45,6 +56,14 @@ use crate::ui::{Handler, TimerId};
 thread_local! {
     /// The executor timer armed for the earliest due time, if any.
     static ARMED: RefCell<Option<Armed>> = const { RefCell::new(None) };
+    /// The timers' clock once the program stopped it (the module's "A
+    /// stopped clock").
+    static STOPPED: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// The timers' clock: the host's, until the program stops it.
+fn clock() -> Duration {
+    STOPPED.with(Cell::get).unwrap_or_else(host_clock)
 }
 
 struct Armed {
@@ -60,13 +79,7 @@ pub fn timer(node: &Node, delay: f64, period: f64, handler: Rc<dyn Fn()>) -> f64
     let delay = milliseconds(delay, "delay");
     let period = (period >= 0.0 || period.is_nan()).then(|| milliseconds(period, "period"));
     let added = with_tree(|tree| {
-        tree.add_timer(
-            node.id(),
-            host_clock(),
-            delay,
-            period,
-            Handler::from_rc(handler),
-        )
+        tree.add_timer(node.id(), clock(), delay, period, Handler::from_rc(handler))
     });
     let id = match added {
         Ok(id) => id.number(),
@@ -100,11 +113,40 @@ fn milliseconds(value: f64, what: &str) -> Duration {
     Duration::from_secs_f64(value.max(0.0) / 1000.0)
 }
 
+/// `__ui_advance_clock(milliseconds)` — stops the timers' clock (at its
+/// first call, where it is then), and moves it by `milliseconds`: to each
+/// due time on the way in turn, running that time's pass, then to the end.
+/// A timer set by a handler on the way fires on the way when it is due by
+/// the end.
+pub fn advance_clock(by: f64) {
+    let by = milliseconds(by, "clock step");
+    let start = clock();
+    STOPPED.with(|stopped| stopped.set(Some(start)));
+    // Stopped: nothing stays armed.
+    rearm();
+    let end = start + by;
+    while let Some(due) = with_tree(|tree| tree.next_timer_due()).filter(|due| *due <= end) {
+        // An overdue timer (set before the clock stopped) fires now: the
+        // clock never goes back.
+        let now = due.max(clock());
+        STOPPED.with(|stopped| stopped.set(Some(now)));
+        pass(now);
+    }
+    STOPPED.with(|stopped| stopped.set(Some(end)));
+    rearm();
+}
+
+/// `__ui_timer_count()` — how many element timers are live.
+pub fn timer_count() -> i32 {
+    with_tree(|tree| i32::try_from(tree.timer_count()).unwrap_or(i32::MAX))
+}
+
 /// Arms the executor's timer for the earliest due time of the tree's timers,
 /// when that is not the time it is armed for: cancelling the one armed
-/// before, and arming none when no timer is left.
+/// before, and arming none when no timer is left or the clock is stopped.
 pub(crate) fn rearm() {
-    let due = with_tree(|tree| tree.next_timer_due());
+    let stopped = STOPPED.with(Cell::get).is_some();
+    let due = with_tree(|tree| tree.next_timer_due()).filter(|_| !stopped);
     let old = ARMED.with(|armed| {
         let mut armed = armed.borrow_mut();
         if armed.as_ref().map(|armed| armed.due) == due {
@@ -112,7 +154,7 @@ pub(crate) fn rearm() {
         }
         let old = armed.take();
         if let Some(due) = due {
-            let handle = executor_timer(covering_milliseconds(due, host_clock()));
+            let handle = executor_timer(covering_milliseconds(due, clock()));
             let waited = handle.clone();
             spawn(
                 async move {
@@ -153,7 +195,12 @@ fn fire() {
     // This is the armed timer firing: nothing is armed now.
     ARMED.with(|armed| armed.borrow_mut().take());
     let _arm_after = ArmAfter;
-    let now = host_clock();
+    pass(clock());
+}
+
+/// One pass over the tree's timers due at `now`, each handler called with
+/// nothing of the tree borrowed.
+fn pass(now: Duration) {
     let mark = with_tree(|tree| tree.timer_mark());
     while let Some(handler) = with_tree(|tree| tree.pop_due_timer(now, mark)) {
         handler.call();

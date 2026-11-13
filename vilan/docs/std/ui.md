@@ -574,6 +574,8 @@ struct ElementTimer;
 impl ElementTimer {
 	fun cancel(self)                                                     // never fires again
 }
+fun advance_clock(by: Duration)                                          // a stopped clock, stepped
+fun timer_count(): usize                                                 // the live timers
 ```
 
 A timer belongs to an element, as its handlers do. Its handler runs as one turn,
@@ -591,8 +593,17 @@ burst. The period is at least a millisecond.
 However many timers are set, the program waits for the earliest alone, in the
 same event loop as everything else; with no timer set, an idle window wakes for
 nothing. A pending timer keeps the program running, as a `std::time::Timer` does,
-until it fires its last time, is cancelled, or ends with its element. A caret
-that blinks while its window has the focus:
+until it fires its last time, is cancelled, or ends with its element.
+
+A program that drives its tree itself with `deliver` — a test — can take time
+into its own hands: `advance_clock(by)` STOPS the clock the timers keep (at its
+first call) and moves it on by `by`, firing every timer due on the way at its
+own time, in order, each as one turn. From then on time passes for the timers
+only by that call, no timer wakes the program, and a pending one does not keep
+it running, so a listing of a blink or of a held drag is the same on any
+machine. `timer_count()` is how many timers are live: none in a program at
+rest. A caret that blinks while its window has the focus (the kit's inputs
+blink this way on their own):
 
 ```vilan,native
 import std::gfx::{ Window, dp };
@@ -644,7 +655,10 @@ enum ScrollAxis { Vertical, Horizontal, Both }
 ```
 
 A `scroll` is a viewport over its one child. The child keeps its own size along
-the axis — a column of a thousand rows is as tall as its rows — and the scroll
+the axis — a column of a thousand rows is as tall as its rows, a paragraph in a
+horizontal scroll stays on one line — whatever `shrink` it was given; across the
+axis it is as wide (or as tall) as the viewport, and in a scroll along `Both` it
+keeps its own size both ways. The scroll
 asks for that size but takes what its parent gives it: its content never holds
 it open, so in a column it shrinks to the room left (give it a size, or `grow`
 it into the room, to fill it). The wheel moves the child, clamped to how far it reaches past the
@@ -994,12 +1008,13 @@ impl TextInput {
 	fun selection_color(self, color: Color): TextInput
 	fun on_submit(self, handler: |str| void): TextInput           // Enter, with the value
 	fun disabled(self, disabled: Bindable<bool>): TextInput
+	fun caret_shown(self): bool                                    // focused, enabled, in its blink's on half
 	fun selection(self): Selection                                 // { anchor: usize, caret: usize }
 	fun select(self, anchor: usize, caret: usize)
 }
 impl TextArea {
 	// placeholder, placeholder_style, caret, selection_color, disabled,
-	// is_disabled, selection and select: as TextInput's
+	// is_disabled, caret_shown, selection and select: as TextInput's
 	fun on_submit(self, handler: |str| void): TextArea            // Ctrl+Enter, with the value
 	fun scrolled(self): Point                                      // how far its text is scrolled up
 }
@@ -1027,7 +1042,10 @@ A **text input** edits its cell: every edit writes it, and a write from anywhere
 else is what it shows. A press places the caret and a drag selects — off the
 input and out of the window too, the press having captured the pointer: past the
 field's left or right edge each pointer move extends the selection one grapheme
-beyond what shows, and the field scrolls by it. A double click selects the word
+beyond what shows, and the field scrolls by it; held still out there, the
+selection keeps extending a grapheme at a time — every 100 ms within 25 dp of the
+edge, every 50 ms from 25 dp, 33 ms from 50 dp and 25 ms from 75 dp out — until
+the pointer comes back, the button comes up or the text's end is reached. A double click selects the word
 under the pointer (a run of letters and digits, or of the other graphemes: a
 double click on a space selects the spaces) and a drag from it extends by whole
 words; a triple click selects everything. Left and
@@ -1040,7 +1058,13 @@ own (UTF-16 units, as `len` and `substring` count) and always on a GRAPHEME
 boundary: an emoji with its skin tone, a flag or a letter with a combining accent
 is one step and one Backspace. A text wider than the input scrolls sideways to
 keep the caret in view. The caret and the selection show while the input has the
-focus, drawn by the text itself in its own layout; their colours are the app's
+focus, drawn by the text itself in its own layout. The caret BLINKS — 530 ms on,
+530 ms off — while the input has the focus, is enabled and its window has the
+system's focus, and shows again, its period started over, at every edit and
+caret move; a hidden caret never hides the selection. Anything else arms no
+timer: an unfocused input, a disabled one, a window in the background and a
+screen with no input focused wake for nothing, and a blink repaints the text
+alone, laying nothing out. The caret's and the selection's colours are the app's
 (`caret`, `selection_color`), and otherwise follow the text colour. The keys the
 input acts on, and the keys that type, go no further up the tree, so a shortcut
 on an ancestor does not fire while the user types.
@@ -1100,7 +1124,8 @@ the end. Home and End go to the ends of the visual line, Ctrl+Home and Ctrl+End
 viewport shows and scroll it by as much; all of them extend the selection with
 Shift. Tab moves the focus, as everywhere. A drag past the top or bottom of what
 shows extends the selection one line per pointer move and the text scrolls by
-it; a triple click selects the PARAGRAPH (from one line break to the next, the
+it, and held still there it keeps extending a line at a time, at the input's
+pace; a triple click selects the PARAGRAPH (from one line break to the next, the
 break included) and a drag from it extends by paragraphs. A selection is painted
 one box per visual line, and a selected line break as a small extent at its
 line's end, so a selected empty line shows.
@@ -1122,14 +1147,21 @@ each; a new edit forgets what was undone. The value belongs to the app too, and 
 write from outside (clearing a draft after a submit) ends the history, since the
 recorded changes no longer describe the value.
 
-Not in the kit yet: the clipboard (the window layer offers none), an input
-method's composition (an edit inserts committed text only; a preedit would be a
-run the edited text draws at the caret without the value holding it), and a
-blinking caret (the caret is steady, so an idle window draws nothing; a blink
-needs a timer in the host that stops while the window is unfocused). A drag held
-still past the field's edge does not keep scrolling: the field moves one
-grapheme, or one line, per pointer move, with no timer. Tabs and indentation are
-not an editor feature: Tab moves the focus.
+Cut, copy and paste are the same in both, over `std::gfx`'s clipboard. Ctrl+C
+(Cmd+C, Ctrl+Insert) copies the selection; Ctrl+X (Cmd+X, Shift+Delete) copies it
+and removes it as one change to undo; with nothing selected neither does anything,
+and the key goes on up the tree. Ctrl+V (Cmd+V, Shift+Insert) pastes: the
+clipboard's text arrives in a later turn, and goes in place of the selection as it
+is THEN, as one change; an input disabled or removed by the time it arrives takes
+nothing. A single-line input turns each line break in pasted text (CRLF, LF or
+CR) into a space; a text area turns each into the `"\n"` Enter types. A program
+that tests its copy and paste with no display, where there is no system
+clipboard, calls `std::gfx::use_memory_clipboard()` first.
+
+Not in the kit yet: an input method's composition (an edit inserts committed text
+only; a preedit would be a run the edited text draws at the caret without the
+value holding it). Tabs and indentation are not an editor feature: Tab moves the
+focus.
 
 ## Accessibility
 
