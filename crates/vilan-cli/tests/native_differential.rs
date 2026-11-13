@@ -1859,6 +1859,33 @@ fn f168_agrees(file: &str, source: &str, expected: &str) {
     }
 }
 
+/// A literal handed to a closure VALUE takes the closure's parameter type, not
+/// the expectation around the call: `let x = half(3)` with `half: |i32| f64`
+/// emitted `half(3.0f64)` natively — the literal took the call's `f64` result
+/// type — and rustc refused the build (lane list-extents). Negated, nested in
+/// an `f64` position, and beside a value argument of another type.
+#[test]
+fn a_literal_handed_to_a_closure_value_takes_the_parameters_type() {
+    f168_agrees(
+        "native_probe_closure_literal.vl",
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun near(a: f64, b: f64): bool {\n",
+            "\t(a - b).abs() < 1.0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet half = |id: i32| id.as_f64() / 2.0;\n",
+            "\tlet x = half(3);\n",
+            "\tlet scaled = |count: usize, by: f64| count.as_f64() * by;\n",
+            "\tprint(i\"{x} {half(-2)} {near(half(1000), 500.0)} {scaled(4, 1.5)}\");\n",
+            "}\n",
+        ),
+        "1.5 -1 true 6\n",
+    );
+}
+
 /// F168: ONE generic reached with a static argument and with a reactive one,
 /// from code with an ambient owner and from code with none. Two instances: the
 /// static one declares no hidden parameter, so the calls that hold an owner

@@ -571,8 +571,10 @@ bound attribute does.
 
 ```vilan,fragment
 // std::ui::kit
-fun virtual_list<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(source: S, extent: Dp, key: |T| K, render: |T| C): VirtualList<T, K>
-fun virtual_list_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child>(source: S, extent: Dp, key: |T| K, render: |SignalCell<T>| C): VirtualList<T, K>
+fun virtual_list<T: PartialEq, K: PartialEq + Hashable, S: RowFeed<T>, C: Child, E: RowExtent>(source: S, extent: E, key: |T| K, render: |T| C): VirtualList<T, K>
+fun virtual_list_by<T, K: PartialEq + Hashable, S: RowFeed<T>, C: Child, E: RowExtent>(source: S, extent: E, key: |T| K, render: |SignalCell<T>| C): VirtualList<T, K>
+fun estimated(extent: Dp): Estimated                             // rows of differing heights
+trait RowExtent                                                  // Dp (fixed) and Estimated
 impl VirtualList<T, K> {
 	fun overscan(self, rows: usize): VirtualList<T, K>               // 2 until set
 	fun offset(self, cell: SignalCell<Point>): VirtualList<T, K>     // bound both ways
@@ -580,6 +582,10 @@ impl VirtualList<T, K> {
 	fun reveal_key(self, key: K): bool
 	fun count(self): usize
 	fun built(self): (usize, usize)                                  // the rows in the tree
+	fun scrolled(self): Dp                                           // from the whole list's top
+	fun range(self): Dp                                              // the largest offset
+	fun row_top(self, index: usize): Dp                              // where a row starts
+	fun row_at(self, offset: Dp): Option<usize>                      // the row at an offset
 	fun viewport(self): ScrollElement                                // the scroll underneath
 }
 impl VirtualList with Attributes, Child
@@ -590,9 +596,11 @@ elements, laid out and kept. `std::ui::kit::virtual_list` is a keyed list on a
 `scroll` that builds, lays out and paints only the rows its viewport shows — and
 `overscan` more on each side, two until set — however long the list is. Its
 source, key and render are `each`'s, and so is what a change keeps; `virtual_list_by`
-is `each_by`'s twin, handing each row a cell. Every row is `extent` tall: the
-list sets that height on the element `render` answers, and the arithmetic of
-which rows the offset shows needs no layout. The scroll's range is still the whole
+is `each_by`'s twin, handing each row a cell. With a `Dp` extent every row is
+that tall: the list sets that height on the element `render` answers, and the
+arithmetic of which rows the offset shows needs no layout. With
+`estimated(dp(..))` each row takes its own height — see
+[rows of differing heights](#rows-of-differing-heights). The scroll's range is still the whole
 list's (the rows above the window are padding), so a scrollbar drawn from it is
 right; the list takes every attribute an element takes, and grows or sizes like
 any `scroll`.
@@ -657,10 +665,88 @@ again and measures only the newcomers. A change to the source is a pass over the
 window's items, whatever the list's length, plus the list's own copy of the
 items (an insert at the top moves that copy along, as a `List` does).
 
-The extent is fixed; a list whose rows differ in height (an estimate corrected by
-measuring the rows that are built) is not here yet. Every row's box is laid out in
-`f32`: past about four million dp (125,000 rows of 32 dp) its position loses part
-of a pixel.
+### Rows of differing heights
+
+`virtual_list(source, estimated(dp(48)), key, render)` lays every row out at its
+own height — a wrapped text, a row that grows when it is expanded — and guesses
+the rows it has not built: at the estimate until the first rows are measured, then
+at the mean of the rows measured so far. A built row is measured each time it lays
+out at a new size (its height as the layout solver gave it), and the list keeps a
+height per measured row and the guess elsewhere in a structure that answers where
+a row starts and which row an offset falls in, each in O(log n) (two Fenwick
+trees; an insert or a removal rebuilds them from that row on, as the list's own
+copy of the items moves). The scroll's range is their sum, so it is exact once
+every row has been seen and a guess before.
+
+```vilan,native
+import std::gfx::{ Size, dp };
+import std::range::Range;
+import std::reactive::ListCell;
+import std::ui::kit::{ estimated, virtual_list };
+import std::ui::{ column, layout, text };
+
+fun main() {
+	let notes: ListCell<str> = ListCell::of(Range::new(0, 1000).to_list().map(|number: i32| {
+		if number % 3 == 0 { i"Note {number}, which runs on for long enough to wrap" } else { i"Note {number}" }
+	}));
+	let list = virtual_list(notes, estimated(dp(40)), |note: str| note, |note: str| {
+		<text padding(dp(8))>{note}</text>
+	})
+		.grow(1.0);
+	let screen = <column>{list}</column>;
+	layout(screen, Size::new(dp(240), dp(400)), 1.0);
+	list.reveal(500);                                       // by the guess, then measured
+	layout(screen, Size::new(dp(240), dp(400)), 1.0);
+}
+main();
+```
+
+A measured height that differs from the guess, or a change of the source above
+the viewport, would move what the viewport shows. The list ANCHORS instead: in
+the same layout it moves its offset so that what you are looking at stays put.
+
+- **The anchor** is the first row whose top edge is inside the viewport — or, when
+  no row starts inside it, the row across its top edge. After the change, that
+  row's top edge is where it was on the screen: a row above it that grows, an
+  insert or a removal above it, moves the offset by as much, and the rows from the
+  anchor down do not move. A row below the anchor, or the anchor itself, growing
+  pushes the rows under it down.
+- **When the change removes the anchor**, the row that followed it (at the end of
+  the list, the one before) keeps its own place on the screen.
+- **A row the source moves** carries the anchor with it; **a whole new list** (a
+  plain `SignalCell<List<T>>` changes as one) finds the anchor again by its key,
+  and keeps the heights measured for every key it still has.
+- **At the very top** (offset 0) there is no anchor: the list stays at the top, so
+  a row inserted there shows. **At the very bottom** (scrolled to the end, the list
+  taller than the viewport) the bottom edge is the anchor: the list stays at its
+  end, as a log or a chat does.
+- **`reveal(index)`** of a row never measured scrolls by the guess, then puts the
+  row where `reveal` meant it once the rows around it are measured: its top edge
+  at the viewport's top when it came from above, its bottom edge at the
+  viewport's bottom when it came from below (moving as little as it takes, as
+  always). The next change of another kind — the wheel, an operation of the
+  source, a row measured again — ends that.
+
+Each measurement is laid out again in the same frame (`on_resize`), so a frame
+never shows a row where the guess put it; a window of rows that all differ from
+the guess settles in a few passes of the host's eight (`FrameTimes::passes`: three
+for rows of 30 to 150 dp guessed at 400). A row of an estimated list is never
+shrunk to fit (`shrink(0)` is set on it).
+
+A fixed extent keeps its rules: no measuring, and an insert above the window keeps
+the offset (the rows move down one place).
+
+### Positions past four million dp
+
+The layout runs in `f32`, which past about four million dp cannot place a box to
+the pixel. A list taller than 4,194,304 dp therefore lays its column out relative
+to a BASE the list keeps in `f64` near its window — the rows above the base are
+not in the column at all — so the boxes it holds stay under a million dp from the
+column's top whatever the list's length: ten million rows of 32 dp scroll, click
+and meet exactly. Past that size the `scroll` underneath (`viewport()`) speaks the
+column's numbers, and so does its accessibility node's scroll position; read the
+list's own `scrolled()`, `range()`, `row_top` and `row_at`, which are the whole
+list's, and bind `offset(cell)`, which is too.
 
 ## Showing it
 
@@ -671,7 +757,7 @@ fun draw<C: Child>(frame: Frame, root: C)                        // in a frame o
 fun layout<C: Child>(root: C, size: Size, scale_factor: f64)     // boxes only
 fun deliver<C: Child>(root: C, event: Event)                     // an event, with no window
 fun last_frame(window: Window): FrameTimes
-struct FrameTimes { layout: f64, paint: f64, draw: f64, solved: bool, measured: i32, moved: i32, rebuilt: i32 }
+struct FrameTimes { layout: f64, paint: f64, draw: f64, solved: bool, measured: i32, moved: i32, rebuilt: i32, passes: i32 }
 ```
 
 `mount` makes the tree the window's contents: its frames lay the tree out at the

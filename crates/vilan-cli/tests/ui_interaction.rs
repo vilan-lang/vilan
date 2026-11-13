@@ -52,6 +52,14 @@
 //!    window's rows in the tree. Then in a window: `g` (the middle row
 //!    revealed), a wheel notch, a click on the row under the pointer, whose
 //!    id the program prints and the test works out from the offset alone.
+//!    With `--varied` (F174: notes of differing heights on an ESTIMATED
+//!    extent), its `--check` is held to `tests/ui/virtual-list-varied-check.txt`
+//!    — the anchoring cases, reveals corrected once measured, random
+//!    operations, ten million fixed rows past the old `f32` limit, a plain
+//!    signal's whole lists — and in a window, with an estimate eight times too
+//!    large: three wheel notches and a click on the row under the pointer,
+//!    which must be the row the list's own heights put there, every frame
+//!    laid out within the host's eight passes.
 //!
 //! 6. native-ui.md P5, accessibility publishing: the todo list driven
 //!    through AT-SPI on a private session bus (`support::atspi`), as a screen
@@ -450,7 +458,13 @@ fn the_counter_and_the_ten_thousand_row_list_run_end_to_end() {
 /// The recorded listing of an example's `--check`, compared line for line
 /// (regenerated with `VILAN_REGENERATE_UI_CHECK=1`: READ it first).
 fn assert_check_listing(binary: &Path, recorded: &str) -> String {
+    assert_check_listing_with(binary, &[], recorded)
+}
+
+/// [`assert_check_listing`], with more arguments for the check mode.
+fn assert_check_listing_with(binary: &Path, arguments: &[&str], recorded: &str) -> String {
     let checked = Command::new(binary)
+        .args(arguments)
         .arg("--check")
         .arg("--font")
         .arg(test_font())
@@ -542,6 +556,117 @@ fn the_todo_list_on_the_kit_runs_end_to_end() {
         code,
         Some(0),
         "closing the todo list ended it with {code:?}:\n{report}"
+    );
+}
+
+/// F174: the virtual list with rows of differing heights (`--varied`, an
+/// estimated extent). No window: the recorded listing, every check in it true,
+/// and a window's rows at most in the tree. In a window, with an estimate of
+/// 400 dp for rows of 30 to 150 (every row differs from it, by far): the wheel
+/// moves the list, and a click lands on the row the list's heights and its
+/// offset put under the pointer; every frame converged within the host's
+/// passes.
+#[test]
+fn the_virtual_list_of_differing_heights_anchors_and_a_click_lands_on_its_row() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let list = build_example("ui-virtual-list", "vlist_varied");
+
+    // 1. With no window.
+    let listed = assert_check_listing_with(&list, &["--varied"], "virtual-list-varied-check.txt");
+    for refused in [
+        ": false",
+        "settled=false",
+        "consistent=false",
+        "meet=false",
+        "placed=false",
+    ] {
+        assert!(!listed.contains(refused), "{refused}:\n{listed}");
+    }
+    let steps: Vec<(usize, usize)> = listed.lines().filter_map(tree_counts).collect();
+    assert!(steps.len() >= 20, "{listed}");
+    for (rows, elements) in &steps {
+        assert!(*rows <= 30 && *elements <= 2 * 30 + 10, "{listed}");
+    }
+
+    // 2. In a window.
+    let injector = build_injector();
+    let started = Instant::now();
+    let mut running = Running::start(
+        &list,
+        &["--smoke", "--varied", "--estimate", "400"],
+        "vilan ui virtual list",
+    );
+    running.wait_for("frame 1 ", started);
+    let viewport = running.wait_for("box viewport ", started);
+    let (x, y) = centre(&viewport);
+    running.inject(&injector, &["move", &x, &y]);
+    running.inject(&injector, &["wheel", "down", "3"]);
+    let scrolled = running.wait_until("a frame scrolled by the wheel", started, |line| {
+        line.starts_with("frame ")
+            && field(line, "offset=").parse::<f64>().expect("an offset") > 0.0
+    });
+    // The last frame before the click is the layout the click lands on: no
+    // frame is drawn while nothing changes.
+    running.inject(&injector, &["press", "release"]);
+    let clicked = running.wait_for("clicked ", started);
+    let before_click = running
+        .seen
+        .iter()
+        .take_while(|line| !line.starts_with("clicked "))
+        .filter(|line| line.starts_with("frame "))
+        .last()
+        .cloned()
+        .unwrap_or(scrolled);
+    let id: i64 = clicked
+        .trim_start_matches("clicked ")
+        .trim()
+        .parse()
+        .expect("an id");
+    let middle: i64 = field(&before_click, "middle_row=").parse().expect("a row");
+    let margin: f64 = field(&before_click, "middle_margin=")
+        .parse()
+        .expect("a margin");
+    assert!(
+        id == middle || (margin < 1.0 && (id - middle).abs() == 1),
+        "clicked {id}, but the list's heights put row {middle} under the pointer:\n{}",
+        running.seen.join("\n")
+    );
+    running.wait_until("the clicked row's frame", started, |line| {
+        line.starts_with("frame ") && field(line, "clicked=") == format!("{id}")
+    });
+    // For the report: how many passes each frame's layout took.
+    let passes: Vec<&str> = running
+        .seen
+        .iter()
+        .filter(|line| line.starts_with("frame "))
+        .map(|frame| field(frame, "passes="))
+        .collect();
+    eprintln!("layout passes per frame: {}", passes.join(" "));
+    for frame in running
+        .seen
+        .iter()
+        .filter(|line| line.starts_with("frame "))
+    {
+        let passes: usize = field(frame, "passes=").parse().expect("a count");
+        assert!(
+            passes < 8,
+            "a layout used every pass the host allows: {frame}"
+        );
+        let tree: usize = field(frame, "tree=").parse().expect("a count");
+        assert!(
+            tree <= 2 * 30 + 10,
+            "the tree held more than a window: {frame}"
+        );
+    }
+    running.inject(&injector, &["close"]);
+    let (code, seen, stderr) = running.exit(started);
+    assert_eq!(
+        code,
+        Some(0),
+        "closing the list ended it with {code:?}:\n{}\n--- stderr\n{stderr}",
+        seen.join("\n")
     );
 }
 

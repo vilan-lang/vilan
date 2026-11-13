@@ -8,6 +8,11 @@
 //   m     the bottom row moved to the top   g     the middle row revealed
 //   End   the last row revealed
 //
+// With `--varied` the rows are notes of differing heights — wrapped texts of
+// different lengths — on an ESTIMATED extent (`estimated(dp(48))`): each built row
+// is measured, and the list anchors what the viewport shows while the estimates
+// are corrected. A click on a note lengthens it (one row resized).
+//
 // Modes:
 //
 //   --smoke            a line per frame: the offset, the rows built, the
@@ -20,6 +25,10 @@
 //                      over many repetitions (layout and the program's own
 //                      work; no paint)
 //   --rows N           N rows instead of 100,000
+//   --varied           the notes of differing heights (every mode above)
+//   --estimate N       with --varied --smoke: the estimate, in dp (48 until set)
+//   --estimated        with --measure: the fixed mode's rows on an estimated
+//                      extent, to compare the two forms on equal rows
 
 import std::fs::read_bytes;
 import std::gfx::{
@@ -46,7 +55,7 @@ import std::range::Range;
 import std::reactive::{ ListCell, Signal, SignalCell };
 import std::shared::Shared;
 import std::time::now;
-import std::ui::kit::{ VirtualList, virtual_list, virtual_list_by };
+import std::ui::kit::{ RowExtent, VirtualList, estimated, virtual_list, virtual_list_by };
 import std::ui::{
 	Align,
 	Element,
@@ -139,7 +148,18 @@ fun entry_list(
 	rows: Shared<HashMap<i32, Element>>,
 	clicked: |i32| void,
 ): VirtualList<Entry, i32> {
-	virtual_list_by(entries, dp(extent()), |entry: Entry| entry.id, |entry: SignalCell<Entry>| {
+	entry_list_at(entries, dp(extent()), rows, clicked)
+}
+
+/// `entry_list` on any extent: the measure mode compares the fixed and the
+/// estimated form on these rows.
+fun entry_list_at<E: RowExtent>(
+	entries: ListCell<Entry>,
+	extent: E,
+	rows: Shared<HashMap<i32, Element>>,
+	clicked: |i32| void,
+): VirtualList<Entry, i32> {
+	virtual_list_by(entries, extent, |entry: Entry| entry.id, |entry: SignalCell<Entry>| {
 		let element = list_row(entry, entries, clicked);
 		rows.write().insert(entry.get().id, element);
 		element
@@ -167,6 +187,16 @@ fun after(arguments: List<str>, flag: str, fallback: str): str {
 fun main() {
 	let arguments = args();
 	let count = after(arguments, "--rows", "100000").parse_f64().unwrap_or(100000.0).as_i32();
+	if arguments.contains("--varied") {
+		if arguments.contains("--check") {
+			check_varied(arguments, count);
+		} else if arguments.contains("--measure") {
+			measure_varied(arguments, count);
+		} else {
+			show_varied(arguments, count);
+		}
+		ret;
+	}
 	if arguments.contains("--check") {
 		check(arguments, count);
 		ret;
@@ -535,6 +565,14 @@ fun check(arguments: List<str>, count: i32) {
 // --- Measure mode: costs with no window -------------------------------------------
 
 fun measure(arguments: List<str>, count: i32) {
+	if arguments.contains("--estimated") {
+		measure_entries(arguments, count, estimated(dp(extent())), "estimated");
+	} else {
+		measure_entries(arguments, count, dp(extent()), "fixed");
+	}
+}
+
+fun measure_entries<E: RowExtent>(arguments: List<str>, count: i32, extent: E, form: str) {
 	let font = font_of(arguments);
 	let size = Size::new(dp(480), dp(640));
 	mut firsts: List<i32> = [];
@@ -542,34 +580,29 @@ fun measure(arguments: List<str>, count: i32) {
 		let started = now();
 		let entries = entries_of(count);
 		let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
-		let list = entry_list(entries, rows, |_id: i32| {}).grow(1.0);
+		let list = entry_list_at(entries, extent, rows, |_id: i32| {}).grow(1.0);
 		let root = <column style(style().font(FontFamily::Named(font)))>{list}</column>.element();
 		layout(root, size, 1.0);
 		firsts.push(now().since(started).as_millis().as_i32());
 	}
 	let listed = numbers_of(firsts);
-	print(i"rows={count} first_ms(7 runs)={listed}");
+	print(i"{form} rows={count} first_ms(7 runs)={listed}");
 	let entries = entries_of(count);
 	let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
-	let list = entry_list(entries, rows, |_id: i32| {}).grow(1.0);
+	let list = entry_list_at(entries, extent, rows, |_id: i32| {}).grow(1.0);
 	let root = <column style(style().font(FontFamily::Named(font)))>{list}</column>.element();
 	layout(root, size, 1.0);
 	list.reveal((count / 2).as_usize());
 	layout(root, size, 1.0);
-	let repeats = 200;
 	let timed = |name: str, step: |i32| void| {
-		let started = now();
-		for index in Range::new(0, repeats) {
-			step(index);
-			layout(root, size, 1.0);
-		}
-		let total = now().since(started).as_millis();
-		print(i"rows={count} {name}_us={total.as_i32() * 1000 / repeats} ({repeats} repetitions)");
+		print(i"{form} rows={count} {name}_us={median_of_batches(root, size, step)} (median of 7 batches of 100)");
 	};
 	let middle = (count / 2).as_usize();
-	timed("scroll_step", |index: i32| {
+	let steps: Shared<usize> = Shared::new(0);
+	timed("scroll_step", |_index: i32| {
 		// 96 dp down: three rows leave at the top, three are built at the bottom.
-		list.reveal(middle + 20 + 3 * index.as_usize());
+		steps.write() = steps.read() + 1;
+		list.reveal(middle + 20 + 3 * steps.read());
 	});
 	timed("one_row_change", |index: i32| {
 		let (first, _last) = list.built();
@@ -582,6 +615,535 @@ fun measure(arguments: List<str>, count: i32) {
 	timed("remove_at_top", |_index: i32| {
 		entries.remove_at(0);
 	});
+}
+
+/// What one `step` and the layout after it take, in microseconds: the median of
+/// seven batches of a hundred (the clock counts milliseconds).
+fun median_of_batches(root: Element, size: Size, step: |i32| void): i32 {
+	mut batches: List<i32> = [];
+	for batch in Range::new(0, 7) {
+		let started = now();
+		for index in Range::new(0, 100) {
+			step(batch * 100 + index);
+			layout(root, size, 1.0);
+		}
+		batches.push(now().since(started).as_millis().as_i32() * 10);
+	}
+	mut sorted = batches;
+	sorted.sort();
+	sorted[3]
+}
+
+// --- Varied mode: notes of differing heights on an estimated extent -----------
+
+/// One note: its id (its key and its label), and words added to it (a click adds
+/// some, so its row grows).
+struct Note {
+	id: i32,
+	extra: i32,
+}
+
+/// The note's text: between 1 and 29 words of its own, plus its extra ones —
+/// wrapped, one to five lines at the window's width.
+fun note_text(note: Note): str {
+	let vocabulary = [
+		"lorem",
+		"ipsum",
+		"dolor",
+		"sit",
+		"amet",
+		"consectetur",
+		"adipiscing",
+		"elit",
+		"sed",
+		"do",
+		"eiusmod",
+		"tempor",
+	];
+	let count = 1 + (note.id * 37 + note.id / 7) % 29 + note.extra;
+	mut text = i"Note {note.id}:";
+	for word in Range::new(0, count) {
+		text = text + " " + vocabulary[((note.id + word) % 12).as_usize()];
+	}
+	text
+}
+
+fun notes_of(count: i32): ListCell<Note> {
+	mut initial: List<Note> = [];
+	for id in Range::new(0, count) {
+		initial.push(Note { id, extra = 0 });
+	}
+	ListCell::of(initial)
+}
+
+/// The notes' list on an estimated extent, every row registered in `rows` by id
+/// as it is built; a click on a note lengthens it.
+fun note_list(
+	notes: ListCell<Note>,
+	estimate: f64,
+	rows: Shared<HashMap<i32, Element>>,
+	clicked: |i32| void,
+): VirtualList<Note, i32> {
+	virtual_list_by(notes, estimated(dp(estimate)), |note: Note| note.id, |note: SignalCell<Note>| {
+		let id = note.get().id;
+		let element = <column
+			padding_x(dp(12))
+			padding_y(dp(6))
+			style(row_look(id))
+			label(i"row {id}")
+			focusable
+			on_click(|| {
+				let now = note.get();
+				match note_position(notes, id) {
+					Some(let at) => notes.set_at(at, Note { id, extra = now.extra + 12 }),
+					None => {},
+				}
+				clicked(id);
+			})
+		>
+			<text>{note.derive(|now: Note| note_text(now))}</text>
+		</column>.element();
+		rows.write().insert(id, element);
+		element
+	})
+}
+
+fun note_position(notes: ListCell<Note>, id: i32): Option<usize> {
+	notes.peek(|list: &List<Note>| {
+		mut found: Option<usize> = None;
+		mut at: usize = 0;
+		for found.is_none() && at < list.len() {
+			if list[at].id == id {
+				found = Some(at);
+			}
+			at += 1;
+		}
+		found
+	})
+}
+
+fun note_id(notes: ListCell<Note>, index: usize): i32 {
+	notes.peek(|list: &List<Note>| list[index].id)
+}
+
+/// The window with `--varied`: the notes, a line per frame with `--smoke`.
+fun show_varied(arguments: List<str>, count: i32) {
+	let smoke = arguments.contains("--smoke");
+	let estimate = after(arguments, "--estimate", "48").parse_f64().unwrap_or(48.0);
+	let window = match Window::builder()
+		.title("vilan ui virtual list")
+		.size(dp(480), dp(640))
+		.open() {
+		Ok(let window) => window,
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	let notes = notes_of(count);
+	let clicked: Shared<i32> = Shared::new(-1);
+	let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let list = note_list(notes, estimate, rows, |id: i32| {
+		clicked.write() = id;
+		if smoke {
+			print(i"clicked {id}");
+		}
+	}).grow(1.0).label("viewport");
+	let root = <column style(style().text_color(Color::rgb(30, 30, 40))) label("list")>
+		<text padding(dp(12)) style(style().weight(700))>
+			{i"{count} notes of differing heights: scroll, or click one to lengthen it"}
+		</text>
+		{list}
+	</column>;
+	mount(window, root);
+	if !smoke {
+		ret;
+	}
+	let frames: Shared<i32> = Shared::new(0);
+	window.on_frame(|frame: Frame| {
+		draw(frame, root);
+		frames.write() = frames.read() + 1;
+		let times = last_frame(window);
+		let (first, last) = list.built();
+		// The row at the viewport's middle, by the list's own heights: where the
+		// pointer the test puts there should land.
+		let bounds = list.element().bounds();
+		let middle = list.scrolled().value() + bounds.height.value() / 2.0;
+		let at = list.row_at(dp(middle)).unwrap_or(0);
+		let margin = (middle - list.row_top(at).value()).min(list.row_top(at + 1).value() - middle);
+		print(i"frame {frames.read()} offset={list.scrolled().value()} rows={notes.size()} built={first}..{last} tree={root.element().outline().len()} clicked={clicked.read()} passes={times.passes} middle_row={note_id(notes, at)} middle_margin={margin} layout_us={times.layout.round()} paint_us={times.paint.round()}");
+		if frames.read() == 1 {
+			print(i"box viewport {bounds.x.value()} {bounds.y.value()} {bounds.width.value()} {bounds.height.value()}");
+		}
+	});
+}
+
+/// Within a pixel: the row boxes are snapped, the list's sums are not.
+fun near(a: f64, b: f64): bool {
+	(a - b).abs() < 1.0
+}
+
+fun check_varied(arguments: List<str>, count: i32) {
+	let font = font_of(arguments);
+	let size = Size::new(dp(480), dp(640));
+	let notes = notes_of(count);
+	let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let list = note_list(notes, 48.0, rows, |_id: i32| {}).grow(1.0).label("viewport");
+	let root = <column style(style().font(FontFamily::Named(font))) label("list")>
+		<text padding(dp(12))>"Notes of differing heights"</text>
+		{list}
+	</column>.element();
+	let none = Modifiers { shift = false, control = false, alt = false, meta = false };
+	let row_of = |id: i32| rows.read().get(id).unwrap();
+	let list_top = || list.element().bounds().y.value();
+	let view = || list.element().bounds().height.value();
+	// A row's top edge on the screen: its box, moved by the scroll's own offset.
+	let on_screen = |id: i32| row_of(id).bounds().y.value() - list.viewport().scrolled().y.value();
+	// The same, from the list's heights and its logical offset.
+	let said = |index: usize| list_top() + list.row_top(index).value() - list.scrolled().value();
+	// The rows built meet (each starts where the one before ends) and sit where
+	// the list's heights say.
+	let consistent = || {
+		let (first, last) = list.built();
+		mut good = true;
+		mut at = first;
+		for at < last {
+			let id = note_id(notes, at);
+			if !near(on_screen(id), said(at)) {
+				good = false;
+			}
+			if at + 1 < last {
+				let below = row_of(note_id(notes, at + 1)).bounds().y.value();
+				let bounds = row_of(id).bounds();
+				if bounds.y.value() + bounds.height.value() != below {
+					good = false;
+				}
+			}
+			at += 1;
+		}
+		good
+	};
+	// The anchor as `Hold` picks it: the first row whose top edge is in the
+	// viewport, and that edge on the screen.
+	let anchor = || {
+		let (first, last) = list.built();
+		mut found: (i32, f64) = (-1, 0.0);
+		mut at = first;
+		for found.0 < 0 && at < last {
+			let top = said(at);
+			if top >= list_top() - 0.01 && top < list_top() + view() {
+				let id = note_id(notes, at);
+				found = (id, on_screen(id));
+			}
+			at += 1;
+		}
+		found
+	};
+	let report = |what: str| {
+		layout(root, size, 1.0);
+		let (first, last) = list.built();
+		let offset = list.scrolled().value();
+		// Laid out again: a list that had not converged within the host's passes
+		// would move now.
+		layout(root, size, 1.0);
+		let settled = list.scrolled().value() == offset && list.built() == (first, last);
+		print(i"{what}: offset={offset} range={list.range().value()} count={list.count()} built={first}..{last} {rows_in(root)} settled={settled} consistent={consistent()}");
+	};
+	let kept = |what: str, held: (i32, f64)| {
+		let (id, edge) = held;
+		print(i"  anchor row {id} kept on the screen ({what}): {near(on_screen(id), edge)}");
+	};
+
+	// 1. The first layout: rows built by the estimate, measured, and the window
+	// corrected in the same `layout`.
+	report("first layout");
+	print("accessibility at the first layout:");
+	print(list.element().accessibility().trim());
+
+	// 2. Far down, by reveal: the row is placed by the estimate, then held with
+	// its bottom edge at the viewport's bottom (it was below the viewport) as the
+	// rows around it are measured.
+	let middle = (count / 2).as_usize();
+	list.reveal(middle);
+	report("reveal middle");
+	let middle_id = note_id(notes, middle);
+	let middle_bottom = on_screen(middle_id) + row_of(middle_id).bounds().height.value();
+	print(i"  row {middle}'s bottom at the viewport's bottom: {near(middle_bottom, list_top() + view())}");
+
+	// 3. The anchoring cases, each against the anchor taken before the change.
+	mut held = anchor();
+	notes.insert_at(0, Note { id = -1, extra = 0 });
+	report("inserted at the top");
+	kept("a row inserted far above", held);
+	held = anchor();
+	notes.remove_at(0);
+	report("removed at the top");
+	kept("a row removed far above", held);
+	held = anchor();
+	let (first, _last) = list.built();
+	let above = note_id(notes, first);
+	notes.set_at(first, Note { id = above, extra = 40 });
+	report(i"row {above} above the viewport lengthened");
+	kept("a row above it resized", held);
+	held = anchor();
+	let (anchor_id, _edge) = held;
+	let anchor_at = note_position(notes, anchor_id).unwrap();
+	let next_id = note_id(notes, anchor_at + 1);
+	let next_before = on_screen(next_id);
+	notes.set_at(anchor_at, Note { id = anchor_id, extra = 30 });
+	report(i"the anchor row {anchor_id} lengthened");
+	kept("its own top edge", held);
+	print(i"  row {next_id} below it moved down: {on_screen(next_id) > next_before + 1.0}");
+	held = anchor();
+	let below_at = note_position(notes, held.0).unwrap() + 2;
+	notes.set_at(below_at, Note { id = note_id(notes, below_at), extra = 20 });
+	report(i"row {note_id(notes, below_at)} below the anchor lengthened");
+	kept("a row below it resized", held);
+	held = anchor();
+	let removed_id = held.0;
+	let removed_at = note_position(notes, removed_id).unwrap();
+	let follower = note_id(notes, removed_at + 1);
+	let follower_edge = on_screen(follower);
+	notes.remove_at(removed_at);
+	report(i"the anchor row {removed_id} removed");
+	print(i"  row {follower} after it kept its place on the screen: {near(on_screen(follower), follower_edge)}");
+	held = anchor();
+	notes.move_range(notes.size() - 1, 1, 0);
+	report("the bottom row moved to the top");
+	kept("a row moved from below to above", held);
+	held = anchor();
+	deliver(root, Event::Scrolled(Scroll {
+		position = Point::new(dp(240), dp(300)),
+		x = dp(0),
+		y = dp(-50),
+		modifiers = none,
+	}));
+	report("wheel 50 down");
+	print(i"  anchor row {held.0} moved up by the wheel's 50 dp: {near(on_screen(held.0), held.1 - 50.0)}");
+
+	// 4. At the very top there is no anchor: a row inserted there shows.
+	list.reveal(0);
+	report("revealed the first row");
+	notes.insert_at(0, Note { id = -2, extra = 0 });
+	report("inserted at the very top");
+	print(i"  offset 0, the new row first on the screen: {list.scrolled().value() == 0.0 && near(on_screen(-2), list_top())}");
+
+	// 5. At the very bottom the anchor is the bottom edge: the list stays at its
+	// end when a row above changes.
+	list.reveal(notes.size() - 1);
+	report("revealed the last row");
+	let last_id = note_id(notes, notes.size() - 1);
+	let end = || near(
+		on_screen(last_id) + row_of(last_id).bounds().height.value(),
+		list_top() + view(),
+	);
+	print(i"  the last row's bottom at the viewport's bottom: {end()} at the end: {near(list.scrolled().value(), list.range().value())}");
+	let (first_built, _l) = list.built();
+	notes.set_at(first_built + 3, Note { id = note_id(notes, first_built + 3), extra = 25 });
+	report("a row near the end lengthened");
+	print(i"  still at the end: {near(list.scrolled().value(), list.range().value())} the last row's bottom at the viewport's bottom: {end()}");
+
+	// 6. A reveal from above, of a row never measured: placed by the estimate,
+	// then corrected so its BOTTOM edge is at the viewport's bottom.
+	list.reveal(0);
+	layout(root, size, 1.0);
+	let target = 30;
+	list.reveal(target);
+	report(i"revealed row {target} from above");
+	let target_id = note_id(notes, target);
+	let bottom = on_screen(target_id) + row_of(target_id).bounds().height.value();
+	print(i"  row {target}'s bottom at the viewport's bottom: {near(bottom, list_top() + view())}");
+	// And by key, from below, far up: its TOP edge at the viewport's top.
+	list.reveal(notes.size() - 1);
+	layout(root, size, 1.0);
+	let found = list.reveal_key(60000);
+	report("reveal_key 60000 from below");
+	print(i"  found: {found}; its top at the viewport's top: {near(on_screen(60000), list_top())}");
+
+	// 7. Random operations anywhere in the list, around the window and far from
+	// it: after each, the rows meet and sit where the heights say, and an anchor
+	// the operation did not touch kept its place.
+	mut seed: usize = 7;
+	mut inconsistent = 0;
+	mut moved = 0;
+	mut next_note = 200000;
+	for step in Range::new(0, 240) {
+		seed = (seed * 75 + 74) % 65537;
+		let choice = seed % 5;
+		seed = (seed * 75 + 74) % 65537;
+		let (first, last) = list.built();
+		let near_window = step % 2 == 0;
+		let span = if near_window { last - first + 8 } else { notes.size() - 1 };
+		let start = if near_window && first >= 4 { first - 4 } else { 0 };
+		let at = (start + seed % span).min(notes.size() - 2);
+		let before = anchor();
+		let anchor_at = note_position(notes, before.0).unwrap_or(0);
+		mut touches = at == anchor_at;
+		if choice == 0 {
+			notes.insert_at(at, Note { id = next_note, extra = (seed % 9).as_i32() });
+			next_note += 1;
+			touches = false;
+		} else if choice == 1 {
+			notes.remove_at(at);
+		} else if choice == 2 || choice == 3 {
+			notes.set_at(at, Note { id = note_id(notes, at), extra = (seed % 31).as_i32() });
+			touches = false;
+		} else {
+			let to = (seed / 3) % (notes.size() - 1);
+			notes.move_range(at, 1, to);
+		}
+		layout(root, size, 1.0);
+		if !consistent() {
+			inconsistent += 1;
+		}
+		if !touches && before.0 >= 0 && !near(on_screen(before.0), before.1) {
+			moved += 1;
+		}
+	}
+	report("240 random operations");
+	print(i"  steps where the rows were not where the heights say: {inconsistent}; an untouched anchor moved: {moved}");
+
+	// 8. Past the old f32 limit, with a fixed extent: 10,000,000 rows of 32 dp
+	// (320,000,000 dp). A click lands on the row the logical offset says, and the
+	// rows built meet exactly where the extent puts them.
+	let far_clicked: Shared<i32> = Shared::new(-1);
+	let far_rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let numbers: SignalCell<List<i32>> = Signal::new(Range::new(0, 10000000).to_list());
+	let far = virtual_list(numbers, dp(32), |number: i32| number, |number: i32| {
+		let built = <row label(i"row {number}") on_click(|| far_clicked.write() = number)>
+			<text>{i"{number}"}</text>
+		</row>.element();
+		far_rows.write().insert(number, built);
+		built
+	}).height(dp(300));
+	let far_root = <column style(style().font(FontFamily::Named(font)))>{far}</column>.element();
+	let far_size = Size::new(dp(200), dp(400));
+	let far_report = |what: str| {
+		layout(far_root, far_size, 1.0);
+		let (first, last) = far.built();
+		let top = far.element().bounds().y.value();
+		let shift = far.viewport().scrolled().y.value();
+		mut meet = true;
+		mut placed = true;
+		mut at = first;
+		for at < last {
+			let bounds = far_rows.read().get(at.as_i32()).unwrap().bounds();
+			// Where the extent puts it: the whole list's coordinates, made the
+			// screen's by the logical offset.
+			let wanted = top + at.as_f64() * 32.0 - far.scrolled().value();
+			if (bounds.y.value() - shift - wanted).abs() > 1.0 {
+				placed = false;
+			}
+			if at + 1 < last {
+				let below = far_rows.read().get((at + 1).as_i32()).unwrap().bounds().y.value();
+				if bounds.y.value() + bounds.height.value() != below {
+					meet = false;
+				}
+			}
+			at += 1;
+		}
+		print(i"{what}: offset={far.scrolled().value()} range={far.range().value()} count={far.count()} built={first}..{last} {rows_in(far_root)} meet={meet} placed={placed}");
+	};
+	far_report("ten million rows");
+	far.reveal(9999990);
+	far_report("ten million rows, row 9999990 revealed");
+	let far_point = Point::new(dp(100), dp(97.25));
+	deliver(far_root, Event::Scrolled(Scroll {
+		position = far_point,
+		x = dp(0),
+		y = dp(7.5),
+		modifiers = none,
+	}));
+	far_report("ten million rows, wheel 7.5 up");
+	deliver(far_root, Event::Scrolled(Scroll {
+		position = far_point,
+		x = dp(0),
+		y = dp(3000.25),
+		modifiers = none,
+	}));
+	far_report("ten million rows, wheel 3000.25 further up");
+	let wanted = far
+		.row_at(dp(far.scrolled().value() + far_point.y.value() - far.element().bounds().y.value()))
+		.unwrap();
+	let primary = |at: Point| Pointer { position = at, button = Button::Left, modifiers = none };
+	deliver(far_root, Event::PointerPressed(primary(far_point)));
+	deliver(far_root, Event::PointerReleased(primary(far_point)));
+	print(i"  a click at y {far_point.y.value()}: row {far_clicked.read()}, the offset says row {wanted}: {far_clicked.read() == wanted.as_i32()}");
+
+	// 9. A plain signal of a list, estimated: every change is a whole new list.
+	// The heights measured carry over by key, and the anchor is found by its key.
+	let plain_rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let words: SignalCell<List<i32>> = Signal::new(Range::new(0, 2000).to_list());
+	let plain = virtual_list(words, estimated(dp(40)), |number: i32| number, |number: i32| {
+		let built = <text label(i"row {number}") padding(dp(4))>
+			{note_text(Note { id = number, extra = 0 })}
+		</text>.element();
+		plain_rows.write().insert(number, built);
+		built
+	}).height(dp(300));
+	let plain_root = <column style(style().font(FontFamily::Named(font)))>{plain}</column>.element();
+	let plain_size = Size::new(dp(300), dp(400));
+	layout(plain_root, plain_size, 1.0);
+	plain.reveal(1000);
+	layout(plain_root, plain_size, 1.0);
+	let plain_top = || plain.element().bounds().y.value();
+	let plain_screen = |id: i32| plain_rows
+		.read()
+		.get(id)
+		.unwrap()
+		.bounds().y
+		.value()
+		- plain.viewport().scrolled().y.value();
+	let anchor_edge = plain_screen(1000);
+	let measured_top = plain.row_top(1000).value();
+	let plain_bottom = anchor_edge + plain_rows.read().get(1000).unwrap().bounds().height.value();
+	print(i"plain, row 1000 revealed: {rows_in(plain_root)} its bottom at the viewport's bottom: {near(plain_bottom, plain_top() + plain.element().bounds().height.value())}");
+	// Ten new rows at the top, the rest the same keys.
+	mut grown: List<i32> = Range::new(-10, 0).to_list();
+	for number in Range::new(0, 2000) {
+		grown.push(number);
+	}
+	words.set(grown);
+	layout(plain_root, plain_size, 1.0);
+	print(i"plain, ten rows put on top: {rows_in(plain_root)} count={plain.count()} row 1000 kept on the screen: {near(plain_screen(1000), anchor_edge)}");
+	// The same keys again, ten removed: the heights measured came along.
+	words.set(Range::new(0, 2000).to_list());
+	layout(plain_root, plain_size, 1.0);
+	print(i"plain, back to the first list: row 1000 starts where it did: {plain.row_top(1000).value() == measured_top} kept on the screen: {near(plain_screen(1000), anchor_edge)}");
+}
+
+/// What the notes' changes cost: `--measure --varied`.
+fun measure_varied(arguments: List<str>, count: i32) {
+	let font = font_of(arguments);
+	let size = Size::new(dp(480), dp(640));
+	let notes = notes_of(count);
+	let rows: Shared<HashMap<i32, Element>> = Shared::new(HashMap::new());
+	let list = note_list(notes, 48.0, rows, |_id: i32| {}).grow(1.0);
+	let root = <column style(style().font(FontFamily::Named(font)))>{list}</column>.element();
+	layout(root, size, 1.0);
+	let middle = (count / 2).as_usize();
+	list.reveal(middle);
+	layout(root, size, 1.0);
+	let steps: Shared<usize> = Shared::new(0);
+	let scroll_step = median_of_batches(root, size, |_index: i32| {
+		steps.write() = steps.read() + 1;
+		list.reveal(middle + 20 + 3 * steps.read());
+	});
+	print(i"varied rows={count} scroll_step_us={scroll_step} (median of 7 batches of 100)");
+	let resize = median_of_batches(root, size, |index: i32| {
+		let (first, _last) = list.built();
+		let at = first + 5;
+		notes.set_at(at, Note { id = note_id(notes, at), extra = (index % 2) * 20 });
+	});
+	print(i"varied rows={count} one_row_resize_us={resize} (median of 7 batches of 100)");
+	let insert = median_of_batches(root, size, |index: i32| {
+		notes.insert_at(0, Note { id = count + index, extra = 0 });
+	});
+	print(i"varied rows={count} insert_at_top_us={insert} (median of 7 batches of 100)");
+	let remove = median_of_batches(root, size, |_index: i32| {
+		notes.remove_at(0);
+	});
+	print(i"varied rows={count} remove_at_top_us={remove} (median of 7 batches of 100)");
 }
 
 main();
