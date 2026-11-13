@@ -157,7 +157,11 @@ Rust workspace, seventeen crates, plus the language's own tree:
   a handle nor a parent); text measures itself through the text system during layout, layout and
   paint are separate passes, and every box is snapped with `Units`' rule, the renderer's. Part P3
   made it incremental and interactive: every element keeps its subtree's nested `Scene` and a
-  change invalidates the one element and the chain above it; the solver re-runs only taffy's dirty
+  change invalidates the one element and the chain above it. That scene is in the element's OWN
+  coordinates, placed by its parent's (`SceneBuilder::scene_at`: a whole-pixel offset the encoder
+  adds after snapping, so the pixels are the window-coordinate ones), and a box that only moved
+  invalidates its parent, not itself (F170; `scene_reads_size` says when a one-pixel change of
+  snapped size repaints it). The solver re-runs only taffy's dirty
   chains and the snap visits only those (pinned against a full snap); the root's viewport cell is
   a FIXED grid track — an `auto` one made every re-solve ask the root's content sizes, which taffy
   keys by the parent's size, so the first re-solve after a resize re-measured every leaf. Style
