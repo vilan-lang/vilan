@@ -7,7 +7,7 @@
 # red until it is accepted here the same way.
 #
 #   cd crates/vilan-rt-gfx
-#   cargo about generate -c about.toml ../../about.hbs -o notices.txt
+#   cargo about generate --offline -c about.toml ../../about.hbs -o notices.txt
 #   tr -d '\r' <notices.txt >THIRD-PARTY-NOTICES.txt && rm notices.txt
 #
 # (Some licence texts arrive with Windows line endings; the leg compares with

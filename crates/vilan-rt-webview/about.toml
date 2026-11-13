@@ -6,7 +6,7 @@
 # this file and refuses a licence outside it.
 #
 #   cd crates/vilan-rt-webview
-#   cargo about generate -c about.toml ../../about.hbs -o THIRD-PARTY-NOTICES.txt
+#   cargo about generate --offline -c about.toml ../../about.hbs -o THIRD-PARTY-NOTICES.txt
 #
 # The notices are what a desktop program's binary links (on Linux, `option-ext`
 # below) and are named in the vilan guide's native chapter for anyone who ships

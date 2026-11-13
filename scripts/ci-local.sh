@@ -231,8 +231,16 @@ leg_webview() {
         cargo clippy --all-targets -- -D warnings || exit 1
         cargo test || exit 1
         cargo audit --deny unsound --ignore RUSTSEC-2024-0429 || exit 1
+        # `--offline`: the licence texts come from the crates' own files in
+        # the lockfile's sources, which the steps above already fetched.
+        # Without it cargo-about also asks clearlydefined.io, whose answer
+        # for a crate changes when it harvests a new version, and this byte
+        # check went red on CI with nothing changed here (run 43519114590).
+        # The notices cover every platform's crates, so fetch the whole
+        # lockfile first: a Linux build never downloaded the Windows ones.
+        cargo fetch --locked || exit 1
         notices=$(mktemp)
-        cargo about generate -c about.toml ../../about.hbs -o "$notices" || exit 1
+        cargo about generate --offline -c about.toml ../../about.hbs -o "$notices" || exit 1
         tr -d '\r' <"$notices" | cmp - THIRD-PARTY-NOTICES.txt || exit 1
         rm -f "$notices"
     ) || status=$?
@@ -282,8 +290,16 @@ leg_gfx() {
         cargo clippy --all-targets -- -D warnings || exit 1
         VILAN_REQUIRE_GFX=1 cargo test || exit 1
         cargo audit --deny unsound || exit 1
+        # `--offline`: the licence texts come from the crates' own files in
+        # the lockfile's sources, which the steps above already fetched.
+        # Without it cargo-about also asks clearlydefined.io, whose answer
+        # for a crate changes when it harvests a new version, and this byte
+        # check went red on CI with nothing changed here (run 43519114590).
+        # The notices cover every platform's crates, so fetch the whole
+        # lockfile first: a Linux build never downloaded the Windows ones.
+        cargo fetch --locked || exit 1
         notices=$(mktemp)
-        cargo about generate -c about.toml ../../about.hbs -o "$notices" || exit 1
+        cargo about generate --offline -c about.toml ../../about.hbs -o "$notices" || exit 1
         tr -d '\r' <"$notices" | cmp - THIRD-PARTY-NOTICES.txt || exit 1
         rm -f "$notices"
     ) || status=$?
