@@ -79,32 +79,41 @@ fn tracked_files_under(directory: &str) -> Vec<String> {
         .collect()
 }
 
-/// Copies `directory`'s tracked files into a fresh temp tree and returns its
-/// root, preserving the layout below `directory` so relative paths inside the
-/// example (a workspace member, a sibling module) still resolve.
-fn stage(directory: &str) -> PathBuf {
+/// Where `directory` is staged: a fresh temp tree of its own.
+fn stage_root(directory: &str) -> PathBuf {
     let tag = directory.rsplit('/').next().expect("example name");
-    let staged =
-        support::scratch_root().join(format!("vilan_example_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
+    support::scratch_root().join(format!("vilan_example_{tag}_{}", std::process::id()))
+}
+
+/// Copies `directory`'s tracked files into a fresh temp tree and returns the
+/// example's directory in it. The tree keeps the repository's layout, so
+/// relative paths inside the example (a workspace member, a sibling module)
+/// still resolve — and so does a path dependency on a package of this
+/// repository (`ui-icons` takes `vilan/packages/lucide` as
+/// `../../packages/lucide`): an example whose manifest names `packages/` has
+/// the tracked files under `vilan/packages` staged beside it.
+fn stage(directory: &str) -> PathBuf {
+    let staged_root = stage_root(directory);
+    let _ = std::fs::remove_dir_all(&staged_root);
 
     let root = repo_root();
-    let files = tracked_files_under(directory);
+    let mut files = tracked_files_under(directory);
     assert!(
         !files.is_empty(),
         "{directory} has no tracked files — an example that exists only in the \
          working tree is not one a clone can build"
     );
+    let manifest =
+        std::fs::read_to_string(root.join(directory).join("vilan.toml")).unwrap_or_default();
+    if manifest.contains("packages/") {
+        files.extend(tracked_files_under("vilan/packages"));
+    }
     for file in &files {
-        let relative = file
-            .strip_prefix(directory)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .expect("tracked path sits under the example");
-        let destination = staged.join(relative);
+        let destination = staged_root.join(file);
         std::fs::create_dir_all(destination.parent().expect("a parent")).unwrap();
         std::fs::copy(root.join(file), &destination).unwrap();
     }
-    staged
+    staged_root.join(directory)
 }
 
 /// What a built example must additionally prove — E22's decide-at-take-up
@@ -206,6 +215,11 @@ fn post_build(directory: &str) -> PostBuild {
         // native-ui.md P5, text editing: the notes pad on the kit's text area;
         // its native build and runs are `ui_interaction.rs`'s.
         "ui-notes" => PostBuild::NativeOnly { module: "std::gfx" },
+        // gfx-path.md S4: Lucide's icons from the generated package
+        // `vilan/packages/lucide`, taken by a path dependency (staged beside
+        // it); its native build and its recorded `--check` are
+        // `ui_interaction.rs`'s.
+        "ui-icons" => PostBuild::NativeOnly { module: "std::gfx" },
         _ => PostBuild::BuildOnly,
     }
 }
@@ -407,7 +421,7 @@ fn build_example(directory: &str) -> Option<String> {
             dangling.join("\n")
         ));
     }
-    let _ = std::fs::remove_dir_all(&staged);
+    let _ = std::fs::remove_dir_all(stage_root(directory));
     None
 }
 
@@ -441,7 +455,7 @@ fn check_native_only(directory: &str, staged: &std::path::Path, module: &str) ->
             "--- {directory}: the JavaScript build must refuse it naming `{module}`; it said:\n{said}"
         ));
     }
-    let _ = std::fs::remove_dir_all(staged);
+    let _ = std::fs::remove_dir_all(stage_root(directory));
     None
 }
 

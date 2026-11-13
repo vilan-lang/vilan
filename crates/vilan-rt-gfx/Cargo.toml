@@ -144,6 +144,11 @@ vilan-rt-poll = { path = "../vilan-rt-poll" }
 [dev-dependencies]
 # Golden images are PNG files.
 png = { version = "=0.18.1" }
+# The reference rasteriser of the Lucide sweep (`src/path/lucide_sweep.rs`,
+# gfx-path.md S4): an independent stroker and coverage to hold `zeno`'s masks
+# to. Already in the lockfile through winit's Adwaita decorations on Linux, so
+# it adds no package; `png-format` stays off (it would want a second `png`).
+tiny-skia = { version = "=0.11.4", default-features = false, features = ["std"] }
 
 # The window example closes ITSELF through the X server, with the same
 # WM_DELETE_WINDOW message a window manager sends, so the xvfb proof exercises

@@ -1,0 +1,22 @@
+column icons 0 0 480 160
+  row saved 20 20 64 18
+  row row 20 58 370 47
+    column Search 20 58 50 47
+    column Settings 94 58 68 47
+    column Type 186 58 33 47
+    column Delete 243 58 51 47
+    icon Notifications 318 81 24 24
+accessibility:
+Group "icons"
+  Group "saved"
+    Label value="Saved"
+  Group "row"
+    Group "Search"
+      Label value="Search"
+    Group "Settings"
+      Label value="Settings"
+    Group "Type"
+      Label value="Type"
+    Group "Delete"
+      Label value="Delete"
+    Image "Notifications"
