@@ -355,3 +355,10 @@ class = "ci"
 ratio = 1.01
 reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0013 at next 85ce6095, x1.0011 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
 item = "M202"
+
+[[bump]]
+subject = "genapp:46"
+class = "ci"
+ratio = 1.01
+reason = "Order 58 (B740, a miscompile fix: a hidden context parameter is bare only where every entry has the value, 67372fb4): callgrind on one machine 7,492,274,724 at next 9cf4669e to 7,613,935,515 with the fix (x1.0162). The context analysis itself moved by 3.6M; the rest is downstream of 815 strict but uncovered functions in genapp-46 that now hold an Option and take a `Some(..)` wrap or a `None` argument per call, where the base passed `undefined`. That is the cost of passing the right value; M204 asks whether the wraps can be cheaper"
+item = "M204"
