@@ -727,6 +727,7 @@ the scroll's offset).
 fun button<C: ButtonContent>(content: C, on_click: || void): Button   // a str (its label too) or an element
 fun checkbox(checked: SignalCell<bool>): Checkbox                    // toggles the cell
 fun text_input(value: SignalCell<str>): TextInput                    // edits the cell
+fun text_area(value: SignalCell<str>): TextArea                       // edits the cell, many lines
 
 impl Button   { fun disabled(self, disabled: Bindable<bool>): Button  fun is_disabled(self): bool }
 impl Checkbox { fun disabled(self, disabled: Bindable<bool>): Checkbox  fun is_disabled(self): bool }
@@ -739,6 +740,12 @@ impl TextInput {
 	fun disabled(self, disabled: Bindable<bool>): TextInput
 	fun selection(self): Selection                                 // { anchor: usize, caret: usize }
 	fun select(self, anchor: usize, caret: usize)
+}
+impl TextArea {
+	// placeholder, placeholder_style, caret, selection_color, disabled,
+	// is_disabled, selection and select: as TextInput's
+	fun on_submit(self, handler: |str| void): TextArea            // Ctrl+Enter, with the value
+	fun scrolled(self): Point                                      // how far its text is scrolled up
 }
 ```
 
@@ -771,7 +778,8 @@ words; a triple click selects everything. Left and
 Right move a grapheme (with Ctrl or Alt, a word), Home and End to the ends, each
 extending the selection with Shift; Backspace and Delete remove the selection,
 or a grapheme (with Ctrl or Alt, a word); Ctrl+A (or Cmd+A) selects everything;
-typed text replaces the selection; Enter runs `on_submit`. Indices are `str`'s
+typed text replaces the selection; Enter runs `on_submit`; Ctrl+Z (Cmd+Z) undoes
+and Ctrl+Shift+Z or Ctrl+Y redoes. Indices are `str`'s
 own (UTF-16 units, as `len` and `substring` count) and always on a GRAPHEME
 boundary: an emoji with its skin tone, a flag or a letter with a combining accent
 is one step and one Backspace. A text wider than the input scrolls sideways to
@@ -822,12 +830,50 @@ fun main() {
 main();
 ```
 
+A **text area** is the multi-line text input: a column (`Role::TextArea`) around a
+vertical `scroll` around its text, which wraps at the area's width (a word longer
+than a line breaks where it must) and scrolls inside the height the app gives it
+— with no height it grows with its text. It does everything the input does, with
+these differences. Enter types a line break (`"\n"`) and Ctrl+Enter (Cmd+Enter)
+runs `on_submit`. Up and Down move a VISUAL line toward a goal column: the x the
+caret had when the run of vertical moves began, kept until the caret moves any
+other way, so the caret crossing a short line comes back to its column on the
+next long one; Up from the first line goes to the start, Down from the last to
+the end. Home and End go to the ends of the visual line, Ctrl+Home and Ctrl+End
+(Cmd too) to the text's; Page Up and Page Down move as many lines as the
+viewport shows and scroll it by as much; all of them extend the selection with
+Shift. Tab moves the focus, as everywhere. A drag past the top or bottom of what
+shows extends the selection one line per pointer move and the text scrolls by
+it; a triple click selects the PARAGRAPH (from one line break to the next, the
+break included) and a drag from it extends by paragraphs. A selection is painted
+one box per visual line, and a selected line break as a small extent at its
+line's end, so a selected empty line shows.
+
+At a soft wrap — where a long line continues on the next visual line — one index
+is both the end of the upper line and the start of the lower one. It is on the
+LOWER line: its caret is drawn at the lower line's start, and Home there stays.
+The upper line's last caret position is before the space it broke at (or, for a
+word broken inside, before its last grapheme), which is where End, a press past
+the line's end and a move up or down onto that line put the caret. Nothing ever
+answers an index that draws on another line than the one it was asked for.
+
+Undo is the same in both. Each edit is recorded as the text it removed and the
+text it inserted, with the selection before it, in a history of 100 changes;
+undo puts the text and that selection back, redo makes the change again. Typing
+is ONE change until the caret moves some other way, a line break is typed or
+another kind of edit comes, and runs of Backspace and of Delete are one change
+each; a new edit forgets what was undone. The value belongs to the app too, and a
+write from outside (clearing a draft after a submit) ends the history, since the
+recorded changes no longer describe the value.
+
 Not in the kit yet: the clipboard (the window layer offers none), an input
-method's composition (the part after this one, P5), and a blinking caret (the
-caret is steady, so an idle window draws nothing; a blink needs a timer in the
-host that stops while the window is unfocused). A drag held still past the
-field's edge does not keep scrolling: the field moves one grapheme per pointer
-move, with no timer.
+method's composition (an edit inserts committed text only; a preedit would be a
+run the edited text draws at the caret without the value holding it), and a
+blinking caret (the caret is steady, so an idle window draws nothing; a blink
+needs a timer in the host that stops while the window is unfocused). A drag held
+still past the field's edge does not keep scrolling: the field moves one
+grapheme, or one line, per pointer move, with no timer. Tabs and indentation are
+not an editor feature: Tab moves the focus.
 
 ## Accessibility
 
@@ -838,7 +884,7 @@ every mounted window publishes its tree to the system's accessibility API
 listens nothing is built and nothing wakes: an idle window stays idle.
 
 ```vilan,fragment
-enum Role { Group, Heading, Paragraph, Button, Link, TextField, Checkbox, List, ListItem, Image }
+enum Role { Group, Heading, Paragraph, Button, Link, TextField, Checkbox, List, ListItem, Image, TextArea }
 ```
 
 What is published, element by element:
@@ -857,7 +903,10 @@ What is published, element by element:
 A **button**, a **checkbox**, a **link** and a **heading** are named by their
 `label`, or else by the text inside them, and nothing inside them is published
 on its own (a button's text is its name, not a second thing to read). A **text
-field** is published with its value, its placeholder and its selection. An
+field** is published with its value, its placeholder and its selection; a
+`Role::TextArea` as a multi-line one, its text in a run per visual line and its
+selection as a line and a grapheme in it (`selection=line:grapheme..` in
+`accessibility()`'s listing). An
 element's states go with it: `checked`, `disabled_state`, whether it has the
 focus, and for a list holding only some of its items, each item's place in the
 whole (`items_shown`). The kit sets all of them: `checkbox` its checked state,

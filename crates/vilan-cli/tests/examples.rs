@@ -203,6 +203,9 @@ fn post_build(directory: &str) -> PostBuild {
         // native-ui.md P4's exit test: the virtual list of 100,000 rows; its
         // native build and runs are `ui_interaction.rs`'s.
         "ui-virtual-list" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P5, text editing: the notes pad on the kit's text area;
+        // its native build and runs are `ui_interaction.rs`'s.
+        "ui-notes" => PostBuild::NativeOnly { module: "std::gfx" },
         _ => PostBuild::BuildOnly,
     }
 }

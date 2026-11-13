@@ -515,6 +515,8 @@ export enum Role {
 	List,
 	ListItem,
 	Image,
+	/// A multi-line text field (`std::ui::kit`'s text area).
+	TextArea,
 }
 
 fun align_code(align: Align): f64 {
@@ -574,6 +576,7 @@ fun role_code(role: Role): f64 {
 		Role::List => 7.0,
 		Role::ListItem => 8.0,
 		Role::Image => 9.0,
+		Role::TextArea => 10.0,
 	}
 }
 

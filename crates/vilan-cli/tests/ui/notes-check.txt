@@ -1,0 +1,139 @@
+column notes pad 0 0 420 420
+  row title 20 60 380 34
+  column notes 20 106 380 150
+    row lock 20 268 68 35
+    text count 100 276 144 19
+start: title="" note="" caret=0 anchor=0 scrolled=0 focus=- log=[]
+accessibility at the start:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="" placeholder="Title" selection=0..0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  MultilineTextInput "notes" value="" placeholder="Write something" selection=0:0..0:0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  Button "lock" [click focus]
+  Label "count" value="1 lines, 0 units"
+title typed, two backspaces: title="groceri" note="" caret=0 anchor=0 scrolled=0 focus=title log=[]
+undo in the title: the backspaces: title="groceries" note="" caret=0 anchor=0 scrolled=0 focus=title log=[]
+undo in the title: the typing: title="" note="" caret=0 anchor=0 scrolled=0 focus=title log=[]
+redo in the title: title="groceries" note="" caret=0 anchor=0 scrolled=0 focus=title log=[]
+up in the title: it bubbles: title="groceries" note="" caret=0 anchor=0 scrolled=0 focus=title log=[screen key]
+enter in the title: the note has the focus: title="groceries" note="" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+typed three lines: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=71 anchor=71 scrolled=0 focus=notes log=[]
+accessibility typed three lines:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="groceries" selection=9..9 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="groceries" graphemes=9
+  MultilineTextInput "notes" value="first line\nsecond\na third line, long enough to wrap past the right edge" focused selection=3:14..3:14 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="first line\n" graphemes=11
+    TextRun value="second\n" graphemes=7
+    TextRun value="a third line, long enough to wrap past " graphemes=39
+    TextRun value="the right edge" graphemes=14
+  Button "lock" [click focus]
+  Label "count" value="3 lines, 71 units"
+ctrl home, end: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=10 anchor=10 scrolled=0 focus=notes log=[]
+down to the short line: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=17 anchor=17 scrolled=0 focus=notes log=[]
+down again: the goal column comes back: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=28 anchor=28 scrolled=0 focus=notes log=[]
+down onto the wrapped part: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=67 anchor=67 scrolled=0 focus=notes log=[]
+up three times: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=10 anchor=10 scrolled=0 focus=notes log=[]
+up from the first line: the start: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+down past the last line: the end: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=71 anchor=71 scrolled=0 focus=notes log=[]
+home on the wrapped part: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=57 anchor=57 scrolled=0 focus=notes log=[]
+accessibility the caret at the wrap point:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="groceries" selection=9..9 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="groceries" graphemes=9
+  MultilineTextInput "notes" value="first line\nsecond\na third line, long enough to wrap past the right edge" focused selection=3:0..3:0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="first line\n" graphemes=11
+    TextRun value="second\n" graphemes=7
+    TextRun value="a third line, long enough to wrap past " graphemes=39
+    TextRun value="the right edge" graphemes=14
+  Button "lock" [click focus]
+  Label "count" value="3 lines, 71 units"
+left: before the space: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=56 anchor=56 scrolled=0 focus=notes log=[]
+accessibility the caret before the space:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="groceries" selection=9..9 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="groceries" graphemes=9
+  MultilineTextInput "notes" value="first line\nsecond\na third line, long enough to wrap past the right edge" focused selection=2:38..2:38 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="first line\n" graphemes=11
+    TextRun value="second\n" graphemes=7
+    TextRun value="a third line, long enough to wrap past " graphemes=39
+    TextRun value="the right edge" graphemes=14
+  Button "lock" [click focus]
+  Label "count" value="3 lines, 71 units"
+home, end on the upper line: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=56 anchor=56 scrolled=0 focus=notes log=[]
+a click past the wrapped line's end: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=56 anchor=56 scrolled=0 focus=notes log=[]
+accessibility after the click past the end:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="groceries" selection=9..9 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="groceries" graphemes=9
+  MultilineTextInput "notes" value="first line\nsecond\na third line, long enough to wrap past the right edge" focused selection=2:38..2:38 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="first line\n" graphemes=11
+    TextRun value="second\n" graphemes=7
+    TextRun value="a third line, long enough to wrap past " graphemes=39
+    TextRun value="the right edge" graphemes=14
+  Button "lock" [click focus]
+  Label "count" value="3 lines, 71 units"
+shift down twice, shift end: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=56 anchor=0 scrolled=0 focus=notes log=[]
+accessibility a selection over three lines:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="groceries" selection=9..9 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="groceries" graphemes=9
+  MultilineTextInput "notes" value="first line\nsecond\na third line, long enough to wrap past the right edge" focused selection=0:0..2:38 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="first line\n" graphemes=11
+    TextRun value="second\n" graphemes=7
+    TextRun value="a third line, long enough to wrap past " graphemes=39
+    TextRun value="the right edge" graphemes=14
+  Button "lock" [click focus]
+  Label "count" value="3 lines, 71 units"
+ctrl shift home: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+six more lines: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=113 anchor=113 scrolled=57.5 focus=notes log=[]
+ctrl home scrolls back: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+press on the first line: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=0 anchor=0 scrolled=0 focus=notes log=[]
+past the bottom edge, once: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=86 anchor=0 scrolled=1.25 focus=notes log=[]
+past the bottom edge, twice: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=93 anchor=0 scrolled=20 focus=notes log=[]
+past the bottom edge, three times: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=100 anchor=0 scrolled=38.75 focus=notes log=[]
+released below: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=100 anchor=0 scrolled=38.75 focus=notes log=[]
+double click on first: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=5 anchor=0 scrolled=0 focus=notes log=[]
+triple click: the paragraph: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=11 anchor=0 scrolled=0 focus=notes log=[]
+triple click, drag a line down: two paragraphs: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=18 anchor=0 scrolled=0 focus=notes log=[]
+page down: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=86 anchor=86 scrolled=58 focus=notes log=[]
+page down again: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=113 anchor=113 scrolled=58 focus=notes log=[]
+shift page up: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=57 anchor=113 scrolled=0 focus=notes log=[]
+typed abcdef: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9abcdef" caret=119 anchor=119 scrolled=57.5 focus=notes log=[]
+backspace twice: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9abcd" caret=117 anchor=117 scrolled=57.5 focus=notes log=[]
+undo: the backspaces: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9abcdef" caret=119 anchor=119 scrolled=57.5 focus=notes log=[]
+undo: the typing: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9" caret=113 anchor=113 scrolled=57.5 focus=notes log=[]
+redo: the typing: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9abcdef" caret=119 anchor=119 scrolled=57.5 focus=notes log=[]
+redo: the backspaces: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9abcd" caret=117 anchor=117 scrolled=57.5 focus=notes log=[]
+home, delete twice: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nne 9abcd" caret=107 anchor=107 scrolled=57.5 focus=notes log=[]
+undo: both deletes: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9abcd" caret=107 anchor=107 scrolled=57.5 focus=notes log=[]
+select all, type over it: title="groceries" note="x" caret=1 anchor=1 scrolled=0 focus=notes log=[]
+undo: everything back, everything selected: title="groceries" note="first line\nsecond\na third line, long enough to wrap past the right edge\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9abcd" caret=117 anchor=0 scrolled=57.5 focus=notes log=[]
+set from outside, then undo: nothing: title="groceries" note="set by the app" caret=14 anchor=0 scrolled=0 focus=notes log=[]
+ctrl enter: title="groceries" note="set by the app" caret=14 anchor=0 scrolled=0 focus=notes log=[submit 1 lines]
+locked: title="groceries" note="set by the app" caret=14 anchor=0 scrolled=0 focus=- log=[]
+accessibility locked:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="groceries" disabled
+  MultilineTextInput "notes" value="set by the app" disabled
+  Button "lock" focused [click focus]
+  Label "count" value="1 lines, 14 units"
+typing while locked: title="groceries" note="set by the app" caret=14 anchor=0 scrolled=0 focus=- log=[screen key]
+unlocked, focused: title="groceries" note="set by the app" caret=14 anchor=14 scrolled=0 focus=notes log=[]
+accessibility at the end:
+Group "notes pad"
+  Label value="Notes"
+  TextInput "title" value="groceries" selection=9..9 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="groceries" graphemes=9
+  MultilineTextInput "notes" value="set by the app" focused selection=0:14..0:14 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="set by the app" graphemes=14
+  Button "lock" [click focus]
+  Label "count" value="1 lines, 14 units"

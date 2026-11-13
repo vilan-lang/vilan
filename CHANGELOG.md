@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: feature -->
+**Native UI: `std::ui::kit::text_area`, multi-line text editing, and undo in both text inputs (native-ui.md P5).** `text_area(cell)` edits a `SignalCell<str>` over many lines: the text wraps at the area's width (a word longer than a line breaks where it must) and scrolls inside the height the app gives it, keeping the caret in view; Enter types a line break and Ctrl+Enter runs `on_submit`; Up and Down move a visual line toward a goal column kept across a run of vertical moves; Home and End go to the ends of the visual line (with Ctrl, of the text), Page Up and Page Down by the viewport, each extending the selection with Shift; a drag past the top or bottom extends a line per move, a double click selects a word and a triple click the paragraph; a selection is painted a box per visual line, a selected line break as a small extent. An index at a soft wrap is on the lower line (its caret at that line's start), and the upper line's last position is before the space it broke at. The area publishes as a multi-line text field (`Role::TextArea`), a text run per visual line. Both the area and `text_input` now undo (Ctrl+Z) and redo (Ctrl+Shift+Z, Ctrl+Y) through one shared editor: a history of 100 changes, typing and runs of Backspace or Delete coalesced, the selection before each change restored, and a write to the value from outside ending the history. The host's edited text answers the ends of a visual line, the index a line above or below at a goal x and the caret's box, and its queries now read the layout at the laid-out width rather than the last painted one, so a window-less `--check` sees the lines a window draws. `vilan/examples/ui-notes` is the exit test.
+
+---
+
 <!-- family: fix -->
 **Native: `ListCell::peek`, `HashMapCell::peek`, `HashSetCell::peek` and `Weak::get` build (B739).** The native backend refused the `WeakGet` intrinsic by name, so every `peek` was a JavaScript-only read. `weak.get()` is now a view of the cell's value, not a copy: the cell is pinned and its value lent for the statement that reads the view (a `match` subject's whole match), and a write of the cell inside that extent is the runtime's reentrancy stop, as a read inside `update` is. `vilan/examples/ui-virtual-list` reads its list in place with `peek` again.
 

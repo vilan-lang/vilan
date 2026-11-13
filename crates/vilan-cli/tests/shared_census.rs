@@ -310,13 +310,16 @@ const CENSUS: &[(&str, usize, &str)] = &[
         "E: a checkbox's disabled flag, as the button's",
     ),
     (
-        "ui/kit/inputs.vl",
-        10,
-        "E: a text input's caret, anchor, focus, disabled flag and caret and \
-         selection colours and width (P4), and the unit a press drags by with \
-         the word a double click selected (F172) — minted by the builder, read and \
-         written by the element's handlers the tree keeps and by the `TextInput` \
-         value's methods, which the program calls long after the builder returned",
+        "ui/kit/editing.vl",
+        15,
+        "E: the kit's editor behind the text input (P4) and the text area (P5) — \
+         its caret, anchor, focus, disabled flag and caret and selection colours \
+         and width, the unit a press drags by with the word or paragraph it \
+         selected (F172), the goal x of a run of vertical moves, and undo's done \
+         and undone changes, merge flag and expected value — minted by \
+         `Editor::new`, read and written by the element's handlers the tree keeps \
+         and by the `TextInput` and `TextArea` values' methods, which the program \
+         calls long after the builder returned",
     ),
     (
         "ui/kit/lists.vl",
@@ -452,7 +455,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 299,
+        total, 304,
         "the total number of `Shared` construction sites in std changed"
     );
 

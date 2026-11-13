@@ -262,6 +262,14 @@ pub enum IndexRule {
     /// grapheme further and the caret's reveal scrolls the field by it. In
     /// a text that shows whole, the end it is past.
     Drag,
+    /// A multi-line drag's (a text area's): [`Drag`](IndexRule::Drag) while
+    /// the point is level with the part of the text that shows; above or
+    /// below it, the first index up or down from the line at that edge
+    /// whose line does not show whole, at the point's x — one line beyond
+    /// what shows, so each move extends the selection a line further and
+    /// the caret's reveal scrolls the text by it. In a text that shows
+    /// whole, the start or the end it is past.
+    DragLines,
 }
 
 /// The accessibility role an element announces (R10), published through the
@@ -276,6 +284,8 @@ pub enum Role {
     Button,
     Link,
     TextField,
+    /// A multi-line text field (`std::ui::kit`'s text area).
+    TextArea,
     Checkbox,
     List,
     ListItem,
@@ -408,9 +418,11 @@ struct TextContent {
     shapings: u32,
     /// Its caret and selection, when it is being edited (`text_edit`).
     editing: Option<Editing>,
-    /// The width constraint it was last painted at: the layout the caret
-    /// questions are answered from.
-    painted_at: Option<f32>,
+    /// The width constraint an edited text was last laid out at (its content
+    /// box's width less the caret's room: the width its paint shapes it at),
+    /// set by the layout's snap: the layout the caret questions are answered
+    /// from, painted or not (a window-less `--check` never paints).
+    laid_out_at: Option<f32>,
 }
 
 /// A text being edited (`std::ui::kit`'s text input, native-ui.md P4): its
@@ -436,6 +448,9 @@ struct Editing {
     /// The selection's colour (the text's at a quarter of its alpha when
     /// `None`).
     selection_color: Option<Color>,
+    /// A word longer than a line breaks where it must (a multi-line field,
+    /// `text_multiline`); otherwise text wraps only between words.
+    break_words: bool,
 }
 
 impl Default for Editing {
@@ -447,6 +462,7 @@ impl Default for Editing {
             caret_color: None,
             caret_width: 1.0,
             selection_color: None,
+            break_words: false,
         }
     }
 }
@@ -492,30 +508,22 @@ impl TextContent {
     /// the solver's max-content measure serves the final width it then
     /// assigns, and nothing is shaped twice for the same lines.
     fn shaped_for(&mut self, constraint: Option<f32>, text: &mut TextSystem) -> TextLayout {
-        let answers = |shaped: &Shaped| {
-            let width = shaped.layout.size().width;
-            match (constraint, shaped.constraint) {
-                (None, None) => true,
-                (None, Some(_)) => false,
-                // The same constraint again (a min-content paragraph is
-                // wider than its constraint of zero), or one in its range.
-                (Some(wanted), Some(kept)) if (kept - wanted).abs() <= WIDTH_EPSILON => true,
-                (Some(wanted), kept) => {
-                    width <= wanted + WIDTH_EPSILON
-                        && kept.is_none_or(|kept| kept + WIDTH_EPSILON >= wanted)
-                }
-            }
-        };
-        if let Some(found) = self.shaped.iter().position(answers) {
+        if let Some(found) = self
+            .shaped
+            .iter()
+            .position(|shaped| shaped.answers(constraint))
+        {
             let shaped = self.shaped.remove(found);
             let layout = shaped.layout.clone();
             self.shaped.insert(0, shaped);
             return layout;
         }
-        let layout = if self.editing.is_some() {
-            text.editable_layout(&self.text, &self.resolved.style, constraint)
-        } else {
-            text.layout(&self.text, &self.resolved.style, constraint)
+        let layout = match &self.editing {
+            Some(editing) if editing.break_words => {
+                text.editable_layout_breaking_words(&self.text, &self.resolved.style, constraint)
+            }
+            Some(_) => text.editable_layout(&self.text, &self.resolved.style, constraint),
+            None => text.layout(&self.text, &self.resolved.style, constraint),
         };
         self.shapings += 1;
         self.shaped.insert(
@@ -532,6 +540,35 @@ impl TextContent {
     fn reshape(&mut self) {
         self.shaped.clear();
         self.shapings = 0;
+    }
+
+    /// The kept paragraph [`shaped_for`](Self::shaped_for) would answer for
+    /// `constraint`, without shaping one: what a reader with no text system
+    /// (the accessibility conversion) reads.
+    fn kept_for(&self, constraint: Option<f32>) -> Option<&TextLayout> {
+        self.shaped
+            .iter()
+            .find(|shaped| shaped.answers(constraint))
+            .map(|shaped| &shaped.layout)
+    }
+}
+
+impl Shaped {
+    /// Whether this paragraph has the lines a paragraph shaped at
+    /// `constraint` would have (see [`TextContent::shaped_for`]).
+    fn answers(&self, constraint: Option<f32>) -> bool {
+        let width = self.layout.size().width;
+        match (constraint, self.constraint) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            // The same constraint again (a min-content paragraph is wider
+            // than its constraint of zero), or one in its range.
+            (Some(wanted), Some(kept)) if (kept - wanted).abs() <= WIDTH_EPSILON => true,
+            (Some(wanted), kept) => {
+                width <= wanted + WIDTH_EPSILON
+                    && kept.is_none_or(|kept| kept + WIDTH_EPSILON >= wanted)
+            }
+        }
     }
 }
 
@@ -1831,8 +1868,23 @@ impl UiTree {
         Ok(())
     }
 
-    /// An edited text's layout as it was last painted (one line, before its
-    /// first paint), shaped again if its text changed since.
+    /// `node`, a text, edited as a MULTI-LINE field's (`std::ui::kit`'s text
+    /// area): a word longer than its line breaks where it must, so nothing
+    /// runs out of the box it wraps in. Lays it out again the first time.
+    pub fn text_multiline(&mut self, node: NodeId) -> Result<(), UiError> {
+        let content = self.text_content(node)?;
+        let editing = content.editing.get_or_insert_with(Editing::default);
+        if !editing.break_words {
+            editing.break_words = true;
+            content.reshape();
+            self.text_changed(node);
+        }
+        Ok(())
+    }
+
+    /// An edited text's layout at the width it was last laid out at (one
+    /// line, before its first layout), shaped again if its text changed
+    /// since.
     fn edited_layout(
         &mut self,
         node: NodeId,
@@ -1842,7 +1894,7 @@ impl UiTree {
         if content.editing.is_none() {
             return Err(UiError::NotEdited);
         }
-        let constraint = content.painted_at;
+        let constraint = content.laid_out_at;
         Ok(content.shaped_for(constraint, text))
     }
 
@@ -1860,11 +1912,44 @@ impl UiTree {
         let layout = self.edited_layout(node, text)?;
         let origin = self.content_origin_on_screen(node);
         let local = |point: Point| Point::new(point.x - origin.x, point.y - origin.y);
+        // The part of the text that shows: a drag's rules read past its
+        // edges.
+        let shown = self.shown_on_screen(node);
         let byte = match rule {
             IndexRule::Nearest => layout.index_at(local(point)),
             IndexRule::Under => layout.grapheme_at(local(point)),
-            IndexRule::Drag => {
-                let shown = self.shown_on_screen(node);
+            IndexRule::DragLines if point.y < shown.top() || point.y > shown.bottom() => {
+                let downward = point.y > shown.bottom();
+                let inside = Point::new(
+                    point.x.clamp(shown.left(), shown.right()),
+                    point.y.clamp(shown.top(), shown.bottom()),
+                );
+                let goal = local(inside).x;
+                let mut at = layout.index_at(local(inside)).ok_or(UiError::NotEdited)?;
+                // Its line shows whole: the caret's top and bottom (its
+                // line's) inside what shows, to a thousandth of a dp.
+                let shows_whole = |index: usize| {
+                    layout.caret(index, 0.0).is_some_and(|caret| {
+                        let top = origin.y + caret.top();
+                        top >= shown.top() - WIDTH_EPSILON
+                            && top + caret.size.height <= shown.bottom() + WIDTH_EPSILON
+                    })
+                };
+                // Out from the edge a line at a time to the first line that
+                // does not show whole: its reveal scrolls it in, and the
+                // next move lands one further.
+                while shows_whole(at) {
+                    let next = layout
+                        .vertical(at, goal, if downward { 1 } else { -1 })
+                        .ok_or(UiError::NotEdited)?;
+                    if next == at {
+                        break;
+                    }
+                    at = next;
+                }
+                Some(at)
+            }
+            IndexRule::Drag | IndexRule::DragLines => {
                 let inside = Point::new(point.x.clamp(shown.left(), shown.right()), point.y);
                 let mut at = layout.index_at(local(inside)).ok_or(UiError::NotEdited)?;
                 let rightward = point.x > shown.right();
@@ -2000,6 +2085,62 @@ impl UiTree {
         let byte = byte_of_unit(content, index);
         let stepped = layout.step(byte, forward, word).ok_or(UiError::NotEdited)?;
         Ok(unit_of_byte(content, stepped))
+    }
+
+    /// The UTF-16 index of the start (or with `end`, the last caret
+    /// position) of the visual line `index` of an edited text is on: Home's
+    /// and End's in a text area (`text/editing.rs` says which line an index
+    /// at a soft wrap is on).
+    pub fn text_line_end(
+        &mut self,
+        node: NodeId,
+        index: usize,
+        end: bool,
+        text: &mut TextSystem,
+    ) -> Result<usize, UiError> {
+        let layout = self.edited_layout(node, text)?;
+        let content = self.text(node).unwrap_or("");
+        let byte = byte_of_unit(content, index);
+        let found = layout.line_end(byte, end).ok_or(UiError::NotEdited)?;
+        Ok(unit_of_byte(content, found))
+    }
+
+    /// The UTF-16 index of an edited text `lines` visual lines below
+    /// `index`'s (above, when negative) nearest `goal_x` (dp from the text's
+    /// left: the x a run of vertical moves started from); its start past
+    /// the first line, its end past the last.
+    pub fn text_vertical(
+        &mut self,
+        node: NodeId,
+        index: usize,
+        goal_x: f32,
+        lines: isize,
+        text: &mut TextSystem,
+    ) -> Result<usize, UiError> {
+        let goal_x = finite(goal_x, "a goal x")?;
+        let layout = self.edited_layout(node, text)?;
+        let content = self.text(node).unwrap_or("");
+        let byte = byte_of_unit(content, index);
+        let found = layout
+            .vertical(byte, goal_x, lines)
+            .ok_or(UiError::NotEdited)?;
+        Ok(unit_of_byte(content, found))
+    }
+
+    /// The caret's box at UTF-16 `index` of an edited text, in dp from the
+    /// text's top-left corner (its line's top and height; no width): where
+    /// a vertical move's goal x comes from, and how far a page moved.
+    pub fn text_caret_box(
+        &mut self,
+        node: NodeId,
+        index: usize,
+        text: &mut TextSystem,
+    ) -> Result<Rect, UiError> {
+        let layout = self.edited_layout(node, text)?;
+        let content = self.text(node).unwrap_or("");
+        layout
+            .caret(byte_of_unit(content, index), 0.0)
+            .ok_or(UiError::NotEdited)
     }
 
     /// Where `node`'s content box is drawn, in dp from its root's top-left
@@ -2349,6 +2490,14 @@ impl UiTree {
             data.placed = placed;
             data.content_offset = content_offset;
             data.content_size = content_size;
+            if let Content::Text(TextContent {
+                editing: Some(editing),
+                laid_out_at,
+                ..
+            }) = &mut data.content
+            {
+                *laid_out_at = Some((content_size.width - editing.caret_width).max(0.0));
+            }
             if data.scroll.is_some() {
                 scrolls.push(node);
             }
@@ -2714,7 +2863,7 @@ impl UiTree {
                 };
                 let shown = !content.text.is_empty() || content.editing.is_some();
                 if shown {
-                    content.painted_at = Some(width);
+                    content.laid_out_at = Some(width);
                     let layout = content.shaped_for(Some(width), text);
                     match content.editing.as_ref().filter(|editing| editing.active) {
                         Some(editing) => {
@@ -2917,6 +3066,14 @@ fn measure(
                         AvailableSpace::MinContent => Some(0.0),
                         AvailableSpace::MaxContent => None,
                     });
+                    // An edited text is shaped at its width less the caret's
+                    // room — the width its paint shapes it at — so a text
+                    // wrapping at a given width wraps where it is drawn.
+                    let caret_room = content
+                        .editing
+                        .as_ref()
+                        .map_or(0.0, |editing| editing.caret_width);
+                    let constraint = constraint.map(|width| (width - caret_room).max(0.0));
                     let layout = content.shaped_for(constraint, text);
                     first_baseline = Some(layout.first_baseline());
                     let mut shaped = layout.size();

@@ -186,7 +186,12 @@ Rust workspace, seventeen crates, plus the language's own tree:
   (`text/editing.rs`, recorded only when asked) that paints its own caret and selection and
   answers where a point or a step lands, in the program's UTF-16 indices.
   `vilan/examples/ui-todo` is their exit test, in `ui_interaction.rs` with its own recorded
-  listing (`tests/ui/todo-check.txt`). The virtual list is plain vilan over a `scroll` (a column
+  listing (`tests/ui/todo-check.txt`). The text input and the text area (P5,
+  `text_areas.vl`) share ONE editor, `ui/kit/editing.vl` (keys, pointer, undo); an index
+  at a soft wrap is on the LOWER visual line (`text/editing.rs`'s head is the rule), and the
+  tree's caret questions read the layout at the laid-out width (`laid_out_at`, set by the
+  snap), never only the painted one. `vilan/examples/ui-notes` is the area's exit test
+  (`tests/ui/notes-check.txt`). The virtual list is plain vilan over a `scroll` (a column
   as tall as every row, the rows above the window as its top padding, the window an `each` over
   a cell of its items); what it needed from the host is `on_resize` (told after a layout, and
   `__ui_layout` lays out again when a handler changed the tree), an offset kept unclamped while

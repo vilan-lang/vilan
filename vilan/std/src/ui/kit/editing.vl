@@ -1,0 +1,777 @@
+// `std::ui::kit`'s EDITOR: everything its single-line input (`inputs.vl`) and its
+// text area (`text_areas.vl`) share — the caret and the selection, the keys, the
+// pointer, typing, and undo — over one edited text. Not public: each component
+// keeps one and answers its own surface; `Selection` alone is re-exported (by
+// `ui/kit.vl`).
+//
+// THE TEXT is EDITED: this module keeps its caret and the other end of its
+// selection, and the tree draws them in the text's layout and answers where a point
+// or a step lands (`vilan-rt-gfx`'s `text/editing.rs`), because only the layout
+// knows where the graphemes are.
+//
+// INDICES are `str`'s own (UTF-16 units, what `len` and `substring` count), and
+// always on a grapheme boundary: a step moves one grapheme (an emoji with its
+// modifiers, a letter with its combining marks), Backspace and Delete remove one.
+//
+// ONE LINE OR MANY. A multi-line editor's value holds line breaks ("\n", which
+// Enter types) and wraps at its width; an index at a soft wrap is on the LOWER
+// line, its caret at that line's start (`text/editing.rs`'s rule). Up and Down move
+// by visual line toward a GOAL x: the x the caret had when the run of vertical
+// moves began, kept until the caret moves any other way, so a caret passing a short
+// line comes back to its column on the next long one.
+//
+// UNDO. Each edit is recorded as the text it removed and the text it inserted at
+// one index, with the selection before it, in a history of at most `HISTORY_LIMIT`
+// changes: Ctrl+Z (Cmd+Z) undoes one and restores that selection, Ctrl+Shift+Z or
+// Ctrl+Y redoes it. Typing COALESCES: characters typed one after another are one
+// change, until the caret moves any other way, a line break is typed, or another
+// kind of edit comes; so are runs of Backspace and of Delete. A new edit forgets
+// what was undone. The value is the app's too, and a write to it from outside
+// (`draft.set("")` after a submit) ends the history: the changes no longer describe
+// the value, so undo forgets them rather than corrupt it.
+
+[platform("@process")] mod self;
+
+import pkg::gfx::{ Color, Dp, Event, KeyName, KeyPress, Point, current_event, dp };
+import pkg::option::Option::{ self, None, Some };
+import pkg::reactive::SignalCell;
+import pkg::shared::Shared;
+import pkg::ui::{
+	Attributes,
+	Element,
+	Node,
+	ScrollElement,
+	click_count,
+	stop_event,
+	ui_set_focusable,
+};
+
+// --- The seam: `vilan-rt-gfx`'s `host::ui`, an edited text ---------------------------
+
+/// A text's caret and the other end of its selection (`str` indices), drawn while
+/// `active` and then scrolled into view.
+[extern("__ui_text_edit")]
+external fun ui_text_edit(node: Node, caret: i32, anchor: i32, active: bool): void;
+
+/// An edited text's caret colour and width, and its selection's colour; a negative
+/// alpha leaves a colour to the text's.
+[extern("__ui_text_edit_look")]
+external fun ui_text_edit_look(
+	node: Node,
+	caret_red: f64,
+	caret_green: f64,
+	caret_blue: f64,
+	caret_alpha: f64,
+	caret_width: f64,
+	selection_red: f64,
+	selection_green: f64,
+	selection_blue: f64,
+	selection_alpha: f64,
+): void;
+
+/// An edited text as a multi-line field's: a word longer than its line breaks where
+/// it must.
+[extern("__ui_text_multiline")]
+external fun ui_text_multiline(node: Node): void;
+
+/// The index a point (dp from the window's top-left) lands on, by `rule`: 0 the
+/// nearest grapheme edge, 1 the start of the grapheme under it, 2 a drag's (one
+/// grapheme past the edge of what shows, when the point is beyond it), 3 a
+/// multi-line drag's (and one line past the top or bottom of what shows).
+[extern("__ui_text_index_at")]
+external fun ui_text_index_at(node: Node, x: f64, y: f64, rule: i32): i32;
+
+/// The start (or with `end`, the end) of the word around `index`: the run of word
+/// graphemes, or of the others, the grapheme there is in.
+[extern("__ui_text_word")]
+external fun ui_text_word(node: Node, index: i32, end: bool): i32;
+
+/// The next (`forward`) or previous grapheme boundary from `index`, or with `word`
+/// the end of the next word or the start of the previous one.
+[extern("__ui_text_step")]
+external fun ui_text_step(node: Node, index: i32, forward: bool, word: bool): i32;
+
+/// The start (or with `end`, the last caret position) of the visual line `index` is
+/// on.
+[extern("__ui_text_line_end")]
+external fun ui_text_line_end(node: Node, index: i32, end: bool): i32;
+
+/// The index `lines` visual lines below `index`'s (above, when negative) nearest
+/// `goal_x` dp from the text's left; the text's start past the first line, its end
+/// past the last.
+[extern("__ui_text_vertical")]
+external fun ui_text_vertical(node: Node, index: i32, goal_x: f64, lines: i32): i32;
+
+/// The caret's box at `index`, in dp from the text's top-left: 0 its x, 1 its
+/// line's top, 2 its line's height.
+[extern("__ui_text_caret_number")]
+external fun ui_text_caret_number(node: Node, index: i32, which: i32): f64;
+
+// --- The editor --------------------------------------------------------------------
+
+/// The two ends of a text input's or a text area's selection, as `str` counts
+/// (UTF-16 units): `caret`, where typing goes, and `anchor`, the other end — the
+/// same index when nothing is selected.
+export struct Selection {
+	anchor: usize,
+	caret: usize,
+}
+
+/// How many changes the history keeps: the oldest goes first.
+let HISTORY_LIMIT: usize = 100;
+
+/// What made a change, for coalescing: typing, Backspace and Delete each merge with
+/// the change before them of their own kind; anything else stands alone.
+enum ChangeKind {
+	Typing,
+	Backspace,
+	Delete,
+	Alone,
+}
+
+/// One edit, as undo needs it: at `from`, `removed` was replaced by `inserted`, and
+/// before it the selection was `anchor` to `caret`.
+struct Change {
+	from: usize,
+	removed: str,
+	inserted: str,
+	anchor: usize,
+	caret: usize,
+	kind: ChangeKind,
+}
+
+/// See the module's head.
+export(in pkg) struct Editor {
+	value: SignalCell<str>,
+	/// The edited text's element.
+	field: Node,
+	/// The focusable element around it: the one the handlers are on.
+	shell: Element,
+	multiline: bool,
+	/// A multi-line editor's viewport and its offset: what Page Up and Page Down
+	/// move by and scroll.
+	viewport: Option<ScrollElement>,
+	offset: Option<SignalCell<Point>>,
+	caret: Shared<usize>,
+	anchor: Shared<usize>,
+	/// What the press being dragged selects by: 1 graphemes, 2 words (a double
+	/// click), 3 a triple click's (everything on one line, a paragraph on many);
+	/// and the word or paragraph the press selected, which a drag keeps selected.
+	unit: Shared<usize>,
+	unit_start: Shared<usize>,
+	unit_end: Shared<usize>,
+	/// The x (dp from the text's left) a run of vertical moves keeps to; negative
+	/// when no run is going on.
+	goal: Shared<f64>,
+	focused: Shared<bool>,
+	off: Shared<bool>,
+	/// The caret's colour and width and the selection's colour: `None` leaves a
+	/// colour to the text's.
+	caret_color: Shared<Option<Color>>,
+	caret_width: Shared<f64>,
+	selection_color: Shared<Option<Color>>,
+	/// Undo: the changes made, the changes undone, whether the next edit may merge
+	/// into the last change, and the value the last change left (see the head).
+	done: Shared<List<Change>>,
+	undone: Shared<List<Change>>,
+	merging: Shared<bool>,
+	expected: Shared<str>,
+}
+
+export(in pkg) impl Editor {
+	/// An editor of `value` drawn by the text `field` inside the focusable `shell`;
+	/// its handlers are wired by `wire`.
+	fun new(
+		value: SignalCell<str>,
+		field: Node,
+		shell: Element,
+		multiline: bool,
+		viewport: Option<ScrollElement>,
+		offset: Option<SignalCell<Point>>,
+	): Editor {
+		if multiline {
+			ui_text_multiline(field);
+		}
+		let editor = Editor {
+			value,
+			field,
+			shell,
+			multiline,
+			viewport,
+			offset,
+			caret = Shared::new(0),
+			anchor = Shared::new(0),
+			unit = Shared::new(1),
+			unit_start = Shared::new(0),
+			unit_end = Shared::new(0),
+			goal = Shared::new(-1.0),
+			focused = Shared::new(false),
+			off = Shared::new(false),
+			caret_color = Shared::new(None),
+			caret_width = Shared::new(1.0),
+			selection_color = Shared::new(None),
+			done = Shared::new([]),
+			undone = Shared::new([]),
+			merging = Shared::new(false),
+			expected = Shared::new(value.get()),
+		};
+		editor.show();
+		editor
+	}
+
+	/// The focus, the pointer, the keys and typed text, on the shell.
+	fun wire(self) {
+		let editor = self;
+		let _wired = self.shell
+			.on_focus(|| {
+				editor.focused.write() = true;
+				editor.show();
+			})
+			.on_blur(|| {
+				editor.focused.write() = false;
+				editor.show();
+			})
+			.on_press(|| {
+				if editor.off.read() {
+					ret;
+				}
+				if current_event() is Some(Event::PointerPressed(let pointer)) {
+					editor.press(pointer.position, pointer.modifiers.shift);
+				}
+			})
+			.on_pointer_move(|point: Point| {
+				// A drag: the button went down on the editor and is still down; the
+				// moves come here wherever the pointer is (the press captured it).
+				if !editor.off.read() && editor.shell.interaction().pressed {
+					editor.drag(point);
+				}
+			})
+			.on_key(|key: KeyPress| editor.key(key))
+			.on_text(|typed: str| {
+				if editor.off.read() {
+					ret;
+				}
+				let now = editor.selection();
+				editor.replace(now.anchor.min(now.caret), now.anchor.max(now.caret), typed, ChangeKind::Typing);
+				stop_event();
+			});
+	}
+
+	/// The key that submits: Enter on one line, Ctrl+Enter (Cmd+Enter) on many,
+	/// where Enter types a line break.
+	fun submits(self, key: KeyPress): bool {
+		if self.off.read() || !(key.key is KeyName::Enter) {
+			ret false;
+		}
+		!self.multiline || key.modifiers.control || key.modifiers.meta
+	}
+
+	fun set_caret_look(self, color: Color, width: Dp) {
+		self.caret_color.write() = Some(color);
+		self.caret_width.write() = width.value();
+		self.show_look();
+	}
+
+	fun set_selection_color(self, color: Color) {
+		self.selection_color.write() = Some(color);
+		self.show_look();
+	}
+
+	/// Disabled (or not): no edit, no caret, out of the tab order, a drag in
+	/// progress ended.
+	fun set_disabled(self, value: bool) {
+		self.off.write() = value;
+		ui_set_focusable(self.shell.node, !value);
+		if value {
+			self.shell.release_pointer();
+		}
+		let _published = self.shell.disabled_state(value);
+		self.show();
+	}
+
+	fun is_disabled(self): bool {
+		self.off.read()
+	}
+
+	/// The selection now (both ends at the caret when nothing is selected), kept
+	/// within the value.
+	fun selection(self): Selection {
+		let length = self.value.get().len();
+		Selection { anchor = self.anchor.read().min(length), caret = self.caret.read().min(length) }
+	}
+
+	/// Selects from `anchor` to `caret` (kept within the value; the tree moves an
+	/// index inside a grapheme to its start when it draws it).
+	fun select(self, anchor: usize, caret: usize) {
+		let length = self.value.get().len();
+		self.anchor.write() = anchor.min(length);
+		self.caret.write() = caret.min(length);
+		self.goal.write() = -1.0;
+		self.merging.write() = false;
+		self.show();
+	}
+}
+
+/// The editor's own steps.
+impl Editor {
+	/// Tells the tree where the caret and the selection are, and whether they show.
+	fun show(self) {
+		let now = self.selection();
+		ui_text_edit(
+			self.field,
+			now.caret.as_i32(),
+			now.anchor.as_i32(),
+			self.focused.read() && !self.off.read(),
+		);
+	}
+
+	fun show_look(self) {
+		let (caret_red, caret_green, caret_blue, caret_alpha) = channels(self.caret_color.read());
+		let (selection_red, selection_green, selection_blue, selection_alpha) = channels(
+			self.selection_color.read(),
+		);
+		ui_text_edit_look(
+			self.field,
+			caret_red,
+			caret_green,
+			caret_blue,
+			caret_alpha,
+			self.caret_width.read(),
+			selection_red,
+			selection_green,
+			selection_blue,
+			selection_alpha,
+		);
+	}
+
+	fun index_at(self, point: Point, rule: i32): usize {
+		ui_text_index_at(self.field, point.x.value(), point.y.value(), rule).as_usize()
+	}
+
+	/// A press at `point`: by the count of presses in a row, the caret placed there
+	/// (with `extend`, the selection extended to it), the word under it, or the
+	/// triple click's unit (everything, or on many lines the paragraph).
+	fun press(self, point: Point, extend: bool) {
+		let count = click_count();
+		if count >= 3 {
+			self.unit.write() = 3;
+			if self.multiline {
+				let (start, end) = self.paragraph(self.index_at(point, 1));
+				self.unit_start.write() = start;
+				self.unit_end.write() = end;
+				self.select(start, end);
+			} else {
+				self.select(0, self.value.get().len());
+			}
+		} else if count == 2 {
+			self.unit.write() = 2;
+			let under = self.index_at(point, 1).as_i32();
+			let start = ui_text_word(self.field, under, false).as_usize();
+			let end = ui_text_word(self.field, under, true).as_usize();
+			self.unit_start.write() = start;
+			self.unit_end.write() = end;
+			self.select(start, end);
+		} else {
+			self.unit.write() = 1;
+			self.place(self.index_at(point, 0), extend);
+		}
+	}
+
+	/// The pointer at `point` while the press is held: the selection extended to it
+	/// by the press's unit.
+	fun drag(self, point: Point) {
+		let unit = self.unit.read();
+		if unit >= 3 && !self.multiline {
+			ret;
+		}
+		let at = self.index_at(point, if self.multiline { 3 } else { 2 });
+		if unit == 1 {
+			self.place(at, true);
+			ret;
+		}
+		let (start, end) = (self.unit_start.read(), self.unit_end.read());
+		if unit == 3 {
+			// By paragraphs: the pressed one stays selected, with every paragraph
+			// up to the one the pointer's index is in (a pointer on the next line's
+			// first column is in the next paragraph).
+			let (from, to) = self.paragraph(at);
+			if from < start {
+				self.select(end, from);
+			} else {
+				self.select(start, to.max(end));
+			}
+			ret;
+		}
+		// By words: the pressed one stays selected, and the selection reaches the
+		// far end of the word the pointer is in, on the far side of it.
+		if at < start {
+			self.select(end, ui_text_word(self.field, at.as_i32(), false).as_usize());
+		} else if at > end {
+			let reached = ui_text_word(self.field, (at - 1).as_i32(), true).as_usize();
+			self.select(start, reached);
+		} else {
+			self.select(start, end);
+		}
+	}
+
+	/// The paragraph around `index`: from after the line break before it to after
+	/// the one at or after it (the text's ends where there is none).
+	fun paragraph(self, index: usize): (usize, usize) {
+		let now = self.value.get();
+		let at = index.min(now.len());
+		let start = match now.substring(0, at).last_index_of("\n") {
+			Some(let found) => found + 1,
+			None => 0,
+		};
+		let end = match now.substring(at, now.len()).index_of("\n") {
+			Some(let found) => at + found + 1,
+			None => now.len(),
+		};
+		(start, end)
+	}
+
+	fun step(self, from: usize, forward: bool, word: bool): usize {
+		ui_text_step(self.field, from.as_i32(), forward, word).as_usize()
+	}
+
+	/// The caret to `at`; the anchor stays when `extend`, and follows otherwise.
+	/// Ends a run of vertical moves and of typing.
+	fun place(self, at: usize, extend: bool) {
+		self.goal.write() = -1.0;
+		self.move_to(at, extend);
+	}
+
+	fun move_to(self, at: usize, extend: bool) {
+		self.caret.write() = at;
+		if !extend {
+			self.anchor.write() = at;
+		}
+		self.merging.write() = false;
+		self.show();
+	}
+
+	/// The goal x of the run of vertical moves going on, or the caret's x, which
+	/// starts one.
+	fun goal_x(self, from: usize): f64 {
+		let held = self.goal.read();
+		if held >= 0.0 {
+			ret held;
+		}
+		let x = ui_text_caret_number(self.field, from.as_i32(), 0);
+		self.goal.write() = x;
+		x
+	}
+
+	/// The caret `lines` visual lines down (up, when negative), toward the goal x.
+	fun vertical(self, lines: i32, extend: bool) {
+		let from = self.caret.read().min(self.value.get().len());
+		let at = ui_text_vertical(self.field, from.as_i32(), self.goal_x(from), lines).as_usize();
+		self.move_to(at, extend);
+	}
+
+	/// Page Down (`forward`) or Page Up: the caret as many lines as the viewport
+	/// shows whole, toward the goal x, and the viewport scrolled by as much as the
+	/// caret moved, so the caret keeps its place on the screen.
+	fun page(self, forward: bool, extend: bool) {
+		let (viewport, offset) = match (self.viewport, self.offset) {
+			(Some(let viewport), Some(let offset)) => (viewport, offset),
+			_ => ret,
+		};
+		let from = self.caret.read().min(self.value.get().len());
+		let line = ui_text_caret_number(self.field, from.as_i32(), 2);
+		let shown = viewport.element().bounds().height.value();
+		let lines = (shown / line).floor().max(1.0).as_i32();
+		let top = ui_text_caret_number(self.field, from.as_i32(), 1);
+		let goal = self.goal_x(from);
+		let at = ui_text_vertical(self.field, from.as_i32(), goal, if forward {
+			lines
+		} else {
+			-lines
+		})
+			.as_usize();
+		let moved = ui_text_caret_number(self.field, at.as_i32(), 1) - top;
+		let scrolled = viewport.scrolled();
+		offset.set(Point::new(scrolled.x, dp(scrolled.y.value() + moved)));
+		self.move_to(at, extend);
+	}
+
+	/// The value with `from .. to` replaced by `inserted`, and the caret after it;
+	/// recorded for undo as `kind` (nothing is recorded when nothing changes).
+	fun replace(self, from: usize, to: usize, inserted: str, kind: ChangeKind) {
+		let now = self.value.get();
+		let removed = now.substring(from, to);
+		if removed != "" || inserted != "" {
+			let before = self.selection();
+			self.record(Change {
+				from,
+				removed,
+				inserted,
+				anchor = before.anchor,
+				caret = before.caret,
+				kind,
+			});
+		}
+		self.write(now.substring(0, from) + inserted + now.substring(to, now.len()));
+		let at = from + inserted.len();
+		self.caret.write() = at;
+		self.anchor.write() = at;
+		self.goal.write() = -1.0;
+		self.merging.write() = true;
+		self.show();
+	}
+
+	fun write(self, next: str) {
+		self.expected.write() = next;
+		self.value.set(next);
+	}
+
+	/// Whether the history still describes the value: no write from outside since
+	/// the last change. When it does not, it is forgotten.
+	fun history_holds(self): bool {
+		if self.value.get() == self.expected.read() {
+			ret true;
+		}
+		self.done.write() = [];
+		self.undone.write() = [];
+		self.expected.write() = self.value.get();
+		false
+	}
+
+	/// `change` into the history: merged into the last change when both are a run
+	/// of one kind (see the head), and forgetting what was undone.
+	fun record(self, change: Change) {
+		let _holds = self.history_holds();
+		self.undone.write() = [];
+		if self.merging.read() {
+			if self.done.write().pop() is Some(let last) {
+				match merged(last, change) {
+					Some(let both) => {
+						self.done.write().push(both);
+						ret;
+					},
+					None => self.done.write().push(last),
+				}
+			}
+		}
+		self.done.write().push(change);
+		if self.done.read().len() > HISTORY_LIMIT {
+			let _oldest = self.done.write().remove(0);
+		}
+	}
+
+	/// Ctrl+Z: the last change taken back, and the selection before it restored.
+	fun undo(self) {
+		if !self.history_holds() {
+			ret;
+		}
+		if self.done.write().pop() is Some(let change) {
+			let now = self.value.get();
+			self.write(now.substring(0, change.from)
+				+ change.removed
+				+ now.substring(change.from + change.inserted.len(), now.len()));
+			self.undone.write().push(change);
+			self.select(change.anchor, change.caret);
+		}
+	}
+
+	/// Ctrl+Shift+Z or Ctrl+Y: the last change undone made again, the caret after
+	/// what it inserted.
+	fun redo(self) {
+		if !self.history_holds() {
+			ret;
+		}
+		if self.undone.write().pop() is Some(let change) {
+			let now = self.value.get();
+			self.write(now.substring(0, change.from)
+				+ change.inserted
+				+ now.substring(change.from + change.removed.len(), now.len()));
+			self.done.write().push(change);
+			let at = change.from + change.inserted.len();
+			self.select(at, at);
+		}
+	}
+
+	/// A key, while it has the focus (see `inputs.vl`'s and `text_areas.vl`'s
+	/// heads). A key it acts on goes no further; so does a key that types (its text
+	/// arrives as a text event), so an app's shortcut on an ancestor does not fire
+	/// while the user types.
+	fun key(self, key: KeyPress) {
+		if self.off.read() {
+			ret;
+		}
+		let modifiers = key.modifiers;
+		let command = modifiers.control || modifiers.meta;
+		let word = modifiers.control || modifiers.alt;
+		let extend = modifiers.shift;
+		let now = self.selection();
+		let (start, end) = (now.anchor.min(now.caret), now.anchor.max(now.caret));
+		let selected = start != end;
+		let length = self.value.get().len();
+		match key.key {
+			KeyName::Left => {
+				if selected && !extend {
+					self.place(start, false);
+				} else {
+					self.place(self.step(now.caret, false, word), extend);
+				}
+				stop_event();
+			},
+			KeyName::Right => {
+				if selected && !extend {
+					self.place(end, false);
+				} else {
+					self.place(self.step(now.caret, true, word), extend);
+				}
+				stop_event();
+			},
+			KeyName::Up => {
+				if self.multiline {
+					self.vertical(-1, extend);
+					stop_event();
+				}
+			},
+			KeyName::Down => {
+				if self.multiline {
+					self.vertical(1, extend);
+					stop_event();
+				}
+			},
+			KeyName::PageUp => {
+				if self.multiline {
+					self.page(false, extend);
+					stop_event();
+				}
+			},
+			KeyName::PageDown => {
+				if self.multiline {
+					self.page(true, extend);
+					stop_event();
+				}
+			},
+			KeyName::Home => {
+				if self.multiline && !command {
+					self.place(
+						ui_text_line_end(self.field, now.caret.as_i32(), false).as_usize(),
+						extend,
+					);
+				} else {
+					self.place(0, extend);
+				}
+				stop_event();
+			},
+			KeyName::End => {
+				if self.multiline && !command {
+					self.place(
+						ui_text_line_end(self.field, now.caret.as_i32(), true).as_usize(),
+						extend,
+					);
+				} else {
+					self.place(length, extend);
+				}
+				stop_event();
+			},
+			KeyName::Enter => {
+				if self.multiline && !command {
+					self.replace(start, end, "\n", ChangeKind::Alone);
+					stop_event();
+				}
+			},
+			KeyName::Backspace => {
+				if selected {
+					self.replace(start, end, "", ChangeKind::Alone);
+				} else {
+					let from = self.step(now.caret, false, word);
+					self.replace(from, now.caret, "", ChangeKind::Backspace);
+				}
+				stop_event();
+			},
+			KeyName::Delete => {
+				if selected {
+					self.replace(start, end, "", ChangeKind::Alone);
+				} else {
+					let to = self.step(now.caret, true, word);
+					self.replace(now.caret, to, "", ChangeKind::Delete);
+				}
+				stop_event();
+			},
+			KeyName::Char(let typed) => {
+				if command && (typed == "a" || typed == "A") {
+					self.select(0, length);
+					stop_event();
+				} else if command && (typed == "z" || typed == "Z") {
+					if modifiers.shift {
+						self.redo();
+					} else {
+						self.undo();
+					}
+					stop_event();
+				} else if command && (typed == "y" || typed == "Y") {
+					self.redo();
+					stop_event();
+				} else if !command && !modifiers.alt {
+					stop_event();
+				}
+			},
+			_ => {},
+		}
+	}
+}
+
+/// `last` and `next` as one change when `next` continues `last`'s run: typing right
+/// after what `last` typed, Backspace right before what it removed, Delete at the
+/// same place. The selection kept is `last`'s (the one before the run).
+fun merged(last: Change, next: Change): Option<Change> {
+	match (last.kind, next.kind) {
+		(ChangeKind::Typing, ChangeKind::Typing) => {
+			if next.removed == "" && last.from + last.inserted.len() == next.from {
+				Some(Change {
+					from = last.from,
+					removed = last.removed,
+					inserted = last.inserted + next.inserted,
+					anchor = last.anchor,
+					caret = last.caret,
+					kind = ChangeKind::Typing,
+				})
+			} else {
+				None
+			}
+		},
+		(ChangeKind::Backspace, ChangeKind::Backspace) => {
+			if next.from + next.removed.len() == last.from {
+				Some(Change {
+					from = next.from,
+					removed = next.removed + last.removed,
+					inserted = "",
+					anchor = last.anchor,
+					caret = last.caret,
+					kind = ChangeKind::Backspace,
+				})
+			} else {
+				None
+			}
+		},
+		(ChangeKind::Delete, ChangeKind::Delete) => {
+			if next.from == last.from {
+				Some(Change {
+					from = last.from,
+					removed = last.removed + next.removed,
+					inserted = "",
+					anchor = last.anchor,
+					caret = last.caret,
+					kind = ChangeKind::Delete,
+				})
+			} else {
+				None
+			}
+		},
+		_ => None,
+	}
+}
+
+/// A colour's channels, or a negative alpha for none.
+fun channels(color: Option<Color>): (f64, f64, f64, f64) {
+	match color {
+		Some(let color) => (color.red, color.green, color.blue, color.alpha),
+		None => (0.0, 0.0, 0.0, -1.0),
+	}
+}

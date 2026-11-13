@@ -42,6 +42,17 @@
 //!   it moves down one place, so the top one is new and the bottom one goes,
 //!   and the column grows by a row).
 //!
+//! - `edited_<lines>`: `std::ui::kit::text_area`'s shape (part P5) at 1,000 and
+//!   10,000 lines of 40 characters: a `scroll` 640 dp tall over a stack over
+//!   one EDITED text, multi-line, wrapping at 960 dp. `first_us` and
+//!   `first_paint_us`; `type_*` (a character typed in the middle: the run
+//!   replaced and the caret moved, as the kit's two calls do, laid out, then
+//!   painted: the whole paragraph is reshaped, which is what one text costs);
+//!   `caret_*` (the caret moved a line: no layout, the text repainted);
+//!   `vertical_us` (the index a line below, the kit's Down);
+//!   `access_full_us` (the area converted for assistive technology, a run a
+//!   visual line).
+//!
 //! Every tree also reports `access_full_us` (the whole tree converted for
 //! assistive technology and published as a platform's first tree, part P5)
 //! and `access_one_text_*` (after the one-text change: the tree converted
@@ -55,7 +66,7 @@
 use std::time::Instant;
 
 use vilan_rt_gfx::ui::{
-    AccessPublisher, AccessWindow, Align, ElementKind, Length, NodeId, SizeProperty, UiTree,
+    AccessPublisher, AccessWindow, Align, ElementKind, Length, NodeId, Role, SizeProperty, UiTree,
 };
 use vilan_rt_gfx::{Edges, SceneBuilder, Size, TextSystem, Units};
 
@@ -741,9 +752,104 @@ fn measure_windowed(count: usize, runs: usize) {
     }
 }
 
+/// A text area of `lines` lines laid out, typed into, its caret moved.
+fn measure_edited(lines: usize, runs: usize) {
+    let name = format!("edited_{lines}");
+    let mut samples = Samples::default();
+    let at_100 = Units::new(1.0, 1.0).unwrap();
+    let window = Size::new(960.0, 640.0);
+    let line = "a line of text, forty characters long..\n";
+    let content: String = line.repeat(lines);
+    let middle = (lines / 2) * line.len();
+    for _ in 0..runs {
+        let mut text = TextSystem::without_system_fonts();
+        let font = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fonts/NotoMono-Regular.ttf"),
+        )
+        .expect("the test font");
+        text.register_font(font).unwrap();
+        let mut builder = Builder {
+            tree: UiTree::new(),
+        };
+        let root = builder.node(ElementKind::Column);
+        builder.tree.set_role(root, Role::TextArea);
+        let scroll = builder.node(ElementKind::Scroll);
+        builder
+            .tree
+            .set_size(scroll, SizeProperty::Height, Length::Dp(640.0))
+            .unwrap();
+        let stack = builder.node(ElementKind::Stack);
+        let field = builder.text(&content);
+        builder.tree.text_multiline(field).unwrap();
+        builder.tree.text_edit(field, middle, middle, true).unwrap();
+        builder.add(stack, &[field]);
+        builder.add(scroll, &[stack]);
+        builder.add(root, &[scroll]);
+        let tree = &mut builder.tree;
+        let paint = |tree: &mut UiTree, text: &mut TextSystem| {
+            let mut scene = SceneBuilder::new();
+            tree.paint(root, &mut scene, text).unwrap();
+        };
+        samples.push(
+            "first_us",
+            timed(|| {
+                tree.layout(root, window, at_100, &mut text).unwrap();
+            }),
+        );
+        samples.push("first_paint_us", timed(|| paint(tree, &mut text)));
+        let typed = format!("{}x{}", &content[..middle], &content[middle..]);
+        samples.push(
+            "type_us",
+            timed(|| {
+                tree.set_run(field, 0, &typed).unwrap();
+                tree.text_edit(field, middle + 1, middle + 1, true).unwrap();
+                tree.layout(root, window, at_100, &mut text).unwrap();
+            }),
+        );
+        samples.push("type_paint_us", timed(|| paint(tree, &mut text)));
+        let mut below = 0;
+        samples.push(
+            "vertical_us",
+            timed(|| {
+                below = tree
+                    .text_vertical(field, middle + 1, 6.0, 1, &mut text)
+                    .unwrap();
+            }),
+        );
+        samples.push(
+            "caret_us",
+            timed(|| {
+                tree.text_edit(field, below, below, true).unwrap();
+                tree.layout(root, window, at_100, &mut text).unwrap();
+            }),
+        );
+        samples.push("caret_paint_us", timed(|| paint(tree, &mut text)));
+        let mut publisher = AccessPublisher::default();
+        samples.push(
+            "access_full_us",
+            timed(|| {
+                publisher.update(tree.access_tree(Some(root), ACCESS_WINDOW), true);
+            }),
+        );
+    }
+    for (key, values) in samples.rows {
+        println!("{name}_{key}={}", median(values));
+    }
+}
+
 fn main() {
+    // `cargo run --release --example ui_measure -- edited` measures the text
+    // area alone.
+    if std::env::args().nth(1).as_deref() == Some("edited") {
+        measure_edited(1_000, 7);
+        measure_edited(10_000, 3);
+        return;
+    }
     measure("screen", screen, 21);
     measure("rows", |builder| rows(builder, 10_000), 7);
     measure_windowed(10_000, 7);
     measure_windowed(100_000, 7);
+    measure_edited(1_000, 7);
+    measure_edited(10_000, 3);
 }
