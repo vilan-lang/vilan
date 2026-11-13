@@ -13,7 +13,7 @@
 //!    primitive: its bounds are the union of its glyphs' quads.
 //! 3. **Batch.** Instances are grouped by what a draw call can share: every
 //!    SDF quad (rectangles, shadows, underlines) shares one pipeline; textured
-//!    quads (glyphs, images) share another and split by texture. Within a
+//!    quads (glyphs, path masks, images) share another and split by texture. Within a
 //!    group they are sorted by order, and groups are drained in order: the
 //!    group with the lowest pending order emits every instance up to the
 //!    lowest order pending in any other group. A frame whose primitives do
@@ -24,6 +24,7 @@ use crate::atlas::{AtlasGlyph, PageKind};
 use crate::color::{Color, Fill};
 use crate::geometry::{Corners, Point, Rect, Transform};
 use crate::order::{DeviceBounds, OrderAssigner, intersection, is_empty};
+use crate::path::{Path, PathMaskKey, PathPaint, PlacedMask};
 use crate::scene::{Command, Image, Rectangle, Scene, Shadow, Underline};
 use crate::text::{GlyphRasterKey, TextLayout, subpixel_split};
 use crate::units::{Units, to_pixel};
@@ -57,15 +58,15 @@ pub(crate) const QUAD_KIND_SHADOW: f32 = 1.0;
 pub(crate) const FILL_SOLID: f32 = 0.0;
 pub(crate) const FILL_LINEAR_GRADIENT: f32 = 1.0;
 
-/// One textured quad: a glyph or an image.
+/// One textured quad: a glyph, a path's mask or an image.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct SpriteInstance {
     pub(crate) bounds: [f32; 4],
     /// Normalised texture coordinates: left, top, right, bottom.
     pub(crate) texture_bounds: [f32; 4],
-    /// A mask glyph's tint; for a colour glyph or an image, white with the
-    /// layer opacity as alpha.
+    /// A mask glyph's (or path's) tint; for a colour glyph or an image, white
+    /// with the layer opacity as alpha.
     pub(crate) color: [f32; 4],
     pub(crate) corner_radii: [f32; 4],
     pub(crate) clip_bounds: [f32; 4],
@@ -84,6 +85,8 @@ pub(crate) enum TextureKey {
     MaskPage(u32),
     ColorPage(u32),
     Image(u64),
+    /// A path's mask too large for the atlas, in a texture of its own (R8).
+    PathMask(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -100,11 +103,20 @@ pub(crate) struct Batch {
     pub(crate) end: u32,
 }
 
-/// Where the encoder finds glyphs: the renderer's atlas (rasterising misses
-/// through the frame's text system), or a stand-in in the unit tests.
+/// Where the encoder finds glyphs and path masks: the renderer's atlas
+/// (rasterising misses through the frame's text system, and paths by
+/// `zeno`), or a stand-in in the unit tests.
 pub(crate) trait GlyphSource {
     fn glyph(&mut self, key: GlyphRasterKey) -> Option<AtlasGlyph>;
     fn page_size(&self) -> u32;
+
+    /// A path's mask. A source with no mask rasteriser (a stand-in that only
+    /// answers glyphs) draws no paths: the renderer's own source overrides
+    /// this.
+    fn path_mask(&mut self, key: PathMaskKey) -> Option<PlacedMask> {
+        let _ = key;
+        None
+    }
 }
 
 /// What one frame draws, ready to upload.
@@ -329,6 +341,13 @@ impl Walk<'_> {
                     bounds,
                     corner_radii,
                 } => self.image(image, *bounds, *corner_radii),
+                Command::Path {
+                    path,
+                    origin,
+                    scale,
+                    paint,
+                    color,
+                } => self.path(path, *origin, *scale, *paint, *color),
                 Command::PushClip {
                     bounds,
                     corner_radii,
@@ -669,6 +688,90 @@ impl Walk<'_> {
         }
     }
 
+    /// A path: its origin snapped to a whole device pixel (R7) the way a
+    /// text baseline is (before the placed scenes' offset, so a path in a
+    /// placed scene draws the pixels it draws in window coordinates), and its
+    /// mask, made at the device scale, drawn as one tinted quad.
+    fn path(&mut self, path: &Path, origin: Point, scale: f32, paint: PathPaint, color: Color) {
+        self.frame.primitives += 1;
+        let tint = premultiplied_opacity(color, self.state.opacity);
+        let device_scale = scale * self.state.transform.scale * self.content_scale();
+        if tint[3] <= 0.0
+            || path.is_empty()
+            || !(device_scale.is_finite() && device_scale > 0.0)
+            || matches!(paint, PathPaint::Stroke(stroke) if stroke.width <= 0.0)
+        {
+            self.cull();
+            return;
+        }
+        let [local_x, local_y] = self.scaled_point(origin);
+        let x = to_pixel(local_x) + self.state.offset[0];
+        let y = to_pixel(local_y) + self.state.offset[1];
+        // A path wholly outside the clip is skipped before its mask is made,
+        // by its points grown by the stroke's reach and a pixel.
+        let bounds = path.bounds();
+        let reach = paint.reach();
+        let extent = [
+            x + (bounds.left() - reach) * device_scale - 1.0,
+            y + (bounds.top() - reach) * device_scale - 1.0,
+            x + (bounds.right() + reach) * device_scale + 1.0,
+            y + (bounds.bottom() + reach) * device_scale + 1.0,
+        ];
+        if self.visible(&extent).is_none() {
+            self.cull();
+            return;
+        }
+        let Some(mask) = self
+            .glyphs
+            .path_mask(PathMaskKey::new(path, paint, device_scale))
+        else {
+            self.cull();
+            return;
+        };
+        let (texture, texture_bounds, left, top, width, height) = match mask {
+            PlacedMask::Atlas(placed) => {
+                let page_size = self.glyphs.page_size() as f32;
+                (
+                    TextureKey::MaskPage(placed.page),
+                    [
+                        placed.x as f32 / page_size,
+                        placed.y as f32 / page_size,
+                        (placed.x + placed.width) as f32 / page_size,
+                        (placed.y + placed.height) as f32 / page_size,
+                    ],
+                    placed.left,
+                    placed.top,
+                    placed.width,
+                    placed.height,
+                )
+            }
+            PlacedMask::Own(own) => (
+                TextureKey::PathMask(own.id),
+                [0.0, 0.0, 1.0, 1.0],
+                own.left,
+                own.top,
+                own.width,
+                own.height,
+            ),
+        };
+        // `top` is above the origin, as a glyph's is above its baseline.
+        let quad_left = x + left as f32;
+        let quad_top = y - top as f32;
+        let quad = [
+            quad_left,
+            quad_top,
+            quad_left + width as f32,
+            quad_top + height as f32,
+        ];
+        let Some(visible) = self.visible(&quad) else {
+            self.cull();
+            return;
+        };
+        let instance = self.sprite(quad, texture_bounds, tint, SPRITE_KIND_MASK);
+        let order = self.encoder.assigner.insert(visible);
+        self.encoder.staged_sprites.push((texture, order, instance));
+    }
+
     fn text(&mut self, layout: &TextLayout, origin: Point, color: Color) {
         self.frame.primitives += 1;
         let tint = premultiplied_opacity(color, self.state.opacity);
@@ -775,6 +878,7 @@ impl Walk<'_> {
 mod tests {
     use super::*;
     use crate::geometry::Edges;
+    use crate::path::Path;
     use crate::scene::{Border, SceneBuilder};
     use crate::text::{LayoutData, ShapedGlyph, ShapedRun};
     use crate::{Color, Size};
@@ -782,9 +886,14 @@ mod tests {
 
     /// A glyph source where every glyph is an 8 x 10 mask on page 0, its
     /// bitmap's top-left 8 pixels above the pen, except glyph 99, a colour
-    /// glyph on colour page 0.
+    /// glyph on colour page 0; and every path mask a 12 x 12 mask on page 0
+    /// at texel (16, 32), one pixel left of and above the path's origin,
+    /// except at a device scale over 10, where it is a 300 x 300 mask of its
+    /// own.
+    #[derive(Default)]
     struct BoxGlyphs {
         requests: Vec<GlyphRasterKey>,
+        path_requests: Vec<f32>,
     }
 
     impl GlyphSource for BoxGlyphs {
@@ -808,6 +917,29 @@ mod tests {
 
         fn page_size(&self) -> u32 {
             256
+        }
+
+        fn path_mask(&mut self, key: PathMaskKey) -> Option<PlacedMask> {
+            self.path_requests.push(key.device_scale());
+            if key.device_scale() > 10.0 {
+                return Some(PlacedMask::Own(crate::path::masks::OwnMask {
+                    id: 7,
+                    width: 300,
+                    height: 300,
+                    left: 0,
+                    top: 0,
+                }));
+            }
+            Some(PlacedMask::Atlas(AtlasGlyph {
+                kind: PageKind::Mask,
+                page: 0,
+                x: 16,
+                y: 32,
+                width: 12,
+                height: 12,
+                left: -1,
+                top: 1,
+            }))
         }
     }
 
@@ -840,9 +972,7 @@ mod tests {
         let mut encoder = Encoder::default();
         let mut frame = EncodedFrame::default();
         let units = Units::new(scale_factor, 1.0).expect("valid units");
-        let mut glyphs = BoxGlyphs {
-            requests: Vec::new(),
-        };
+        let mut glyphs = BoxGlyphs::default();
         encoder.encode(scene, units, (400, 300), &mut glyphs, &mut frame);
         frame
     }
@@ -1021,9 +1151,7 @@ mod tests {
         let scene = builder.finish().expect("balanced");
         let mut encoder = Encoder::default();
         let mut frame = EncodedFrame::default();
-        let mut glyphs = BoxGlyphs {
-            requests: Vec::new(),
-        };
+        let mut glyphs = BoxGlyphs::default();
         encoder.encode(
             &scene,
             Units::new(1.25, 1.0).expect("valid"),
@@ -1080,9 +1208,7 @@ mod tests {
                 builder.scene_at(&inner, offset);
                 let mut encoder = Encoder::default();
                 let mut frame = EncodedFrame::default();
-                let mut glyphs = BoxGlyphs {
-                    requests: Vec::new(),
-                };
+                let mut glyphs = BoxGlyphs::default();
                 let scene = builder.finish().expect("balanced");
                 encoder.encode(&scene, units, (400, HEIGHT), &mut glyphs, &mut frame);
                 (frame, glyphs.requests)
@@ -1160,5 +1286,205 @@ mod tests {
         // bottom-right: the outer clip's; bottom-left: the outer clip's (10)
         // over the inner clip's edge.
         assert_eq!(quad.clip_radii, [4.0, 0.0, 10.0, 10.0]);
+    }
+
+    fn check() -> Path {
+        Path::from_svg("M20 6 9 17l-5-5").expect("valid")
+    }
+
+    fn lucide() -> PathPaint {
+        PathPaint::Stroke(crate::path::Stroke::new(2.0))
+    }
+
+    /// R7: a path's origin snaps to a whole device pixel on both axes, a
+    /// half rounding up, and its mask is asked for at the device scale (the
+    /// path's scale times the transform's times the content scale).
+    #[test]
+    fn a_paths_origin_snaps_to_a_whole_device_pixel() {
+        let mut builder = SceneBuilder::new();
+        builder.push_transform(Transform::scale(2.0));
+        builder.path(&check(), Point::new(5.15, 5.3), 0.5, lucide(), Color::BLACK);
+        builder.pop();
+        let scene = builder.finish().expect("balanced");
+        let mut encoder = Encoder::default();
+        let mut frame = EncodedFrame::default();
+        let mut glyphs = BoxGlyphs::default();
+        encoder.encode(
+            &scene,
+            Units::new(1.25, 1.0).expect("valid"),
+            (400, 300),
+            &mut glyphs,
+            &mut frame,
+        );
+        // x: 5.15 * 2 * 1.25 = 12.875 -> 13; y: 13.25 -> 13. The mask is one
+        // pixel left of and above the origin.
+        assert_eq!(frame.sprites.len(), 1);
+        assert_eq!(frame.sprites[0].bounds, [12.0, 12.0, 12.0, 12.0]);
+        assert_eq!(frame.sprites[0].parameters[0], SPRITE_KIND_MASK);
+        assert_eq!(
+            frame.sprites[0].texture_bounds,
+            [16.0 / 256.0, 32.0 / 256.0, 28.0 / 256.0, 44.0 / 256.0]
+        );
+        assert_eq!(glyphs.path_requests, vec![0.5 * 2.0 * 1.25]);
+        // A half pixel rounds up: 0.4 * 1.25 = 0.5 -> 1.
+        let mut builder = SceneBuilder::new();
+        builder.path(&check(), Point::new(0.4, 0.4), 1.0, lucide(), Color::BLACK);
+        let frame = encode(&builder.finish().expect("balanced"), 1.25);
+        assert_eq!(frame.sprites[0].bounds, [0.0, 0.0, 12.0, 12.0]);
+    }
+
+    /// A path inside a placed scene (`scene_at`, how `std::ui` places each
+    /// element's scene) draws the pixels it draws at offset zero moved by
+    /// whole device pixels, and the pixels the same path draws in window
+    /// coordinates at the placed position; its mask is the same one. A
+    /// million pixels down (a long list), where an `f32` has no room for the
+    /// origin's fraction, it still snaps as it does at zero.
+    #[test]
+    fn a_path_in_a_placed_scene_draws_the_pixels_it_draws_in_window_coordinates() {
+        let origin = Point::new(3.3, 0.47);
+        let mut inner = SceneBuilder::new();
+        inner.path(&check(), origin, 0.75, lucide(), Color::BLACK);
+        let inner = inner.finish().expect("balanced");
+        for scale_factor in [1.0, 1.25, 1.5, 2.0] {
+            let units = Units::new(scale_factor, 1.0).expect("valid units");
+            let encoded = |scene: &Scene| {
+                let mut encoder = Encoder::default();
+                let mut frame = EncodedFrame::default();
+                let mut glyphs = BoxGlyphs::default();
+                encoder.encode(scene, units, (2000, 1_100_000), &mut glyphs, &mut frame);
+                (frame, glyphs.path_requests)
+            };
+            let mut at_zero = SceneBuilder::new();
+            at_zero.scene_at(&inner, Point::ZERO);
+            let (at_zero, zero_requests) = encoded(&at_zero.finish().expect("balanced"));
+            assert_eq!(at_zero.sprites.len(), 1);
+            for (x, y) in [
+                (1.0, 0.0),
+                (7.0, 13.0),
+                (101.0, 57.0),
+                (3.0, 1211.0),
+                (5.0, 1_048_577.0),
+            ] {
+                // A snapped box's corner: whole device pixels as dp, a float
+                // error off.
+                let offset = Point::new(x / scale_factor + 1.0e-3, y / scale_factor + 1.0e-3);
+                let mut placed = SceneBuilder::new();
+                placed.scene_at(&inner, offset);
+                let (placed, placed_requests) = encoded(&placed.finish().expect("balanced"));
+                let zero = at_zero.sprites[0].bounds;
+                let moved = [zero[0] + x, zero[1] + y, zero[2], zero[3]];
+                assert_eq!(placed.sprites[0].bounds, moved, "at {scale_factor}");
+                assert_eq!(placed_requests, zero_requests, "the same mask");
+                // The same path drawn in window coordinates where the placed
+                // one lands (near the top, where an `f32` holds the fraction).
+                if y > 100_000.0 {
+                    continue;
+                }
+                let mut window = SceneBuilder::new();
+                window.path(
+                    &check(),
+                    Point::new(x / scale_factor + origin.x, y / scale_factor + origin.y),
+                    0.75,
+                    lucide(),
+                    Color::BLACK,
+                );
+                let (window, _) = encoded(&window.finish().expect("balanced"));
+                assert_eq!(window.sprites[0].bounds, moved, "at {scale_factor}");
+            }
+        }
+    }
+
+    /// A path wholly outside the clip is culled before its mask is asked
+    /// for; one that reaches into it (by its stroke) is drawn.
+    #[test]
+    fn a_path_outside_the_clip_is_culled_without_making_its_mask() {
+        let mut builder = SceneBuilder::new();
+        builder.push_clip(Rect::new(0.0, 0.0, 50.0, 50.0), Corners::ZERO);
+        builder.path(&check(), Point::new(60.0, 0.0), 1.0, lucide(), Color::BLACK);
+        // The check's points start 4 units right of its origin and its stroke
+        // reaches one unit left of them: its ink starts at 46.5 + 4 - 1, half
+        // a dp inside the clip.
+        builder.path(&check(), Point::new(46.5, 0.0), 1.0, lucide(), Color::BLACK);
+        builder.pop();
+        let scene = builder.finish().expect("balanced");
+        let mut encoder = Encoder::default();
+        let mut frame = EncodedFrame::default();
+        let mut glyphs = BoxGlyphs::default();
+        encoder.encode(
+            &scene,
+            Units::new(1.0, 1.0).expect("valid"),
+            (400, 300),
+            &mut glyphs,
+            &mut frame,
+        );
+        assert_eq!(
+            glyphs.path_requests.len(),
+            1,
+            "only the second is asked for"
+        );
+        assert_eq!((frame.primitives, frame.culled_primitives), (2, 1));
+    }
+
+    /// A path's mask and the text beside it share a mask page and so one draw
+    /// call; a large mask draws from its own texture, texel for texel.
+    #[test]
+    fn a_path_batches_with_text_and_a_large_mask_draws_from_its_own_texture() {
+        let mut builder = SceneBuilder::new();
+        builder.path(&check(), Point::new(0.0, 0.0), 1.0, lucide(), Color::BLACK);
+        builder.text(&layout(&[1, 2]), Point::new(40.0, 0.0), Color::BLACK);
+        builder.path(
+            &check(),
+            Point::new(100.0, 0.0),
+            1.0,
+            lucide(),
+            Color::BLACK,
+        );
+        let frame = encode(&builder.finish().expect("balanced"), 1.0);
+        assert_eq!(
+            frame.batches,
+            vec![Batch {
+                kind: BatchKind::Sprites(TextureKey::MaskPage(0)),
+                start: 0,
+                end: 4,
+            }]
+        );
+        let mut builder = SceneBuilder::new();
+        builder.path(&check(), Point::new(0.0, 0.0), 12.0, lucide(), Color::BLACK);
+        let frame = encode(&builder.finish().expect("balanced"), 1.0);
+        assert_eq!(
+            frame.batches[0].kind,
+            BatchKind::Sprites(TextureKey::PathMask(7))
+        );
+        assert_eq!(frame.sprites[0].texture_bounds, [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(frame.sprites[0].bounds, [0.0, 0.0, 300.0, 300.0]);
+    }
+
+    /// A path's colour is its tint, the layer's opacity multiplied in; a
+    /// transparent one, an empty one and a zero-width stroke draw nothing.
+    #[test]
+    fn a_path_is_tinted_and_an_invisible_one_is_culled() {
+        let mut builder = SceneBuilder::new();
+        builder.push_layer(0.5);
+        builder.path(&check(), Point::ZERO, 1.0, lucide(), Color::rgb(255, 0, 0));
+        builder.pop();
+        builder.path(&check(), Point::ZERO, 1.0, lucide(), Color::TRANSPARENT);
+        builder.path(
+            &Path::from_svg("").expect("empty"),
+            Point::ZERO,
+            1.0,
+            lucide(),
+            Color::BLACK,
+        );
+        builder.path(
+            &check(),
+            Point::ZERO,
+            1.0,
+            PathPaint::Stroke(crate::path::Stroke::new(0.0)),
+            Color::BLACK,
+        );
+        let frame = encode(&builder.finish().expect("balanced"), 1.0);
+        assert_eq!(frame.sprites.len(), 1);
+        assert_eq!(frame.sprites[0].color, [1.0, 0.0, 0.0, 0.5]);
+        assert_eq!((frame.primitives, frame.culled_primitives), (4, 3));
     }
 }

@@ -6,12 +6,15 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use crate::GfxError;
-use crate::atlas::{AtlasGlyph, AtlasLimits, AtlasStats, GlyphAtlas, PageKind, PageStorage};
+use crate::atlas::{
+    AtlasGlyph, AtlasKey, AtlasLimits, AtlasStats, GlyphAtlas, PageKind, PageStorage,
+};
 use crate::color::Color;
 use crate::encode::{
     BatchKind, EncodedFrame, Encoder, GlyphSource, QuadInstance, SpriteInstance, TextureKey,
 };
 use crate::gpu::GpuContext;
+use crate::path::{MaskStorage, PathMaskKey, PathMasks, PlacedMask};
 use crate::scene::{ImageData, Scene};
 use crate::text::{GlyphRasterKey, TextSystem};
 use crate::units::Units;
@@ -28,6 +31,9 @@ pub struct FrameStats {
     /// transparent, or empty).
     pub culled_primitives: u32,
     pub atlas: AtlasStats,
+    /// Path masks too large for the atlas, each in a texture of its own
+    /// (gfx-path.md R8), after the frame.
+    pub path_mask_textures: u32,
     /// CPU time to encode the scene, upload, record and submit. Not the GPU's
     /// time: submission returns before the GPU finishes.
     pub cpu_time: Duration,
@@ -51,7 +57,8 @@ struct BoundTexture {
     texture: wgpu::Texture,
 }
 
-/// The atlas's pages on the GPU.
+/// The atlas's pages on the GPU, and the textures of path masks too large
+/// for it.
 struct GpuPages {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -59,6 +66,7 @@ struct GpuPages {
     sampler: wgpu::Sampler,
     mask: Vec<BoundTexture>,
     color: Vec<BoundTexture>,
+    path_masks: HashMap<u64, BoundTexture>,
 }
 
 fn bind_texture(
@@ -163,22 +171,80 @@ impl PageStorage for GpuPages {
     }
 }
 
+impl MaskStorage for GpuPages {
+    fn create_mask_texture(&mut self, id: u64, width: u32, height: u32, pixels: &[u8]) {
+        let size = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("path mask"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width),
+                rows_per_image: None,
+            },
+            size,
+        );
+        // Sampled texel for texel, as the glyph pages are: the mask is made
+        // at the size it is drawn at, on whole device pixels.
+        let bound = bind_texture(
+            &self.device,
+            &self.layout,
+            &self.sampler,
+            texture,
+            "path mask",
+        );
+        self.path_masks.insert(id, bound);
+    }
+
+    fn free_mask_texture(&mut self, id: u64) {
+        self.path_masks.remove(&id);
+    }
+}
+
 /// The encoder's glyph source for one frame: the atlas, rasterising a miss
-/// through the frame's text system and uploading it to a GPU page.
+/// through the frame's text system and uploading it to a GPU page, and the
+/// path masks, rasterised by `zeno`.
 struct FrameGlyphs<'a> {
     atlas: &'a mut GlyphAtlas,
     text: &'a mut TextSystem,
     pages: &'a mut GpuPages,
+    paths: &'a mut PathMasks,
+    maximum_texture_side: u32,
 }
 
 impl GlyphSource for FrameGlyphs<'_> {
     fn glyph(&mut self, key: GlyphRasterKey) -> Option<AtlasGlyph> {
         let text = &mut *self.text;
-        self.atlas.resolve(key, || text.rasterize(&key), self.pages)
+        self.atlas
+            .resolve(AtlasKey::Glyph(key), || text.rasterize(&key), self.pages)
     }
 
     fn page_size(&self) -> u32 {
         self.atlas.page_size()
+    }
+
+    fn path_mask(&mut self, key: PathMaskKey) -> Option<PlacedMask> {
+        self.paths
+            .resolve(key, self.atlas, self.pages, self.maximum_texture_side)
     }
 }
 
@@ -248,6 +314,7 @@ pub(crate) struct Renderer {
     sprite_capacity: u64,
     atlas: GlyphAtlas,
     pages: GpuPages,
+    path_masks: PathMasks,
     images: HashMap<u64, UploadedImage>,
     encoder: Encoder,
     frame: EncodedFrame,
@@ -437,7 +504,9 @@ impl Renderer {
                 sampler: glyph_sampler,
                 mask: Vec::new(),
                 color: Vec::new(),
+                path_masks: HashMap::new(),
             },
+            path_masks: PathMasks::default(),
             images: HashMap::new(),
             encoder: Encoder::default(),
             frame: EncodedFrame::default(),
@@ -563,13 +632,17 @@ impl Renderer {
         let started = Instant::now();
         let (width, height) = (target.width, target.height);
         self.atlas.begin_frame();
+        self.path_masks.begin_frame();
         let mut glyphs = FrameGlyphs {
             atlas: &mut self.atlas,
             text,
             pages: &mut self.pages,
+            paths: &mut self.path_masks,
+            maximum_texture_side: context.maximum_texture_side(),
         };
         self.encoder
             .encode(scene, units, (width, height), &mut glyphs, &mut self.frame);
+        self.path_masks.end_frame(&mut self.pages);
         self.sync_images(context)?;
         self.upload_instances(context);
         context.queue.write_buffer(
@@ -628,6 +701,7 @@ impl Renderer {
                             TextureKey::MaskPage(page) => &self.pages.mask[page as usize],
                             TextureKey::ColorPage(page) => &self.pages.color[page as usize],
                             TextureKey::Image(id) => &self.images[&id].texture,
+                            TextureKey::PathMask(id) => &self.pages.path_masks[&id],
                         };
                         pass.set_pipeline(&self.sprite_pipeline);
                         pass.set_bind_group(1, &bound.bind_group, &[]);
@@ -645,6 +719,7 @@ impl Renderer {
             primitives: self.frame.primitives,
             culled_primitives: self.frame.culled_primitives,
             atlas: self.atlas.stats(),
+            path_mask_textures: self.path_masks.own_textures() as u32,
             cpu_time: started.elapsed(),
         })
     }

@@ -763,6 +763,19 @@ fn moved_by(command: Command, offset: Point) -> Command {
             bounds: rect(bounds),
             corner_radii,
         },
+        Command::Path {
+            path,
+            origin,
+            scale,
+            paint,
+            color,
+        } => Command::Path {
+            path,
+            origin: point(origin),
+            scale,
+            paint,
+            color,
+        },
         Command::PushClip {
             bounds,
             corner_radii,
@@ -3279,6 +3292,13 @@ fn in_window_coordinates(scene: &Scene) -> Scene {
                 bounds,
                 corner_radii,
             } => builder.image(&image, bounds, corner_radii),
+            Command::Path {
+                path,
+                origin,
+                scale,
+                paint,
+                color,
+            } => builder.path(&path, origin, scale, paint, color),
             Command::PushClip {
                 bounds,
                 corner_radii,

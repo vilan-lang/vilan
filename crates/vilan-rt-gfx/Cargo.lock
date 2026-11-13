@@ -2741,6 +2741,7 @@ dependencies = [
  "wgpu",
  "winit",
  "x11rb",
+ "zeno",
 ]
 
 [[package]]

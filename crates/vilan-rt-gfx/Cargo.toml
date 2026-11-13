@@ -84,6 +84,12 @@ fontique = { version = "=0.12.0", features = ["fontconfig-dlopen"] }
 # Glyph rasterisation: outlines, colour outlines (COLR) and colour bitmaps
 # (emoji). Default features (`scale`, `render`) are the rasteriser.
 swash = { version = "=0.2.10" }
+# Paths (gfx-path.md, R1 and R2): a path is drawn as a coverage mask that
+# `zeno` rasterises on the CPU, the rasteriser `swash` already draws glyphs
+# with. Named directly at the version and with the features `swash` already
+# resolves (`eval` for strokes and bounds, `std`), so it adds no package and
+# no build: the lockfile is unchanged.
+zeno = { version = "=0.3.3", default-features = false, features = ["eval", "std"] }
 # `std::ui`'s layout (native-ui.md P2, R4): flexbox for rows and columns, and
 # a one-cell grid for stacks (every child in the same cell, anchored by its
 # own alignment), under std::ui's vocabulary — the solver is invisible in the

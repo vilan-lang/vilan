@@ -15,6 +15,14 @@
 //!   is rasterised. `thread_cpu_us_per_frame` is this thread's CPU time per
 //!   frame over the same loop (build, render and the wait), as a cross-check.
 //! - the atlas's pages and bytes after the run.
+//! - paths (gfx-path.md S1): `icons_240_cpu_us_median` against
+//!   `rectangles_240_cpu_us_median`, the CPU time (`FrameStats::cpu_time`:
+//!   encode, upload, record, submit) of a frame of 240 icons at 24 dp whose
+//!   masks are cached, and of a frame of 240 rounded rectangles in the same
+//!   grid, medians over 50 frames; their ratio; and per icon its parse time
+//!   and `first_frame_extra_us`, what a frame drawing it for the first time
+//!   costs over the same frame with its mask cached (rasterise and upload),
+//!   a median over 21 new device sizes near 24 dp.
 //!
 //! Thread CPU time is read from `/proc/thread-self/schedstat` (Linux); where
 //! that file does not exist the cross-check is not printed.
@@ -22,9 +30,15 @@
 use std::time::{Duration, Instant};
 
 use vilan_rt_gfx::{
-    AdapterPreference, Border, Color, GpuContext, LinearGradient, OffscreenRenderer, Point, Rect,
-    Rectangle, Scene, SceneBuilder, Shadow, TextLayout, TextStyle, TextSystem, Underline, Units,
+    AdapterPreference, Border, Color, FillRule, GpuContext, LinearGradient, OffscreenRenderer,
+    Path, PathPaint, Point, Rect, Rectangle, Scene, SceneBuilder, Shadow, Stroke, TextLayout,
+    TextStyle, TextSystem, Underline, Units,
 };
+
+#[path = "../tests/support/icons.rs"]
+mod icons;
+
+use icons::{ICON_BOX, ICONS, IconPaint, STROKE_WIDTH};
 
 /// This thread's time on a CPU so far.
 fn thread_cpu_time() -> Option<Duration> {
@@ -93,6 +107,115 @@ fn scene(labels: &[TextLayout]) -> Scene {
         }
     }
     scene.finish().expect("a balanced scene")
+}
+
+fn icon_paint(paint: IconPaint) -> PathPaint {
+    match paint {
+        IconPaint::Stroke => PathPaint::Stroke(Stroke::new(STROKE_WIDTH)),
+        IconPaint::Fill => PathPaint::Fill(FillRule::NonZero),
+        IconPaint::FillEvenOdd => PathPaint::Fill(FillRule::EvenOdd),
+    }
+}
+
+/// 240 cells of 32 dp in a 24 x 10 grid: an icon of 24 dp in each (the
+/// seven in turn), or a rounded rectangle of 24 dp.
+fn grid(paths: &[(Path, PathPaint)], icons: bool) -> Scene {
+    let mut scene = SceneBuilder::new();
+    for index in 0..240 {
+        let (x, y) = ((index % 24) as f32 * 32.0, (index / 24) as f32 * 32.0);
+        if icons {
+            let (path, paint) = &paths[index % paths.len()];
+            scene.path(
+                path,
+                Point::new(x, y),
+                24.0 / ICON_BOX,
+                *paint,
+                Color::BLACK,
+            );
+        } else {
+            scene.rectangle(
+                Rectangle::new(Rect::new(x, y, 24.0, 24.0), Color::BLACK).with_radius(6.0),
+            );
+        }
+    }
+    scene.finish().expect("a balanced scene")
+}
+
+/// The median CPU time of `frames` renders of `scene` (after one warm-up).
+fn render_cpu(
+    target: &mut OffscreenRenderer,
+    scene: &Scene,
+    text: &mut TextSystem,
+    frames: usize,
+) -> Duration {
+    let units = Units::new(1.0, 1.0).expect("valid units");
+    target
+        .render(scene, units, text, Color::WHITE)
+        .expect("warm-up");
+    target.finish().expect("the GPU finishes");
+    let mut times = Vec::new();
+    for _ in 0..frames {
+        let stats = target
+            .render(scene, units, text, Color::WHITE)
+            .expect("a frame");
+        target.finish().expect("the GPU finishes");
+        times.push(stats.cpu_time);
+    }
+    median(times)
+}
+
+fn measure_paths(context: GpuContext, text: &mut TextSystem) {
+    let paths: Vec<(Path, PathPaint)> = ICONS
+        .iter()
+        .map(|icon| {
+            (
+                Path::from_svg(icon.data).expect("the icons parse"),
+                icon_paint(icon.paint),
+            )
+        })
+        .collect();
+    let mut target = OffscreenRenderer::new(context, 768, 320).expect("a target");
+    let icons = render_cpu(&mut target, &grid(&paths, true), text, 50);
+    let rectangles = render_cpu(&mut target, &grid(&paths, false), text, 50);
+    println!("icons_240_cpu_us_median={}", icons.as_micros());
+    println!("rectangles_240_cpu_us_median={}", rectangles.as_micros());
+    println!(
+        "icons_over_rectangles={:.3}",
+        icons.as_secs_f64() / rectangles.as_secs_f64()
+    );
+
+    let units = Units::new(1.0, 1.0).expect("valid units");
+    for (icon, (path, paint)) in ICONS.iter().zip(&paths) {
+        let mut parses = Vec::new();
+        for _ in 0..21 {
+            let started = Instant::now();
+            std::hint::black_box(Path::from_svg(icon.data).expect("parses"));
+            parses.push(started.elapsed());
+        }
+        let mut extra = Vec::new();
+        for step in 0..21 {
+            // A device size no frame drew before: a new mask.
+            let scale = 24.0 / ICON_BOX * (1.0 + (step + 1) as f32 * 1.0e-3);
+            let mut scene = SceneBuilder::new();
+            scene.path(path, Point::new(4.0, 4.0), scale, *paint, Color::BLACK);
+            let scene = scene.finish().expect("balanced");
+            let first = target
+                .render(&scene, units, text, Color::WHITE)
+                .expect("a frame");
+            target.finish().expect("the GPU finishes");
+            let cached = target
+                .render(&scene, units, text, Color::WHITE)
+                .expect("a frame");
+            target.finish().expect("the GPU finishes");
+            extra.push(first.cpu_time.saturating_sub(cached.cpu_time));
+        }
+        println!(
+            "icon={:?} parse_us={:.1} first_frame_extra_us={:.1}",
+            icon.name,
+            median(parses).as_secs_f64() * 1.0e6,
+            median(extra).as_secs_f64() * 1.0e6
+        );
+    }
 }
 
 fn median(mut values: Vec<Duration>) -> Duration {
@@ -175,4 +298,6 @@ fn main() {
         stats.atlas.texture_bytes,
         stats.atlas.resident_glyphs
     );
+    let context = target.context().clone();
+    measure_paths(context, &mut text);
 }
