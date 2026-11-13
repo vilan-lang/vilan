@@ -17,7 +17,10 @@
 //                   soft wrap (the caret's line, by the accessibility listing),
 //                   Shift selection over lines, a drag past the bottom edge, double
 //                   and triple clicks, Page Down, undo and redo, Ctrl+Enter, the
-//                   lock — with the state each step left printed
+//                   lock — with the state each step left printed; then, on a
+//                   stopped clock stepped by hand (`advance_clock`), the caret's
+//                   blink and a drag held below the area (F176), with the live
+//                   timers counted
 
 import std::display::Display;
 import std::fs::read_bytes;
@@ -43,11 +46,13 @@ import std::process::{ args, exit };
 import std::range::Range;
 import std::reactive::{ Signal, SignalCell };
 import std::shared::Shared;
+import std::time::Duration;
 import std::ui::kit::{ TextArea, TextInput, button, text_area, text_input };
 import std::ui::{
 	Align,
 	Element,
 	Style,
+	advance_clock,
 	column,
 	deliver,
 	draw,
@@ -59,6 +64,7 @@ import std::ui::{
 	row,
 	style,
 	text,
+	timer_count,
 };
 
 // --- The app's look: the kit has none -------------------------------------------
@@ -248,6 +254,9 @@ fun check(arguments: List<str>) {
 	let app = notes(font, log);
 	let root = app.root;
 	let area = app.area;
+	// The timers' clock stops here: time passes for them only by `advance_clock`
+	// below, so no step depends on the machine's speed.
+	advance_clock(Duration::millis(0));
 	layout(root, size, 1.0);
 	for entry in root.outline() {
 		if entry.label != "" {
@@ -519,6 +528,75 @@ fun check(arguments: List<str>) {
 	click(find("notes"));
 	report("unlocked, focused");
 	tell("at the end");
+
+	// 13. The caret's blink (F176): with the area focused and enabled, in a
+	// focused window; an edit or a caret move shows it again; the lock stops it.
+	let blink = |what: str| {
+		layout(root, size, 1.0);
+		print(i"{what}: caret_shown={area.caret_shown()} timers={timer_count()}");
+	};
+	let step = |milliseconds: i53| {
+		advance_clock(Duration::millis(milliseconds));
+		layout(root, size, 1.0);
+	};
+	blink("focused, in an unfocused window");
+	deliver(root, Event::FocusChanged(true));
+	blink("the window focused");
+	step(530);
+	blink("530 ms: off");
+	key(KeyName::Enter, no);
+	blink("a line break typed: on");
+	step(530);
+	blink("530 ms: off");
+	key(KeyName::Up, no);
+	blink("up a line: on");
+	click(find("lock"));
+	blink("locked");
+	step(2000);
+	blink("two seconds locked: no timer");
+	click(find("lock"));
+	click(find("notes"));
+	blink("unlocked, focused");
+
+	// 14. A drag held still below the area keeps extending the selection a line a
+	// step (every 100 ms within 25 dp of the edge, every 25 ms from 75 dp out)
+	// until the end of the text, where the timer stops by itself.
+	app.note.set("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16");
+	key(KeyName::Home, control);
+	report("sixteen lines, ctrl home");
+	let held = Point::new(left, bounds.y + bounds.height + dp(10));
+	press(Point::new(left, first_line));
+	deliver(root, Event::PointerMoved(held));
+	report("held 10 dp below");
+	blink("the edge timer beside the blink");
+	step(99);
+	report("99 ms: no step yet");
+	step(1);
+	report("100 ms: a line further");
+	deliver(root, Event::PointerMoved(Point::new(left, bounds.y + bounds.height + dp(90))));
+	report("90 dp below");
+	step(25);
+	report("25 ms: a line further");
+	mut steps = 0;
+	for {
+		if timer_count() <= 1 || steps >= 200 {
+			jump break;
+		}
+		step(25);
+		steps = steps + 1;
+	}
+	report(i"held until the end ({steps} steps)");
+	blink("the edge timer ended at the end");
+	release(Point::new(left, bounds.y + bounds.height + dp(90)));
+	key(KeyName::Home, control);
+	layout(root, size, 1.0);
+	press(Point::new(left, first_line));
+	deliver(root, Event::PointerMoved(held));
+	blink("held below again");
+	release(held);
+	blink("released");
+	deliver(root, Event::FocusChanged(false));
+	blink("the window unfocused");
 }
 
 fun after(arguments: List<str>, flag: str): str {

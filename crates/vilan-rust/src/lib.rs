@@ -19023,6 +19023,12 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_timer", "ui::timer", &[0]),
         ("__ui_cancel_timer", "ui::cancel_timer", &[]),
         ("__ui_window_focused", "ui::window_focused", &[0]),
+        // F176 in the kit: the caret's blink, a drag held past the edge, and
+        // a stopped clock for a program that drives its tree itself.
+        ("__ui_text_caret_shown", "ui::text_caret_shown", &[0]),
+        ("__ui_text_past_edge", "ui::text_past_edge", &[0]),
+        ("__ui_advance_clock", "ui::advance_clock", &[]),
+        ("__ui_timer_count", "ui::timer_count", &[]),
     ];
     FUNCTIONS
         .iter()

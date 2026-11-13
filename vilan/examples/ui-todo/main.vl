@@ -18,7 +18,9 @@
 //                   triple clicks, a drag past the field's edge scrolling it,
 //                   graphemes, Enter, a click on a checkbox, Space on a focused
 //                   one, a click on a remove button — with the state each step
-//                   left printed
+//                   left printed; then, on a stopped clock stepped by hand
+//                   (`advance_clock`), the caret's blink and a drag held past
+//                   the field's edge (F176), with the live timers counted
 
 import std::display::Display;
 import std::fs::read_bytes;
@@ -44,6 +46,7 @@ import std::process::{ args, exit };
 import std::range::Range;
 import std::reactive::{ ListCell, Signal, SignalCell };
 import std::shared::Shared;
+import std::time::Duration;
 import std::ui::kit::{ TextInput, button, checkbox, text_input };
 import std::ui::{
 	Align,
@@ -53,6 +56,7 @@ import std::ui::{
 	Length,
 	OutlineEntry,
 	Style,
+	advance_clock,
 	column,
 	deliver,
 	draw,
@@ -67,6 +71,7 @@ import std::ui::{
 	stack,
 	style,
 	text,
+	timer_count,
 	when,
 };
 
@@ -366,6 +371,9 @@ fun check(arguments: List<str>) {
 	let app = todo(font, log);
 	let root = app.root;
 	let input = app.input;
+	// The timers' clock stops here: time passes for them only by `advance_clock`
+	// below, so no step depends on the machine's speed.
+	advance_clock(Duration::millis(0));
 	layout(root, size, 1.0);
 	for entry in root.outline() {
 		if entry.label != "" {
@@ -617,6 +625,124 @@ fun check(arguments: List<str>) {
 	report("remove milk");
 	click(find("remove bread"), no);
 	report("remove bread");
+
+	// 8. The caret's blink (F176): only with the input focused, enabled, in a
+	// focused window; every edit shows the caret again and starts the period
+	// over; nothing else arms a timer.
+	let blink = |what: str| {
+		layout(root, size, 1.0);
+		print(i"{what}: caret_shown={input.caret_shown()} timers={timer_count()}");
+	};
+	let step = |milliseconds: i53| {
+		advance_clock(Duration::millis(milliseconds));
+		layout(root, size, 1.0);
+	};
+	blink("nothing focused");
+	click(find("new item"), no);
+	blink("focused, in an unfocused window");
+	step(2000);
+	blink("two seconds on: steady");
+	deliver(root, Event::FocusChanged(true));
+	blink("the window focused");
+	step(529);
+	blink("529 ms");
+	step(1);
+	blink("530 ms: off");
+	step(530);
+	blink("1060 ms: on");
+	step(530);
+	blink("1590 ms: off");
+	type_text("x");
+	blink("typed while off: on again");
+	step(529);
+	blink("529 ms after the edit");
+	step(1);
+	blink("530 ms after the edit: off");
+	key(KeyName::Left, no);
+	blink("a caret move: on again");
+	deliver(root, Event::FocusChanged(false));
+	blink("the window unfocused");
+	step(2000);
+	blink("two seconds on: steady");
+	deliver(root, Event::FocusChanged(true));
+	let _off = input.disabled(true);
+	blink("disabled");
+	let _on = input.disabled(false);
+	click(find("new item"), no);
+	blink("enabled, focused again");
+	click(Point::new(dp(400), dp(470)), no);
+	blink("the focus taken away");
+
+	// 9. A drag held still past the field's edge keeps extending the selection,
+	// a grapheme a step: every 100 ms within 25 dp of the edge, faster further
+	// out (every 25 ms from 75 dp), until the pointer comes back, the button
+	// comes up, or the caret reaches the end.
+	let field = input.element().bounds();
+	let level = field.y + field.height / 2.0;
+	click(find("new item"), no);
+	key(KeyName::Char("a"), control);
+	type_text("a line of text long enough to be wider than the field it is typed in");
+	key(KeyName::Home, no);
+	report("a long line again, home");
+	click(elsewhere, no);
+	press(Point::new(inside, level));
+	let edge = field.x + field.width;
+	deliver(root, Event::PointerMoved(Point::new(edge + dp(10), level)));
+	report("held 10 dp past the right edge");
+	blink("the edge timer armed beside the blink");
+	step(99);
+	report("99 ms: no step yet");
+	step(1);
+	report("100 ms: one step");
+	step(100);
+	report("200 ms: another");
+	deliver(root, Event::PointerMoved(Point::new(edge + dp(80), level)));
+	report("80 dp out");
+	step(25);
+	report("25 ms later: a step");
+	step(25);
+	report("50 ms: another");
+	deliver(root, Event::PointerMoved(Point::new(inside + dp(40), level)));
+	report("back inside");
+	blink("the edge timer gone");
+	step(500);
+	report("500 ms inside: nothing moves");
+	deliver(root, Event::PointerMoved(Point::new(edge + dp(80), level)));
+	release(Point::new(edge + dp(80), level));
+	blink("released past the edge");
+	step(500);
+	report("500 ms after the release: nothing moves");
+	// To the end: the timer stops there by itself.
+	click(elsewhere, no);
+	key(KeyName::Home, no);
+	report("home");
+	press(Point::new(inside, level));
+	deliver(root, Event::PointerMoved(Point::new(edge + dp(80), level)));
+	mut steps = 0;
+	for {
+		if timer_count() <= 1 || steps >= 200 {
+			jump break;
+		}
+		step(25);
+		steps = steps + 1;
+	}
+	report(i"held until the end ({steps} steps)");
+	blink("the edge timer ended at the end");
+	release(Point::new(edge + dp(80), level));
+	// Disabled while held: the press is released and the timer goes at once.
+	click(elsewhere, no);
+	key(KeyName::End, no);
+	report("end");
+	press(Point::new(far, level));
+	deliver(root, Event::PointerMoved(Point::new(dp(-40), level)));
+	blink("held past the left edge");
+	let _held_off = input.disabled(true);
+	blink("disabled while held");
+	step(500);
+	report("500 ms disabled: nothing moves");
+	let _held_on = input.disabled(false);
+	click(Point::new(dp(400), dp(470)), no);
+	blink("at the end");
 }
 
 fun after(arguments: List<str>, flag: str): str {

@@ -2726,6 +2726,93 @@ fn a_focused_edited_text_paints_its_selection_under_and_its_caret_over_it() {
     assert_eq!(fixture.tree.last_pass().rebuilt, 2, "the text and the root");
 }
 
+/// F176: the blink's flip. The caret alone goes; the selection stays; nothing
+/// is laid out or measured, and only the text's scene chain is rebuilt. The
+/// same value again is no change at all, so a blink costs one repaint a flip.
+#[test]
+fn a_hidden_caret_repaints_the_text_alone_and_keeps_the_selection() {
+    let mut fixture = Fixture::new();
+    let root = fixture.element(ElementKind::Column);
+    let row = fixture.element(ElementKind::Row);
+    fixture.tree.set_align(root, Align::Start).unwrap();
+    let node = edited(&mut fixture, "abcd", 0, false);
+    let other = fixture.paragraph("other", 10.0);
+    fixture.add(row, &[node]);
+    fixture.add(root, &[row, other]);
+    fixture.tree.text_edit_look(node, None, 2.0, None).unwrap();
+    fixture.tree.text_edit(node, 3, 1, true).unwrap();
+    fixture.layout(root, 300.0, 300.0);
+    let shown = edited_paint(&mut fixture, root);
+    assert_eq!(shown.len(), 4, "selection, text, caret, other: {shown:?}");
+
+    fixture.tree.text_caret_shown(node, false).unwrap();
+    assert!(!fixture.layout(root, 300.0, 300.0), "no solve");
+    assert_eq!(fixture.tree.last_pass().measured, 0);
+    assert_eq!(
+        edited_paint(&mut fixture, root),
+        [
+            "rect 6.0 0.0 12.0 12.0".to_string(),
+            "text".to_string(),
+            "text".to_string(),
+        ],
+        "the selection stays, the caret goes"
+    );
+    assert_eq!(
+        fixture.tree.last_pass().rebuilt,
+        3,
+        "the text, its row and the root"
+    );
+    // The same value again: nothing to repaint.
+    let generations = fixture.tree.generations();
+    fixture.tree.text_caret_shown(node, false).unwrap();
+    assert_eq!(fixture.tree.generations(), generations);
+    fixture.tree.text_caret_shown(node, true).unwrap();
+    assert!(!fixture.layout(root, 300.0, 300.0), "no solve");
+    assert_eq!(edited_paint(&mut fixture, root), shown);
+    // Only an edited text has a caret to hide.
+    assert_eq!(
+        fixture.tree.text_caret_shown(other, false),
+        Err(UiError::NotEdited)
+    );
+}
+
+/// F176: how far a point is past the part of an edited text that shows,
+/// along its lines (a scrolled field's left and right) and down them (a
+/// text area's top and bottom), through the scroll that clips it.
+#[test]
+fn a_point_past_the_edge_of_what_shows_is_measured_along_the_fields_axis() {
+    let mut fixture = Fixture::new();
+    // The root pads by 5: the 30 dp field shows x 5..35.
+    let (_, _, node) = scrolled_field(&mut fixture, "a line wider than the field");
+    let past = |fixture: &Fixture, x: f32, y: f32, lines: bool| {
+        fixture
+            .tree
+            .text_past_edge(node, Point::new(x, y), lines)
+            .unwrap()
+    };
+    assert_eq!(past(&fixture, 20.0, 10.0, false), 0.0, "level with it");
+    assert_eq!(
+        past(&fixture, 75.0, 10.0, false),
+        40.0,
+        "past the right edge"
+    );
+    assert_eq!(past(&fixture, -5.0, 10.0, false), -10.0, "before the left");
+    let (_, _, _, height) = fixture.rect(node);
+    assert_eq!(
+        past(&fixture, 20.0, 5.0 + height + 7.0, true),
+        7.0,
+        "below, down the lines"
+    );
+    assert_eq!(past(&fixture, 20.0, 1.0, true), -4.0, "above");
+    let plain = fixture.paragraph("plain", 10.0);
+    assert_eq!(
+        fixture
+            .tree
+            .text_past_edge(plain, Point::new(0.0, 0.0), false),
+        Err(UiError::NotEdited)
+    );
+}
+
 #[test]
 fn caret_questions_to_a_text_not_edited_or_not_a_text_are_refused() {
     let mut fixture = Fixture::new();

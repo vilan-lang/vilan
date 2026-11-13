@@ -94,7 +94,7 @@ use crate::units::Units;
 
 mod timers;
 
-pub use timers::{cancel_timer, timer};
+pub use timers::{advance_clock, cancel_timer, timer, timer_count};
 
 thread_local! {
     /// The program's elements: one tree per program, on the thread that
@@ -641,6 +641,23 @@ pub fn text_index_at(node: &Node, x: f64, y: f64, rule: i32) -> i32 {
         with_text(|text| or_fail(tree.text_index_at(node.id(), point, rule, text)))
     });
     i32::try_from(index).unwrap_or(i32::MAX)
+}
+
+/// `__ui_text_past_edge(node, x, y, lines)` — how far the point (dp from
+/// the window's top-left) lies past the part of an edited text that shows,
+/// along x (or with `lines`, y): negative before it, positive after it, 0
+/// level with it.
+pub fn text_past_edge(node: &Node, x: f64, y: f64, lines: bool) -> f64 {
+    let point = Point::new(x as f32, y as f32);
+    f64::from(with_tree(|tree| {
+        or_fail(tree.text_past_edge(node.id(), point, lines))
+    }))
+}
+
+/// `__ui_text_caret_shown(node, shown)` — whether an edited text's caret is
+/// drawn (a blink's off half when not); it alone repaints.
+pub fn text_caret_shown(node: &Node, shown: bool) {
+    change(node, |tree, id| or_fail(tree.text_caret_shown(id, shown)));
 }
 
 /// `__ui_text_word(node, index, end)` — the start (or with `end`, the end)

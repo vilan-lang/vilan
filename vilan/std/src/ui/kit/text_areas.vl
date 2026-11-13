@@ -19,17 +19,17 @@
 //
 // THE POINTER: a press places the caret, a drag extends the selection — past the
 // top or bottom of what shows each move extends it one line further and the caret's
-// reveal scrolls by it; a double click selects a word, a triple click the PARAGRAPH
-// (from one line break to the next, the break included), and a drag from either
-// extends by whole words or paragraphs.
+// reveal scrolls by it, and held still there a timer keeps stepping (`editing.vl`);
+// a double click selects a word, a triple click the PARAGRAPH (from one line break
+// to the next, the break included), and a drag from either extends by whole words
+// or paragraphs.
 //
 // A selection is painted a box a visual line, and a selected line break as a small
 // extent at its line's end. For assistive technology it is a multi-line text field
 // (`Role::TextArea`), its text a run per visual line.
 //
-// Not here, as for the input: the clipboard, an input method's composition, a
-// blinking caret, and a drag held still past the edge scrolling on its own (F176).
-// Nor tabs and indentation as an editor feature: Tab moves the focus.
+// Not here, as for the input: the clipboard and an input method's composition. Nor
+// tabs and indentation as an editor feature: Tab moves the focus.
 
 [platform("@process")] mod self;
 
@@ -162,6 +162,13 @@ export impl TextArea {
 	/// Whether it is disabled now.
 	fun is_disabled(self): bool {
 		self.editor.is_disabled()
+	}
+
+	/// Whether its caret is drawn now: it has the focus and is enabled, and the
+	/// caret is in the shown half of its blink. The caret blinks only while its
+	/// window has the focus too, and shows again at every edit and caret move.
+	fun caret_shown(self): bool {
+		self.editor.caret_shown()
 	}
 
 	/// The selection now (both ends at the caret when nothing is selected), kept

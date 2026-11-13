@@ -444,6 +444,9 @@ struct Editing {
     anchor: usize,
     /// The caret and the selection are drawn (the input has the focus).
     active: bool,
+    /// The caret is in the shown half of its blink (F176: the kit's timer
+    /// flips it). Hiding it hides the caret alone, never the selection.
+    caret_shown: bool,
     /// The caret's colour (the text's when `None`) and width in dp.
     caret_color: Option<Color>,
     caret_width: f32,
@@ -461,6 +464,7 @@ impl Default for Editing {
             caret: 0,
             anchor: 0,
             active: false,
+            caret_shown: true,
             caret_color: None,
             caret_width: 1.0,
             selection_color: None,
@@ -1900,6 +1904,19 @@ impl UiTree {
         Ok(())
     }
 
+    /// Whether an edited text's caret is drawn (F176, the blink's off half
+    /// when not): the text alone repaints, nothing is laid out, and its
+    /// selection is drawn either way. The same value again changes nothing.
+    pub fn text_caret_shown(&mut self, node: NodeId, shown: bool) -> Result<(), UiError> {
+        let content = self.text_content(node)?;
+        let editing = content.editing.as_mut().ok_or(UiError::NotEdited)?;
+        if editing.caret_shown != shown {
+            editing.caret_shown = shown;
+            self.invalidate(node);
+        }
+        Ok(())
+    }
+
     /// An edited text's caret colour (its text colour when `None`) and width
     /// in dp, and its selection's colour (its text colour at a quarter of
     /// its alpha when `None`).
@@ -1955,6 +1972,39 @@ impl UiTree {
         }
         let constraint = content.laid_out_at;
         Ok(content.shaped_for(constraint, text))
+    }
+
+    /// How far `point` (dp from its root's top-left corner, as the window
+    /// reports the pointer) lies past the part of an edited text that shows,
+    /// across its lines (x) or, with `lines`, down them (y): negative before
+    /// its left (top) edge, positive past its right (bottom) edge, 0 level
+    /// with it. How fast a drag held still out there scrolls (F176).
+    pub fn text_past_edge(&self, node: NodeId, point: Point, lines: bool) -> Result<f32, UiError> {
+        match &self.data(node).content {
+            Content::Text(TextContent {
+                editing: Some(_), ..
+            }) => {}
+            Content::Text(_) => return Err(UiError::NotEdited),
+            _ => {
+                return Err(UiError::WrongKind {
+                    property: "caret",
+                    kind: self.kind(node),
+                });
+            }
+        }
+        let shown = self.shown_on_screen(node);
+        let (at, before, after) = if lines {
+            (point.y, shown.top(), shown.bottom())
+        } else {
+            (point.x, shown.left(), shown.right())
+        };
+        Ok(if at < before {
+            at - before
+        } else if at > after {
+            at - after
+        } else {
+            0.0
+        })
     }
 
     /// The UTF-16 index in an edited text that `point` (dp from its root's
@@ -2985,6 +3035,9 @@ fn paint_edited(
         });
     }
     builder.text(layout, origin, color);
+    if !editing.caret_shown {
+        return;
+    }
     if let Some(caret) = layout.caret(caret, editing.caret_width) {
         let x = caret
             .left()

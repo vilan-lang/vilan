@@ -216,6 +216,10 @@ Rust workspace, seventeen crates, plus the language's own tree:
   in the tree beside the handlers and end with them (`remove`, `free`); the tree reads no clock,
   and `host/ui/timers.rs` arms ONE executor timer for the earliest, so the shell's `wait_for`
   needs no timer input of its own. The window's focus (winit's `Focused`) is event kind 11.
+  The kit's editor uses them for the caret's BLINK (a host flag on the edited text,
+  `text_caret_shown`: a repaint of its chain, no layout) and a drag held past the edge;
+  a `--check` listing STOPS the timers' clock with `ui::advance_clock` and steps it, so
+  no listing reads the wall clock (`host/ui/timers.rs`, "A stopped clock").
   ACCESSIBILITY (P5): `ui/access.rs` turns the tree into an `accesskit` tree (pure; pinned by
   `ui/access/tests.rs` and by the examples' `--check` listings through
   `Element::accessibility()`) and plans an assistive tool's action as the focus, reveal,
