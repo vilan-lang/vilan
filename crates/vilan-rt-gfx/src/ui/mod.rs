@@ -38,13 +38,20 @@
 //!    text style) or the size changed, the solver runs from the root's
 //!    viewport — re-measuring only what its cache lost, the dirty chain —
 //!    and every element's box is SNAPPED to the device pixel grid by
-//!    [`Units`]' one rule, the renderer's (R16). A box that moved is marked
-//!    for repaint.
+//!    [`Units`]' one rule, the renderer's (R16). A box whose size changed is
+//!    marked for repaint; a box that only moved marks its PARENT (F170).
 //! 2. [`UiTree::paint`]: every element keeps the SCENE of its own subtree
-//!    (`std::gfx`'s nested [`Scene`]). A change marks the one element (and
-//!    the chain of scenes above it, which only recombine their children's
-//!    kept scenes) for rebuilding; everything else is appended as it was
-//!    built. A frame with nothing changed appends the root's kept scene.
+//!    (`std::gfx`'s nested [`Scene`]), in its OWN coordinates (its box's
+//!    top-left corner at the origin), and its parent's scene places it at
+//!    its offset in the parent's box ([`SceneBuilder::scene_at`]). Boxes are
+//!    snapped, so every offset is whole device pixels, and the encoder adds
+//!    it after snapping: a placed scene draws exactly the pixels it drew in
+//!    window coordinates. A change marks the one element (and the chain of
+//!    scenes above it, which only recombine their children's kept scenes)
+//!    for rebuilding; everything else is appended as it was built. A frame
+//!    with nothing changed appends the root's kept scene, and an insert at
+//!    the top of a long list rebuilds the newcomer and the chain above it,
+//!    not every row it pushed down.
 //!
 //! So a property that changes paint only (a colour, a radius, an opacity, a
 //! condition's look) repaints its element without a layout pass, and a
@@ -600,6 +607,11 @@ pub struct NodeData {
     /// The snapped box, in dp from the root's top-left corner (a scrolled
     /// element's box is where it is laid out, before the scroll's offset).
     bounds: Rect,
+    /// Where its box sits in its parent's box (in the window, for a root):
+    /// the offset its parent's scene places its scene at. Kept beside
+    /// `bounds` so the snap can tell a box that moved with its parent (its
+    /// parent's scene still places it right) from one that moved within it.
+    placed: Point,
     /// Where the content box (inside the padding) starts in the box.
     content_offset: Point,
     /// The UNsnapped content size: text is wrapped at the width the solver
@@ -609,6 +621,13 @@ pub struct NodeData {
     /// The scene of its subtree from the last paint, kept until something
     /// in it changes. When it is `None`, so is every ancestor's.
     scene: Option<Scene>,
+    /// Whether that scene draws the box's snapped size (a background, a
+    /// border, a shadow, a clip). Its content (a text, an image) is drawn in
+    /// the content box, which is not snapped; and a box's snapped size
+    /// depends on where it sits (each edge is rounded on its own), so a
+    /// box that only moved may change size by a pixel without its scene
+    /// changing.
+    scene_reads_size: bool,
 }
 
 impl NodeData {
@@ -645,9 +664,11 @@ impl NodeData {
             handle: true,
             root: None,
             bounds: Rect::default(),
+            placed: Point::default(),
             content_offset: Point::default(),
             content_size: Size::default(),
             scene: None,
+            scene_reads_size: false,
         }
     }
 }
@@ -2250,9 +2271,15 @@ impl UiTree {
 
     /// Snaps every box under `root` to the device grid: each edge on its own,
     /// by [`Units`]' rule (the renderer's), so boxes that share an edge in dp
-    /// share it on the device and a hairline stays one pixel (R16). A box
-    /// that moved is marked for repaint; a scroll's range follows its child,
-    /// and its offset is clamped into it.
+    /// share it on the device and a hairline stays one pixel (R16). A scroll's
+    /// range follows its child, and its offset is clamped into it.
+    ///
+    /// What a box that moved repaints (F170): an element's scene is in its
+    /// own coordinates, placed by its parent's scene at its offset in the
+    /// parent's box. A box whose size or content box changed is repainted; a
+    /// box that only moved within its parent repaints nothing of its own, its
+    /// parent's scene places it anew; a box that moved with its parent
+    /// changes no scene at all.
     ///
     /// With `chains` (the elements the solver re-ran, and their ancestors),
     /// only what can have moved is visited: the chains, the children the
@@ -2267,9 +2294,11 @@ impl UiTree {
         chains: Option<&std::collections::HashSet<NodeId>>,
     ) {
         let scale = units.content_scale();
-        let mut pending = vec![(root, Point::new(0.0, 0.0))];
+        // Each with its parent's layout origin and its parent's snapped box's
+        // corner (the window's for the root).
+        let mut pending = vec![(root, Point::ZERO, Point::ZERO)];
         let mut scrolls = Vec::new();
-        while let Some((node, parent_origin)) = pending.pop() {
+        while let Some((node, parent_origin, parent_corner)) = pending.pop() {
             let layout = *self.taffy.layout(node).expect("a laid-out element");
             let origin = Point::new(
                 parent_origin.x + layout.location.x,
@@ -2287,16 +2316,25 @@ impl UiTree {
                 (layout.size.height - inset_top - layout.padding.bottom - layout.border.bottom)
                     .max(0.0),
             );
+            let placed = Point::new(
+                bounds.left() - parent_corner.x,
+                bounds.top() - parent_corner.y,
+            );
             let data = self.data_mut(node);
             let moved = data.bounds != bounds
                 || data.content_offset != content_offset
                 || data.content_size != content_size;
+            let reshaped = (data.bounds.size != bounds.size && data.scene_reads_size)
+                || data.content_offset != content_offset
+                || data.content_size != content_size;
+            let replaced = data.placed != placed;
             let resized = data.bounds.size != bounds.size
                 && data
                     .handlers
                     .iter()
                     .any(|(kind, _)| *kind == EventKind::Resize);
             data.bounds = bounds;
+            data.placed = placed;
             data.content_offset = content_offset;
             data.content_size = content_size;
             if data.scroll.is_some() {
@@ -2305,7 +2343,15 @@ impl UiTree {
             if moved {
                 self.stats.moved += 1;
                 self.hover_stale = true;
+            }
+            if reshaped {
                 self.invalidate(node);
+            }
+            if replaced
+                && let Some(parent) = self.taffy.parent(node)
+                && self.kind(parent) != ElementKind::Viewport
+            {
+                self.invalidate(parent);
             }
             if resized {
                 self.resize_notices.push(node);
@@ -2315,7 +2361,7 @@ impl UiTree {
                 for index in 0..self.taffy.child_count(node) {
                     let child = self.taffy.get_child_id(node, index);
                     if self.kind(child) != ElementKind::Marker {
-                        pending.push((child, origin));
+                        pending.push((child, origin, bounds.origin));
                     }
                 }
             }
@@ -2524,12 +2570,16 @@ impl UiTree {
         self.root_state(root)?;
         self.stats.rebuilt = 0;
         let scene = self.compose(root, text);
-        builder.scene(&scene);
+        builder.scene_at(&scene, self.data(root).placed);
         Ok(())
     }
 
-    /// `node`'s subtree scene: the kept one, or rebuilt from its own look
-    /// and its children's (kept or rebuilt) scenes.
+    /// `node`'s subtree scene, in its own coordinates (its box's top-left
+    /// corner at the origin): the kept one, or rebuilt from its own look and
+    /// its children's (kept or rebuilt) scenes, each placed at its offset in
+    /// this box. Every box is snapped, so every offset is a whole number of
+    /// device pixels and a placed scene draws the pixels it drew in window
+    /// coordinates (see `SceneBuilder::scene_at`).
     fn compose(&mut self, node: NodeId, text: &mut TextSystem) -> Scene {
         if let Some(scene) = &self.data(node).scene {
             return scene.clone();
@@ -2538,20 +2588,30 @@ impl UiTree {
         let mut children = Vec::with_capacity(count);
         for index in 0..count {
             let child = self.taffy.get_child_id(node, index);
-            if self.kind(child) != ElementKind::Marker {
-                children.push(self.compose(child, text));
+            // One look at the child's data for its kind, its place and its
+            // kept scene: a long list's parent reads ten thousand of them.
+            let data = self.data(child);
+            if data.kind == ElementKind::Marker {
+                continue;
             }
+            let placed = data.placed;
+            let scene = match &data.scene {
+                Some(scene) => scene.clone(),
+                None => self.compose(child, text),
+            };
+            children.push((scene, placed));
         }
         let mut builder = SceneBuilder::new();
         let opacity = self.data(node).paint.opacity;
         if opacity < 1.0 {
             builder.push_layer(opacity);
         }
-        self.paint_element(node, &mut builder, text);
+        let mut reads_size = self.paint_element(node, &mut builder, text);
         let data = self.data(node);
         let clipped = data.clip && !children.is_empty();
+        reads_size |= clipped;
         if clipped {
-            let (area, corners) = padding_box(data);
+            let (area, corners) = padding_box_of(own_box(data), &data.paint);
             builder.push_clip(area, corners);
         }
         let shifted = data
@@ -2562,8 +2622,8 @@ impl UiTree {
         if let Some(offset) = shifted {
             builder.push_transform(Transform::translate(-offset.x, -offset.y));
         }
-        for child in &children {
-            builder.scene(child);
+        for (child, placed) in &children {
+            builder.scene_at(child, *placed);
         }
         if shifted.is_some() {
             builder.pop();
@@ -2576,16 +2636,27 @@ impl UiTree {
         }
         let scene = builder.finish().expect("a balanced element scene");
         self.stats.rebuilt += 1;
-        self.data_mut(node).scene = Some(scene.clone());
+        let data = self.data_mut(node);
+        data.scene = Some(scene.clone());
+        data.scene_reads_size = reads_size;
         scene
     }
 
-    /// One element's own primitives: shadow, background and border, then its
-    /// content (an image, a paragraph).
-    fn paint_element(&mut self, node: NodeId, builder: &mut SceneBuilder, text: &mut TextSystem) {
+    /// One element's own primitives, in its own coordinates: shadow,
+    /// background and border, then its content (an image, a paragraph).
+    /// Answers whether they draw the box's snapped size (see
+    /// `NodeData::scene_reads_size`).
+    fn paint_element(
+        &mut self,
+        node: NodeId,
+        builder: &mut SceneBuilder,
+        text: &mut TextSystem,
+    ) -> bool {
         let data = self.data(node);
-        let bounds = data.bounds;
+        let bounds = own_box(data);
         let paint = data.paint.clone();
+        let bordered = paint.border_widths != Edges::default();
+        let reads_size = paint.shadow.is_some() || paint.background.is_some() || bordered;
         if let Some(shadow) = paint.shadow {
             let spread = shadow.spread;
             builder.shadow(Shadow {
@@ -2600,7 +2671,6 @@ impl UiTree {
                 color: shadow.color,
             });
         }
-        let bordered = paint.border_widths != Edges::default();
         if paint.background.is_some() || bordered {
             builder.rectangle(Rectangle {
                 bounds,
@@ -2648,6 +2718,7 @@ impl UiTree {
                 }
             }
         }
+        reads_size
     }
 }
 
@@ -2727,18 +2798,30 @@ fn clamp_offset(offset: Point, range: Size, axis: ScrollAxis) -> Point {
     )
 }
 
+/// An element's box in its own coordinates: where its scene draws it.
+fn own_box(data: &NodeData) -> Rect {
+    Rect {
+        origin: Point::ZERO,
+        size: data.bounds.size,
+    }
+}
+
 /// An element's padding box — inside its border — with its corners reduced by
 /// the border: where a clipping element's children show.
 fn padding_box(data: &NodeData) -> (Rect, Corners) {
-    let bounds = data.bounds;
-    let widths = data.paint.border_widths;
+    padding_box_of(data.bounds, &data.paint)
+}
+
+/// The padding box of a box at `bounds` painted with `paint`.
+fn padding_box_of(bounds: Rect, paint: &Paint) -> (Rect, Corners) {
+    let widths = paint.border_widths;
     let area = Rect::new(
         bounds.left() + widths.left,
         bounds.top() + widths.top,
         (bounds.size.width - widths.left - widths.right).max(0.0),
         (bounds.size.height - widths.top - widths.bottom).max(0.0),
     );
-    let corners = data.paint.corners;
+    let corners = paint.corners;
     let inner = |radius: f32, first: f32, second: f32| (radius - first.max(second)).max(0.0);
     (
         area,

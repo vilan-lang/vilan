@@ -552,7 +552,10 @@ measures only a new row's texts; the rows that stay where they are in the new
 order are not touched at all. Hover, press and focus belong to the element, so a
 moved row keeps them; a removed one takes them with it (a press inside it is
 cancelled, and no click follows its release). Every row below an insert or a
-removal has a new box, and its scene is built again.
+removal has a new box, but its scene is kept: each element's scene is drawn in
+its own coordinates and placed by its parent's, so only the parent's is built
+again (and a row whose background, border or shadow is now a device pixel
+taller or shorter where it sits).
 
 The region — its rows, its place, its subscription — belongs to the ambient owner
 when there is one (`mount_root`, `run_with_owner`) and is taken out of the tree

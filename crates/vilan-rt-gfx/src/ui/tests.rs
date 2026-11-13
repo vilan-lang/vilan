@@ -697,15 +697,88 @@ fn painted_image(fit: Fit) -> (Rect, bool) {
     (bounds, clipped)
 }
 
+/// The commands a scene draws, nested scenes inlined and placed ones moved
+/// into the window's coordinates: what the element scenes, each in its own
+/// coordinates, add up to.
 fn flatten(scene: &Scene) -> Vec<Command> {
     let mut commands = Vec::new();
     for command in scene.commands.iter() {
         match command {
             Command::Scene(nested) => commands.extend(flatten(nested)),
+            Command::PlacedScene { scene, offset } => commands.extend(
+                flatten(scene)
+                    .into_iter()
+                    .map(|command| moved_by(command, *offset)),
+            ),
             other => commands.push(other.clone()),
         }
     }
     commands
+}
+
+/// `command` moved by `offset` dp. (No element scene holds a scaling
+/// transform, under which a move would not commute with the transform.)
+fn moved_by(command: Command, offset: Point) -> Command {
+    let rect = |rect: Rect| {
+        Rect::new(
+            rect.left() + offset.x,
+            rect.top() + offset.y,
+            rect.size.width,
+            rect.size.height,
+        )
+    };
+    let point = |point: Point| Point::new(point.x + offset.x, point.y + offset.y);
+    match command {
+        Command::Rectangle(mut rectangle) => {
+            rectangle.bounds = rect(rectangle.bounds);
+            if let Fill::LinearGradient(gradient) = &mut rectangle.fill {
+                gradient.start = point(gradient.start);
+                gradient.end = point(gradient.end);
+            }
+            Command::Rectangle(rectangle)
+        }
+        Command::Shadow(mut shadow) => {
+            shadow.bounds = rect(shadow.bounds);
+            Command::Shadow(shadow)
+        }
+        Command::Text {
+            layout,
+            origin,
+            color,
+        } => Command::Text {
+            layout,
+            origin: point(origin),
+            color,
+        },
+        Command::Underline(mut underline) => {
+            underline.origin = point(underline.origin);
+            Command::Underline(underline)
+        }
+        Command::Image {
+            image,
+            bounds,
+            corner_radii,
+        } => Command::Image {
+            image,
+            bounds: rect(bounds),
+            corner_radii,
+        },
+        Command::PushClip {
+            bounds,
+            corner_radii,
+        } => Command::PushClip {
+            bounds: rect(bounds),
+            corner_radii,
+        },
+        Command::PushTransform(transform) => {
+            assert_eq!(transform.scale, 1.0, "an element scene only translates");
+            Command::PushTransform(transform)
+        }
+        other @ (Command::PushLayer { .. } | Command::Pop) => other,
+        Command::Scene(_) | Command::PlacedScene { .. } => {
+            unreachable!("flatten inlines nested scenes first")
+        }
+    }
 }
 
 #[test]
@@ -831,8 +904,8 @@ fn an_unchanged_root_paints_the_same_retained_scene() {
             .paint(root, &mut builder, &mut fixture.text)
             .unwrap();
         match &builder.finish().unwrap().commands[..] {
-            [Command::Scene(scene)] => scene.clone(),
-            other => panic!("one nested scene, not {other:?}"),
+            [Command::PlacedScene { scene, .. }] => scene.clone(),
+            other => panic!("one placed scene, not {other:?}"),
         }
     };
     let first = paint(&mut fixture);
@@ -3121,4 +3194,385 @@ fn a_drag_past_the_fields_edge_lands_one_grapheme_beyond_what_shows() {
         (word(&mut fixture, 5, false), word(&mut fixture, 5, true)),
         (3, 5)
     );
+}
+
+// ============================================ F170: scenes in own coordinates ===
+
+/// Glyphs for the encoder without a rasteriser: every glyph an 8 x 10 mask
+/// whose top is 8 above the pen. Records what it is asked for, less the text
+/// system (two fixtures have two).
+struct StandInGlyphs {
+    requests: Vec<(u32, u32, u32, u8)>,
+}
+
+impl crate::encode::GlyphSource for StandInGlyphs {
+    fn glyph(&mut self, key: crate::text::GlyphRasterKey) -> Option<crate::atlas::AtlasGlyph> {
+        self.requests
+            .push((key.font, key.glyph, key.size_bits, key.subpixel_bin));
+        Some(crate::atlas::AtlasGlyph {
+            kind: crate::atlas::PageKind::Mask,
+            page: 0,
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 10,
+            left: 0,
+            top: 8,
+        })
+    }
+
+    fn page_size(&self) -> u32 {
+        256
+    }
+}
+
+/// What the encoder makes of a scene: every instance in device pixels, the
+/// draw calls, and the glyphs (with their subpixel bins) it asked for.
+#[derive(Debug, PartialEq)]
+struct Encoded {
+    quads: Vec<crate::encode::QuadInstance>,
+    sprites: Vec<crate::encode::SpriteInstance>,
+    batches: Vec<crate::encode::Batch>,
+    glyphs: Vec<(u32, u32, u32, u8)>,
+}
+
+fn encoded(scene: &Scene, scale: f32) -> Encoded {
+    let mut encoder = crate::encode::Encoder::default();
+    let mut frame = crate::encode::EncodedFrame::default();
+    let mut glyphs = StandInGlyphs {
+        requests: Vec::new(),
+    };
+    encoder.encode(scene, units(scale), (600, 600), &mut glyphs, &mut frame);
+    Encoded {
+        quads: frame.quads,
+        sprites: frame.sprites,
+        batches: frame.batches,
+        glyphs: glyphs.requests,
+    }
+}
+
+fn root_scene(fixture: &mut Fixture, root: NodeId) -> Scene {
+    let mut builder = SceneBuilder::new();
+    fixture
+        .tree
+        .paint(root, &mut builder, &mut fixture.text)
+        .unwrap();
+    builder.finish().unwrap()
+}
+
+/// The same primitives with every element scene's offset folded into them:
+/// a scene in window coordinates, as the tree painted before F170.
+fn in_window_coordinates(scene: &Scene) -> Scene {
+    let mut builder = SceneBuilder::new();
+    for command in flatten(scene) {
+        match command {
+            Command::Rectangle(rectangle) => builder.rectangle(rectangle),
+            Command::Shadow(shadow) => builder.shadow(shadow),
+            Command::Text {
+                layout,
+                origin,
+                color,
+            } => builder.text(&layout, origin, color),
+            Command::Underline(underline) => builder.underline(underline),
+            Command::Image {
+                image,
+                bounds,
+                corner_radii,
+            } => builder.image(&image, bounds, corner_radii),
+            Command::PushClip {
+                bounds,
+                corner_radii,
+            } => builder.push_clip(bounds, corner_radii),
+            Command::PushTransform(transform) => builder.push_transform(transform),
+            Command::PushLayer { opacity } => builder.push_layer(opacity),
+            Command::Pop => builder.pop(),
+            Command::Scene(_) | Command::PlacedScene { .. } => {
+                unreachable!("flatten inlines nested scenes")
+            }
+        }
+    }
+    builder.finish().unwrap()
+}
+
+/// `fractional_screen` and, below it: a bordered card (a 1 dp hairline,
+/// rounded, a shadow past its box, clipping a paragraph wider than it), a
+/// scroll scrolled by a fractional offset over rows of fractional height,
+/// a focused edited text with a selection, and a picture cropped to cover
+/// its box (its top 25 dp above the box: a half pixel at 150%, in the
+/// element's own coordinates a negative one). Laid out at `scale`.
+fn busy_screen(fixture: &mut Fixture, scale: f32) -> NodeId {
+    let root = fractional_screen(fixture);
+    let card = fixture.block(61.3, 23.7);
+    fixture
+        .tree
+        .set_background(card, Color::new(1.0, 1.0, 1.0, 1.0));
+    fixture
+        .tree
+        .set_border(card, Edges::all(1.0), Color::new(0.0, 0.0, 0.0, 1.0));
+    fixture.tree.set_corners(card, Corners::all(4.0));
+    fixture.tree.set_shadow(
+        card,
+        DropShadow {
+            offset: Point::new(0.5, 1.5),
+            blur: 3.0,
+            spread: 0.7,
+            color: Color::new(0.0, 0.0, 0.0, 0.5),
+        },
+    );
+    fixture.tree.set_clip(card, true);
+    let overflowing = fixture.paragraph("words wider than their card", 9.0);
+    fixture.add(card, &[overflowing]);
+    let scroll = fixture.element(ElementKind::Scroll);
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Width, Length::Dp(80.5))
+        .unwrap();
+    fixture
+        .tree
+        .set_size(scroll, SizeProperty::Height, Length::Dp(40.3))
+        .unwrap();
+    let column = fixture.element(ElementKind::Column);
+    for index in 0..9 {
+        let row = fixture.block(70.0, 9.3);
+        if index % 2 == 0 {
+            fixture.tree.set_background(row, blue());
+        }
+        fixture.add(column, &[row]);
+    }
+    fixture.add(scroll, &[column]);
+    let field = edited(fixture, "select me", 0, false);
+    fixture.tree.text_edit_look(field, None, 1.0, None).unwrap();
+    fixture.tree.text_edit(field, 6, 2, true).unwrap();
+    let picture = fixture.element(ElementKind::Image);
+    fixture.tree.set_texture(picture, texture(20, 20)).unwrap();
+    fixture.tree.set_fit(picture, Fit::Cover).unwrap();
+    for (property, value) in [(SizeProperty::Width, 100.0), (SizeProperty::Height, 50.0)] {
+        fixture
+            .tree
+            .set_size(picture, property, Length::Dp(value))
+            .unwrap();
+    }
+    fixture.add(root, &[card, scroll, field, picture]);
+    fixture.layout_at(root, 200.0, 320.0, scale);
+    fixture
+        .tree
+        .set_scroll_offset(scroll, Point::new(0.0, 13.3))
+        .unwrap();
+    fixture.layout_at(root, 200.0, 320.0, scale);
+    root
+}
+
+/// F170: each element's scene is in its own coordinates and its parent's
+/// places it at a snapped box's corner, so the frame is, instance for
+/// instance, the one the same primitives draw in window coordinates —
+/// boxes, the hairline, the shadow past the box, the rounded clip, the
+/// scroll's offset, glyph bins and baselines, the caret and the selection —
+/// at every scale.
+#[test]
+fn placed_element_scenes_draw_what_window_coordinates_draw() {
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let mut fixture = Fixture::new();
+        let root = busy_screen(&mut fixture, scale);
+        let scene = root_scene(&mut fixture, root);
+        let placed = encoded(&scene, scale);
+        assert!(
+            placed.quads.len() > 5 && placed.glyphs.len() > 20,
+            "too little drawn at {scale} to compare"
+        );
+        // Not `assert_eq!`: a frame's dump is thousands of lines.
+        assert!(
+            placed == encoded(&in_window_coordinates(&scene), scale),
+            "at {scale}, the placed scenes draw other instances than window coordinates"
+        );
+    }
+}
+
+/// One row of `moving_rows`: a label (11 dp text, a fractional line height)
+/// and a 7.3 dp mark; every other row has a background, whose snapped
+/// height changes with where the row sits.
+fn moving_row(fixture: &mut Fixture, id: usize, tall: bool) -> NodeId {
+    let row = fixture.element(ElementKind::Row);
+    fixture.tree.set_gap(row, 2.5).unwrap();
+    if id.is_multiple_of(2) {
+        fixture.tree.set_background(row, blue());
+    }
+    let label = fixture.paragraph(&format!("row {id}"), 11.0);
+    let mark = fixture.block(9.4, if tall { 21.9 } else { 7.3 });
+    fixture.tree.set_background(mark, red());
+    fixture.add(row, &[label, mark]);
+    row
+}
+
+/// A column of `moving_row`s, ids in `order`, `tall` the one with a taller
+/// mark; laid out at 150% and painted.
+fn moving_rows(fixture: &mut Fixture, order: &[usize], tall: Option<usize>) -> NodeId {
+    let column = fixture.element(ElementKind::Column);
+    fixture.tree.set_padding(column, Edges::all(3.3)).unwrap();
+    for id in order {
+        let row = moving_row(fixture, *id, tall == Some(*id));
+        fixture.add(column, &[row]);
+    }
+    fixture.layout_at(column, 200.0, 400.0, 1.5);
+    column
+}
+
+/// F170: rows that moved keep their scenes, and the frame is still the one a
+/// tree built fresh in the new order draws — through an insert at the top, a
+/// move from the bottom to the top, a removal, and a sibling growing — at
+/// 150%, where a moved row's snapped height can change by a pixel (so a row
+/// with a background is repainted, and one without is not).
+#[test]
+fn a_moved_element_draws_what_a_fresh_one_draws() {
+    let mut fixture = Fixture::new();
+    let mut order: Vec<usize> = (0..12).collect();
+    let column = moving_rows(&mut fixture, &order, None);
+    let mut rows: Vec<NodeId> = fixture.tree.children(column);
+    root_scene(&mut fixture, column);
+    let compare = |fixture: &mut Fixture, order: &[usize], tall: Option<usize>, step: &str| {
+        fixture.layout_at(column, 200.0, 400.0, 1.5);
+        let moved = encoded(&root_scene(fixture, column), 1.5);
+        let mut fresh = Fixture::new();
+        let fresh_column = moving_rows(&mut fresh, order, tall);
+        assert!(
+            moved == encoded(&root_scene(&mut fresh, fresh_column), 1.5),
+            "after {step}, the kept scenes draw other instances than fresh ones"
+        );
+    };
+
+    let inserted = moving_row(&mut fixture, 12, false);
+    fixture.tree.insert_before(rows[0], inserted).unwrap();
+    rows.insert(0, inserted);
+    order.insert(0, 12);
+    compare(&mut fixture, &order, None, "an insert at the top");
+
+    let last = rows.pop().unwrap();
+    fixture.tree.insert_before(rows[0], last).unwrap();
+    rows.insert(0, last);
+    let id = order.pop().unwrap();
+    order.insert(0, id);
+    compare(
+        &mut fixture,
+        &order,
+        None,
+        "the bottom row moved to the top",
+    );
+
+    let removed = rows.remove(3);
+    drop(fixture.tree.remove(removed));
+    order.remove(3);
+    compare(&mut fixture, &order, None, "a removal");
+
+    let grown = order[2];
+    let mark = fixture.tree.children(rows[2])[1];
+    fixture
+        .tree
+        .set_size(mark, SizeProperty::Height, Length::Dp(21.9))
+        .unwrap();
+    compare(&mut fixture, &order, Some(grown), "a sibling grew");
+}
+
+/// F170's dirty rule, by counting: a move repaints no element of its own,
+/// only the parent that places it; a newcomer is painted once; every row
+/// that moved keeps its scene, the same one.
+#[test]
+fn a_list_operation_rebuilds_the_newcomer_and_the_parent_only() {
+    let mut fixture = Fixture::new();
+    let (column, _) = list(&mut fixture, 50);
+    fixture.layout(column, 300.0, 2000.0);
+    paint_stats(&mut fixture, column);
+    let kept_scene = |fixture: &Fixture, node: NodeId| {
+        fixture
+            .tree
+            .data(node)
+            .scene
+            .clone()
+            .expect("a painted row keeps its scene")
+    };
+    let rows = fixture.tree.children(column);
+    let watched = rows[30];
+    let before = kept_scene(&fixture, watched);
+
+    // Insert at the top: the new row, its two texts, and the column.
+    let inserted = fixture.element(ElementKind::Row);
+    let label = fixture.paragraph("new", 10.0);
+    let value = fixture.paragraph("000", 10.0);
+    fixture.add(inserted, &[label, value]);
+    fixture.tree.insert_before(rows[0], inserted).unwrap();
+    fixture.layout(column, 300.0, 2000.0);
+    assert!(
+        fixture.tree.last_pass().moved >= 150,
+        "every row moved down"
+    );
+    assert_eq!(paint_stats(&mut fixture, column).rebuilt, 4);
+    assert!(
+        kept_scene(&fixture, watched).same_as(&before),
+        "kept, moved"
+    );
+
+    // The bottom row to the top: the column alone.
+    fixture.tree.insert_before(inserted, rows[49]).unwrap();
+    fixture.layout(column, 300.0, 2000.0);
+    assert_eq!(paint_stats(&mut fixture, column).rebuilt, 1);
+
+    // A removal: the column alone.
+    drop(fixture.tree.remove(inserted));
+    fixture.layout(column, 300.0, 2000.0);
+    assert_eq!(paint_stats(&mut fixture, column).rebuilt, 1);
+
+    // A sibling grows (taller, its texts as wide as before): it (its texts
+    // moved in it) and the column.
+    fixture
+        .tree
+        .set_padding(
+            rows[10],
+            Edges {
+                top: 4.0,
+                right: 0.0,
+                bottom: 4.0,
+                left: 0.0,
+            },
+        )
+        .unwrap();
+    fixture.layout(column, 300.0, 2000.0);
+    assert_eq!(paint_stats(&mut fixture, column).rebuilt, 2);
+    assert!(kept_scene(&fixture, watched).same_as(&before));
+}
+
+/// F170: a box moved inside a parent whose box did not change (a fixed-size
+/// row whose gap grew, with no look of its own) is placed anew by that
+/// parent: the parent's scene is rebuilt, the moved child's is kept.
+#[test]
+fn a_box_moved_inside_an_unchanged_parent_is_placed_anew() {
+    let spaced = |fixture: &mut Fixture, gap: f32| {
+        let row = row(fixture, 200.0, 40.0);
+        fixture.tree.set_gap(row, gap).unwrap();
+        let (first, second) = (fixture.block(30.0, 10.0), fixture.block(30.0, 10.0));
+        fixture.tree.set_background(first, red());
+        fixture.tree.set_background(second, blue());
+        fixture.add(row, &[first, second]);
+        (row, second)
+    };
+    let mut fixture = Fixture::new();
+    let (row, second) = spaced(&mut fixture, 4.0);
+    fixture.layout(row, 300.0, 100.0);
+    root_scene(&mut fixture, row);
+    let before = fixture.tree.data(second).scene.clone().unwrap();
+    fixture.tree.set_gap(row, 25.0).unwrap();
+    fixture.layout(row, 300.0, 100.0);
+    assert_eq!(fixture.rect(second).0, 55.0);
+    let moved = encoded(&root_scene(&mut fixture, row), 1.0);
+    assert_eq!(fixture.tree.last_pass().rebuilt, 1, "the row alone");
+    assert!(
+        fixture
+            .tree
+            .data(second)
+            .scene
+            .as_ref()
+            .unwrap()
+            .same_as(&before)
+    );
+    let mut fresh = Fixture::new();
+    let (fresh_row, _) = spaced(&mut fresh, 25.0);
+    fresh.layout(fresh_row, 300.0, 100.0);
+    assert!(moved == encoded(&root_scene(&mut fresh, fresh_row), 1.0));
 }

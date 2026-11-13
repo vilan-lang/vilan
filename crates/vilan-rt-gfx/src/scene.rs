@@ -183,6 +183,12 @@ pub(crate) enum Command {
     },
     Pop,
     Scene(Scene),
+    /// A nested scene moved by `offset` dp, which the encoder lands on the
+    /// device grid (see [`SceneBuilder::scene_at`]).
+    PlacedScene {
+        scene: Scene,
+        offset: Point,
+    },
 }
 
 /// A built scene. See the module documentation.
@@ -469,6 +475,40 @@ impl SceneBuilder {
         self.commands.push(Command::Scene(scene.clone()));
         if let Some(bounds) = scene.bounds {
             self.include(bounds);
+        }
+    }
+
+    /// Appends a built scene moved by `offset` dp, ROUNDED TO WHOLE DEVICE
+    /// PIXELS when it is drawn: how `std::ui` places each element's scene,
+    /// which is built in the element's own coordinates. Because the move is
+    /// a whole number of pixels, every pixel the scene draws (a snapped edge,
+    /// a glyph's subpixel position, a rounded baseline) is the one it draws
+    /// at offset zero, moved; an offset already on the grid (a snapped box's
+    /// corner) draws exactly where it says. (The bounds count the offset
+    /// unrounded: half a device pixel off at most, inside the encoder's
+    /// one-pixel margin for culling.)
+    pub fn scene_at(&mut self, scene: &Scene, offset: Point) {
+        if scene.commands.is_empty() {
+            return;
+        }
+        if !(offset.x.is_finite() && offset.y.is_finite()) {
+            self.record(SceneError::InvalidTransform(Transform::translate(
+                offset.x, offset.y,
+            )));
+            return;
+        }
+        self.primitive_count += scene.primitive_count;
+        self.commands.push(Command::PlacedScene {
+            scene: scene.clone(),
+            offset,
+        });
+        if let Some(bounds) = scene.bounds {
+            self.include(Rect::new(
+                bounds.left() + offset.x,
+                bounds.top() + offset.y,
+                bounds.size.width,
+                bounds.size.height,
+            ));
         }
     }
 

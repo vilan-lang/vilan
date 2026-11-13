@@ -4,7 +4,10 @@
 //! 1. **Flatten.** The scene's commands are walked with a stack of what is in
 //!    force (transform, clip, opacity); nested scenes are walked in place.
 //!    Every primitive is scaled by [`Units`], snapped (`units.rs`), clipped,
-//!    and dropped when nothing of it is visible.
+//!    and dropped when nothing of it is visible. A PLACED scene
+//!    ([`SceneBuilder::scene_at`](crate::SceneBuilder::scene_at)) moves by a
+//!    whole number of device pixels, added AFTER its primitives are snapped:
+//!    it draws exactly the pixels it draws at offset zero, moved.
 //! 2. **Order** (R14). Each surviving primitive's quad bounds go through the
 //!    overlap test (`order.rs`), which gives its order. A text run is ONE
 //!    primitive: its bounds are the union of its glyphs' quads.
@@ -23,7 +26,7 @@ use crate::geometry::{Corners, Point, Rect, Transform};
 use crate::order::{DeviceBounds, OrderAssigner, intersection, is_empty};
 use crate::scene::{Command, Image, Rectangle, Scene, Shadow, Underline};
 use crate::text::{GlyphRasterKey, TextLayout, subpixel_split};
-use crate::units::Units;
+use crate::units::{Units, to_pixel};
 
 /// One SDF quad: a rounded rectangle with fill and border, or a shadow.
 /// Every length is in device pixels.
@@ -127,6 +130,9 @@ struct Clip {
 #[derive(Clone, Copy)]
 struct State {
     transform: Transform,
+    /// Whole device pixels added after scaling and snapping: the placed
+    /// scenes in force (zero outside any).
+    offset: [f32; 2],
     clip: Clip,
     opacity: f32,
 }
@@ -188,6 +194,7 @@ impl Encoder {
             frame,
             state: State {
                 transform: Transform::IDENTITY,
+                offset: [0.0, 0.0],
                 clip: viewport,
                 opacity: 1.0,
             },
@@ -342,24 +349,37 @@ impl Walk<'_> {
                     // every pop has its push.
                     self.state = self.encoder.stack.pop().expect("a built scene is balanced");
                 }
-                Command::Scene(nested) => {
-                    // A nested scene wholly outside the clip draws nothing:
-                    // skipped without walking it (a row scrolled out of view
-                    // in a long list).
-                    if self.outside_clip(nested) {
-                        self.frame.primitives += nested.primitive_count() as u32;
-                        self.frame.culled_primitives += nested.primitive_count() as u32;
-                        self.frame.culled_scenes += 1;
-                        continue;
-                    }
-                    // A nested scene's own pushes and pops are balanced, so it
-                    // leaves the state as it found it.
-                    let depth = self.encoder.stack.len();
-                    self.scene(nested);
-                    debug_assert_eq!(depth, self.encoder.stack.len());
-                }
+                Command::Scene(nested) => self.nested(nested, None),
+                Command::PlacedScene { scene, offset } => self.nested(scene, Some(*offset)),
             }
         }
+    }
+
+    /// A nested scene, moved by `offset` dp rounded to whole device pixels
+    /// when it is placed.
+    fn nested(&mut self, nested: &Scene, offset: Option<Point>) {
+        let saved = self.state.offset;
+        if let Some(offset) = offset {
+            let scale = self.state.transform.scale * self.content_scale();
+            self.state.offset = [
+                saved[0] + (offset.x * scale).round(),
+                saved[1] + (offset.y * scale).round(),
+            ];
+        }
+        // A nested scene wholly outside the clip draws nothing: skipped
+        // without walking it (a row scrolled out of view in a long list).
+        if self.outside_clip(nested) {
+            self.frame.primitives += nested.primitive_count() as u32;
+            self.frame.culled_primitives += nested.primitive_count() as u32;
+            self.frame.culled_scenes += 1;
+        } else {
+            // A nested scene's own pushes and pops are balanced, so it leaves
+            // the state as it found it.
+            let depth = self.encoder.stack.len();
+            self.scene(nested);
+            debug_assert_eq!(depth, self.encoder.stack.len());
+        }
+        self.state.offset = saved;
     }
 
     fn content_scale(&self) -> f32 {
@@ -372,7 +392,8 @@ impl Walk<'_> {
         (length * self.state.transform.scale * self.content_scale()).max(0.0)
     }
 
-    /// A rectangle under the current transform, snapped (`units.rs`).
+    /// A rectangle under the current transform, snapped (`units.rs`), then
+    /// placed.
     fn device_rect(&self, rect: Rect) -> DeviceBounds {
         let transformed = self.state.transform.apply_rect(rect);
         let (left, width) = self
@@ -381,13 +402,21 @@ impl Walk<'_> {
         let (top, height) = self
             .units
             .snap_span(transformed.top(), transformed.size.height);
-        [left, top, left + width, top + height]
+        let [x, y] = self.state.offset;
+        [left + x, top + y, left + width + x, top + height + y]
     }
 
-    fn device_point(&self, point: Point) -> [f32; 2] {
+    /// A point under the current transform, in device pixels BEFORE the
+    /// placed scenes' whole-pixel offset (which [`Walk::device_point`] adds).
+    fn scaled_point(&self, point: Point) -> [f32; 2] {
         let transformed = self.state.transform.apply(point);
         let scale = self.content_scale();
         [transformed.x * scale, transformed.y * scale]
+    }
+
+    fn device_point(&self, point: Point) -> [f32; 2] {
+        let [x, y] = self.scaled_point(point);
+        [x + self.state.offset[0], y + self.state.offset[1]]
     }
 
     /// A border or hairline width under the current transform (R16: the
@@ -399,11 +428,12 @@ impl Walk<'_> {
     fn clip_within(&self, bounds: Rect, corner_radii: Corners) -> Clip {
         let transformed = self.state.transform.apply_rect(bounds);
         let scale = self.content_scale();
+        let [x, y] = self.state.offset;
         let new_bounds = [
-            (transformed.left() * scale).round(),
-            (transformed.top() * scale).round(),
-            (transformed.right() * scale).round(),
-            (transformed.bottom() * scale).round(),
+            to_pixel(transformed.left() * scale) + x,
+            to_pixel(transformed.top() * scale) + y,
+            to_pixel(transformed.right() * scale) + x,
+            to_pixel(transformed.bottom() * scale) + y,
         ];
         let new_radii = corner_radii
             .to_array()
@@ -449,11 +479,12 @@ impl Walk<'_> {
         };
         let transformed = self.state.transform.apply_rect(bounds);
         let scale = self.content_scale();
+        let [x, y] = self.state.offset;
         let device = [
-            transformed.left() * scale - 1.0,
-            transformed.top() * scale - 1.0,
-            transformed.right() * scale + 1.0,
-            transformed.bottom() * scale + 1.0,
+            transformed.left() * scale - 1.0 + x,
+            transformed.top() * scale - 1.0 + y,
+            transformed.right() * scale + 1.0 + x,
+            transformed.bottom() * scale + 1.0 + y,
         ];
         is_empty(&intersection(&device, &self.state.clip.bounds))
     }
@@ -565,7 +596,9 @@ impl Walk<'_> {
         let transformed = self.state.transform.apply(underline.origin);
         let width = underline.width * self.state.transform.scale;
         let (left, device_width) = self.units.snap_span(transformed.x, width);
-        let top = (transformed.y * self.content_scale()).round();
+        let top = to_pixel(transformed.y * self.content_scale());
+        let [x, y] = self.state.offset;
+        let (left, top) = (left + x, top + y);
         let thickness = self.line_width(underline.thickness);
         let shape = [left, top, left + device_width, top + thickness];
         let color = premultiplied_opacity(underline.color, self.state.opacity);
@@ -655,8 +688,14 @@ impl Walk<'_> {
                 continue;
             }
             for glyph in &run.glyphs {
-                let [pen_x, pen_y] =
-                    self.device_point(Point::new(origin.x + glyph.x, origin.y + glyph.y));
+                // The pen before the placed offset: its subpixel bin and its
+                // rounded baseline are the same wherever the scene is placed.
+                let [local_x, local_y] =
+                    self.scaled_point(Point::new(origin.x + glyph.x, origin.y + glyph.y));
+                let [pen_x, pen_y] = [
+                    local_x + self.state.offset[0],
+                    local_y + self.state.offset[1],
+                ];
                 // Glyphs far outside the clip are skipped before the atlas is
                 // asked for them. The margins are generous (a glyph's ink
                 // rarely reaches an em from its pen), so this never drops a
@@ -669,8 +708,9 @@ impl Walk<'_> {
                 {
                     continue;
                 }
-                let (whole_x, subpixel_bin) = subpixel_split(pen_x);
-                let baseline = pen_y.round();
+                let (whole_x, subpixel_bin) = subpixel_split(local_x);
+                let whole_x = whole_x + self.state.offset[0];
+                let baseline = to_pixel(local_y) + self.state.offset[1];
                 let key = GlyphRasterKey {
                     system: data.system,
                     font: run.font,
@@ -1006,6 +1046,103 @@ mod tests {
         );
         // The baseline (9 * 1.25 = 11.25) snaps to 11; the bitmap's top is 8 above.
         assert_eq!(frame.sprites[1].bounds, [13.0, 3.0, 8.0, 10.0]);
+    }
+
+    /// F170: a placed scene moves by whole device pixels, added after its
+    /// primitives are snapped, so it draws exactly the pixels it draws at
+    /// offset zero, moved — fractional edges, a hairline, a shadow, a clip,
+    /// a glyph's subpixel bin and its rounded baseline included — at every
+    /// scale, wherever on the grid it lands: an offset a float error off the
+    /// grid (as the difference of two snapped corners can be) lands on it,
+    /// and a million pixels down (a long list), where an `f32` has no room
+    /// for the baseline's fraction, it still rounds as it does at zero.
+    #[test]
+    fn a_placed_scene_draws_its_pixels_moved_by_whole_device_pixels() {
+        let mut inner = SceneBuilder::new();
+        inner.shadow(Shadow {
+            bounds: Rect::new(0.4, 1.3, 20.2, 9.9),
+            corner_radius: 2.0,
+            blur: 3.0,
+            color: Color::BLACK,
+        });
+        inner.rectangle(solid(0.3, 0.7, 30.2, 1.0).with_border(Border::all(1.0, Color::BLACK)));
+        inner.push_clip(Rect::new(0.5, 0.5, 40.0, 30.0), Corners::all(3.0));
+        // At 100% the baseline is at 9.47: a fraction that a pen a million
+        // pixels down cannot hold.
+        inner.text(&layout(&[1, 2, 3]), Point::new(0.3, 0.47), Color::BLACK);
+        inner.pop();
+        let inner = inner.finish().expect("balanced");
+        const HEIGHT: u32 = 1_100_000;
+        for scale_factor in [1.0, 1.25, 1.5, 2.0] {
+            let units = Units::new(scale_factor, 1.0).expect("valid units");
+            let encoded = |offset: Point| {
+                let mut builder = SceneBuilder::new();
+                builder.scene_at(&inner, offset);
+                let mut encoder = Encoder::default();
+                let mut frame = EncodedFrame::default();
+                let mut glyphs = BoxGlyphs {
+                    requests: Vec::new(),
+                };
+                let scene = builder.finish().expect("balanced");
+                encoder.encode(&scene, units, (400, HEIGHT), &mut glyphs, &mut frame);
+                (frame, glyphs.requests)
+            };
+            let (at_zero, zero_glyphs) = encoded(Point::ZERO);
+            assert!(!at_zero.sprites.is_empty() && at_zero.quads.len() == 2);
+            for (x, y) in [
+                (1.0, 0.0),
+                (7.0, 13.0),
+                (101.0, 57.0),
+                (3.0, 211.0),
+                (5.0, 1_048_577.0),
+            ] {
+                // A snapped box's corner: whole device pixels, as dp, and a
+                // float error off.
+                let offset = Point::new(x / scale_factor + 1.0e-3, y / scale_factor + 1.0e-3);
+                let (placed, placed_glyphs) = encoded(offset);
+                let moved = |bounds: [f32; 4], corners: bool| {
+                    if corners {
+                        [bounds[0] + x, bounds[1] + y, bounds[2] + x, bounds[3] + y]
+                    } else {
+                        [bounds[0] + x, bounds[1] + y, bounds[2], bounds[3]]
+                    }
+                };
+                // The window is the clip outside the scene's own: it stays.
+                let viewport = [0.0, 0.0, 400.0, HEIGHT as f32];
+                let clip = |bounds: [f32; 4]| {
+                    if bounds == viewport {
+                        bounds
+                    } else {
+                        moved(bounds, true)
+                    }
+                };
+                for (zero, placed) in at_zero.quads.iter().zip(&placed.quads) {
+                    assert_eq!(
+                        placed.bounds,
+                        moved(zero.bounds, false),
+                        "at {scale_factor}"
+                    );
+                    assert_eq!(placed.clip_bounds, clip(zero.clip_bounds));
+                    assert_eq!(placed.border_widths, zero.border_widths);
+                }
+                for (zero, placed) in at_zero.sprites.iter().zip(&placed.sprites) {
+                    assert_eq!(
+                        placed.bounds,
+                        moved(zero.bounds, false),
+                        "at {scale_factor}"
+                    );
+                    assert_ne!(
+                        zero.clip_bounds, viewport,
+                        "the text is in the scene's clip"
+                    );
+                    assert_eq!(placed.clip_bounds, clip(zero.clip_bounds));
+                }
+                assert_eq!(placed.quads.len(), at_zero.quads.len());
+                assert_eq!(placed.sprites.len(), at_zero.sprites.len());
+                assert_eq!(placed.batches, at_zero.batches);
+                assert_eq!(placed_glyphs, zero_glyphs, "the same subpixel bins");
+            }
+        }
     }
 
     #[test]

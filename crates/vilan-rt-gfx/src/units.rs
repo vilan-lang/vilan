@@ -44,6 +44,24 @@ impl Default for Units {
     }
 }
 
+/// A device coordinate on the pixel grid: the nearest whole pixel, a half
+/// rounding UP (towards positive), where `f32::round` rounds a half away from
+/// zero. The two agree on every coordinate at or right of the window's
+/// origin; they differ on a negative half, which is where the one this crate
+/// uses matters: a scene placed by whole pixels (`SceneBuilder::scene_at`) is
+/// snapped in its own coordinates and then moved, and only a rounding that
+/// treats -22.5 as it treats 344.5 snaps an edge at its own -22.5 to the
+/// pixel the same edge at the window's 344.5 lands on (F170: a picture
+/// cropped to cover its box starts above it).
+pub(crate) fn to_pixel(device: f32) -> f32 {
+    let floor = device.floor();
+    if device - floor >= 0.5 {
+        floor + 1.0
+    } else {
+        floor
+    }
+}
+
 /// Spans and widths below this many dp follow the hairline rule (R16).
 pub(crate) const HAIRLINE_LIMIT_DP: f32 = 2.0;
 
@@ -81,14 +99,14 @@ impl Units {
     /// snapped start and the snapped length. See the module documentation.
     pub(crate) fn snap_span(&self, start: f32, length: f32) -> (f32, f32) {
         let scale = self.content_scale();
-        let device_start = (start * scale).round();
+        let device_start = to_pixel(start * scale);
         if length.is_nan() || length <= 0.0 {
             return (device_start, 0.0);
         }
         if length < HAIRLINE_LIMIT_DP {
             return (device_start, (length * scale).floor().max(1.0));
         }
-        let device_end = ((start + length) * scale).round();
+        let device_end = to_pixel((start + length) * scale);
         (device_start, (device_end - device_start).max(1.0))
     }
 
@@ -172,6 +190,20 @@ mod tests {
                 position += width;
             }
         }
+    }
+
+    /// A half rounds up on both sides of zero, so a coordinate moved by
+    /// whole pixels lands where the moved rounding does (F170).
+    #[test]
+    fn a_half_pixel_rounds_up_wherever_it_is() {
+        assert_eq!(to_pixel(344.5), 345.0);
+        assert_eq!(to_pixel(-22.5), -22.0);
+        assert_eq!(to_pixel(-22.5) + 367.0, to_pixel(-22.5 + 367.0));
+        assert_eq!(to_pixel(-22.6), -23.0);
+        assert_eq!(to_pixel(2.49), 2.0);
+        assert_eq!(to_pixel(0.0), 0.0);
+        let scale = units(1.5);
+        assert_eq!(scale.snap_span(-15.0, 100.0), (-22.0, 150.0));
     }
 
     #[test]
