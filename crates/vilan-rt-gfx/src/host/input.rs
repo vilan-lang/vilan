@@ -23,6 +23,7 @@
 //! | 8 | resized | width, height | |
 //! | 9 | scale changed | scale factor | |
 //! | 10 | close requested | | |
+//! | 11 | focus changed | focused (0 or 1) | |
 //!
 //! Positions and sizes are dp (device pixels divided by the window's content
 //! scale, the same scale its frames are drawn at). A button is 0 left, 1
@@ -57,6 +58,7 @@ pub(crate) const TEXT_INPUT: i32 = 7;
 pub(crate) const RESIZED: i32 = 8;
 pub(crate) const SCALE_CHANGED: i32 = 9;
 pub(crate) const CLOSE_REQUESTED: i32 = 10;
+pub(crate) const FOCUS_CHANGED: i32 = 11;
 
 /// One event, ready to cross.
 #[derive(Clone, Debug, PartialEq)]
@@ -178,16 +180,24 @@ impl RawEvent {
     pub(crate) fn close_requested() -> RawEvent {
         RawEvent::new(CLOSE_REQUESTED, &[])
     }
+
+    /// The window gained (`true`) or lost the system's keyboard focus.
+    pub(crate) fn focus_changed(focused: bool) -> RawEvent {
+        RawEvent::new(FOCUS_CHANGED, &[f64::from(u8::from(focused))])
+    }
 }
 
 /// Milliseconds since the host first asked: a press's time.
 pub(crate) fn since_start() -> f64 {
+    host_clock().as_secs_f64() * 1000.0
+}
+
+/// The host's ONE clock: the time since it was first read. A press's time
+/// ([`since_start`]) and an element timer's due time (`ui/timers.rs`) are
+/// both read from it, and the tree is handed its readings, never the clock.
+pub(crate) fn host_clock() -> std::time::Duration {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_secs_f64()
-        * 1000.0
+    START.get_or_init(std::time::Instant::now).elapsed()
 }
 
 fn button_code(button: MouseButton) -> f64 {

@@ -26,6 +26,7 @@ fn insert_window(id: u32) {
                 scale_factor: 1.0,
                 pointer: (0.0, 0.0),
                 modifiers: ModifiersState::empty(),
+                focused: false,
                 on_frame: None,
                 on_event: None,
                 ui_root: None,

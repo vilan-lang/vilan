@@ -395,6 +395,7 @@ trait Attributes {
 	fun on_focus(self, handler: || void): Self                // does not bubble
 	fun on_blur(self, handler: || void): Self                 // does not bubble
 	fun on_resize(self, handler: |Size| void): Self           // laid out at a new size
+	fun on_window_focus(self, handler: |bool| void): Self     // its window gained or lost the focus
 }
 fun stop_event()                                              // inside a handler
 fun click_count(): usize                                      // presses in a row: 2 a double click
@@ -460,6 +461,85 @@ into view: every `scroll` around it moves as little as it takes to show it —
 not at all when it shows already — and `scroll_into_view()` does the same for any
 element. Key and text events go to the focused
 element first. The `focused()` condition, `on_focus` and `on_blur` follow it.
+
+That is the focus INSIDE a window. The window itself has the system's keyboard
+focus or not — another window may have it — and an element can ask:
+`window_focused()` answers whether the window its tree is in has it, and
+`on_window_focus(|focused| ..)` is told whenever that changes, on every element
+that listens, in tree order, whatever holds the focus inside. Neither bubbles
+nor can be stopped. A tree in no window is in no focused window, until a
+`std::gfx` `Event::FocusChanged(true)` is `deliver`ed to it. A blinking caret
+stops in an unfocused window this way, so an idle window in the background
+wakes for nothing.
+
+## Timers
+
+```vilan,fragment
+impl Element {
+	fun after(self, delay: Duration, handler: || void): ElementTimer    // once, `delay` from now
+	fun every(self, period: Duration, handler: || void): ElementTimer   // every `period`, from `period` on
+	fun window_focused(self): bool
+}
+struct ElementTimer;
+impl ElementTimer {
+	fun cancel(self)                                                     // never fires again
+}
+```
+
+A timer belongs to an element, as its handlers do. Its handler runs as one turn,
+the way an event handler does, and it is gone for good when it is cancelled or
+when its element is removed for good (a keyed list's row going, a conditional
+turning off); after either it never fires. Times are `std::time`'s `Duration`.
+A timer fires at its time or later, never before: timers due together fire in
+the order of their times, and two due at the same time in the order they were
+set. A timer set by a timer's handler waits for the next round, even with no
+delay. `every` keeps its phase — each call is due a whole number of periods
+after the first, however late the one before ran — and a program that falls
+more than a period behind skips the calls it missed rather than catching up in a
+burst. The period is at least a millisecond.
+
+However many timers are set, the program waits for the earliest alone, in the
+same event loop as everything else; with no timer set, an idle window wakes for
+nothing. A pending timer keeps the program running, as a `std::time::Timer` does,
+until it fires its last time, is cancelled, or ends with its element. A caret
+that blinks while its window has the focus:
+
+```vilan,native
+import std::gfx::{ Window, dp };
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::shared::Shared;
+import std::time::Duration;
+import std::ui::{ ElementTimer, mount_root, row, text };
+
+fun main() {
+	match Window::builder().title("Blink").size(dp(240), dp(120)).open() {
+		Ok(let window) => {
+			let shown: SignalCell<bool> = Signal::new(true);
+			let blink: Shared<Option<ElementTimer>> = Shared::new(None);
+			let _owner = mount_root(window, || {
+				let caret = <row padding(dp(24))>
+					<text>{shown.derive(|on: bool| if on { "|" } else { " " })}</text>
+				</row>;
+				let element = caret.element();
+				caret.on_window_focus(|focused: bool| {
+					if blink.read() is Some(let timer) {
+						timer.cancel();
+					}
+					shown.set(true);
+					blink.write() = if focused {
+						Some(element.every(Duration::millis(530), || shown.set(!shown.get())))
+					} else {
+						None
+					};
+				})
+			});
+		},
+		Err(let reason) => print(i"no window: {reason}"),
+	}
+}
+main();
+```
 
 ## Scrolling
 
@@ -755,7 +835,7 @@ fun mount<C: Child>(window: Window, root: C)                     // the window s
 fun mount_root<C: Child>(window: Window, body: || C): Owner      // built under an owner, then mounted
 fun draw<C: Child>(frame: Frame, root: C)                        // in a frame of your own
 fun layout<C: Child>(root: C, size: Size, scale_factor: f64)     // boxes only
-fun deliver<C: Child>(root: C, event: Event)                     // an event, with no window
+fun deliver<C: Child>(root: C, event: Event)                     // an event, with no window (a focus change too)
 fun last_frame(window: Window): FrameTimes
 struct FrameTimes { layout: f64, paint: f64, draw: f64, solved: bool, measured: i32, moved: i32, rebuilt: i32, passes: i32 }
 ```

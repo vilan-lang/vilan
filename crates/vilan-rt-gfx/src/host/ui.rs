@@ -62,7 +62,15 @@
 //! Event kinds for `__ui_on`: 0 pointer enter, 1 pointer leave, 2 pointer
 //! move, 3 press, 4 release, 5 click, 6 scroll, 7 key, 8 key release, 9 text,
 //! 10 focus, 11 blur, 12 resize (never routed: told after a layout, see
-//! [`layout`]; `__ui_resized` reads the size while the handler runs).
+//! [`layout`]; `__ui_resized` reads the size while the handler runs), 13 the
+//! window's focus (never routed: told to every element listening when the
+//! window gains or loses the system's focus, see [`window_focused`]).
+//!
+//! # Timers
+//!
+//! An element's timers (`__ui_timer`, `__ui_cancel_timer`; F176) are kept in
+//! the tree with its handlers and waited for by one executor timer:
+//! `timers.rs`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -84,6 +92,10 @@ use crate::ui::{
 };
 use crate::units::Units;
 
+mod timers;
+
+pub use timers::{cancel_timer, timer};
+
 thread_local! {
     /// The program's elements: one tree per program, on the thread that
     /// draws.
@@ -100,6 +112,10 @@ thread_local! {
     static LAST_FRAME: Cell<FrameRecord> = const { Cell::new(FrameRecord::NONE) };
     /// The size a resize handler is being told, while it runs.
     static RESIZED: Cell<Size> = const { Cell::new(Size::new(0.0, 0.0)) };
+    /// The window focus last told to each root's tree (a focus-changed event
+    /// routed into it, by its window or by `__ui_deliver`): what
+    /// [`window_focused`] answers before it asks the window.
+    static ROOT_FOCUS: RefCell<HashMap<NodeId, bool>> = RefCell::new(HashMap::new());
 }
 
 /// How many times one [`layout`] lays its tree out: the pass, and once more
@@ -791,6 +807,7 @@ pub fn on(node: &Node, kind: i32, handler: Rc<dyn Fn()>) {
             EventKind::Focus,
             EventKind::Blur,
             EventKind::Resize,
+            EventKind::WindowFocus,
         ],
         f64::from(kind),
         "event kind",
@@ -1007,6 +1024,9 @@ pub fn frame_number(window: u32, which: i32) -> f64 {
 /// Routes one window event into `root`'s tree and calls the handlers it
 /// names; asks the root's window for a frame when the tree changed.
 pub(crate) fn dispatch(root: &Node, raw: &RawEvent) {
+    if raw.kind == raw_input::FOCUS_CHANGED {
+        return tell_window_focus(root, raw);
+    }
     let input = match raw.kind {
         raw_input::POINTER_MOVED => Input::PointerMoved(position(raw)),
         raw_input::POINTER_PRESSED if raw.numbers[2] == 0.0 => Input::Pressed {
@@ -1040,6 +1060,42 @@ pub(crate) fn dispatch(root: &Node, raw: &RawEvent) {
     if with_tree(|tree| tree.generations()) != before {
         request_frame(id);
     }
+}
+
+/// The window `root` is mounted in (or, for `__ui_deliver`, the window it
+/// stands for) gained or lost the focus: recorded for [`window_focused`],
+/// and told to every element of the tree listening, in tree order, with the
+/// event as `std::gfx`'s current event (F176).
+fn tell_window_focus(root: &Node, raw: &RawEvent) {
+    let id = root.id();
+    ROOT_FOCUS.with(|focus| focus.borrow_mut().insert(id, raw.numbers[0] != 0.0));
+    let (handlers, before) = with_tree(|tree| (tree.window_focus_handlers(id), tree.generations()));
+    let outer = STATE.with(|state| state.borrow_mut().current_event.replace(raw.clone()));
+    for handler in &handlers {
+        handler.call();
+    }
+    STATE.with(|state| state.borrow_mut().current_event = outer);
+    drop(handlers);
+    if with_tree(|tree| tree.generations()) != before {
+        request_frame(id);
+    }
+}
+
+/// `__ui_window_focused(node)` — 1 when the window the element's tree is
+/// mounted in has the system's keyboard focus, else 0: the focus last told
+/// to the tree (by its window, or delivered), else its window's, else none
+/// (a tree in no window, as a `--check` run's, is in no focused window).
+pub fn window_focused(node: &Node) -> i32 {
+    let root = with_tree(|tree| tree.root_of(node.id()));
+    let focused = ROOT_FOCUS
+        .with(|focus| focus.borrow().get(&root).copied())
+        .or_else(|| {
+            MOUNTS
+                .with(|mounts| mounts.borrow().get(&root).copied())
+                .and_then(|window| with_window(window, |slot| slot.focused))
+        })
+        .unwrap_or(false);
+    i32::from(focused)
 }
 
 fn position(raw: &RawEvent) -> Point {

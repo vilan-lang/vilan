@@ -149,6 +149,9 @@ pub(crate) struct WindowSlot {
     /// position of its own.
     pub(crate) pointer: (f64, f64),
     pub(crate) modifiers: winit::keyboard::ModifiersState,
+    /// Whether the window has the system's keyboard focus (winit's
+    /// `Focused`; F176): `false` until the system says it has.
+    pub(crate) focused: bool,
     pub(crate) on_frame: Option<Rc<dyn Fn()>>,
     pub(crate) on_event: Option<Rc<dyn Fn()>>,
     /// The `std::ui` tree mounted in the window (`ui::mount`): its events
@@ -360,6 +363,7 @@ pub fn open(
                 scale_factor: 1.0,
                 pointer: (0.0, 0.0),
                 modifiers: winit::keyboard::ModifiersState::empty(),
+                focused: false,
                 on_frame: None,
                 on_event: None,
                 ui_root: None,
@@ -423,12 +427,14 @@ pub fn on_event(id: u32, callback: Rc<dyn Fn()>) {
 }
 
 /// `__gfx_window_number(id, which)` — the window's width (0) and height (1)
-/// in dp, and its scale factor (2). A closed window answers 0.
+/// in dp, its scale factor (2), and whether it has the system's keyboard
+/// focus (3: 1 or 0). A closed window answers 0.
 pub fn window_number(id: u32, which: i32) -> f64 {
     with_window(id, |slot| match which {
         0 => slot.size().0,
         1 => slot.size().1,
         2 => slot.scale_factor,
+        3 => f64::from(u8::from(slot.focused)),
         _ => panic_with(&format!("{which} is not a `std::gfx` window number")),
     })
     .unwrap_or(0.0)

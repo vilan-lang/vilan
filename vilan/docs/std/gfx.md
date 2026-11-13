@@ -269,6 +269,7 @@ impl Window {
 	fun close(self)                               // closing the last one stops the program
 	fun size(self): Size                          // 0 x 0 once closed
 	fun scale_factor(self): f64
+	fun focused(self): bool                       // has the system's keyboard focus
 }
 impl WindowBuilder {
 	fun title(own self, title: str): WindowBuilder
@@ -304,6 +305,7 @@ enum Event {
 	Resized(Size),
 	ScaleChanged(f64),
 	CloseRequested,
+	FocusChanged(bool),
 }
 struct Pointer { position: Point, button: Button, modifiers: Modifiers }
 enum Button { Left, Right, Middle, Back, Forward, Other(i32) }
@@ -329,6 +331,12 @@ line, and positive `x` and `y` mean the content should move right and down.
 
 `Resized` is followed in the same turn by a frame at the new size, so a window
 being dragged larger redraws in step with the drag.
+
+`FocusChanged(true)` says the window now has the system's keyboard focus (keys
+come to it), `FocusChanged(false)` that another window took it; `Window::focused`
+reads it at any time, and is `false` until the system first says so. A program
+that animates only for the person typing — a blinking caret — stops while it is
+`false`.
 
 `current_event()` answers the event being delivered right now: inside the
 event callback, the one it was handed; inside a [`std::ui`](ui.md#events)

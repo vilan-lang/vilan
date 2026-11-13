@@ -671,6 +671,7 @@ std/ui.md h2 style
 std/ui.md h2 conditions
 std/ui.md h2 events
 std/ui.md h2 focus
+std/ui.md h2 timers
 std/ui.md h2 scrolling
 std/ui.md h2 lists-and-conditional-children
 std/ui.md h2 a-virtual-list

@@ -212,7 +212,10 @@ Rust workspace, seventeen crates, plus the language's own tree:
   counted in the tree by the time the input CARRIES (`Input::Pressed { time }`, stamped by the
   shell; a delivered press carries 0), so the tree's pins choose the clock. The host asks
   `UiTree::refresh_hover` after every layout pass, so content moving under a still pointer moves
-  the hover in the same frame.
+  the hover in the same frame. ELEMENT TIMERS (F176, `ui/timers.rs`'s module doc is the rule) live
+  in the tree beside the handlers and end with them (`remove`, `free`); the tree reads no clock,
+  and `host/ui/timers.rs` arms ONE executor timer for the earliest, so the shell's `wait_for`
+  needs no timer input of its own. The window's focus (winit's `Focused`) is event kind 11.
   ACCESSIBILITY (P5): `ui/access.rs` turns the tree into an `accesskit` tree (pure; pinned by
   `ui/access/tests.rs` and by the examples' `--check` listings through
   `Element::accessibility()`) and plans an assistive tool's action as the focus, reveal,

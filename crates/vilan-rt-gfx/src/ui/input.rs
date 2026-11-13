@@ -159,6 +159,10 @@ pub enum EventKind {
     /// The element was laid out at a new size: never routed, told after a
     /// layout ([`UiTree::take_resize_notices`]).
     Resize,
+    /// The window the tree is mounted in gained or lost the system's focus
+    /// (F176): never routed, told to every element listening
+    /// ([`UiTree::window_focus_handlers`]).
+    WindowFocus,
 }
 
 /// One window input, as the tree routes it. Positions are dp from the
@@ -277,6 +281,29 @@ impl UiTree {
     /// Adds a handler for `kind` on `node`, after the ones it has.
     pub fn add_handler(&mut self, node: NodeId, kind: EventKind, handler: Handler) {
         self.data_mut(node).handlers.push((kind, handler));
+    }
+
+    /// Every [`EventKind::WindowFocus`] handler in `root`'s tree, in tree
+    /// order (F176): a window's focus belongs to no element, so it is told to
+    /// every element that listens, the way a resize is told rather than
+    /// routed. Nothing bubbles and nothing can stop it.
+    pub fn window_focus_handlers(&self, root: NodeId) -> Vec<Handler> {
+        let mut handlers = Vec::new();
+        if !self.is_alive(root) {
+            return handlers;
+        }
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            for (kind, handler) in &self.data(node).handlers {
+                if *kind == EventKind::WindowFocus {
+                    handlers.push(handler.clone());
+                }
+            }
+            for index in (0..self.taffy.child_count(node)).rev() {
+                pending.push(self.taffy.get_child_id(node, index));
+            }
+        }
+        handlers
     }
 
     /// Makes `node` focusable at `index` in the tab order (see `NodeData`'s

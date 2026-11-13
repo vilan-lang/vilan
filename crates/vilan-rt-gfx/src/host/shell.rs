@@ -197,6 +197,14 @@ pub(crate) fn wait_for(deadline: Option<Instant>, drain_wake: Option<Instant>) -
     }
 }
 
+/// Whether a wait that ended at its time owes the program a turn: only when
+/// the program's deadline — its earliest executor timer, element timers
+/// (`host/ui/timers.rs`) included — has been reached at `now`. A drain wake
+/// ([`PresentDrain`]) reaches no deadline, and an idle program has none.
+pub(crate) fn deadline_reached(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| deadline <= now)
+}
+
 impl Shell<'_> {
     /// Turns the program until it has nothing left to do now, settling after
     /// each turn — a settle that answers an open or closes the last window
@@ -413,9 +421,7 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
     /// held an event for it.
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
         if matches!(cause, StartCause::ResumeTimeReached { .. })
-            && self
-                .deadline
-                .is_some_and(|deadline| deadline <= Instant::now())
+            && deadline_reached(self.deadline, Instant::now())
         {
             self.owes_a_turn = true;
         }
@@ -552,6 +558,14 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => self.queue(id, RawEvent::text_input(text)),
+            WindowEvent::Focused(focused) => {
+                let was =
+                    super::with_window(id, |slot| std::mem::replace(&mut slot.focused, focused));
+                // Told to the program only when it changed (F176).
+                if was == Some(!focused) {
+                    self.queue(id, RawEvent::focus_changed(focused));
+                }
+            }
             _ => {}
         }
     }

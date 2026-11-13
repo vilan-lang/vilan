@@ -18,6 +18,12 @@
 //                   no window: build the screen in both spellings (tags, and the
 //                   builder calls they lower to) and compare their boxes, then
 //                   drive the tree with `deliver` and print what each event did
+//   --timers        no window: element timers (F176) — a repeating timer that
+//                   cancels itself on its third call and then sets a one-shot
+//                   one, and a timer on an element removed before it is due —
+//                   and the window focus told to a tree; each step caused by the
+//                   one before, so the lines come in one order however slow the
+//                   machine, and the program ends by itself when no timer is left
 
 import std::display::Display;
 import std::fs::read_bytes;
@@ -43,10 +49,11 @@ import std::process::{ args, exit };
 import std::range::Range;
 import std::reactive::{ Signal, SignalCell };
 import std::shared::Shared;
-import std::time::sleep;
+import std::time::{ Duration, sleep };
 import std::ui::{
 	Align,
 	Element,
+	ElementTimer,
 	Interaction,
 	Justify,
 	OutlineEntry,
@@ -65,6 +72,7 @@ import std::ui::{
 	stop_event,
 	style,
 	text,
+	when,
 	window_below,
 };
 
@@ -217,6 +225,10 @@ fun main() {
 	let arguments = args();
 	if arguments.contains("--check") {
 		check(arguments);
+		ret;
+	}
+	if arguments.contains("--timers") {
+		timers();
 		ret;
 	}
 	let smoke = arguments.contains("--smoke");
@@ -406,6 +418,46 @@ fun check(arguments: List<str>) {
 	layout(root, Size::new(dp(280), dp(240)), 1.0);
 	let narrow = count_text(root.outline());
 	print(i"count height wide={wide} narrow={narrow}");
+}
+
+// --- Timers mode: element timers and the window's focus, with no window ---------
+
+fun timers() {
+	let shown = Signal::new(true);
+	let doomed = row();
+	let root = <column>{when(shown, || doomed)}</column>;
+	let body = root.element();
+	// A timer on an element removed for good before the timer is due: it never
+	// fires (the lines below would say so before "done").
+	doomed.element().after(Duration::millis(5), || print("a removed element's timer fired"));
+	shown.set(false);
+	print(i"removed, elements left {body.outline().len()}");
+	let ticks = Shared::new(0);
+	let repeating: Shared<Option<ElementTimer>> = Shared::new(None);
+	repeating.write() = Some(body.every(Duration::millis(10), || {
+		ticks.write() = ticks.read() + 1;
+		print(i"tick {ticks.read()}");
+		if ticks.read() == 3 {
+			if repeating.read() is Some(let timer) {
+				timer.cancel();
+			}
+			body.after(Duration::millis(20), || {
+				print("after fired");
+				// Held until here, so its removal (not its freeing) is what
+				// ended its timer.
+				print(i"removed element still held, {doomed.element().outline().len()} element");
+				print("done");
+			});
+		}
+	}));
+	body
+		.on_window_focus(
+			|focused: bool| print(i"window focus {focused}, read back {body.window_focused()}"),
+		);
+	print(i"focused before {body.window_focused()}");
+	deliver(root, Event::FocusChanged(true));
+	deliver(root, Event::FocusChanged(false));
+	print("timers set");
 }
 
 fun after(arguments: List<str>, flag: str): str {
