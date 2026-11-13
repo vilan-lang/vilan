@@ -6161,6 +6161,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Expr::Local(binding) if self.program.functions.contains_key(&binding) => {
                 self.function_value(binding, span)?
             }
+            // B740: a read of an `Option`-flavoured hidden context parameter
+            // where the bare value is wanted. The context pass records one only
+            // where every entry handed `Some`, so the unwrap never panics.
+            Expr::Local(binding) if self.program.context_unwrapped_reads.contains(&id) => {
+                let name = self.binding_name(binding);
+                format!("{name}.clone().expect(\"a covered context holds its value\")")
+            }
             Expr::Local(binding) => self.read_module_binding_or_local(binding, span)?,
             Expr::Parameter(binding) => self.binding_name(binding),
             Expr::Variable(binding) => self.declaration(binding, depth)?,

@@ -377,10 +377,12 @@ external fun ui_outline_text(index: i32, which: i32): str;
 /// instance declare only the context parameters its body names, so a static
 /// `.gap(dp(8))` from code with no owner builds natively): its reactive arm
 /// REQUIRES an owner, so a binding with no owner is refused instead of kept by its
-/// source. That difference is the owner's call. (Tried 2026-11-12: a keyed child
-/// placed from code with no owner is then still refused natively, because the
-/// context pass decides a hidden parameter's FLAVOUR — strict or optional — per
-/// function too.)
+/// source. That difference is the owner's call. (Tried 2026-11-12, again once
+/// B740 made a hidden parameter optional wherever a caller has no owner: `ui`,
+/// `gfx`, `ui-list` and `ui-virtual-list` check and build natively on
+/// `MaybeSignal`; `ui-counter` and `ui-todo` are refused, because each binds a
+/// signal into its tree before `mount`, with no owner — exactly that
+/// difference.)
 export trait Bindable<T> {
 	fun bind(own self, apply: |T| void);
 }

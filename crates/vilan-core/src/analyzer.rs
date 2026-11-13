@@ -78709,7 +78709,8 @@ pub struct Program<'src> {
     /// rather than the context's bare `T` — the parameter's FLAVOUR
     /// (`reactive-turns.md` §5.1), recorded where the pass MINTS the parameter
     /// and known there exactly: a parameter holds the bare value when its
-    /// provider is a strict node or a `run` closure, and `Option<T>` otherwise.
+    /// provider is a `run` closure, or a strict node every entry into which
+    /// has a value to hand (covered, B740), and `Option<T>` otherwise.
     ///
     /// The parameter itself stays record-less for the reason above, so the
     /// flavour cannot live on a `parameters` entry. It is a separate marker for
@@ -78718,6 +78719,15 @@ pub struct Program<'src> {
     /// keyed on `parameters` sees plumbing dressed as source. Membership is the
     /// bool: absent means bare.
     pub context_optional_hidden_parameters: HashSet<Id>,
+    /// B740: the reads of an `Option`-flavoured hidden parameter
+    /// ([`Program::context_optional_hidden_parameters`]) that stand where the
+    /// BARE value is wanted — a strict `get()` in an `Option` holder, or the
+    /// argument such a holder threads to a bare callee — by the read's own
+    /// entity (an `Expr::Local` of the parameter). Both emitters unwrap the
+    /// `Option` there. The context pass records one only in a node every entry
+    /// into which hands it `Some` (it is covered), so the unwrap never meets a
+    /// `None`.
+    pub context_unwrapped_reads: HashSet<Id>,
     /// papers-54's B?2: the context arguments the context pass threads to a
     /// `for x in subject` loop's implicit `next` call, by the loop's id. The
     /// call graph records that call as an edge keyed by the loop (no
@@ -94355,6 +94365,7 @@ fn analyze_over_world<'src>(
         unwired_method_calls: analyzer.unwired_method_calls,
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
+        context_unwrapped_reads: HashSet::default(),
         for_each_context_arguments: HashMap::default(),
         cleared_clause_contexts: HashSet::default(),
         context_bindings: Vec::new(),
