@@ -188,6 +188,16 @@ Rust workspace, seventeen crates, plus the language's own tree:
   `__ui_layout` lays out again when a handler changed the tree), an offset kept unclamped while
   a layout is pending (`ScrollState::measured_at`), and Tab's reveal of an element with no box
   yet waiting for the next layout (`pending_reveal`).
+  ACCESSIBILITY (P5): `ui/access.rs` turns the tree into an `accesskit` tree (pure; pinned by
+  `ui/access/tests.rs` and by the examples' `--check` listings through
+  `Element::accessibility()`) and plans an assistive tool's action as the focus, reveal,
+  pointer, key and text input a person would give; `host/access.rs` keeps one
+  `accesskit_winit` adapter per window (a window is made hidden, given its adapter, then
+  shown), publishes after a turn only while a tool listens, and carries actions out in a
+  turn. Its AT-SPI proof is `ui_interaction.rs`'s accessibility test on a private bus
+  (`tests/support/atspi.rs`), skipped without at-spi2-core. Never start AT-SPI's launcher
+  without a private `XDG_RUNTIME_DIR` and `GSETTINGS_BACKEND=memory`: it takes the user's
+  `$XDG_RUNTIME_DIR/at-spi/bus` and writes the accessibility switch into their dconf.
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

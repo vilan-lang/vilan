@@ -18634,6 +18634,10 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_text_step", "ui::text_step", &[0]),
         // P4's virtual list: a resize handler reads the size it is told.
         ("__ui_resized", "ui::resized", &[]),
+        // P5: accessibility publishing — a list holding only some of its
+        // items, and the listing of what an assistive tool is told.
+        ("__ui_set_items", "ui::set_items", &[0]),
+        ("__ui_accessibility", "ui::accessibility", &[0]),
     ];
     FUNCTIONS
         .iter()

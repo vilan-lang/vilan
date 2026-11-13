@@ -376,6 +376,12 @@ fun check(arguments: List<str>) {
 		print(i"{what}: draft=\"{app.draft.get()}\" caret={now.caret} anchor={now.anchor} items={listing(app.items)} focus={focus} log=[{lines.read().join(", ")}]");
 		lines.write() = [];
 	};
+	// What an assistive tool is told of the screen (native-ui.md P5).
+	let tell = |what: str| {
+		layout(root, size, 1.0);
+		print(i"accessibility {what}:");
+		print(root.accessibility().trim());
+	};
 	let find = |label: str| {
 		mut found = Point::new(dp(-1), dp(-1));
 		for entry in root.outline() {
@@ -418,6 +424,7 @@ fun check(arguments: List<str>) {
 
 	// 1. A click focuses the input; the Add button is disabled while it is empty.
 	report("start");
+	tell("at the start");
 	click(find("add"), no);
 	report("add while empty");
 	click(find("new item"), no);
@@ -428,6 +435,7 @@ fun check(arguments: List<str>) {
 		type_text(letter);
 	}
 	report("typed milk");
+	tell("typed milk");
 	key(KeyName::Left, no);
 	key(KeyName::Left, no);
 	report("left twice");
@@ -525,6 +533,7 @@ fun check(arguments: List<str>) {
 	type_text("milk");
 	click(find("add"), no);
 	report("add button");
+	tell("with two items");
 
 	// 6. The checkbox: Tab from the input passes the disabled Add button and
 	// reaches the first checkbox, and Space checks it; a click unchecks it.
@@ -532,6 +541,7 @@ fun check(arguments: List<str>) {
 	key(KeyName::Tab, no);
 	key(KeyName::Char(" "), no);
 	report("tab, space");
+	tell("with bread checked and focused");
 	click(find("check bread"), no);
 	report("click check bread");
 	click(find("check milk"), no);

@@ -187,6 +187,9 @@ impl Window<type T> {
 			}
 			self.shown.set(window);
 		}
+		// Assistive technology hears the rows built as items `first ..` of the
+		// whole list, not as a list of a few.
+		let _items = self.column.items_shown(first, count);
 		let top = first.as_f64() * extent;
 		if top != span.top {
 			self.span.write().top = top;

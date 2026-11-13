@@ -48,6 +48,14 @@
 //!    revealed), a wheel notch, a click on the row under the pointer, whose
 //!    id the program prints and the test works out from the offset alone.
 //!
+//! 6. native-ui.md P5, accessibility publishing: the todo list driven
+//!    through AT-SPI on a private session bus (`support::atspi`), as a screen
+//!    reader would — the input and the Add button found by role and name, the
+//!    input's text set and the button pressed, the new item's check box
+//!    pressed — each step proven by the program's own line. It skips, with
+//!    the reason, where AT-SPI's bus launcher or `gdbus` is missing, whatever
+//!    `VILAN_REQUIRE_GFX` says.
+//!
 //! Ordering comes from the programs' lines — each injection waits for the
 //! line its predecessor caused — never from a sleep. No assertion reads a
 //! time: the frame times the programs print are for a person (the report's
@@ -505,6 +513,51 @@ fn the_todo_list_on_the_kit_runs_end_to_end() {
         code,
         Some(0),
         "closing the todo list ended it with {code:?}:\n{report}"
+    );
+}
+
+/// native-ui.md P5: the todo list as a screen reader meets it, over AT-SPI on
+/// a private session bus (`support::atspi`): its window, its input and its Add
+/// button found by role and name, the input's text set and the button
+/// pressed through the accessibility API — the program hears a typed value
+/// and a click and adds the item — and the new item's check box pressed the
+/// same way.
+#[test]
+fn the_todo_list_is_driven_through_the_accessibility_bus() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    // Not part of what the `gfx` leg requires: a box without AT-SPI's
+    // launcher skips with the reason whatever `VILAN_REQUIRE_GFX` says.
+    if let Some(reason) = support::atspi::tools_missing() {
+        eprintln!("skipped: {reason}");
+        return;
+    }
+    // Its own entry name: the kit test stages `todo` at the same time.
+    let todo = build_example("ui-todo", "todo_access");
+    let session = support::atspi::Session::start();
+    let started = Instant::now();
+    let mut running =
+        Running::start_in(&todo, &["--smoke"], "vilan ui todo", &session.environment());
+    running.wait_for("frame 1 ", started);
+
+    let input = session.wait_for(support::atspi::ENTRY, "new item", "EditableText");
+    session.set_text(&input, "milk");
+    running.wait_for("draft=milk ", started);
+    let add = session.wait_for(support::atspi::PUSH_BUTTON, "add", "Action");
+    session.act(&add, 0);
+    running.wait_for("add milk", started);
+    running.wait_for("draft= items=[[ ] milk]", started);
+    let check = session.wait_for(support::atspi::CHECK_BOX, "check milk", "Action");
+    session.act(&check, 0);
+    running.wait_for("items=[[x] milk]", started);
+
+    let group = session.group();
+    drop(running);
+    drop(session);
+    assert!(
+        support::xvfb::live_in_group(group).is_empty(),
+        "the private bus outlived its session"
     );
 }
 

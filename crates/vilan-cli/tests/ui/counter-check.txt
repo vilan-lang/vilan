@@ -6,6 +6,12 @@ column counter 0 0 360 240
       text  106 137 58 17
     row Reset 194 127 78 37
       text  212 137 42 17
+accessibility:
+Group "counter"
+  Label "count" value="Count: 0"
+  Group "buttons"
+    Button "Add one" [click focus]
+    Button "Reset" [click focus]
 over add: count=0 add=h reset=- handlers=[]
 pressed add: count=0 add=hpf reset=- handlers=[]
 released add: count=1 add=hf reset=- handlers=[click Add one, click counter]
@@ -13,6 +19,12 @@ pressed add, released outside: count=1 add=f reset=- handlers=[click counter]
 enter: count=2 add=f reset=- handlers=[key Add one]
 x: count=2 add=f reset=- handlers=[key counter]
 tab: count=2 add=- reset=f handlers=[key counter]
+accessibility after tab:
+Group "counter"
+  Label "count" value="Count: 2"
+  Group "buttons"
+    Button "Add one" [click focus]
+    Button "Reset" focused [click focus]
 space: count=0 add=- reset=f handlers=[key Reset]
 tab again: count=0 add=f reset=- handlers=[key counter]
 shift tab: count=0 add=- reset=f handlers=[key counter]

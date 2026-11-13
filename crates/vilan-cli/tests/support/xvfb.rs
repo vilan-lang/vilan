@@ -53,7 +53,19 @@ impl Running {
     /// Starts `binary` with `arguments` under `xvfb-run -a`, in a process
     /// group of its own, and waits for the wrapper to name its display.
     pub fn start(binary: &Path, arguments: &[&str], title: &str) -> Running {
+        Running::start_in(binary, arguments, title, &[])
+    }
+
+    /// [`Running::start`] with `environment` added to the program's (a
+    /// private session bus, say: `support::atspi`).
+    pub fn start_in(
+        binary: &Path,
+        arguments: &[&str],
+        title: &str,
+        environment: &[(String, String)],
+    ) -> Running {
         let mut command = Command::new("xvfb-run");
+        command.envs(environment.iter().map(|(name, value)| (name, value)));
         command
             .args(["-a", "-s", "-screen 0 1280x1024x24", "sh", "-c"])
             .arg("printf 'display %s %s\\n' \"$DISPLAY\" \"$XAUTHORITY\"; exec \"$0\" \"$@\"")

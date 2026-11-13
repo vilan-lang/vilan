@@ -21,10 +21,10 @@ export struct Checkbox {
 /// write the cell's opposite; a write from anywhere else is what it shows next. It
 /// is an empty ROW with the role `Role::Checkbox`: the app gives it its children —
 /// the box, the mark (`when(checked, || ..)`), a text — and its look, and labels it
-/// with `label(..)`.
+/// with `label(..)`. Assistive technology is told whether it is checked.
 export fun checkbox(checked: SignalCell<bool>): Checkbox {
 	let off: Shared<bool> = Shared::new(false);
-	let toggle = pressable(Role::Checkbox, off, || checked.set(!checked.get()));
+	let toggle = pressable(Role::Checkbox, off, || checked.set(!checked.get())).checked(checked);
 	Checkbox { element = toggle.element(), off }
 }
 

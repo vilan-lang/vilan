@@ -606,6 +606,20 @@ and spacing its own; its end-to-end test drives the screen with no window agains
 a recorded listing (typing, selections, graphemes, Tab, Space) and then in a
 window through the X server.
 
+### Accessibility
+
+A GPU window publishes its elements to the system's accessibility API while a
+screen reader or another assistive tool listens: each element's role, its name
+(its label, or the text inside a button), its value and its states, from the
+same tree that draws. The tool's actions — focus, click, set a text field's
+value — come back as the pointer and keyboard input a person would give, so the
+app writes no code for them. What it must do is NAME what shows no text: an icon
+button gets `label("save")`, a meaningful image a label, a heading
+`role(Role::Heading)`. `element.accessibility()` prints what a tool is told, for
+a test of those names; the [std::ui page](../std/ui.md#accessibility) has the
+rules. The todo example's end-to-end test drives it through Linux's AT-SPI as a
+screen reader would; Windows and macOS are not yet verified at run time.
+
 ## Debug by default
 
 `vilan run --backend rust` builds in **debug**, and so does `vilan build
@@ -679,5 +693,6 @@ notifications, deep links, secure token storage, or second window to manage,
 and no installer or package — each is its own slice. A GPU window's **native
 UI** (`std::ui`) has its elements, layout, styles, events, focus, scrolling,
 keyed lists and conditional children, and its first components (`std::ui::kit`: a
-button, a checkbox, a single-line text input, a virtual list); paths, multi-line
-text editing, the clipboard, input methods and accessibility come after them.
+button, a checkbox, a single-line text input, a virtual list) and publishes them
+to the system's accessibility API; paths, multi-line text editing, the clipboard
+and input methods come after them.

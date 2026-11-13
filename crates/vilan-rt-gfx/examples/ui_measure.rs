@@ -39,6 +39,11 @@
 //!   it moves down one place, so the top one is new and the bottom one goes,
 //!   and the column grows by a row).
 //!
+//! Every tree also reports `access_full_us` (the whole tree converted for
+//! assistive technology and published as a platform's first tree, part P5)
+//! and `access_one_text_*` (after the one-text change: the tree converted
+//! again and compared, and the nodes the update carries).
+//!
 //! Times are wall time on this thread, medians over runs: the passes are
 //! CPU-bound and single-threaded, so on an unloaded core wall time is CPU
 //! time, and on a loaded machine they are upper bounds. Text is shaped with
@@ -46,8 +51,18 @@
 
 use std::time::Instant;
 
-use vilan_rt_gfx::ui::{Align, ElementKind, Length, NodeId, SizeProperty, UiTree};
+use vilan_rt_gfx::ui::{
+    AccessPublisher, AccessWindow, Align, ElementKind, Length, NodeId, SizeProperty, UiTree,
+};
 use vilan_rt_gfx::{Edges, SceneBuilder, Size, TextSystem, Units};
+
+/// The window a measured tree's accessibility is published in.
+const ACCESS_WINDOW: AccessWindow<'static> = AccessWindow {
+    title: "measure",
+    scale: 1.0,
+    width: 960.0,
+    height: 640.0,
+};
 
 fn timed(body: impl FnOnce()) -> u128 {
     let start = Instant::now();
@@ -264,6 +279,15 @@ fn measure(name: &str, build: impl Fn(&mut Builder) -> NodeId, runs: usize) {
                 paint(tree, &mut text);
             }),
         );
+        // Accessibility (P5): the whole tree converted and published as a
+        // platform's first tree.
+        let mut publisher = AccessPublisher::default();
+        samples.push(
+            "access_full_us",
+            timed(|| {
+                publisher.update(tree.access_tree(Some(root), ACCESS_WINDOW), true);
+            }),
+        );
         if let Some(value) = value_of(tree, root, 5_000) {
             // One row's text changes, its width the same: the solver
             // measures that text again and places the column's rows; one
@@ -280,6 +304,19 @@ fn measure(name: &str, build: impl Fn(&mut Builder) -> NodeId, runs: usize) {
             samples.push("one_text_moved", tree.last_pass().moved as u128);
             samples.push("one_text_paint_us", timed(|| paint(tree, &mut text)));
             samples.push("one_text_rebuilt", tree.last_pass().rebuilt as u128);
+            // The update a listening tool is sent for it: the whole tree
+            // converted again and compared, one node sent.
+            let mut sent = 0;
+            samples.push(
+                "access_one_text_us",
+                timed(|| {
+                    sent = publisher
+                        .update(tree.access_tree(Some(root), ACCESS_WINDOW), false)
+                        .nodes
+                        .len();
+                }),
+            );
+            samples.push("access_one_text_nodes", sent as u128);
             // A scroll: the offset moves; nothing is laid out, and only the
             // scroll's own scene is rebuilt.
             let mut offset = 0.0;
@@ -523,6 +560,13 @@ fn measure_windowed(count: usize, runs: usize) {
             .layout(root, window, at_100, &mut text)
             .unwrap();
         paint(&mut builder.tree, root, &mut text);
+        let mut publisher = AccessPublisher::default();
+        samples.push(
+            "access_full_us",
+            timed(|| {
+                publisher.update(builder.tree.access_tree(Some(root), ACCESS_WINDOW), true);
+            }),
+        );
         for _ in 0..7 {
             offset += 96.0;
             samples.push(
@@ -569,6 +613,17 @@ fn measure_windowed(count: usize, runs: usize) {
                 timed(|| paint(&mut builder.tree, root, &mut text)),
             );
             samples.push("one_text_rebuilt", builder.tree.last_pass().rebuilt as u128);
+            let mut sent = 0;
+            samples.push(
+                "access_one_text_us",
+                timed(|| {
+                    sent = publisher
+                        .update(builder.tree.access_tree(Some(root), ACCESS_WINDOW), false)
+                        .nodes
+                        .len();
+                }),
+            );
+            samples.push("access_one_text_nodes", sent as u128);
         }
         for _ in 0..7 {
             samples.push(

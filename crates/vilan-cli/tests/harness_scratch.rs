@@ -104,6 +104,13 @@ const PATHS_THE_BINARY_OWNS: &[(&str, &str)] = &[
          characters into the budget before the project name in a lane's \
          worktree, and the bind fails outright (N102)",
     ),
+    (
+        "vilan-cli/tests/support/atspi.rs",
+        "`SUN_LEN` again: the private session bus's socket, and AT-SPI's \
+         accessibility bus socket under `$XDG_RUNTIME_DIR/at-spi/`, must fit in a \
+         `sockaddr_un`; the directory holds only those sockets and is removed \
+         with the session (native-ui.md P5)",
+    ),
 ];
 
 fn repository_root() -> PathBuf {

@@ -70,6 +70,7 @@
 //! No margins (R5): space between siblings is the parent's gap, space inside
 //! an element its padding.
 
+mod access;
 mod input;
 mod style;
 
@@ -83,6 +84,9 @@ use taffy::{
 /// An element's id in its [`UiTree`].
 pub use taffy::NodeId;
 
+pub use access::{
+    AccessPublisher, AccessStep, AccessTree, AccessWindow, WINDOW_NODE, access_id, access_listing,
+};
 pub use input::{DefaultAction, Delivery, EventKind, Handler, Input, Route, Step};
 pub use style::{Condition, Interaction, StyleFields};
 
@@ -223,8 +227,8 @@ pub enum ScrollAxis {
     Both,
 }
 
-/// The accessibility role an element announces (R10). Carried, read by
-/// nothing yet: a later part publishes it through the platform.
+/// The accessibility role an element announces (R10), published through the
+/// platform by `access.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Role {
     #[default]
@@ -553,6 +557,8 @@ pub struct NodeData {
     anchor: Option<Anchor>,
     role: Role,
     label: Option<String>,
+    /// Its states for assistive technology (`access.rs`).
+    access: access::AccessState,
     content: Content,
     /// Children painted inside its padding box only.
     clip: bool,
@@ -600,6 +606,7 @@ impl NodeData {
             anchor: None,
             role: Role::None,
             label: None,
+            access: access::AccessState::default(),
             content,
             clip: kind == ElementKind::Scroll,
             scroll: (kind == ElementKind::Scroll).then(|| ScrollState {
@@ -760,6 +767,8 @@ pub struct UiTree {
     measured: Vec<NodeId>,
     /// Edited texts whose caret the next layout scrolls into view.
     caret_reveals: Vec<NodeId>,
+    /// Moves when only what assistive technology reads changed (`access.rs`).
+    semantics_generation: u64,
 }
 
 impl Default for UiTree {
@@ -967,6 +976,7 @@ impl UiTree {
             stats: PassStats::default(),
             measured: Vec::new(),
             caret_reveals: Vec::new(),
+            semantics_generation: 1,
         }
     }
 
@@ -1440,6 +1450,7 @@ impl UiTree {
 
     pub fn set_role(&mut self, node: NodeId, role: Role) {
         self.data_mut(node).role = role;
+        self.semantics_changed();
     }
 
     pub fn role(&self, node: NodeId) -> Role {
@@ -1448,6 +1459,7 @@ impl UiTree {
 
     pub fn set_label(&mut self, node: NodeId, label: &str) {
         self.data_mut(node).label = Some(label.to_string());
+        self.semantics_changed();
     }
 
     pub fn label(&self, node: NodeId) -> Option<&str> {

@@ -24,9 +24,10 @@ its source changes ([below](#lists-and-conditional-children)).
 Components with behaviour and no look are [`std::ui::kit`](#components-stduikit):
 a button, a checkbox, a single-line text input, and a
 [virtual list](#a-virtual-list) that holds only the rows near its viewport,
-however long its list is. Not here yet: grid layout, text editing beyond one
-line, input methods, and publishing roles and labels to the system's
-accessibility API.
+however long its list is. Every element's role, label and state reach the
+system's accessibility API while an assistive tool listens, and the tool's actions
+come back as pointer and keyboard input ([Accessibility](#accessibility)). Not
+here yet: grid layout, text editing beyond one line, and input methods.
 
 ## Elements
 
@@ -45,6 +46,7 @@ impl Element {
 	fun focus(self)                           // gives it the focus
 	fun scroll_into_view(self)                // every scroll around it shows it
 	fun interaction(self): Interaction        // hovered, pressed, focused now
+	fun accessibility(self): str              // what an assistive tool is told of it
 }
 impl Element with Attributes                 // an Element takes every attribute too
 struct OutlineEntry { depth: usize, kind: str, label: str, bounds: Rect }
@@ -149,6 +151,9 @@ trait Attributes {
 	fun clip(self): Self                                              // children inside its box only
 	fun role(self, role: Role): Self                                  // for assistive technology
 	fun label<V: Bindable<str>>(self, label: V): Self
+	fun checked<V: Bindable<bool>>(self, checked: V): Self            // see Accessibility
+	fun disabled_state<V: Bindable<bool>>(self, disabled: V): Self
+	fun items_shown(self, first: usize, count: usize): Self
 	fun focusable(self): Self                                         // see Focus
 	fun tab_index(self, index: i32): Self
 	// and the events: see Events
@@ -174,9 +179,9 @@ width (a paragraph's longest word).
 (its border and rounded corners included); without it a child larger than its
 parent draws outside it. A `scroll` always clips.
 
-`role` and `label` are carried from this version for assistive technology
-(`Role::Heading`, `Button`, `Link`, `List`, `ListItem`, `Image` and the rest),
-and published to the system by a later one; `outline` lists the label too.
+`role`, `label` and the three states are what assistive technology is told of
+the element (`Role::Heading`, `Button`, `Link`, `List`, `ListItem`, `Image` and
+the rest; see [Accessibility](#accessibility)); `outline` lists the label too.
 
 ## Rows and columns
 
@@ -776,3 +781,91 @@ method's composition (the part after this one, P5), a double click selecting a
 word, a blinking caret (the caret is steady, so an idle window draws nothing),
 and a drag that leaves the input extending the selection there (a pointer move
 goes to the element under the pointer).
+
+## Accessibility
+
+While an assistive tool listens — a screen reader, a magnifier, a test driver —
+every mounted window publishes its tree to the system's accessibility API
+(AT-SPI on Linux, UI Automation on Windows, NSAccessibility on macOS, through
+`accesskit`), and the tool's actions come back into the program. When none
+listens nothing is built and nothing wakes: an idle window stays idle.
+
+```vilan,fragment
+enum Role { Group, Heading, Paragraph, Button, Link, TextField, Checkbox, List, ListItem, Image }
+```
+
+What is published, element by element:
+
+| Element | Published as |
+|---|---|
+| any element with a `role` | that role |
+| a text | a label whose text the tool reads |
+| a labelled image | an image named by its label; an unlabelled one is decorative and left out |
+| a `scroll` | a scroll view, with its offset and range |
+| a labelled row, column or stack | a group named by its label |
+| a row, column or stack with no role and no label | nothing: its children hang from the element above it |
+| a child of a `Role::List` element | a list item |
+| a marker (`each`, `when`) | nothing |
+
+A **button**, a **checkbox**, a **link** and a **heading** are named by their
+`label`, or else by the text inside them, and nothing inside them is published
+on its own (a button's text is its name, not a second thing to read). A **text
+field** is published with its value, its placeholder and its selection. An
+element's states go with it: `checked`, `disabled_state`, whether it has the
+focus, and for a list holding only some of its items, each item's place in the
+whole (`items_shown`). The kit sets all of them: `checkbox` its checked state,
+`disabled(..)` the disabled state, `virtual_list` the items it shows.
+
+**What an app must do** is name what shows no text. A button made from a `str`
+is named by it; a button made from an element — an icon — is named only by its
+`label`:
+
+```vilan,native
+import std::gfx::{ Size, dp };
+import std::io::print;
+import std::reactive::{ Signal, SignalCell };
+import std::ui::kit::{ button, checkbox };
+import std::ui::{ Role, column, layout, stack, text };
+
+fun main() {
+	let saved: SignalCell<bool> = Signal::new(false);
+	let screen = <column label("settings")>
+		<text role(Role::Heading)>"Settings"</text>
+		{button(stack().width(dp(16)).height(dp(16)), || saved.set(true)).label("save")}
+		{checkbox(saved).label("saved")}
+	</column>.element();
+	layout(screen, Size::new(dp(320), dp(200)), 1.0);
+	print(screen.accessibility());
+}
+main();
+```
+
+prints what a tool is told:
+
+```text
+Group "settings"
+  Heading "Settings"
+  Button "save" [click focus]
+  CheckBox "saved" unchecked [click focus]
+```
+
+Name a meaningful image too, give a heading `Role::Heading`, and give a control
+built from plain rows the role it acts as. `accessibility()` is that listing —
+role, name, value, states, the actions offered — for a test of an app's labels.
+
+**Actions** reach the program as the input a person would give, so the program
+cannot tell them apart and needs no code for them: *focus* moves the focus as a
+press does; *click* (a button's, a checkbox's or a link's default action)
+scrolls the element into view and presses and releases the primary button at
+the middle of it — unless something covers it there, when nothing happens;
+*set value* on a text field focuses it, selects everything (Ctrl+A) and types
+the value (or presses Delete, for an empty one); *set selection* presses Home
+and then the arrow keys, grapheme by grapheme, with Shift for the selected part;
+*scroll into view* is `scroll_into_view()`; *scroll up* and *down* (and left and
+right) turn the wheel over the scroll, a page or a line at a time. A disabled
+element offers none but scrolling to it.
+
+Bounds are published in dp with the window's scale beside them, so the platform
+gets device pixels at any scale. Verified on Linux, against AT-SPI; Windows and
+macOS go through the same tree and are not yet verified at run time.
+

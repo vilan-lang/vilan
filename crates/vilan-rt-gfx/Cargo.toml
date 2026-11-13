@@ -96,6 +96,20 @@ taffy = { version = "=0.15.1", default-features = false, features = [
     "flexbox",
     "grid",
 ] }
+# `std::ui`'s roles, labels and states published to the system's
+# accessibility API, and its actions taken back in (native-ui.md section 4.6,
+# R10; part P5): `accesskit`'s tree, and its `winit` adapter, which picks the
+# platform's (AT-SPI over D-Bus on Linux and the BSDs, UI Automation on
+# Windows, NSAccessibility on macOS). The adapter matches the pinned `winit`
+# (it asks for `^0.30.5`). Default features off, each kept one named: the
+# Linux adapter on `async-io` (the program's executor is not tokio) and
+# `raw-window-handle` 0.6, which `winit` already brings.
+accesskit = { version = "=0.25.2" }
+accesskit_winit = { version = "=0.34.2", default-features = false, features = [
+    "accesskit_unix",
+    "async-io",
+    "rwh_06",
+] }
 # Instance data is uploaded as plain bytes.
 bytemuck = { version = "=1.25.2", features = ["derive"] }
 # Blocks on the adapter and device requests (wgpu's are futures).

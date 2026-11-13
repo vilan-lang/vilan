@@ -35,6 +35,7 @@ fn insert_window(id: u32) {
                 frame_due: false,
                 scene: None,
                 closing: false,
+                access_requests: VecDeque::new(),
             },
         )
     });

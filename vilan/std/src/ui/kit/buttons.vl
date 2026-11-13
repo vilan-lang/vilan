@@ -182,6 +182,7 @@ fun bind_disabled<V: Bindable<bool>>(element: Element, off: Shared<bool>, own di
 	disabled.bind(|value: bool| {
 		off.write() = value;
 		ui_set_focusable(element.node, !value);
+		let _published = element.disabled_state(value);
 	});
 }
 

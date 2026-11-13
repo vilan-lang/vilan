@@ -42,6 +42,8 @@
 //! | 18 clip | 0 or 1 |
 //! | 19 tab index | a whole number; `__ui_set_focusable` takes it away |
 //! | 20 scroll axis | 0 vertical, 1 horizontal, 2 both |
+//! | 21 checked | -1 none, 0 unchecked, 1 checked (published, P5) |
+//! | 22 disabled state | 0 or 1 (published, P5) |
 //!
 //! `__ui_set_length` properties: 0 width, 1 height, 2 min width, 3 max width,
 //! 4 min height, 5 max height; units 0 auto, 1 dp, 2 fraction of the parent.
@@ -76,9 +78,9 @@ use crate::geometry::{Corners, Edges, Point, Size};
 use crate::scene::Image;
 use crate::text::FontFamily;
 use crate::ui::{
-    Align, Anchor, Condition, DropShadow, ElementKind, EventKind, Fit, Handler, Input, Justify,
-    Length, OutlineEntry, PassStats, Role, Route, ScrollAxis, SizeProperty, StyleFields, UiError,
-    UiTree,
+    AccessWindow, Align, Anchor, Condition, DropShadow, ElementKind, EventKind, Fit, Handler,
+    Input, Justify, Length, OutlineEntry, PassStats, Role, Route, ScrollAxis, SizeProperty,
+    StyleFields, UiError, UiTree, access_listing,
 };
 use crate::units::Units;
 
@@ -153,12 +155,12 @@ impl Drop for NodeHandle {
 }
 
 impl Node {
-    fn id(&self) -> NodeId {
+    pub(super) fn id(&self) -> NodeId {
         self.handle.id
     }
 }
 
-fn with_tree<R>(body: impl FnOnce(&mut UiTree) -> R) -> R {
+pub(super) fn with_tree<R>(body: impl FnOnce(&mut UiTree) -> R) -> R {
     TREE.with(|tree| body(&mut tree.borrow_mut()))
 }
 
@@ -325,6 +327,8 @@ pub fn set(node: &Node, property: i32, value: f64) {
             );
             or_fail(tree.set_scroll_axis(id, axis))
         }
+        21 => tree.set_checked(id, (value >= 0.0).then_some(value != 0.0)),
+        22 => tree.set_disabled(id, value != 0.0),
         _ => panic_with(&format!("{property} is not a `std::ui` property code")),
     });
 }
@@ -663,7 +667,12 @@ pub fn remove(node: &Node) {
 /// current yet (built since the last layout) is revealed by the next layout
 /// (`UiTree::reveal_when_laid_out`).
 pub fn scroll_into_view(node: &Node) {
-    let id = node.id();
+    reveal_element(node.id());
+}
+
+/// [`scroll_into_view`] by the element's id: what an assistive tool's scroll
+/// into view does too (`host/access.rs`).
+pub(super) fn reveal_element(id: NodeId) {
     let root = with_tree(|tree| {
         let moved = tree.reveal_when_laid_out(id);
         // A reveal left for the next layout asks for that layout.
@@ -715,7 +724,12 @@ pub fn stop() {
 /// `__ui_focus(node)` — gives the element the focus (whether or not Tab
 /// reaches it).
 pub fn focus(node: &Node) {
-    let id = node.id();
+    focus_element(node.id());
+}
+
+/// [`focus`] by the element's id: what an assistive tool's focus does too
+/// (`host/access.rs`).
+pub(super) fn focus_element(id: NodeId) {
     let (deliveries, root) = with_tree(|tree| (tree.focus(Some(id)), tree.root_of(id)));
     for delivery in deliveries {
         delivery.handler.call();
@@ -1031,6 +1045,33 @@ pub fn outline_text(index: i32, which: i32) -> Str {
         1 => str_new(entry.label.as_deref().unwrap_or("")),
         _ => panic_with(&format!("{which} is not a `std::ui` outline text")),
     })
+}
+
+/// `__ui_set_items(node, first, count)` — a list holding only some of its
+/// items: its first child is item `first` (from 0) of `count`, for
+/// assistive technology (P5; `std::ui::kit::virtual_list` sets it).
+pub fn set_items(node: &Node, first: f64, count: f64) {
+    let whole = |value: f64| {
+        if !(value >= 0.0 && value.is_finite()) {
+            panic_with("a list's items are counted from 0");
+        }
+        value as usize
+    };
+    with_tree(|tree| tree.set_items_shown(node.id(), whole(first), whole(count)));
+}
+
+/// `__ui_accessibility(node)` — what an assistive tool is told of the tree
+/// under `node` (`ui/access.rs`'s listing, without the window): one line a
+/// published element.
+pub fn accessibility(node: &Node) -> Str {
+    let window = AccessWindow {
+        title: "",
+        scale: 1.0,
+        width: 0.0,
+        height: 0.0,
+    };
+    let tree = with_tree(|tree| tree.access_tree(Some(node.id()), window));
+    str_new(&access_listing(&tree, false))
 }
 
 /// The elements alive in the program's tree: what a pin on releasing reads.

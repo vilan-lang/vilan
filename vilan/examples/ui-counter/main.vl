@@ -337,6 +337,9 @@ fun check(arguments: List<str>) {
 	for entry in tags {
 		print(i"{"  ".repeat(entry.depth)}{entry.kind} {entry.label} {entry.bounds.x.value()} {entry.bounds.y.value()} {entry.bounds.width.value()} {entry.bounds.height.value()}");
 	}
+	// What an assistive tool is told of the screen (native-ui.md P5).
+	print("accessibility:");
+	print(root.accessibility().trim());
 
 	let report = |what: str| {
 		print(i"{what}: count={count.get()} add={state(add)} reset={state(reset)} handlers=[{lines.read().join(", ")}]");
@@ -378,6 +381,8 @@ fun check(arguments: List<str>) {
 	// 4. Tab and Shift+Tab move the focus through the tab order, wrapping.
 	deliver(root, Event::KeyPressed(key(KeyName::Tab, false)));
 	report("tab");
+	print("accessibility after tab:");
+	print(root.accessibility().trim());
 	deliver(root, Event::KeyPressed(key(KeyName::Char(" "), false)));
 	report("space");
 	deliver(root, Event::KeyPressed(key(KeyName::Tab, false)));

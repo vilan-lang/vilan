@@ -247,6 +247,7 @@ export impl TextInput {
 		disabled.bind(|value: bool| {
 			input.off.write() = value;
 			ui_set_focusable(input.element.node, !value);
+			let _published = input.element.disabled_state(value);
 			input.show();
 		});
 		self
