@@ -61,8 +61,13 @@
 // COMPONENTS are `std::ui::kit` (part P4), under `ui/kit/`: built from these
 // elements, with no look of their own either.
 //
-// Not here yet: grid layout, text editing, publishing roles and labels to the
-// system's accessibility API (R10: carried from this version).
+// ACCESSIBILITY (R10, part P5): every element's role, label and states are
+// published to the system's accessibility API (AT-SPI, UI Automation,
+// NSAccessibility) while an assistive tool listens, and the tool's actions come
+// back as the pointer and keyboard input they stand for. `accessibility()` lists
+// what a tool is told.
+//
+// Not here yet: grid layout, text editing beyond one line.
 
 [platform("@process")] mod self;
 
@@ -125,7 +130,8 @@ import pkg::shared::Shared;
 //
 //   __ui_set property     0 grow, 1 shrink, 2 gap, 3 align, 4 justify, 5 wrap,
 //                         6 anchor, 7 role, 13 fit, 14..17 padding top, right,
-//                         bottom, left, 18 clip, 19 tab index, 20 scroll axis
+//                         bottom, left, 18 clip, 19 tab index, 20 scroll axis,
+//                         21 checked (-1 none), 22 disabled state
 //   __ui_set_length       0 width, 1 height, 2 min width, 3 max width, 4 min
 //                         height, 5 max height; unit 0 auto, 1 dp, 2 fraction
 //   __ui_style_number     0 opacity, 1 text size, 2 line height, 3 weight,
@@ -253,6 +259,15 @@ external fun ui_insert_before(reference: Node, child: Node): void;
 /// Takes `node` out of its parent for good, and drops its subtree's handlers.
 [extern("__ui_remove")]
 external fun ui_remove(node: Node): void;
+
+/// A list holding only some of its items: its first child is item `first` of
+/// `count` (for assistive technology).
+[extern("__ui_set_items")]
+external fun ui_set_items(node: Node, first: f64, count: f64): void;
+
+/// What an assistive tool is told of the tree under `node`, one line an element.
+[extern("__ui_accessibility")]
+external fun ui_accessibility(node: Node): str;
 
 /// Scrolls every `scroll` around `node` as little as it takes to show it.
 [extern("__ui_scroll_into_view")]
@@ -484,8 +499,11 @@ export enum Fit {
 	None,
 }
 
-/// What an element is to someone using assistive technology (R10). Carried from
-/// this version; a later one publishes it to the system's accessibility API.
+/// What an element is to someone using assistive technology (R10), published to
+/// the system's accessibility API. An element with no role is published by its
+/// kind: a text as a label, a scroll as a scroll view, a labelled image as an
+/// image (an unlabelled one is decorative and left out), a labelled row, column
+/// or stack as a group, and a list's children as its items.
 export enum Role {
 	Group,
 	Heading,
@@ -1034,6 +1052,13 @@ export impl Element {
 		ui_release_pointer(self.node);
 	}
 
+	/// What an assistive tool is told of it and everything inside it, one line an
+	/// element, indented by depth: its role, its name, its value, its states and
+	/// the actions it offers (no positions). For a test of an app's labels.
+	fun accessibility(self): str {
+		ui_accessibility(self.node)
+	}
+
 	/// Whether it is hovered, pressed and focused now. While the button is held
 	/// after a press on it, `pressed` stays on wherever the pointer goes, and
 	/// `hovered` says whether the pointer is over it.
@@ -1230,16 +1255,46 @@ export trait Attributes {
 		self
 	}
 
-	/// What it is to assistive technology.
+	/// What it is to assistive technology. A button, a checkbox, a link and a
+	/// heading are named by their label, or else by the text inside them, and
+	/// nothing inside them is published on its own.
 	fun role(self, role: Role): Self {
 		ui_set(self.element().node, 7, role_code(role));
 		self
 	}
 
 	/// What assistive technology reads for it, and the name `outline` lists it by.
+	/// Give one to every control that shows no text (an icon-only button), and to
+	/// an image that means something; a labelled text is named by the label, its
+	/// text its value.
 	fun label<V: Bindable<str>>(self, own label: V): Self {
 		let node = self.element().node;
 		label.bind(|value: str| ui_set_label(node, value));
+		self
+	}
+
+	/// Its state, for assistive technology: checked (`true`) or not, as a checkbox
+	/// or a toggle is (`kit::checkbox` sets it from its cell).
+	fun checked<V: Bindable<bool>>(self, own checked: V): Self {
+		let node = self.element().node;
+		checked.bind(|value: bool| ui_set(node, 21, if value { 1.0 } else { 0.0 }));
+		self
+	}
+
+	/// Shown but not acting, for assistive technology: published as disabled and
+	/// offered no action. It changes nothing else (the `kit` controls'
+	/// `disabled(..)` sets it with their own behaviour).
+	fun disabled_state<V: Bindable<bool>>(self, own disabled: V): Self {
+		let node = self.element().node;
+		disabled.bind(|value: bool| ui_set(node, 22, if value { 1.0 } else { 0.0 }));
+		self
+	}
+
+	/// A list holding only some of its items, for assistive technology: its first
+	/// child (after any region's place) is item `first` (from 0) of `count`, the
+	/// next `first + 1`, and so on (`kit::virtual_list` sets it as it scrolls).
+	fun items_shown(self, first: usize, count: usize): Self {
+		ui_set_items(self.element().node, first.as_f64(), count.as_f64());
 		self
 	}
 

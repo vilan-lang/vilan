@@ -363,6 +363,10 @@ fun check(arguments: List<str>, count: i32) {
 	// 1. The first layout: the viewport's height reaches the list after the pass,
 	// and the rows it shows are built and laid out in the same `layout`.
 	report("first layout");
+	// What an assistive tool is told: the rows built, each its place in the whole
+	// list (native-ui.md P5).
+	print("accessibility at the first layout:");
+	print(list.element().accessibility().trim());
 	let viewport = list.element().bounds();
 	let whole = list.viewport().range().height.value() + viewport.height.value();
 	print(i"the range and the viewport make the whole list: {(whole - count.as_f64() * extent()).abs() <= 1.0}");
@@ -379,6 +383,8 @@ fun check(arguments: List<str>, count: i32) {
 	// 3. Far down, by reveal: nothing in between was ever built.
 	list.reveal((count / 2).as_usize());
 	report("reveal middle");
+	print("accessibility at the middle:");
+	print(list.element().accessibility().trim());
 
 	// 4. Hover, press and focus on a row survive changes that keep it in the
 	// window: another row's change, a programmatic scroll of one row, an insert

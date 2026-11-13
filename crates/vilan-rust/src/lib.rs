@@ -18971,6 +18971,10 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         // F172: pointer capture and presses in a row.
         ("__ui_click_count", "ui::click_count", &[]),
         ("__ui_release_pointer", "ui::release_pointer", &[0]),
+        // P5: accessibility publishing — a list holding only some of its
+        // items, and the listing of what an assistive tool is told.
+        ("__ui_set_items", "ui::set_items", &[0]),
+        ("__ui_accessibility", "ui::accessibility", &[0]),
     ];
     FUNCTIONS
         .iter()

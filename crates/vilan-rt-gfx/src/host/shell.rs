@@ -31,6 +31,14 @@
 //! event the driver's thread read in that time reaches the program within the
 //! next step of the schedule. The schedule ends two seconds after the last
 //! present, and the loop sleeps as before — an idle window costs no wake.
+//!
+//! # Accessibility
+//!
+//! Each window is made HIDDEN, given its accessibility adapter
+//! (`access.rs`), and then shown: the adapter must exist before the window is
+//! first shown. Every window event reaches the adapter first, and after every
+//! turn each window's tree is published if a tool listens and it may have
+//! changed. An adapter's wakes arrive as user events, like the executor's.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -43,9 +51,10 @@ use vilan_rt::{panic_with, str_new};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{Ime, StartCause, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+use super::access::{self, WindowAccess};
 use super::input::{RawEvent, enqueue};
 use super::{HostWake, STATE, TEXT_SCALE, with_text};
 use crate::units::Units;
@@ -58,6 +67,8 @@ pub(crate) fn run(event_loop: EventLoop<HostWake>, turn: &dyn Fn() -> Turn) {
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut shell = Shell {
         shares_x_connection: shares_x_connection(&event_loop),
+        proxy: event_loop.create_proxy(),
+        access: HashMap::new(),
         turn,
         renderers: HashMap::new(),
         ids: HashMap::new(),
@@ -107,6 +118,10 @@ struct Shell<'turn> {
     renderers: HashMap<u32, WindowRenderer>,
     /// The program's id of each open window.
     ids: HashMap<WindowId, u32>,
+    /// What the accessibility adapters wake the loop through.
+    proxy: EventLoopProxy<HostWake>,
+    /// Each open window's accessibility adapter, by the program's id.
+    access: HashMap<u32, WindowAccess>,
     started: bool,
     /// Something was queued for the program, or it was woken, since its last
     /// turn.
@@ -207,8 +222,17 @@ impl Shell<'_> {
                 return self.fail(event_loop, payload);
             }
             if !self.owes_a_turn {
-                return;
+                break;
             }
+        }
+        self.publish_access();
+    }
+
+    /// Publishes each window's accessibility tree, where a tool listens and
+    /// it may have changed (`access.rs`).
+    fn publish_access(&mut self) {
+        for (id, access) in &mut self.access {
+            access.publish(*id);
         }
     }
 
@@ -239,15 +263,16 @@ impl Shell<'_> {
                 .collect()
         });
         for (id, title, (width, height)) in asked {
-            let made = make_window(event_loop, &title, width, height);
+            let made = make_window(event_loop, &title, width, height, id, &self.proxy);
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 let Some(slot) = state.windows.get_mut(&id) else {
                     return;
                 };
                 match made {
-                    Ok(renderer) => {
+                    Ok((renderer, access)) => {
                         let window = Arc::clone(renderer.window());
+                        self.access.insert(id, access);
                         let size = renderer.size();
                         slot.device_size = (size.width, size.height);
                         slot.scale_factor = window.scale_factor();
@@ -287,6 +312,7 @@ impl Shell<'_> {
             if let Some(renderer) = self.renderers.remove(&id) {
                 self.ids.remove(&renderer.window().id());
             }
+            self.access.remove(&id);
         }
         if none_left {
             // Unless a stop is already under way: a second request ends the
@@ -349,21 +375,35 @@ impl Shell<'_> {
     }
 }
 
-/// A window and the renderer on its surface, or why not.
+/// Program window `id`: the window, its accessibility adapter, and the
+/// renderer on its surface; or why not.
+///
+/// The adapter must exist before the window is first shown, so the window is
+/// made hidden and shown once it has one — and only then given its surface.
+/// With the surface made while the window was still hidden, the counter's
+/// xvfb proof saw a frame drawing what the frame before it showed in 5 runs
+/// of 8 (an extra redraw from the window system, its cause not traced);
+/// made after the window is shown, in none of 8.
 fn make_window(
     event_loop: &ActiveEventLoop,
     title: &str,
     width: f64,
     height: f64,
-) -> Result<WindowRenderer, String> {
+    id: u32,
+    proxy: &EventLoopProxy<HostWake>,
+) -> Result<(WindowRenderer, WindowAccess), String> {
     let attributes = Window::default_attributes()
+        .with_visible(false)
         .with_title(title)
         .with_inner_size(LogicalSize::new(width, height));
     let window = event_loop
         .create_window(attributes)
         .map_err(|error| format!("cannot open a window: {error}"))?;
-    WindowRenderer::new(event_loop, Arc::new(window))
-        .map_err(|error| format!("cannot draw in a window: {error}"))
+    let access = WindowAccess::new(event_loop, &window, id, proxy);
+    window.set_visible(true);
+    let renderer = WindowRenderer::new(event_loop, Arc::new(window))
+        .map_err(|error| format!("cannot draw in a window: {error}"))?;
+    Ok((renderer, access))
 }
 
 impl ApplicationHandler<HostWake> for Shell<'_> {
@@ -390,8 +430,21 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: HostWake) {
-        self.owes_a_turn = true;
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: HostWake) {
+        match event {
+            HostWake::Executor => self.owes_a_turn = true,
+            // A tool started listening: its whole tree now, though no turn
+            // is owed.
+            HostWake::AccessActivated(id) => {
+                if let Some(access) = self.access.get_mut(&id) {
+                    access.publish(id);
+                }
+            }
+            HostWake::Action(id, request) => {
+                access::request(id, request);
+                self.owes_a_turn = true;
+            }
+        }
     }
 
     fn window_event(
@@ -403,6 +456,10 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
         let Some(&id) = self.ids.get(&window_id) else {
             return;
         };
+        if let (Some(access), Some(renderer)) = (self.access.get_mut(&id), self.renderers.get(&id))
+        {
+            access.process_event(renderer.window(), &event);
+        }
         let content_scale = STATE.with(|state| {
             state
                 .borrow()

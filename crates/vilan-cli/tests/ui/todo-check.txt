@@ -4,9 +4,25 @@ column todo 0 0 420 480
   scroll list 20 106 380 323
   text count 20 441 380 19
 start: draft="" caret=0 anchor=0 items=[] focus=- log=[]
+accessibility at the start:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="" placeholder="What needs doing?" selection=0..0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  Button "add" disabled
+  ScrollView "list" scroll_y=0/0
+  Label "count" value="0 items"
 add while empty: draft="" caret=0 anchor=0 items=[] focus=- log=[]
 focus: draft="" caret=0 anchor=0 items=[] focus=input log=[]
 typed milk: draft="milk" caret=4 anchor=4 items=[] focus=input log=[]
+accessibility typed milk:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="milk" focused selection=4..4 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="milk" graphemes=4
+  Button "add" [click focus]
+  ScrollView "list" scroll_y=0/0
+  Label "count" value="0 items"
 left twice: draft="milk" caret=2 anchor=2 items=[] focus=input log=[]
 typed X: draft="miXlk" caret=3 anchor=3 items=[] focus=input log=[]
 backspace: draft="milk" caret=2 anchor=2 items=[] focus=input log=[]
@@ -49,7 +65,35 @@ past the right edge, three times: draft="a line of text long enough to be wider 
 released out of the window: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=0 items=[] focus=input log=[]
 enter: draft="" caret=0 anchor=0 items=[[ ] bread] focus=input log=[add bread]
 add button: draft="" caret=0 anchor=0 items=[[ ] bread, [ ] milk] focus=- log=[add milk]
+accessibility with two items:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="" placeholder="What needs doing?" selection=0..0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  Button "add" disabled focused
+  ScrollView "list" scroll_y=0/0
+    CheckBox "check bread" unchecked [click focus]
+    Label value="bread"
+    Button "remove bread" [click focus]
+    CheckBox "check milk" unchecked [click focus]
+    Label value="milk"
+    Button "remove milk" [click focus]
+  Label "count" value="2 items"
 tab, space: draft="" caret=0 anchor=0 items=[[x] bread, [ ] milk] focus=- log=[screen key]
+accessibility with bread checked and focused:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="" placeholder="What needs doing?" selection=0..0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  Button "add" disabled
+  ScrollView "list" scroll_y=0/0
+    CheckBox "check bread" checked focused [click focus]
+    Label value="bread"
+    Button "remove bread" [click focus]
+    CheckBox "check milk" unchecked [click focus]
+    Label value="milk"
+    Button "remove milk" [click focus]
+  Label "count" value="2 items"
 click check bread: draft="" caret=0 anchor=0 items=[[ ] bread, [ ] milk] focus=- log=[]
 click check milk: draft="" caret=0 anchor=0 items=[[ ] bread, [x] milk] focus=- log=[]
 remove milk: draft="" caret=0 anchor=0 items=[[ ] bread] focus=- log=[remove milk]

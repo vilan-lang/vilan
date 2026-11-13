@@ -186,6 +186,7 @@ fun bind_disabled<V: Bindable<bool>>(element: Element, off: Shared<bool>, own di
 		if value {
 			element.release_pointer();
 		}
+		let _published = element.disabled_state(value);
 	});
 }
 

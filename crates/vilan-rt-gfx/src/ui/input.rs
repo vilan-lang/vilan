@@ -283,6 +283,7 @@ impl UiTree {
     /// `tab_index`), or not focusable (`None`).
     pub fn set_tab_index(&mut self, node: NodeId, index: Option<i32>) {
         self.data_mut(node).tab_index = index;
+        self.semantics_changed();
     }
 
     pub fn focused(&self) -> Option<NodeId> {

@@ -69,6 +69,7 @@
 //! proven for one (native-ui.md section 8). The user's text-scale setting is
 //! not read: the text scale is 1. No input method (IME) composition.
 
+mod access;
 mod input;
 mod shell;
 pub mod ui;
@@ -94,10 +95,17 @@ use crate::units::Units;
 
 pub(crate) use input::RawEvent;
 
-/// The user event the window system's loop is woken with: the executor's
-/// wake, from any thread.
+/// The user event the window system's loop is woken with, from any thread:
+/// the executor's wake, or an accessibility adapter's (`access.rs`).
 #[derive(Debug)]
-pub(crate) struct HostWake;
+pub(crate) enum HostWake {
+    Executor,
+    /// An assistive tool started listening to program window `0`: a whole
+    /// tree is owed.
+    AccessActivated(u32),
+    /// An assistive tool asks program window `0` for an action.
+    Action(u32, accesskit::ActionRequest),
+}
 
 /// The text scale every frame is drawn at in the first version: the user's
 /// setting is not read yet.
@@ -154,6 +162,9 @@ pub(crate) struct WindowSlot {
     /// The program closed the window, or its close request was delivered:
     /// the host closes it after this turn.
     pub(crate) closing: bool,
+    /// Actions an assistive tool asked for, carried out in turns
+    /// (`access.rs`).
+    pub(crate) access_requests: VecDeque<accesskit::ActionRequest>,
 }
 
 impl WindowSlot {
@@ -244,7 +255,7 @@ pub fn install() {
                 let _ = proxy
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .send_event(HostWake);
+                    .send_event(HostWake::Executor);
             }));
             EVENT_LOOP.with(|slot| *slot.borrow_mut() = Some(event_loop));
             STATE.with(|state| state.borrow_mut().system = WindowSystem::Ready);
@@ -352,6 +363,7 @@ pub fn open(
                 frame_due: false,
                 scene: None,
                 closing: false,
+                access_requests: VecDeque::new(),
             },
         );
         id
@@ -496,6 +508,8 @@ enum Work {
     /// callback, which reads the same events again.
     UiEvents(ui::Node, Vec<RawEvent>, Option<Rc<dyn Fn()>>),
     Frame(Option<Rc<dyn Fn()>>, (f64, f64), f64),
+    /// An assistive tool's action in a mounted tree (`access.rs`).
+    Access(ui::Node, accesskit::ActionRequest),
     Nothing,
 }
 
@@ -521,6 +535,18 @@ impl IoSource for WindowSource {
                     Some(resolve) => Work::Answer(resolve, answer),
                     None => Work::Nothing,
                 };
+            }
+            // An assistive tool's action, when no window event waits: one
+            // at a time, since it may queue window input of its own.
+            if slot.events.is_empty() && !slot.access_requests.is_empty() {
+                match &slot.ui_root {
+                    Some(root) => {
+                        let request = slot.access_requests.pop_front().expect("one waits");
+                        return Work::Access(root.clone(), request);
+                    }
+                    // Nothing mounted: nothing can act.
+                    None => slot.access_requests.clear(),
+                }
             }
             if !slot.events.is_empty()
                 && let Some(root) = &slot.ui_root
@@ -570,6 +596,10 @@ impl IoSource for WindowSource {
             Work::Frame(callback, size, scale_factor) => {
                 let scene = build_frame(size, scale_factor, callback.as_deref());
                 with_window(self.id, |slot| slot.scene = Some(scene));
+                true
+            }
+            Work::Access(root, request) => {
+                access::perform(self.id, &root, &request);
                 true
             }
             Work::Nothing => false,

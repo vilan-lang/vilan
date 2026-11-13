@@ -85,6 +85,7 @@ guide/native.md h2 elements-and-layout
 guide/native.md h3 interaction
 guide/native.md h3 lists-and-conditional-children
 guide/native.md h3 components
+guide/native.md h3 accessibility
 guide/native.md h2 debug-by-default
 guide/native.md h2 numbers
 guide/native.md h2 where-the-emitted-rust-goes
@@ -674,6 +675,7 @@ std/ui.md h2 lists-and-conditional-children
 std/ui.md h2 a-virtual-list
 std/ui.md h2 showing-it
 std/ui.md h2 components-stduikit
+std/ui.md h2 accessibility
 std/window.md h1 windows
 std/window.md h2 how-a-desktop-program-ends
 std/window.md h2 not-here-yet

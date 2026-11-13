@@ -275,6 +275,7 @@ export impl TextInput {
 				// A drag in progress stops here.
 				input.element.release_pointer();
 			}
+			let _published = input.element.disabled_state(value);
 			input.show();
 		});
 		self
