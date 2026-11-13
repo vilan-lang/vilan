@@ -17991,6 +17991,66 @@ const UI_P3_PROBE: &str = concat!(
     "}\n",
 );
 
+/// gfx-path.md S2: `Path` and `PathBuilder` lower to the GPU crate's host
+/// values, recognized by the externs that read them (as `TextLayout` and
+/// `Texture` are), and parsing, building, reading and drawing a path to one
+/// host call each. Emitted with `--stdout`: no cargo build (the built and
+/// drawn path is `gfx_window.rs`'s).
+#[test]
+fn gfx_path_paths_lower_to_the_hosts_values_and_calls() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_path.vl"), GFX_PATH_PROBE).expect("write the probe");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_path.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    assert!(
+        emitted.status.success(),
+        "the path probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    for expected in [
+        "vilan_rt_gfx::Path",
+        "vilan_rt_gfx::host::PathBuilder",
+        "vilan_rt_gfx::host::path_parse(",
+        "vilan_rt_gfx::host::path_builder(",
+        "vilan_rt_gfx::host::path_segment(",
+        "vilan_rt_gfx::host::path_finish(",
+        "vilan_rt_gfx::host::path_number(",
+        "vilan_rt_gfx::host::path(",
+        "vilan_rt_gfx::host::install();",
+    ] {
+        assert!(source.contains(expected), "no {expected}:\n{source}");
+    }
+}
+
+const GFX_PATH_PROBE: &str = concat!(
+    "import std::gfx::{ Color, FillRule, Frame, Offscreen, Path, PathPaint, Point, Stroke, dp };\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet built = Path::builder().move_to(0.0, 0.0).line_to(4.0, 4.0).close().finish();\n",
+    "\tmatch Path::from_svg(\"M20 6 9 17l-5-5\") {\n",
+    "\t\tOk(let check) => {\n",
+    "\t\t\tprint(check.bounds().width.value());\n",
+    "\t\t\tlet drawn = Offscreen::new(dp(32), dp(32)).render(|frame: Frame| {\n",
+    "\t\t\t\tframe.path(check, Point::new(dp(0), dp(0)), 1.0, PathPaint::Stroke(Stroke::new(2.0)), Color::black());\n",
+    "\t\t\t\tframe.path(built, Point::new(dp(0), dp(0)), 2.0, PathPaint::Fill(FillRule::EvenOdd), Color::black());\n",
+    "\t\t\t});\n",
+    "\t\t\tprint(drawn.is_ok());\n",
+    "\t\t},\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
 const GFX_SYNC_PROBE: &str = concat!(
     "import std::gfx::{ TextLayout, TextStyle };\n",
     "import std::io::print;\n",

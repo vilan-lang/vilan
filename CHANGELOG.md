@@ -25,6 +25,11 @@ written down.
 
 ## Unreleased
 
+<!-- family: feature -->
+**`std::gfx` draws paths: `Path::from_svg` or `Path::builder()`, filled by a rule or stroked, with `Frame::path` (gfx-path.md S1 and S2, RULED R1 to R8).** A path is drawn as a coverage mask that `zeno` (already in the GPU crate through `swash`, now named directly at the same version, so no package is added) rasterises at the device size it is drawn at, stored in the glyph atlas's mask pages under a key of its own and drawn as one tinted quad, as a glyph is: an icon batches with the text beside it, and 240 cached 24 dp icons cost 83 us of CPU a frame against 70 us for 240 rounded rectangles (release, Mesa software Vulkan, a loaded machine). A mask over 256 device pixels a side gets a texture of its own, freed after a frame that does not draw it; a path's origin snaps to a whole device pixel, so a path in a placed scene draws the pixels it draws in window coordinates; two paths parsed from the same data share one mask; a stroke's outline is made once per stroke style and every later size only fills it. SVG path data is parsed strictly by the crate (every command, absolute and relative, arcs included, exponents, compact flags), and a malformed string is an `Err` naming the byte where it stops making sense (`invalid path data at byte 8: expected a number: M10 10 L>`): `zeno`'s own validator accepts `M 10` and `M10 10 L` and drops their last command. Strokes have a width, a join, a cap and a miter limit, in the path's units; solid colour only, no dashes, no clip to a path. Known limit: `zeno` bevels a miter join sharper than 90 degrees whatever the limit (pinned, ignored, F175).
+
+---
+
 <!-- family: fix -->
 **Native: `ListCell::peek`, `HashMapCell::peek`, `HashSetCell::peek` and `Weak::get` build (B739).** The native backend refused the `WeakGet` intrinsic by name, so every `peek` was a JavaScript-only read. `weak.get()` is now a view of the cell's value, not a copy: the cell is pinned and its value lent for the statement that reads the view (a `match` subject's whole match), and a write of the cell inside that extent is the runtime's reentrancy stop, as a read inside `update` is. `vilan/examples/ui-virtual-list` reads its list in place with `peek` again.
 

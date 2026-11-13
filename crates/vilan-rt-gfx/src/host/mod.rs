@@ -54,8 +54,9 @@
 //! answer — the window's id, or why it could not be made (no GPU adapter, a
 //! surface the system refused) — reaches the program from the window's
 //! source in the next turn. A window crosses as its id; everything else
-//! crosses as numbers, strings, and the two host values `std::gfx` declares
-//! (`TextLayout`, `Texture`: this crate's [`TextLayout`] and [`Image`]).
+//! crosses as numbers, strings, and the host values `std::gfx` declares
+//! (`TextLayout`, `Texture`, `Path`: this crate's [`TextLayout`], [`Image`]
+//! and [`Path`](crate::Path); `PathBuilder`, [`PathBuilder`] here).
 //!
 //! Closing the LAST window stops the program the way SIGTERM does
 //! (`vilan_rt::executor::request_termination`): servers drain, the loop ends,
@@ -71,8 +72,13 @@
 
 mod access;
 mod input;
+mod paths;
 mod shell;
 pub mod ui;
+
+pub use paths::{
+    PathBuilder, path, path_builder, path_finish, path_number, path_parse, path_segment,
+};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, VecDeque};

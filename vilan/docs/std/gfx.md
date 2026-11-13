@@ -1,8 +1,8 @@
 # GPU graphics
 
 `std::gfx` opens a window and draws in it with the GPU: rounded rectangles with
-gradients and borders, shadows, text, underlines and textures, under clips,
-transforms and opacity layers. Every length is in display pixels (`dp`), frames
+gradients and borders, shadows, text, underlines, textures and paths, under
+clips, transforms and opacity layers. Every length is in display pixels (`dp`), frames
 are drawn only when something changed, and input arrives as values. It is the
 layer a native UI framework stands on (native-ui.md, part P1): a program that
 draws with it directly lays out and hit-tests by hand, and one that would rather
@@ -16,7 +16,8 @@ check` accepts one, because a check is the same for both backends. It is a
 process module, so a browser build that reaches it is refused at the platform
 check. What is plain vilan — lengths, geometry, colours, the builders — runs
 anywhere; the refusal is by reach, at the first call that needs the GPU or the
-window system (opening a window, shaping text, a texture, an offscreen frame).
+window system (opening a window, shaping text, a texture, a path, an offscreen
+frame).
 
 ## Lengths: `Dp`
 
@@ -167,6 +168,93 @@ A texture's pixels are copied in once; they are uploaded to the GPU on the
 first frame that draws them and freed after the last copy of the texture is
 gone. A texture larger than the GPU's largest texture fails the frame that
 draws it.
+
+## Paths
+
+```vilan,fragment
+struct Path;          // lines, curves and arcs in their own units: a host value
+impl Path {
+	fun from_svg(data: str): Result<Path, str>   // SVG path data; `Err` names the byte
+	fun builder(): PathBuilder
+	fun bounds(self): Rect                        // control points included, in path units
+}
+struct PathBuilder;   // a host value: every method answers the builder
+impl PathBuilder {
+	fun move_to(self, x: f64, y: f64): PathBuilder
+	fun line_to(self, x: f64, y: f64): PathBuilder
+	fun quad_to(self, cx: f64, cy: f64, x: f64, y: f64): PathBuilder
+	fun cubic_to(self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64): PathBuilder
+	fun arc_to(self, rx: f64, ry: f64, rotation: f64, large: bool, sweep: bool, x: f64, y: f64): PathBuilder
+	fun close(self): PathBuilder
+	fun finish(self): Path
+}
+enum FillRule { NonZero, EvenOdd }
+enum Join { Miter, Round, Bevel }
+enum Cap { Butt, Round, Square }
+struct Stroke { width: f64, join: Join, cap: Cap, miter_limit: f64 }
+impl Stroke {
+	fun new(width: f64): Stroke   // round joins, round caps, miter limit 4
+	fun join(own self, join: Join): Stroke
+	fun cap(own self, cap: Cap): Stroke
+	fun miter_limit(own self, miter_limit: f64): Stroke
+}
+enum PathPaint { Fill(FillRule), Stroke(Stroke) }
+impl Frame {
+	fun path(self, path: Path, at: Point, scale: f64, paint: PathPaint, color: Color)
+}
+```
+
+A path is a shape in its OWN units: an icon's box (Lucide draws in 24), or dp
+for a chart drawn at scale 1. `Frame::path` draws it with its origin at `at`
+and `scale` dp to one path unit, so a 24-unit icon at 16 dp is `16.0 / 24.0`;
+a stroke's width is in path units too and scales with the path, as SVG's does.
+`Path::from_svg` reads SVG path data — every command, absolute and relative,
+arcs included — and a malformed string is an `Err` naming the byte where it
+stops making sense, with the data around it (`invalid path data at byte 8:
+expected a number: M10 10 L>`). The builder follows SVG's rules: a segment with
+no contour open starts one at the current point.
+
+A path is drawn the way a glyph is: the renderer makes its coverage mask once,
+at the size it is drawn at, keeps it in the glyph atlas beside the text, and
+draws it as one tinted quad, so a path is sharp at every size and an icon drawn
+every frame costs about what a letter does. Two paths made from the same data
+share their masks; a stroked path makes its outline once per stroke style. Its
+origin snaps to a whole device pixel, so a path that moves moves by whole
+pixels. Paint is one solid colour; dashes, gradients on paths and clipping to a
+path are not here (a path is clipped by the clip in force, like everything).
+A miter join sharper than 90 degrees is bevelled whatever the miter limit; round
+and bevel joins, an icon set's, are exact. A path is a host value: a copy is the
+same path, and two are `==` only when they are one.
+
+```vilan,native
+import std::gfx::{ Cap, Color, FillRule, Frame, Offscreen, Path, PathPaint, Point, Stroke, dp };
+import std::io::print;
+
+fun main() {
+	// Lucide's check, stroked; a triangle from the builder, filled.
+	let check = match Path::from_svg("M20 6 9 17l-5-5") {
+		Ok(let path) => path,
+		Err(let reason) => {
+			print(reason);
+			ret;
+		},
+	};
+	let triangle = Path::builder().move_to(0.0, 10.0).line_to(5.0, 0.0).line_to(10.0, 10.0).close().finish();
+	let drawn = Offscreen::new(dp(64), dp(32)).render(|frame: Frame| {
+		frame.path(check, Point::new(dp(4), dp(4)), 1.0, PathPaint::Stroke(Stroke::new(2.0).cap(Cap::Butt)), Color::rgb(30, 130, 60));
+		frame.path(triangle, Point::new(dp(36), dp(6)), 2.0, PathPaint::Fill(FillRule::NonZero), Color::black());
+	});
+	match drawn {
+		Ok(let image) => print(i"{image.width()} x {image.height()}"),
+		Err(let reason) => print(i"no frame: {reason}"),
+	}
+	match Path::from_svg("M10 10 L") {
+		Ok(let path) => print(path.bounds().width.value()),
+		Err(let reason) => print(reason),
+	}
+}
+main();
+```
 
 ## Windows
 
@@ -332,9 +420,9 @@ main();
 
 ## Not here yet
 
-Paths and icons, more than one window, rotation, text editing beyond typed text,
-input methods, and publishing accessibility to the system are later parts of
-native-ui.md. The user's text-scale setting is not read yet: text and spacing
+Icons as `std::ui` elements (gfx-path.md), more than one window, rotation, text
+editing beyond typed text, input methods, and publishing accessibility to the
+system are later parts of native-ui.md. The user's text-scale setting is not read yet: text and spacing
 are drawn at the display's scale factor alone. A program that reaches both
 `std::window` and `std::gfx` is refused by name — each needs the main thread for
 its own window system's loop — and so is one whose `main` answers an exit code,

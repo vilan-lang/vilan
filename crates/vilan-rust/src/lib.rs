@@ -3585,6 +3585,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.reaches_gfx = true;
                 Ok("vilan_rt_gfx::Image".to_string())
             }
+            // gfx-path.md S2: `Path` and `PathBuilder`, by their readers too.
+            _ if self.struct_read_by(id, "__gfx_path_number") => {
+                self.reaches_gfx = true;
+                Ok("vilan_rt_gfx::Path".to_string())
+            }
+            _ if self.struct_read_by(id, "__gfx_path_segment") => {
+                self.reaches_gfx = true;
+                Ok("vilan_rt_gfx::host::PathBuilder".to_string())
+            }
             // native-ui.md P2: `std::ui`'s element handle, read by its box
             // reader the same way.
             _ if self.struct_read_by(id, "__ui_node_number") => {
@@ -13254,8 +13263,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// [`Emitter::window_host_binding`] is: only `std::gfx` declares a
     /// `__gfx_`-prefixed name. A window crosses as its id, a frame as its
     /// token, everything else as numbers, strings, `Bytes`, `|| void`
-    /// callbacks and the two host values (`TextLayout`, `Texture`), which
-    /// the runtime READS and so takes by reference. `std::ui`'s `__ui_*`
+    /// callbacks and the host values (`TextLayout`, `Texture`, `Path`,
+    /// `PathBuilder`), which the runtime READS and so takes by reference. `std::ui`'s `__ui_*`
     /// helpers (P2) ride the same table and the same reach: its element
     /// handle (`Node`) is a third host value, read the same way.
     fn gfx_host_binding(
@@ -13293,8 +13302,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
 
     /// Whether an `external struct` is the host value read by `symbol`'s
     /// first parameter — `std::image::Image` by `__image_width`, `std::gfx`'s
-    /// `TextLayout` by `__gfx_layout_number` and `Texture` by
-    /// `__gfx_texture_size`. Decided by the helper that READS the struct,
+    /// `TextLayout` by `__gfx_layout_number`, `Texture` by
+    /// `__gfx_texture_size`, `Path` by `__gfx_path_number` and `PathBuilder`
+    /// by `__gfx_path_segment`. Decided by the helper that READS the struct,
     /// never by its name: `Image`, `Texture` and `TextLayout` are names a
     /// program may well give a host class of its own (a DOM
     /// `HTMLImageElement`, say); [`Emitter::node_buffer_struct`] is the same
@@ -18914,6 +18924,14 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__gfx_texture_from_rgba", "texture_from_rgba", &[2]),
         ("__gfx_texture_size", "texture_size", &[0]),
         ("__gfx_offscreen", "offscreen", &[]),
+        // gfx-path.md S2: paths. A path and a path builder are host values
+        // the functions read; a segment and a draw are numbers.
+        ("__gfx_path_parse", "path_parse", &[0]),
+        ("__gfx_path_builder", "path_builder", &[]),
+        ("__gfx_path_segment", "path_segment", &[0]),
+        ("__gfx_path_finish", "path_finish", &[0]),
+        ("__gfx_path_number", "path_number", &[0]),
+        ("__gfx_path", "path", &[1]),
         // native-ui.md P2: `std::ui` (`vilan/std/src/ui.vl`), the element
         // tree in `vilan_rt_gfx::host::ui`. An element crosses as its
         // `Node` handle, which the functions read and so take by reference.

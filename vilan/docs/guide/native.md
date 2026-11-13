@@ -698,5 +698,6 @@ and no installer or package — each is its own slice. A GPU window's **native
 UI** (`std::ui`) has its elements, layout, styles, events, focus, scrolling,
 keyed lists and conditional children, and its first components (`std::ui::kit`: a
 button, a checkbox, a single-line text input, a virtual list) and publishes them
-to the system's accessibility API; paths, multi-line text editing, the clipboard
-and input methods come after them.
+to the system's accessibility API; `std::gfx` draws paths, and icons as
+elements, multi-line text editing, the clipboard and input methods come after
+them.

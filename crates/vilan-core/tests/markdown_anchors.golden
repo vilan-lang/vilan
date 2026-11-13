@@ -469,6 +469,7 @@ std/gfx.md h2 geometry-colour-paint
 std/gfx.md h2 primitives-and-frames
 std/gfx.md h2 text
 std/gfx.md h2 textures
+std/gfx.md h2 paths
 std/gfx.md h2 windows
 std/gfx.md h2 events
 std/gfx.md h2 how-a-gpu-program-ends

@@ -3,11 +3,11 @@
 //
 // A program opens a window, and each frame its frame callback is handed a `Frame`
 // to fill with primitives in display pixels (dp): rounded rectangles with gradients
-// and borders, shadows, text, underlines and textures, under clips, transforms and
-// opacity layers. Frames are drawn ON DEMAND — when the window opens, resizes or
-// changes scale, and when the program asks (`request_redraw`) — so an idle window
-// costs nothing. Input arrives as `Event` values through the window's event
-// callback.
+// and borders, shadows, text, underlines, textures and paths (gfx-path.md), under
+// clips, transforms and opacity layers. Frames are drawn ON DEMAND — when the
+// window opens, resizes or changes scale, and when the program asks
+// (`request_redraw`) — so an idle window costs nothing. Input arrives as `Event`
+// values through the window's event callback.
 //
 // NATIVE ONLY. Its runtime is the `vilan-rt-gfx` crate (`wgpu` + `winit` + a
 // renderer of its own, text by `parley`), which a generated cargo project links
@@ -31,9 +31,9 @@
 // Closing the LAST window stops the program the way SIGTERM does: servers stop
 // accepting and drain, the event loop ends, `main` returns, exit code 0.
 //
-// Not here yet (native-ui.md section 8): paths and icons, more than one window,
-// rotation, text editing, input methods, publishing accessibility. Shared code
-// never names this module (D4).
+// Not here yet (native-ui.md section 8): icons as elements (`std::ui`), more than
+// one window, rotation, text editing, input methods, publishing accessibility.
+// Shared code never names this module (D4).
 
 [platform("@process")] mod self;
 
@@ -254,6 +254,56 @@ external fun gfx_texture_from_rgba(width: u32, height: u32, pixels: Bytes): Resu
 /// A texture's width (0) or height (1) in pixels.
 [extern("__gfx_texture_size")]
 external fun gfx_texture_size(texture: Texture, which: i32): u32;
+
+[extern("__gfx_path_parse")]
+external fun gfx_path_parse(data: str): Result<Path, str>;
+
+[extern("__gfx_path_builder")]
+external fun gfx_path_builder(): PathBuilder;
+
+/// One segment: `verb` 0 move, 1 line, 2 quadratic, 3 cubic, 4 arc (radii,
+/// rotation, the large and sweep flags as 0 or 1, the end), 5 close; its numbers
+/// in order, unused ones 0.
+[extern("__gfx_path_segment")]
+external fun gfx_path_segment(
+	builder: PathBuilder,
+	verb: i32,
+	a: f64,
+	b: f64,
+	c: f64,
+	d: f64,
+	e: f64,
+	f: f64,
+	g: f64,
+): void;
+
+[extern("__gfx_path_finish")]
+external fun gfx_path_finish(builder: PathBuilder): Path;
+
+/// A path's bounds in its own units: left (0), top (1), width (2), height (3).
+[extern("__gfx_path_number")]
+external fun gfx_path_number(path: Path, which: i32): f64;
+
+/// `paint` 0 fills by the rule `rule_or_width` (0 non-zero, 1 even-odd); 1 strokes
+/// `rule_or_width` path units wide with `join` (0 miter, 1 round, 2 bevel), `cap`
+/// (0 butt, 1 round, 2 square) and `miter_limit`.
+[extern("__gfx_path")]
+external fun gfx_path(
+	frame: u32,
+	path: Path,
+	x: f64,
+	y: f64,
+	scale: f64,
+	paint: i32,
+	rule_or_width: f64,
+	join: i32,
+	cap: i32,
+	miter_limit: f64,
+	red: f64,
+	green: f64,
+	blue: f64,
+	alpha: f64,
+): void;
 
 [extern("__gfx_offscreen")]
 external fun gfx_offscreen(
@@ -760,6 +810,171 @@ export impl Texture {
 	}
 }
 
+// --- Paths ---------------------------------------------------------------------
+
+/// A shape made of lines, curves and arcs, in its OWN units: an icon's box (24 for
+/// Lucide's), or dp for a chart drawn at scale 1. Drawn with `Frame::path`, filled
+/// or stroked in one colour, sharp at every size: the renderer makes its coverage
+/// mask at the size it is drawn at, once, and draws it as it draws a glyph, so an
+/// icon costs what a letter costs. A host value: immutable, cheap to copy, and two
+/// are `==` only when they are one (two made from the same data still share their
+/// masks). Named `gfx::Path`: `std::path` is file-system path arithmetic, so a
+/// program that wants both qualifies one.
+export external struct Path;
+
+export impl Path {
+	/// SVG path data (`M20 6 9 17l-5-5`): every command, absolute and relative
+	/// (`M L H V C S Q T A Z`), arcs included, numbers as SVG writes them. Data
+	/// must start with a move; an empty string is an empty path. `Err` names the
+	/// byte where the data stops making sense, and shows the data around it.
+	fun from_svg(data: str): Result<Path, str> {
+		gfx_path_parse(data)
+	}
+
+	/// An empty builder.
+	fun builder(): PathBuilder {
+		gfx_path_builder()
+	}
+
+	/// The smallest rectangle holding every point, control points included, in the
+	/// path's own units (dp only for a path drawn at scale 1).
+	fun bounds(self): Rect {
+		Rect::new(
+			dp(gfx_path_number(self, 0)),
+			dp(gfx_path_number(self, 1)),
+			dp(gfx_path_number(self, 2)),
+			dp(gfx_path_number(self, 3)),
+		)
+	}
+}
+
+/// Builds a `Path` a segment at a time, by SVG's rules: a segment with no contour
+/// open starts one at the current point (the origin at first, the start of the
+/// contour a `close` just ended). Every method answers the builder, so calls chain;
+/// a copy is the same builder. A host value.
+export external struct PathBuilder;
+
+export impl PathBuilder {
+	/// Starts a contour at `(x, y)`.
+	fun move_to(self, x: f64, y: f64): PathBuilder {
+		gfx_path_segment(self, 0, x, y, 0.0, 0.0, 0.0, 0.0, 0.0);
+		self
+	}
+
+	fun line_to(self, x: f64, y: f64): PathBuilder {
+		gfx_path_segment(self, 1, x, y, 0.0, 0.0, 0.0, 0.0, 0.0);
+		self
+	}
+
+	/// A quadratic curve through the control point `(cx, cy)` to `(x, y)`.
+	fun quad_to(self, cx: f64, cy: f64, x: f64, y: f64): PathBuilder {
+		gfx_path_segment(self, 2, cx, cy, x, y, 0.0, 0.0, 0.0);
+		self
+	}
+
+	/// A cubic curve through two control points to `(x, y)`.
+	fun cubic_to(self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64): PathBuilder {
+		gfx_path_segment(self, 3, c1x, c1y, c2x, c2y, x, y, 0.0);
+		self
+	}
+
+	/// SVG's elliptical arc to `(x, y)`: the radii, the ellipse's rotation in
+	/// degrees, whether to take the larger of the two arcs, and whether to sweep
+	/// clockwise (on a screen, where y grows down). A zero radius is a straight
+	/// line.
+	fun arc_to(
+		self,
+		rx: f64,
+		ry: f64,
+		rotation: f64,
+		large: bool,
+		sweep: bool,
+		x: f64,
+		y: f64,
+	): PathBuilder {
+		let large_flag = if large { 1.0 } else { 0.0 };
+		let sweep_flag = if sweep { 1.0 } else { 0.0 };
+		gfx_path_segment(self, 4, rx, ry, rotation, large_flag, sweep_flag, x, y);
+		self
+	}
+
+	/// Closes the open contour with a line back to its start.
+	fun close(self): PathBuilder {
+		gfx_path_segment(self, 5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+		self
+	}
+
+	/// The path of every segment so far. The builder keeps them: more segments
+	/// extend it, and a later `finish` answers the longer path. A coordinate that
+	/// was not a finite number fails the program here, naming the segment.
+	fun finish(self): Path {
+		gfx_path_finish(self)
+	}
+}
+
+/// How a fill decides what is inside a path whose contours cross or nest:
+/// `NonZero` fills a contour inside another drawn the same way round, `EvenOdd`
+/// makes it a hole whatever its direction.
+export enum FillRule {
+	NonZero,
+	EvenOdd,
+}
+
+/// How a stroke turns a corner. A `Miter` corner sharper than 90 degrees is
+/// bevelled whatever the miter limit (the rasteriser's, a known limit).
+export enum Join {
+	Miter,
+	Round,
+	Bevel,
+}
+
+/// How a stroke ends an open contour.
+export enum Cap {
+	Butt,
+	Round,
+	Square,
+}
+
+/// A stroke, in the PATH's units: it scales with the path, as SVG's does. A width
+/// of zero draws nothing; a negative or non-finite width, or a miter limit under 1,
+/// fails the frame. `Stroke::new(width)` is round-joined and round-capped with a
+/// miter limit of 4: an icon set's stroke.
+export struct Stroke {
+	width: f64,
+	join: Join,
+	cap: Cap,
+	/// The longest a miter may be, as a multiple of the width (SVG's
+	/// `stroke-miterlimit`). Read only for `Join::Miter`.
+	miter_limit: f64,
+}
+
+export impl Stroke {
+	fun new(width: f64): Stroke {
+		Stroke { width, join = Join::Round, cap = Cap::Round, miter_limit = 4.0 }
+	}
+
+	fun join(own self, join: Join): Stroke {
+		self.join = join;
+		self
+	}
+
+	fun cap(own self, cap: Cap): Stroke {
+		self.cap = cap;
+		self
+	}
+
+	fun miter_limit(own self, miter_limit: f64): Stroke {
+		self.miter_limit = miter_limit;
+		self
+	}
+}
+
+/// How a path is painted: its inside filled by a rule, or its outline stroked.
+export enum PathPaint {
+	Fill(FillRule),
+	Stroke(Stroke),
+}
+
 // --- Frames --------------------------------------------------------------------
 
 /// The frame being drawn, handed to a frame callback: everything drawn into it is
@@ -897,6 +1112,51 @@ export impl Frame {
 			corners.top_right.value,
 			corners.bottom_right.value,
 			corners.bottom_left.value,
+		);
+	}
+
+	/// Draws `path` with its origin at `at`, `scale` dp to one path unit (a 24-unit
+	/// icon at 16 dp is `16.0 / 24.0`), painted solid `color`. The origin snaps to
+	/// a whole device pixel, so a path that moves moves by whole pixels. A scale
+	/// must be finite and positive; a frame with another fails.
+	fun path(self, path: Path, at: Point, scale: f64, paint: PathPaint, color: Color) {
+		let (code, rule_or_width, join, cap, miter_limit) = match paint {
+			PathPaint::Fill(let rule) => {
+				let even_odd = match rule {
+					FillRule::NonZero => 0.0,
+					FillRule::EvenOdd => 1.0,
+				};
+				(0, even_odd, 0, 0, 0.0)
+			},
+			PathPaint::Stroke(let stroke) => {
+				let join = match stroke.join {
+					Join::Miter => 0,
+					Join::Round => 1,
+					Join::Bevel => 2,
+				};
+				let cap = match stroke.cap {
+					Cap::Butt => 0,
+					Cap::Round => 1,
+					Cap::Square => 2,
+				};
+				(1, stroke.width, join, cap, stroke.miter_limit)
+			},
+		};
+		gfx_path(
+			self.token,
+			path,
+			at.x.value,
+			at.y.value,
+			scale,
+			code,
+			rule_or_width,
+			join,
+			cap,
+			miter_limit,
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha,
 		);
 	}
 
