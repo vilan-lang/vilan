@@ -23,13 +23,60 @@
 //! Lookups resolve against the atlas every frame (a scene holds glyph keys,
 //! never atlas positions), so a retained scene stays correct across any
 //! amount of eviction between the frames that draw it.
+//!
+//! # Path masks
+//!
+//! A path's coverage mask (gfx-path.md R1) is a mask glyph with another key,
+//! [`AtlasKey::Path`]: the same pages, packing and eviction, so an icon and
+//! the text beside it share a page and a draw call. `path/masks.rs` decides
+//! which masks come here (up to 256 pixels a side) and which get a texture of
+//! their own.
 
 pub(crate) mod packer;
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
+use crate::path::PathMaskKey;
 use crate::text::{GlyphContent, GlyphRasterKey, RasterizedGlyph};
 use packer::{Allocation, ShelfAllocator};
+
+/// What an atlas entry is: a glyph at one size and subpixel position, or a
+/// path's mask at one paint and device scale.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum AtlasKey {
+    Glyph(GlyphRasterKey),
+    Path(PathMaskKey),
+}
+
+impl AtlasKey {
+    /// A total order for eviction's tie break, so the order is the same on
+    /// every run (the map's iteration order is not): glyphs before paths,
+    /// each by its fields.
+    fn eviction_order(&self, other: &AtlasKey) -> Ordering {
+        match (self, other) {
+            (AtlasKey::Glyph(first), AtlasKey::Glyph(second)) => (
+                first.system,
+                first.font,
+                first.glyph,
+                first.size_bits,
+                first.subpixel_bin,
+            )
+                .cmp(&(
+                    second.system,
+                    second.font,
+                    second.glyph,
+                    second.size_bits,
+                    second.subpixel_bin,
+                )),
+            (AtlasKey::Path(first), AtlasKey::Path(second)) => {
+                first.order_fields().cmp(&second.order_fields())
+            }
+            (AtlasKey::Glyph(_), AtlasKey::Path(_)) => Ordering::Less,
+            (AtlasKey::Path(_), AtlasKey::Glyph(_)) => Ordering::Greater,
+        }
+    }
+}
 
 /// How large the atlas may grow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,13 +154,13 @@ pub struct AtlasStats {
     pub color_pages: u32,
     /// GPU memory of every page, in bytes.
     pub texture_bytes: u64,
-    /// Glyphs on the pages now.
+    /// Glyphs (and path masks) on the pages now.
     pub resident_glyphs: u32,
-    /// Glyphs evicted since the atlas was made.
+    /// Glyphs (and path masks) evicted since the atlas was made.
     pub evictions: u64,
-    /// Glyph draws skipped because the pages were full of the current frame's
-    /// own glyphs (or the glyph was larger than a page), since the atlas was
-    /// made.
+    /// Glyph (and path mask) draws skipped because the pages were full of the
+    /// current frame's own entries (or the glyph was larger than a page),
+    /// since the atlas was made.
     pub dropped_glyphs: u64,
 }
 
@@ -155,7 +202,7 @@ pub(crate) struct GlyphAtlas {
     limits: AtlasLimits,
     mask_pages: Vec<ShelfAllocator>,
     color_pages: Vec<ShelfAllocator>,
-    entries: HashMap<GlyphRasterKey, Entry>,
+    entries: HashMap<AtlasKey, Entry>,
     frame: u64,
     evictions: u64,
     dropped_glyphs: u64,
@@ -206,16 +253,25 @@ impl GlyphAtlas {
         }
     }
 
-    /// The glyph for `key`, rasterising and uploading it on a miss.
+    /// The entry for `key` when the atlas has one (stamped with the current
+    /// frame): `Some(None)` for one remembered with no pixels, `None` for a
+    /// miss.
+    pub(crate) fn lookup(&mut self, key: &AtlasKey) -> Option<Option<AtlasGlyph>> {
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = self.frame;
+        Some(entry.placed.map(|placed| placed.glyph()))
+    }
+
+    /// The glyph (or path mask) for `key`, rasterising and uploading it on a
+    /// miss.
     pub(crate) fn resolve(
         &mut self,
-        key: GlyphRasterKey,
+        key: AtlasKey,
         rasterize: impl FnOnce() -> Option<RasterizedGlyph>,
         storage: &mut dyn PageStorage,
     ) -> Option<AtlasGlyph> {
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_used = self.frame;
-            return entry.placed.map(|placed| placed.glyph());
+        if let Some(found) = self.lookup(&key) {
+            return found;
         }
         let placed = match rasterize() {
             Some(glyph) if glyph.width > 0 && glyph.height > 0 => {
@@ -330,26 +386,21 @@ impl GlyphAtlas {
         height: u32,
     ) -> Option<(u32, Allocation)> {
         let current_frame = self.frame;
-        let mut candidates: Vec<(u64, GlyphRasterKey)> = self
+        let mut candidates: Vec<(u64, AtlasKey)> = self
             .entries
             .iter()
             .filter(|(_, entry)| {
                 entry.last_used < current_frame
                     && entry.placed.is_some_and(|placed| placed.kind == kind)
             })
-            .map(|(key, entry)| (entry.last_used, *key))
+            .map(|(key, entry)| (entry.last_used, key.clone()))
             .collect();
-        // Oldest first; the key's fields break ties so the order is the same
-        // on every run (the map's iteration order is not).
-        candidates.sort_by_key(|(last_used, key)| {
-            (
-                *last_used,
-                key.system,
-                key.font,
-                key.glyph,
-                key.size_bits,
-                key.subpixel_bin,
-            )
+        // Oldest first; the key breaks ties so the order is the same on every
+        // run (the map's iteration order is not).
+        candidates.sort_by(|(first_used, first), (second_used, second)| {
+            first_used
+                .cmp(second_used)
+                .then_with(|| first.eviction_order(second))
         });
         for (_, key) in candidates {
             let entry = self.entries.remove(&key).expect("a candidate is an entry");
@@ -401,14 +452,14 @@ mod tests {
         }
     }
 
-    fn key(glyph: u32) -> GlyphRasterKey {
-        GlyphRasterKey {
+    fn key(glyph: u32) -> AtlasKey {
+        AtlasKey::Glyph(GlyphRasterKey {
             system: 1,
             font: 0,
             glyph,
             size_bits: 14.0f32.to_bits(),
             subpixel_bin: 0,
-        }
+        })
     }
 
     fn mask(width: u32, height: u32) -> Option<RasterizedGlyph> {

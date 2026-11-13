@@ -9522,6 +9522,83 @@ fn gfx_p1_lengths_geometry_and_colour_are_plain_values() {
     );
 }
 
+// --- gfx-path.md S2: paths -----------------------------------------------------
+//
+// A `Path` and a `PathBuilder` are host values made by `vilan-rt-gfx`: making
+// one is a `__gfx_*` call, so the JavaScript build refuses a program that
+// parses or builds a path, by the module's name, as it refuses shaping text.
+// A `Stroke`, a `PathPaint` and the enums are plain vilan. Parsing and drawing
+// are pinned by `vilan-rt-gfx`'s unit tests and goldens, the native lowering
+// by `native_differential`'s `gfx_path_*`, the drawn path and the byte of a
+// malformed one by `gfx_window.rs`.
+
+fn gfx_path_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::gfx::{{ Cap, FillRule, Join, Path, PathPaint, Stroke }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn gfx_path_parsing_a_path_reaches_the_gfx_host() {
+    assert_fails_with(
+        &gfx_path_program(
+            r#"match Path::from_svg("M0 0 L1 1") { Ok(let path) => print(path.bounds().width.value()), Err(let reason) => print(reason), }"#,
+        ),
+        "this program reaches `std::gfx` (its `__gfx_path_parse`)",
+    );
+    assert_fails_with(
+        &gfx_path_program(
+            r#"print(Path::builder().move_to(0.0, 0.0).finish().bounds().x.value());"#,
+        ),
+        "this program reaches `std::gfx` (its `__gfx_path_",
+    );
+}
+
+#[test]
+fn gfx_path_a_path_program_checks_clean() {
+    let program = gfx_path_program(
+        r#"
+        let check = Path::builder().move_to(20.0, 6.0).line_to(9.0, 17.0).line_to(4.0, 12.0).finish();
+        let parsed = match Path::from_svg("M20 6 9 17l-5-5") { Ok(let path) => path, Err(let reason) => check, };
+        print(parsed.bounds().width.value());
+        "#,
+    );
+    if let Err(errors) = f1_m2_check(&program) {
+        panic!("`vilan check` must accept a path program: {errors:#?}");
+    }
+}
+
+/// A stroke is plain vilan: `Stroke::new` is an icon set's stroke (round
+/// joins and caps, SVG's miter limit of 4), and its builder methods replace
+/// one field each.
+#[test]
+fn gfx_path_a_stroke_is_a_plain_value_with_an_icon_sets_defaults() {
+    assert_compiles_and_runs(
+        &gfx_path_program(
+            r#"
+            let stroke = Stroke::new(2.0);
+            print(stroke.width);
+            print(stroke.miter_limit);
+            print(match stroke.join { Join::Round => "round", Join::Miter => "miter", Join::Bevel => "bevel", });
+            print(match stroke.cap { Cap::Round => "round", Cap::Butt => "butt", Cap::Square => "square", });
+            let sharp = stroke.join(Join::Miter).cap(Cap::Square).miter_limit(10.0);
+            print(match sharp.join { Join::Miter => "miter", _ => "other", });
+            print(match sharp.cap { Cap::Square => "square", _ => "other", });
+            print(sharp.miter_limit);
+            let paint = PathPaint::Fill(FillRule::EvenOdd);
+            print(match paint { PathPaint::Fill(FillRule::EvenOdd) => "even-odd", _ => "other", });
+            "#,
+        ),
+        "2\n4\nround\nround\nmiter\nsquare\n10\neven-odd\n",
+    );
+}
+
 // --- native-ui.md P2: `std::ui` ------------------------------------------------
 //
 // Elements are laid out and drawn by `vilan-rt-gfx`, linked only into a native

@@ -133,7 +133,11 @@ Rust workspace, seventeen crates, plus the language's own tree:
   clippy, tests, audit and notices; the `windows` leg cross-lints it. LINKED BY USE: a program
   that reaches `std::gfx` (`vilan/std/src/gfx.vl`, every extern `__gfx_*`) names it in its
   generated project, seeded with its `Cargo.lock` (`RT_GFX_LOCK`); the embed carries its
-  `.wgsl` shader with its `.rs` files. Its `src/host/` is the program's side: the extern
+  `.wgsl` shader with its `.rs` files. PATHS (gfx-path.md, RULED; `src/path/`) are coverage
+  masks `zeno` makes at the device size, kept in the glyph atlas under `AtlasKey::Path` (over
+  256 pixels a side, a texture of their own) and drawn as a tinted sprite; the SVG parser is
+  the crate's own (`path/svg.rs`), because `zeno`'s validator drops truncated data silently.
+  Its `src/host/` is the program's side: the extern
   functions (a window crosses as its id, a frame as a token, a primitive as numbers, an event
   as a kind code and numbers read one at a time) and the HOST (R8): the emitted `main` calls
   `vilan_rt_gfx::host::install()` first and the host's `run_pending` / `block_on` in place of

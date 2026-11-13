@@ -4,7 +4,7 @@
 //! A program builds a [`Scene`] of primitives in display pixels (dp) and draws
 //! it into a window ([`WindowRenderer`]) or a texture it can read back
 //! ([`OffscreenRenderer`]). The primitives are the set a user interface is
-//! made of (native-ui.md 3.1, less Path, which is a later part):
+//! made of (native-ui.md 3.1):
 //!
 //! | Primitive | Here |
 //! |---|---|
@@ -13,6 +13,7 @@
 //! | Text run | [`TextLayout`] from a [`TextSystem`], drawn with [`SceneBuilder::text`] |
 //! | Underline | [`Underline`] |
 //! | Image | [`Image`] (RGBA pixels), drawn with a rounded clip |
+//! | Path | [`Path`] (SVG path data or a [`PathBuilder`]), filled or stroked ([`PathPaint`]) in one colour by [`SceneBuilder::path`]: a coverage mask from the glyph atlas (gfx-path.md) |
 //! | Clip | [`SceneBuilder::push_clip`]: a rectangle with corner radii |
 //! | Transform | [`SceneBuilder::push_transform`]: translate and uniform scale |
 //! | Layer | [`SceneBuilder::push_layer`]: opacity |
@@ -90,8 +91,9 @@
 //! crosses as the numbers it is made of (one call into [`host`] per
 //! primitive, nothing allocated per primitive), `push_*`/`pop` as plain calls.
 //! Misuse is one error at [`SceneBuilder::finish`], raised as the program's
-//! failure, not a check per call. A shaped [`TextLayout`] and an [`Image`]
-//! (`std::gfx`'s `Texture`) are host values the program holds. A vilan
+//! failure, not a check per call. A shaped [`TextLayout`], an [`Image`]
+//! (`std::gfx`'s `Texture`), a [`Path`] and a path builder are host values
+//! the program holds; a path is drawn by one call of numbers. A vilan
 //! program compiled to Rust calls this crate directly: no interpreter, no
 //! foreign-function boundary on the hot path.
 //!
@@ -105,7 +107,14 @@
 //!   makes, is exact.
 //! - Glyph coverage is blended in linear light with no gamma or contrast
 //!   adjustment, so dark text on a light background reads slightly lighter
-//!   than a platform's own rendering.
+//!   than a platform's own rendering. A path's mask blends the same way, so
+//!   a thin dark stroke (a 16 dp icon's 1.33 px line) reads lighter than a
+//!   browser draws it.
+//! - Paths (`path/`): solid colour only, no clip to a path, no dashes, no
+//!   rotation (gfx-path.md R5, R6). `zeno` 0.3.3's stroker bevels every
+//!   MITER join sharper than 90 degrees whatever the miter limit (SVG mitres
+//!   such a corner when its miter fits the limit); round and bevel joins,
+//!   an icon set's, are unaffected.
 
 mod atlas;
 mod color;
@@ -115,6 +124,7 @@ mod gpu;
 pub mod host;
 mod offscreen;
 mod order;
+mod path;
 mod renderer;
 mod scene;
 mod text;
@@ -127,6 +137,7 @@ pub use color::{Color, Fill, LinearGradient};
 pub use geometry::{Corners, Edges, Point, Rect, Size, Transform};
 pub use gpu::{AdapterPreference, AdapterSummary, GpuContext};
 pub use offscreen::OffscreenRenderer;
+pub use path::{Cap, FillRule, Join, Path, PathBuilder, PathError, PathPaint, Stroke};
 pub use renderer::FrameStats;
 pub use scene::{Border, Image, Rectangle, Scene, SceneBuilder, SceneError, Shadow, Underline};
 pub use text::{FontFamily, SUBPIXEL_BINS, TextLayout, TextStyle, TextSystem};

@@ -24,7 +24,8 @@
 //! 8. the example's scene drawn OFFSCREEN through the same surface
 //!    (`--golden`, no display needed: it also runs the program with no window
 //!    system) matches its golden images at 100% and 150% within one per
-//!    channel.
+//!    channel — the button's plus icon is a stroked `Path` (gfx-path.md S2) —
+//!    and malformed path data is an `Err` naming the byte.
 //!
 //! Frames on change only: every frame after the first must show something
 //! the frame before it did not (an X server may expose a new window once more,
@@ -294,6 +295,13 @@ fn the_gfx_example_draws_on_change_counts_a_click_and_ends_cleanly() {
         golden.status.success(),
         "the offscreen scene does not match its goldens:\n{said}{}",
         String::from_utf8_lossy(&golden.stderr)
+    );
+    // gfx-path.md S2: `Path::from_svg("M10 10 L")` names byte 8, the end,
+    // where a number was due.
+    assert!(
+        said.lines()
+            .any(|line| line == "path: invalid path data at byte 8: expected a number: M10 10 L>"),
+        "malformed path data is not an `Err` naming the byte:\n{said}"
     );
     if std::env::var_os("VILAN_REGENERATE_GFX_GOLDENS").is_none() {
         assert_eq!(

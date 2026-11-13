@@ -11,6 +11,8 @@
     reason = "each test binary uses its own part of the support module"
 )]
 
+pub mod icons;
+
 use std::path::PathBuf;
 
 use vilan_rt_gfx::{AdapterPreference, GpuContext, TextSystem};

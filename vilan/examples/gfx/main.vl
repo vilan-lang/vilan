@@ -1,8 +1,8 @@
 // A counter in a GPU-drawn window (`std::gfx`): a card with a shadow, a label
-// that shows the count, and a button that lights up under the pointer, darkens
-// while pressed and adds one on a click. The count is a `Signal`; the window
-// redraws only when something it shows changed — the count, the hover, the
-// press — and an idle window draws nothing.
+// that shows the count, and a button with a plus icon (a stroked `Path`) that
+// lights up under the pointer, darkens while pressed and adds one on a click.
+// The count is a `Signal`; the window redraws only when something it shows
+// changed — the count, the hover, the press — and an idle window draws nothing.
 //
 // Hit testing is by hand (`Rect::contains`): the element tree that does it for
 // you is a later part (`std::ui`, native-ui.md P2 and P3).
@@ -16,7 +16,9 @@
 //                           draw the scene offscreen with a software adapter
 //                           and the given font, and compare it with the PNG
 //                           (one per channel of tolerance); with
-//                           VILAN_REGENERATE_GFX_GOLDENS set, write it instead
+//                           VILAN_REGENERATE_GFX_GOLDENS set, write it instead;
+//                           first print what `Path::from_svg` says of
+//                           malformed path data
 
 import std::bytes::Bytes;
 import std::fs::{ read_bytes, write_bytes };
@@ -29,10 +31,13 @@ import std::gfx::{
 	Frame,
 	LinearGradient,
 	Offscreen,
+	Path,
+	PathPaint,
 	Point,
 	Rect,
 	Rectangle,
 	Shadow,
+	Stroke,
 	TextLayout,
 	TextStyle,
 	Underline,
@@ -63,9 +68,21 @@ fun button(): Rect {
 	Rect::new(dp(108), dp(140), dp(144), dp(48))
 }
 
+/// Lucide's `plus`, in its 24-unit box.
+fun plus(): Path {
+	match Path::from_svg("M5 12h14M12 5v14") {
+		Ok(let path) => path,
+		Err(let reason) => {
+			print(i"plus: {reason}");
+			exit(2);
+			Path::builder().finish()
+		},
+	}
+}
+
 /// The scene: everything a frame draws, from the count's label, the button's
-/// label and the pointer state.
-fun draw(frame: Frame, label: TextLayout, caption: TextLayout, pointer: Pointer) {
+/// label and icon, and the pointer state.
+fun draw(frame: Frame, label: TextLayout, caption: TextLayout, icon: Path, pointer: Pointer) {
 	let card = card();
 	frame.shadow(Shadow {
 		bounds = card.offset(dp(0), dp(4)),
@@ -107,13 +124,20 @@ fun draw(frame: Frame, label: TextLayout, caption: TextLayout, pointer: Pointer)
 	};
 	frame.push_clip(button, Corners::all(dp(10)));
 	frame.rectangle(Rectangle::new(button, fill));
+	// The icon, 18 dp, then 6 dp of space, then the caption, centred together.
 	let caption_size = caption.size();
+	let icon_size = dp(18);
+	let left = button.x + (button.width - icon_size - dp(6) - caption_size.width) / 2.0;
+	frame.path(
+		icon,
+		Point::new(left, button.y + (button.height - icon_size) / 2.0),
+		icon_size.value() / 24.0,
+		PathPaint::Stroke(Stroke::new(2.5)),
+		Color::white(),
+	);
 	frame.text(
 		caption,
-		Point::new(
-			button.x + (button.width - caption_size.width) / 2.0,
-			button.y + (button.height - caption_size.height) / 2.0,
-		),
+		Point::new(left + icon_size + dp(6), button.y + (button.height - caption_size.height) / 2.0),
 		Color::white(),
 	);
 	frame.pop();
@@ -146,6 +170,7 @@ fun main() {
 	let count: SignalCell<i32> = Signal::new(0);
 	let label: Shared<TextLayout> = Shared::new(label_for(0, style));
 	let caption = TextLayout::new("Add one", TextStyle::new().size(dp(16)).weight(600));
+	let icon = plus();
 	let pointer: Shared<Pointer> = Shared::new(Pointer { hover = false, pressed = false });
 	let frames: Shared<i32> = Shared::new(0);
 	// Smoke mode: the frame that showed the last change (the count at 1, the
@@ -163,7 +188,7 @@ fun main() {
 
 	window.on_frame(|frame: Frame| {
 		let shown = pointer.read();
-		draw(frame, label.read(), caption, Pointer {
+		draw(frame, label.read(), caption, icon, Pointer {
 			hover = shown.hover,
 			pressed = shown.pressed,
 		});
@@ -240,6 +265,11 @@ fun idle_second(frames: Shared<i32>, settled: Shared<Option<i32>>) {
 
 /// Golden mode: the scene offscreen, at 100% and 150%, held to a PNG each.
 fun golden(arguments: List<str>) {
+	// Malformed path data is an `Err` naming the byte: the `L` has no point.
+	match Path::from_svg("M10 10 L") {
+		Ok(let path) => print(i"path: parsed, {path.bounds().width.value()} wide"),
+		Err(let reason) => print(i"path: {reason}"),
+	}
 	let golden = after(arguments, "--golden");
 	let font = after(arguments, "--font");
 	let families = match register_font(read_bytes(font)) {
@@ -256,13 +286,14 @@ fun golden(arguments: List<str>) {
 		.size(dp(16))
 		.weight(600)
 		.family(FontFamily::Named(families[0])));
+	let icon = plus();
 	for scale in [1.0, 1.5] {
 		let path = i"{golden}-{(scale * 100.0).round()}.png";
 		let drawn = Offscreen::new(dp(360), dp(240))
 			.scale_factor(scale)
 			.software(true)
 			.background(Color::rgb(244, 244, 240))
-			.render(|frame: Frame| draw(frame, label, caption, Pointer {
+			.render(|frame: Frame| draw(frame, label, caption, icon, Pointer {
 				hover = true,
 				pressed = false,
 			}));

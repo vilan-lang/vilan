@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::GfxError;
 use crate::color::{Color, Fill};
 use crate::geometry::{Corners, Edges, Point, Rect, Transform};
+use crate::path::{Path, PathPaint, Stroke};
 use crate::text::TextLayout;
 
 /// A rectangle: per-corner radius, a fill, and a border with a width per side.
@@ -173,6 +174,15 @@ pub(crate) enum Command {
         bounds: Rect,
         corner_radii: Corners,
     },
+    /// A path with its origin at `origin`, `scale` dp to one path unit (see
+    /// [`SceneBuilder::path`]).
+    Path {
+        path: Path,
+        origin: Point,
+        scale: f32,
+        paint: PathPaint,
+        color: Color,
+    },
     PushClip {
         bounds: Rect,
         corner_radii: Corners,
@@ -253,6 +263,12 @@ pub enum SceneError {
     InvalidTransform(Transform),
     /// A layer opacity that is NaN. (Others are clamped into 0..=1.)
     InvalidOpacity,
+    /// A path drawn at a scale that is not finite and positive, or at an
+    /// origin that is not finite.
+    InvalidPathPlacement { origin: Point, scale: f32 },
+    /// A stroke whose width is negative or not finite, or whose miter limit
+    /// is under 1 or not finite.
+    InvalidStroke(Stroke),
 }
 
 impl std::fmt::Display for SceneError {
@@ -272,6 +288,18 @@ impl std::fmt::Display for SceneError {
                 "a transform needs a finite translation and a finite, positive scale; got {transform:?}"
             ),
             SceneError::InvalidOpacity => write!(formatter, "a layer's opacity is NaN"),
+            SceneError::InvalidPathPlacement { origin, scale } => write!(
+                formatter,
+                "a path needs a finite origin and a finite, positive scale; got the origin \
+                 ({}, {}) and the scale {scale}",
+                origin.x, origin.y
+            ),
+            SceneError::InvalidStroke(stroke) => write!(
+                formatter,
+                "a stroke needs a finite width of zero or more and a finite miter limit of at \
+                 least 1; got the width {} and the miter limit {}",
+                stroke.width, stroke.miter_limit
+            ),
         }
     }
 }
@@ -399,6 +427,47 @@ impl SceneBuilder {
                 corner_radii,
             },
             bounds,
+        );
+    }
+
+    /// Draws `path` with its origin at `origin` dp and `scale` dp to one
+    /// path unit, painted solid `color` (gfx-path.md 2.1): filled by a rule,
+    /// or stroked with a width in the path's units, which scales with it.
+    /// The renderer snaps the origin to a whole device pixel (R7) and draws
+    /// a coverage mask made at the device size (`path/mod.rs`).
+    pub fn path(&mut self, path: &Path, origin: Point, scale: f32, paint: PathPaint, color: Color) {
+        if !(origin.x.is_finite() && origin.y.is_finite() && scale.is_finite() && scale > 0.0) {
+            self.record(SceneError::InvalidPathPlacement { origin, scale });
+            return;
+        }
+        if let PathPaint::Stroke(stroke) = paint
+            && !stroke.is_valid()
+        {
+            self.record(SceneError::InvalidStroke(stroke));
+            return;
+        }
+        // The path's points (control points included) bound its ink, grown
+        // by the stroke's reach, and by one dp for the origin's snap.
+        let bounds = path.bounds();
+        let reach = paint.reach();
+        let extent = grown(
+            Rect::new(
+                origin.x + (bounds.left() - reach) * scale,
+                origin.y + (bounds.top() - reach) * scale,
+                (bounds.size.width + 2.0 * reach) * scale,
+                (bounds.size.height + 2.0 * reach) * scale,
+            ),
+            1.0,
+        );
+        self.primitive(
+            Command::Path {
+                path: path.clone(),
+                origin,
+                scale,
+                paint,
+                color,
+            },
+            extent,
         );
     }
 
