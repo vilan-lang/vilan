@@ -10,7 +10,18 @@
 //! 2. `--golden`: the same screen drawn OFFSCREEN with a software adapter at
 //!    100% and 150%, held to `tests/ui/screen-100.png` and `screen-150.png`
 //!    within one per channel (`gfx_window.rs`'s tolerance).
-//! 3. `--smoke`: the screen in a real window under `xvfb-run -a`, laid out at
+//! 3. `--icons` (gfx-path.md S3's exit test): the example's second screen,
+//!    icons in rows beside text — in the text's size and colour, at sizes of
+//!    their own, coloured and labelled, inside a button, filled — laid out at
+//!    100% and 150% and held, with what an assistive tool is told of it (the
+//!    labelled icon an image, the decorative ones nothing), to
+//!    `tests/ui/icon-rects.txt`; then drawn offscreen and held to
+//!    `tests/ui/icons-100.png` and `icons-150.png`. Its own goldens, so the
+//!    page's do not move; and its own comparison (tracker N201): a path
+//!    mask's blend rounds apart on two Mesa versions, so up to 12 channel
+//!    values per image may be two off (none further), where the page's
+//!    goldens allow none. `--golden-rule` pins that rule on made-up images.
+//! 4. `--smoke`: the screen in a real window under `xvfb-run -a`, laid out at
 //!    the window's size, one frame drawn, the window closed; exit 0.
 //!
 //! # When it runs
@@ -128,6 +139,115 @@ fn build_example() -> PathBuf {
     binary
 }
 
+/// The icon screen's listing: its boxes at 100% and 150%, and what an
+/// assistive tool is told of it.
+fn icon_listing(binary: &Path) -> String {
+    let output = Command::new(binary)
+        .args(["--rects", "--icons", "--font"])
+        .arg(test_font())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run the icon rects mode");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "--rects --icons failed:\n{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+/// The icon goldens' comparison (tracker N201): every channel within one,
+/// except at most a set number two off and none further, because two
+/// versions of the software rasteriser round a path mask's blend apart. The
+/// page's goldens allow none. Pinned on made-up images, with no GPU.
+fn held_to_golden_rule(binary: &Path) {
+    let output = Command::new(binary)
+        .arg("--golden-rule")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run the golden rule mode");
+    let said = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
+    assert!(output.status.success(), "--golden-rule failed:\n{said}");
+    assert_eq!(
+        said,
+        concat!(
+            "rule every value one off, none allowed: passes\n",
+            "rule one value two off, none allowed: fails\n",
+            "rule three values two off, 12 allowed: passes\n",
+            "rule twelve values two off, 12 allowed: passes\n",
+            "rule thirteen values two off, 12 allowed: fails\n",
+            "rule one value three off, 12 allowed: fails\n",
+        )
+    );
+}
+
+/// Holds `listed` to the recorded listing `name` in `tests/ui`, line for line
+/// (`VILAN_REGENERATE_UI_RECTS` writes it instead).
+fn held_to_listing(name: &str, listed: &str) {
+    let recorded = expected_directory().join(name);
+    if std::env::var_os("VILAN_REGENERATE_UI_RECTS").is_some() {
+        std::fs::write(&recorded, listed).expect("write the listing");
+    }
+    let expected = std::fs::read_to_string(&recorded)
+        .expect("the recorded listing")
+        .replace("\r\n", "\n");
+    if expected != listed {
+        let first = expected
+            .lines()
+            .zip(listed.lines())
+            .position(|(left, right)| left != right)
+            .unwrap_or(expected.lines().count().min(listed.lines().count()));
+        panic!(
+            "{name}: the screen moved from its recorded listing (first difference at line {}):\n\
+             --- recorded\n{}\n--- laid out\n{}",
+            first + 1,
+            expected.lines().nth(first).unwrap_or("(end)"),
+            listed.lines().nth(first).unwrap_or("(end)"),
+        );
+    }
+}
+
+/// Draws a screen offscreen (the page, or the one `extra` names) and holds it
+/// to `tests/ui/<golden>-100.png` and `-150.png`. Answers false when there is
+/// no software adapter and the proof may skip.
+fn matches_goldens(binary: &Path, golden: &str, extra: &[&str]) -> bool {
+    let run = Command::new(binary)
+        .arg("--golden")
+        .arg(expected_directory().join(golden))
+        .args(extra)
+        .arg("--font")
+        .arg(test_font())
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("WAYLAND_SOCKET")
+        .output()
+        .expect("run the golden mode");
+    let said = String::from_utf8_lossy(&run.stdout).to_string();
+    if said.contains("no GPU adapter is available")
+        && !may_run(Some(format!(
+            "no software GPU adapter (install Mesa's lavapipe, mesa-vulkan-drivers): {said}"
+        )))
+    {
+        return false;
+    }
+    assert!(
+        run.status.success(),
+        "the offscreen {golden} does not match its goldens:\n{said}{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    if std::env::var_os("VILAN_REGENERATE_GFX_GOLDENS").is_none() {
+        assert_eq!(
+            said.matches(" matches").count(),
+            2,
+            "both scales are compared:\n{said}"
+        );
+    }
+    true
+}
+
 /// The four listings, as the program prints them.
 fn listings(binary: &Path) -> String {
     let mut all = String::new();
@@ -160,62 +280,22 @@ fn the_ui_example_lays_out_to_its_recorded_rectangles_and_draws_its_goldens() {
     let binary = build_example();
 
     // 1. The recorded rectangles.
-    let recorded = expected_directory().join("screen-rects.txt");
-    let listed = listings(&binary);
-    if std::env::var_os("VILAN_REGENERATE_UI_RECTS").is_some() {
-        std::fs::write(&recorded, &listed).expect("write the listing");
-    }
-    let expected = std::fs::read_to_string(&recorded)
-        .expect("the recorded listing")
-        .replace("\r\n", "\n");
-    if expected != listed {
-        let first = expected
-            .lines()
-            .zip(listed.lines())
-            .position(|(left, right)| left != right)
-            .unwrap_or(expected.lines().count().min(listed.lines().count()));
-        panic!(
-            "the screen's boxes moved from the recorded rectangles (first difference at line \
-             {}):\n--- recorded\n{}\n--- laid out\n{}",
-            first + 1,
-            expected.lines().nth(first).unwrap_or("(end)"),
-            listed.lines().nth(first).unwrap_or("(end)"),
-        );
-    }
+    held_to_listing("screen-rects.txt", &listings(&binary));
 
     // 2. The golden images, offscreen, with no window system.
-    let golden = Command::new(&binary)
-        .arg("--golden")
-        .arg(expected_directory().join("screen"))
-        .arg("--font")
-        .arg(test_font())
-        .env_remove("DISPLAY")
-        .env_remove("WAYLAND_DISPLAY")
-        .env_remove("WAYLAND_SOCKET")
-        .output()
-        .expect("run the golden mode");
-    let said = String::from_utf8_lossy(&golden.stdout).to_string();
-    if said.contains("no GPU adapter is available")
-        && !may_run(Some(format!(
-            "no software GPU adapter (install Mesa's lavapipe, mesa-vulkan-drivers): {said}"
-        )))
-    {
+    if !matches_goldens(&binary, "screen", &[]) {
         return;
     }
-    assert!(
-        golden.status.success(),
-        "the offscreen screen does not match its goldens:\n{said}{}",
-        String::from_utf8_lossy(&golden.stderr)
-    );
-    if std::env::var_os("VILAN_REGENERATE_GFX_GOLDENS").is_none() {
-        assert_eq!(
-            said.matches(" matches").count(),
-            2,
-            "both scales are compared:\n{said}"
-        );
+
+    // 3. The icon screen: its boxes and what a tool is told, then its goldens,
+    // compared by a rule the program states first (N201).
+    held_to_golden_rule(&binary);
+    held_to_listing("icon-rects.txt", &icon_listing(&binary));
+    if !matches_goldens(&binary, "icons", &["--icons"]) {
+        return;
     }
 
-    // 3. A real window: laid out at its size, one frame, closed. The run is a
+    // 4. A real window: laid out at its size, one frame, closed. The run is a
     // process group the harness ends whatever happens here (N198).
     let started = Instant::now();
     let running = Running::start(&binary, &["--smoke"], "vilan ui");

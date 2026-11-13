@@ -21,6 +21,7 @@
 //! | any element with a role | that role (`Role::TextField` is a text input, `Role::TextArea` a multi-line one, `Role::Checkbox` a check box) |
 //! | a text, no role | a label whose value is its text (what a platform reads as a label's name; a labelled text keeps its label too) |
 //! | an image, no role | an image when it has a label; left out (decorative) when it has none |
+//! | an icon, no role | an image when it has a label; left out (decorative) when it has none, in a list too (R10) |
 //! | a scroll | a scroll view, with its offset and range |
 //! | a row, column or stack, no role | a group when labelled, a generic container when focusable, left out otherwise |
 //! | the child of a list, no role | a list item (with its place in the list when the list says it holds only some) |
@@ -422,6 +423,9 @@ fn published_role(tree: &UiTree, node: NodeId, in_list: bool) -> Option<AccessRo
     let labelled = data.label.as_deref().is_some_and(|label| !label.is_empty());
     match data.kind {
         ElementKind::Marker | ElementKind::Viewport => None,
+        // Decorative wherever it is (gfx-path.md R10): an icon says nothing
+        // a label beside it does not, so it is no list item either.
+        ElementKind::Icon if !labelled => None,
         _ if in_list => Some(AccessRole::ListItem),
         ElementKind::Text => match &data.content {
             Content::Text(content) if labelled || !content.text.trim().is_empty() => {
@@ -429,7 +433,7 @@ fn published_role(tree: &UiTree, node: NodeId, in_list: bool) -> Option<AccessRo
             }
             _ => None,
         },
-        ElementKind::Image => labelled.then_some(AccessRole::Image),
+        ElementKind::Image | ElementKind::Icon => labelled.then_some(AccessRole::Image),
         ElementKind::Scroll => Some(AccessRole::ScrollView),
         ElementKind::Row | ElementKind::Column | ElementKind::Stack => {
             if labelled {

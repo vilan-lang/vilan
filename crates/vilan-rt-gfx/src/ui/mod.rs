@@ -72,12 +72,14 @@
 //! | stack | every child in ONE grid cell, each placed by its own anchor |
 //! | text | a leaf measured by the text system, wrapped to the width it is given |
 //! | image | a leaf whose natural size is its texture's, in dp; painted by its fit |
+//! | icon | a leaf measured as a square of its size, or else of the inherited text size; a path in the inherited text colour (`icon.rs`) |
 //! | scroll | a clipped viewport over its one child, which keeps its own size |
 //!
 //! No margins (R5): space between siblings is the parent's gap, space inside
 //! an element its padding.
 
 mod access;
+mod icon;
 mod input;
 mod style;
 mod timers;
@@ -95,6 +97,7 @@ pub use taffy::NodeId;
 pub use access::{
     AccessPublisher, AccessStep, AccessTree, AccessWindow, WINDOW_NODE, access_id, access_listing,
 };
+pub use icon::IconShape;
 pub use input::{
     DefaultAction, Delivery, EventKind, Handler, Input, MULTI_CLICK_DISTANCE, MULTI_CLICK_TIME,
     Route, Step,
@@ -122,6 +125,8 @@ pub enum ElementKind {
     Text,
     Image,
     Scroll,
+    /// A path in a square box, in the inherited text colour (`icon.rs`).
+    Icon,
     /// A position among its parent's children, holding none of its own: where
     /// a keyed list's or a conditional's elements go (`std::ui`'s regions). It
     /// is never laid out, painted, hit or listed.
@@ -139,6 +144,7 @@ impl ElementKind {
             ElementKind::Text => "text",
             ElementKind::Image => "image",
             ElementKind::Scroll => "scroll",
+            ElementKind::Icon => "icon",
             ElementKind::Marker => "marker",
             ElementKind::Viewport => "viewport",
         }
@@ -606,6 +612,7 @@ enum Content {
     Parent,
     Text(TextContent),
     Image(ImageContent),
+    Icon(icon::IconContent),
 }
 
 /// What a root remembers of its last passes.
@@ -683,6 +690,7 @@ impl NodeData {
                 image: None,
                 fit: Fit::Contain,
             }),
+            ElementKind::Icon => Content::Icon(icon::IconContent::default()),
             _ => Content::Parent,
         };
         NodeData {
@@ -746,6 +754,8 @@ pub enum UiError {
     NotEdited,
     /// An element placed before one that is in no parent.
     NoPosition,
+    /// An icon's shape or size that cannot be drawn, and why.
+    InvalidIcon(String),
 }
 
 impl std::fmt::Display for UiError {
@@ -790,6 +800,7 @@ impl std::fmt::Display for UiError {
                 formatter,
                 "an element can be placed before another only when that one is inside a parent"
             ),
+            UiError::InvalidIcon(reason) => write!(formatter, "{reason}"),
         }
     }
 }
@@ -1000,6 +1011,10 @@ fn initial_style(kind: ElementKind) -> taffy::Style {
             style.display = Display::Flex;
         }
         ElementKind::Image => {
+            style.display = Display::Flex;
+            style.item_is_replaced = true;
+        }
+        ElementKind::Icon => {
             style.display = Display::Flex;
             style.item_is_replaced = true;
         }
@@ -2405,16 +2420,22 @@ impl UiTree {
                     Rc::new(inherited.with(&data.text))
                 };
                 let data = self.data_mut(node);
-                data.resolved = resolved.clone();
+                let previous = std::mem::replace(&mut data.resolved, resolved.clone());
                 let mut reshape = false;
                 let mut repaint = false;
-                if let Content::Text(content) = &mut data.content {
-                    reshape = content.resolved.style != resolved.style;
-                    repaint = content.resolved.color != resolved.color;
-                    content.resolved = resolved.clone();
-                    if reshape {
-                        content.reshape();
+                match &mut data.content {
+                    Content::Text(content) => {
+                        reshape = content.resolved.style != resolved.style;
+                        repaint = content.resolved.color != resolved.color;
+                        content.resolved = resolved.clone();
+                        if reshape {
+                            content.reshape();
+                        }
                     }
+                    Content::Icon(content) => {
+                        (reshape, repaint) = content.follows(&previous, &resolved);
+                    }
+                    Content::Parent | Content::Image(_) => {}
                 }
                 if reshape {
                     self.taffy.mark_dirty(node).expect("an element");
@@ -2862,6 +2883,7 @@ impl UiTree {
             });
         }
         let color = data.resolved.color;
+        let resolved = data.resolved.clone();
         // The content box inside the SNAPPED box, at the solver's size.
         let content_size = data.content_size;
         let placed = Rect::new(
@@ -2896,6 +2918,7 @@ impl UiTree {
                     paint_image(builder, image, content.fit, placed, paint.corners);
                 }
             }
+            Content::Icon(content) => content.paint(builder, placed.origin, &resolved),
         }
         reads_size
     }
@@ -3052,7 +3075,7 @@ fn paint_image(builder: &mut SceneBuilder, image: &Image, fit: Fit, area: Rect, 
 
 /// The solver's measure of a leaf: a paragraph wrapped to the width it is
 /// offered, an image at its texture's size (the aspect kept when one side is
-/// known), nothing for an empty parent.
+/// known), an icon at its side, nothing for an empty parent.
 fn measure(
     inputs: taffy::LayoutInput,
     data: Option<&mut NodeData>,
@@ -3133,6 +3156,7 @@ fn measure(
                         },
                     }
                 }
+                Content::Icon(content) => content.measure(&data.resolved, known),
             }
         },
     );

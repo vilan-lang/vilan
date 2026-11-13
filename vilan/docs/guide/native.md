@@ -366,12 +366,13 @@ height).render(draw)` draws one frame into a `std::image` picture.
 
 ## Elements and layout
 
-[`std::ui`](../std/ui.md) builds a GPU window's contents from six element kinds
+[`std::ui`](../std/ui.md) builds a GPU window's contents from seven element kinds
 and lays them out: `row` and `column` put their children in a line, `gap`
 apart, with `padding`, `grow`, `shrink`, `align`, `justify` and `wrap`; `stack`
 puts its children on top of one another, each at its `anchor`; `text` is a
 paragraph that wraps to the width it is given; `image` shows a texture by its
-`fit`; `scroll` is a clipped viewport over one child. Each kind is written as an
+`fit`; `icon` draws a path in the text's colour and size; `scroll` is a clipped
+viewport over one child. Each kind is written as an
 element tag, `<row gap(dp(12))>..</row>`, which lowers to the builder calls
 `row().gap(dp(12)).child(..)`. None has a look of its own: a look is a `Style`
 value — background, border, radius, shadow, opacity, text style — composed with
@@ -424,6 +425,17 @@ pixel at 150%. `vilan/examples/ui` is a whole documentation page: a header, a
 sidebar, a content column with wrapped paragraphs, and a picture card with a
 badge on its corner; its end-to-end test holds the page to recorded rectangles at
 two window sizes and two scales, and to golden images.
+
+An **icon** is SVG path data in a square box — `Icon::stroked("M20 6 9 17l-5-5",
+24.0, 2.0)` is Lucide's check — drawn by `<icon of(check()) />` in the TEXT colour
+and at the text size it inherits, so `<row align(Align::Center)><icon of(check())
+/>"Saved"</row>` matches its label and a hovered button's icon turns with its
+text; `size(dp(..))` and `color(..)` set their own. It is decorative unless it has
+a `label`. Data that does not parse fails the program where the icon is used,
+naming the byte. Std ships no icon set; a set is a package of functions that
+answer `Icon` values ([Icons](../std/ui.md#icons)). The example's second screen
+(`--icons`) holds icons beside text to their own goldens, and the todo example's
+checkbox mark is a check icon.
 
 ### Interaction
 

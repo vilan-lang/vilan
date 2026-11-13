@@ -124,7 +124,27 @@ pub fn path(
     blue: f64,
     alpha: f64,
 ) {
-    let paint = match paint {
+    let paint = path_paint(paint, rule_or_width, join, cap, miter_limit);
+    let origin = Point::new(x as f32, y as f32);
+    let color = color(red, green, blue, alpha);
+    with_frame(frame, |builder| {
+        builder.path(path, origin, scale as f32, paint, color)
+    });
+}
+
+/// A path paint from its codes, as `__gfx_path` and `std::ui`'s
+/// `__ui_set_icon` take it: `paint` 0 fills by the rule `rule_or_width` (0
+/// non-zero, 1 even-odd); 1 strokes `rule_or_width` path units wide with
+/// `join` (0 miter, 1 round, 2 bevel), `cap` (0 butt, 1 round, 2 square)
+/// and `miter_limit`.
+pub(super) fn path_paint(
+    paint: i32,
+    rule_or_width: f64,
+    join: i32,
+    cap: i32,
+    miter_limit: f64,
+) -> PathPaint {
+    match paint {
         0 => PathPaint::Fill(if rule_or_width == 0.0 {
             FillRule::NonZero
         } else {
@@ -147,12 +167,7 @@ pub fn path(
             miter_limit: miter_limit as f32,
         }),
         _ => panic_with(&format!("{paint} is not a `std::gfx` path paint code")),
-    };
-    let origin = Point::new(x as f32, y as f32);
-    let color = color(red, green, blue, alpha);
-    with_frame(frame, |builder| {
-        builder.path(path, origin, scale as f32, paint, color)
-    });
+    }
 }
 
 // ------------------------------------------------ the two values' faces ---

@@ -987,6 +987,34 @@ export enum PathPaint {
 	Stroke(Stroke),
 }
 
+/// `paint` as `__gfx_path`'s numbers, which `std::ui`'s icons cross as too: its
+/// code (0 fill, 1 stroke), the rule (0 non-zero, 1 even-odd) or the width, the
+/// join, the cap and the miter limit.
+export(in pkg) fun path_paint_codes(paint: PathPaint): (i32, f64, i32, i32, f64) {
+	match paint {
+		PathPaint::Fill(let rule) => {
+			let even_odd = match rule {
+				FillRule::NonZero => 0.0,
+				FillRule::EvenOdd => 1.0,
+			};
+			(0, even_odd, 0, 0, 0.0)
+		},
+		PathPaint::Stroke(let stroke) => {
+			let join = match stroke.join {
+				Join::Miter => 0,
+				Join::Round => 1,
+				Join::Bevel => 2,
+			};
+			let cap = match stroke.cap {
+				Cap::Butt => 0,
+				Cap::Round => 1,
+				Cap::Square => 2,
+			};
+			(1, stroke.width, join, cap, stroke.miter_limit)
+		},
+	}
+}
+
 // --- Frames --------------------------------------------------------------------
 
 /// The frame being drawn, handed to a frame callback: everything drawn into it is
@@ -1132,28 +1160,7 @@ export impl Frame {
 	/// a whole device pixel, so a path that moves moves by whole pixels. A scale
 	/// must be finite and positive; a frame with another fails.
 	fun path(self, path: Path, at: Point, scale: f64, paint: PathPaint, color: Color) {
-		let (code, rule_or_width, join, cap, miter_limit) = match paint {
-			PathPaint::Fill(let rule) => {
-				let even_odd = match rule {
-					FillRule::NonZero => 0.0,
-					FillRule::EvenOdd => 1.0,
-				};
-				(0, even_odd, 0, 0, 0.0)
-			},
-			PathPaint::Stroke(let stroke) => {
-				let join = match stroke.join {
-					Join::Miter => 0,
-					Join::Round => 1,
-					Join::Bevel => 2,
-				};
-				let cap = match stroke.cap {
-					Cap::Butt => 0,
-					Cap::Round => 1,
-					Cap::Square => 2,
-				};
-				(1, stroke.width, join, cap, stroke.miter_limit)
-			},
-		};
+		let (code, rule_or_width, join, cap, miter_limit) = path_paint_codes(paint);
 		gfx_path(
 			self.token,
 			path,

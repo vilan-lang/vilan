@@ -79,6 +79,7 @@ Group "todo"
     Label value="milk"
     Button "remove milk" [click focus]
   Label "count" value="2 items"
+check marks: 2 icons
 tab, space: draft="" caret=0 anchor=0 items=[[x] bread, [ ] milk] focus=- log=[screen key]
 accessibility with bread checked and focused:
 Group "todo"

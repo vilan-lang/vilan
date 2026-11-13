@@ -3,7 +3,9 @@
 // card whose badge is anchored to its corner, and a caption beside it. Nothing
 // here is positioned by hand — every box comes from the elements' gap, padding,
 // grow, align and anchor — and nothing reacts to input (`ui-counter` and
-// `ui-list` do).
+// `ui-list` do). A second, smaller screen shows icons in rows beside text
+// (`--icons`): in the text's colour and size, at sizes of their own, coloured,
+// filled, and inside a button.
 //
 // Resize the window: the header and the body follow its width, the paragraphs
 // wrap again, and the sidebar keeps its 200 dp.
@@ -26,6 +28,11 @@
 //                           the given font at 100% and 150%, and compare each
 //                           with its PNG (one per channel of tolerance); with
 //                           VILAN_REGENERATE_GFX_GOLDENS set, write them instead
+//   --golden-rule           print how the golden comparison judges made-up images
+//                           (the icon goldens' allowance, tracker N201)
+//   --icons                 with --rects or --golden: the icon screen instead, at
+//                           its own size (--rects prints what an assistive tool
+//                           is told of it after its boxes)
 
 import std::bytes::Bytes;
 import std::fs::{ read_bytes, write_bytes };
@@ -33,9 +40,11 @@ import std::gfx::{
 	Border,
 	Color,
 	Edges,
+	FillRule,
 	FontFamily,
 	Frame,
 	Offscreen,
+	PathPaint,
 	Size,
 	Texture,
 	Window,
@@ -52,11 +61,13 @@ import std::ui::{
 	DropShadow,
 	Element,
 	Fit,
+	Icon,
 	Justify,
 	Role,
 	Style,
 	column,
 	draw,
+	icon,
 	image,
 	layout,
 	mount,
@@ -233,14 +244,160 @@ fun screen(font: Option<str>, picture: Texture): Element {
 	</column>.element()
 }
 
+// --- The icon screen -------------------------------------------------------------
+//
+// A few of Lucide's icons (ISC licence), as an icon set's generated functions
+// answer them: 24-unit boxes, stroked 2 units wide with round joins and caps. The
+// heart is filled, and the ring is made up to show an even-odd hole. (A real set
+// is a package of these; std ships none.)
+
+fun check(): Icon {
+	Icon::stroked("M20 6 9 17l-5-5", 24.0, 2.0)
+}
+
+fun circle_check(): Icon {
+	Icon::stroked("M22 12a10 10 0 1 1-20 0a10 10 0 1 1 20 0ZM9 12l2 2 4-4", 24.0, 2.0)
+}
+
+fun star(): Icon {
+	Icon::stroked(
+		"M11.525 2.295a.53.53 0 0 1 .95 0l2.31 4.679a2.123 2.123 0 0 0 1.595 1.16l5.166.756a.53.53 0 0 1 .294.904l-3.736 3.638a2.123 2.123 0 0 0-.611 1.878l.882 5.14a.53.53 0 0 1-.771.56l-4.618-2.428a2.122 2.122 0 0 0-1.973 0L6.396 21.01a.53.53 0 0 1-.77-.56l.881-5.139a2.122 2.122 0 0 0-.611-1.879L2.16 9.795a.53.53 0 0 1 .294-.906l5.165-.755a2.122 2.122 0 0 0 1.597-1.16z",
+		24.0,
+		2.0,
+	)
+}
+
+fun settings(): Icon {
+	Icon::stroked(
+		"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2zM15 12a3 3 0 1 1-6 0a3 3 0 1 1 6 0Z",
+		24.0,
+		2.0,
+	)
+}
+
+fun chevron_down(): Icon {
+	Icon::stroked("m6 9 6 6 6-6", 24.0, 2.0)
+}
+
+fun heart(): Icon {
+	Icon::filled(
+		"M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z",
+		24.0,
+	)
+}
+
+fun ring(): Icon {
+	Icon::new(
+		"M12 2a10 10 0 1 1 0 20a10 10 0 1 1 0-20ZM12 7a5 5 0 1 1 0 10a5 5 0 1 1 0-10Z",
+		24.0,
+		PathPaint::Fill(FillRule::EvenOdd),
+	)
+}
+
+/// The icon screen's size, in dp.
+fun icon_screen_size(): Size {
+	Size::new(dp(420), dp(200))
+}
+
+/// Icons in rows beside text. The first takes the text's size and colour; the
+/// second row sets sizes, and one a colour and a label (the only icon an
+/// assistive tool is told of); the button's icon turns white with its text; the
+/// last row is filled.
+fun icon_screen(font: str): Element {
+	let look = style()
+		.font(FontFamily::Named(font))
+		.background(Color::white())
+		.text_color(ink())
+		.text_size(dp(15));
+	let button_look = style().background(accent()).text_color(Color::white()).radius(dp(6));
+	<column padding(dp(16)) gap(dp(14)) align(Align::Start) style(look) label("icons")>
+		<row gap(dp(8)) align(Align::Center) label("saved")>
+			<icon of(check()) />
+			<text>"Saved"</text>
+		</row>
+		<row gap(dp(10)) align(Align::Center) label("sizes")>
+			<icon of(star()) size(dp(16)) />
+			<icon of(settings()) size(dp(24)) />
+			<icon of(circle_check()) size(dp(32)) color(accent()) label("done") />
+			<text>"16, 24 and 32 dp"</text>
+		</row>
+		<row
+			padding_x(dp(12))
+			padding_y(dp(6))
+			gap(dp(6))
+			align(Align::Center)
+			style(button_look)
+			role(Role::Button)
+			label("menu")
+		>
+			<text>"Menu"</text>
+			<icon of(chevron_down()) size(dp(18)) />
+		</row>
+		<row gap(dp(10)) align(Align::Center) label("filled")>
+			<icon of(heart()) size(dp(24)) color(Color::rgb(220, 50, 70)) />
+			<icon of(ring()) size(dp(24)) />
+			<text>"Filled, and an even-odd hole"</text>
+		</row>
+	</column>.element()
+}
+
+/// Rects mode for the icon screen: its boxes at 100% and 150%, then what an
+/// assistive tool is told of it.
+fun icon_rects(arguments: List<str>) {
+	let root = icon_screen(test_font(arguments));
+	for scale in [1.0, 1.5] {
+		layout(root, icon_screen_size(), scale);
+		print(i"icons {icon_screen_size().width.value()} x {icon_screen_size().height.value()} dp at {scale}");
+		for entry in root.outline() {
+			let device = |length: f64| (length * scale).round();
+			print(i"{"  ".repeat(entry.depth)}{entry.kind} {entry.label} {device(entry.bounds.x.value())} {device(entry.bounds.y.value())} {device(entry.bounds.width.value())} {device(entry.bounds.height.value())}");
+		}
+	}
+	print("accessibility:");
+	print(root.accessibility().trim());
+}
+
+/// Golden mode for the icon screen: offscreen, at 100% and 150%.
+fun icon_golden(arguments: List<str>) {
+	let golden = after(arguments, "--golden");
+	let root = icon_screen(test_font(arguments));
+	for scale in [1.0, 1.5] {
+		let path = i"{golden}-{(scale * 100.0).round()}.png";
+		let drawn = Offscreen::new(icon_screen_size().width, icon_screen_size().height)
+			.scale_factor(scale)
+			.software(true)
+			.render(|frame: Frame| draw(frame, root));
+		match drawn {
+			Ok(let image) => compare(path, image, icon_stragglers()),
+			Err(let reason) => {
+				print(i"golden: {reason}");
+				exit(2);
+			},
+		}
+	}
+}
+
 fun main() {
 	let arguments = args();
+	if arguments.contains("--golden-rule") {
+		golden_rule();
+		ret;
+	}
+	let icons = arguments.contains("--icons");
 	if arguments.contains("--rects") {
-		rects(arguments);
+		if icons {
+			icon_rects(arguments);
+		} else {
+			rects(arguments);
+		}
 		ret;
 	}
 	if arguments.contains("--golden") {
-		golden(arguments);
+		if icons {
+			icon_golden(arguments);
+		} else {
+			golden(arguments);
+		}
 		ret;
 	}
 	let window = match Window::builder().title("vilan ui").size(dp(960), dp(640)).open() {
@@ -301,7 +458,7 @@ fun golden(arguments: List<str>) {
 			.software(true)
 			.render(|frame: Frame| draw(frame, root));
 		match drawn {
-			Ok(let image) => compare(path, image),
+			Ok(let image) => compare(path, image, 0),
 			Err(let reason) => {
 				print(i"golden: {reason}");
 				exit(2);
@@ -310,8 +467,20 @@ fun golden(arguments: List<str>) {
 	}
 }
 
-/// Writes `image` to `path` (regenerating), or compares it with the PNG there.
-fun compare(path: str, image: Image) {
+/// How many channel values of an icon golden may be one further off than the
+/// tolerance (two, where the tolerance is one), none further (tracker N201). A
+/// path's coverage mask is blended over the background and encoded to sRGB, and
+/// two versions of the software rasteriser (this box's Mesa and CI's) round the
+/// blend's last bit differently, which the encode stretches to two at a dark
+/// value: the path sheets of the GPU crate met it on CI. The page's goldens draw
+/// no path and keep the plain tolerance (0 allowed).
+fun icon_stragglers(): i32 {
+	12
+}
+
+/// Writes `image` to `path` (regenerating), or compares it with the PNG there:
+/// every channel within one, but for at most `stragglers` within two.
+fun compare(path: str, image: Image, stragglers: i32) {
 	if env("VILAN_REGENERATE_GFX_GOLDENS").is_some() {
 		match image.encode(Format::Png, 100) {
 			Ok(let png) => write_bytes(path, png),
@@ -333,26 +502,83 @@ fun compare(path: str, image: Image) {
 		exit(1);
 		ret;
 	}
-	let differing = differing_channels(expected.rgba(), image.rgba());
-	if differing == 0 {
-		print(i"golden: {path} matches");
+	let found = differences(expected.rgba(), image.rgba());
+	if within(found, stragglers) {
+		if found.past == 0 {
+			print(i"golden: {path} matches");
+		} else {
+			print(i"golden: {path} matches ({found.past} channel values two off, of {stragglers} allowed)");
+		}
 	} else {
-		print(i"golden: {path}: {differing} channels differ by more than 1");
+		print(i"golden: {path}: {found.past} channels differ by more than 1 ({found.far} by more than 2; {stragglers} allowed two off)");
 		exit(1);
 	}
 }
 
-/// Channels that differ by more than one: software Vulkan and software GL
-/// differ by one in a handful.
-fun differing_channels(expected: Bytes, drawn: Bytes): i32 {
-	mut differing = 0;
+/// How two images' channels differ: how many by more than one (past the
+/// tolerance), and how many of those by more than two.
+struct Differences {
+	past: i32,
+	far: i32,
+}
+
+/// Software Vulkan and software GL differ by one in a handful of channels.
+fun differences(expected: Bytes, drawn: Bytes): Differences {
+	mut past = 0;
+	mut far = 0;
 	for index in Range::new(0, drawn.len().as_i32()) {
 		let difference = expected.get(index.as_usize()) - drawn.get(index.as_usize());
 		if difference > 1 || difference < -1 {
-			differing += 1;
+			past += 1;
+		}
+		if difference > 2 || difference < -2 {
+			far += 1;
 		}
 	}
-	differing
+	Differences { past, far }
+}
+
+/// The rule: no channel more than two off, and at most `stragglers` two off.
+fun within(found: Differences, stragglers: i32): bool {
+	found.far == 0 && found.past <= stragglers
+}
+
+/// One made-up case of the rule: 64 channel values of 100, the first ones
+/// moved by `offsets`, judged with `stragglers` allowed.
+fun rule_case(name: str, offsets: List<i32>, stragglers: i32) {
+	let expected = Bytes::alloc(64);
+	let drawn = Bytes::alloc(64);
+	for index in Range::new(0, 64) {
+		expected.set(index.as_usize(), 100);
+		drawn.set(index.as_usize(), 100);
+	}
+	mut at: usize = 0;
+	for offset in offsets {
+		drawn.set(at, 100 + offset);
+		at += 1;
+	}
+	let verdict = if within(differences(expected, drawn), stragglers) { "passes" } else { "fails" };
+	print(i"rule {name}: {verdict}");
+}
+
+/// `count` copies of `offset`.
+fun offsets(count: i32, offset: i32): List<i32> {
+	mut all: List<i32> = [];
+	for _ in Range::new(0, count) {
+		all.push(offset);
+	}
+	all
+}
+
+/// Golden-rule mode: the rule on made-up images, for the test that pins it (no
+/// GPU needed).
+fun golden_rule() {
+	rule_case("every value one off, none allowed", offsets(40, 1), 0);
+	rule_case("one value two off, none allowed", [2], 0);
+	rule_case("three values two off, 12 allowed", [2, -2, 2], icon_stragglers());
+	rule_case("twelve values two off, 12 allowed", offsets(12, 2), icon_stragglers());
+	rule_case("thirteen values two off, 12 allowed", offsets(13, -2), icon_stragglers());
+	rule_case("one value three off, 12 allowed", [3], icon_stragglers());
 }
 
 fun index_of(arguments: List<str>, flag: str): usize {

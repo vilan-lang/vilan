@@ -180,6 +180,12 @@ Rust workspace, seventeen crates, plus the language's own tree:
   `ui_interaction.rs` (the counter with no window against a recorded listing, then by XTEST
   pointer and keyboard; the 10,000-row list scrolled and clicked), in the same `gfx` leg.
   `crates/vilan-rt-gfx/examples/ui_measure.rs` prints the layout and paint costs (release).
+  ICONS (gfx-path.md S3; `ui/icon.rs` has the rules): the `icon` element draws an `Icon` (path
+  data, box, paint) through the path primitive, in the inherited TEXT colour, at its `size` or
+  the inherited text size; decorative unless labelled. `host/ui/icons.rs` parses the data once
+  per program per data, and malformed data FAILS the program naming the byte. Its screen in
+  `ui_screen.rs` (`--icons`) has its own listing and goldens (`tests/ui/icon-rects.txt`,
+  `icons-{100,150}.png`).
   Reactive children (R9: `each`, `when`, `swap` in `ui.vl`) keep their place through a `Marker`
   element (never laid out, painted, hit or listed) and change the tree only by `insert_before`
   (a move when the element is already there) and `remove`, which is FINAL: it drops the

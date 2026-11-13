@@ -18976,6 +18976,9 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         ("__ui_set_run", "ui::set_run", &[0, 2]),
         ("__ui_set_label", "ui::set_label", &[0, 1]),
         ("__ui_set_texture", "ui::set_texture", &[0, 1]),
+        // gfx-path.md S3: an icon's shape crosses as its path data (read),
+        // its box and its paint's numbers; the host parses it.
+        ("__ui_set_icon", "ui::set_icon", &[0, 1]),
         ("__ui_add_child", "ui::add_child", &[0, 1]),
         ("__ui_set_focusable", "ui::set_focusable", &[0]),
         ("__ui_on", "ui::on", &[0]),
