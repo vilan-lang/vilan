@@ -17,8 +17,7 @@
 //!
 //! - an `OnType` site with a recorded concrete receiver narrows to the
 //!   members the receiver's HEAD selects (substitution cannot change a
-//!   head); a receiver-less `OnType` — a `self` call inside a shared trait
-//!   default body — keeps every candidate;
+//!   head);
 //! - an `OnConstraint` site is resolved per ENTRY of the function owning the
 //!   constraint: an entry call whose recorded bindings ground the constraint
 //!   draws edges from THAT caller to only the impl members the concrete type
@@ -26,7 +25,16 @@
 //!   entry's own enclosing function, so a forwarding wrapper resolves per
 //!   call site; anything unresolvable — an opaque binding, a level whose
 //!   entries cannot be enumerated — falls back to every candidate, charged
-//!   at the site itself.
+//!   at the site itself;
+//! - a receiver-less `OnType` site — a `self` call inside a shared trait
+//!   default body — is resolved the same way, per entry of the DEFAULT, with
+//!   the default's `Self` as what each entry grounds (B742): a concrete
+//!   receiver's type, a bounded receiver's parameter (recursing as a binding
+//!   does), another default's `Self` (recursing to that default), or `self`
+//!   handed on as a bounded argument. An entry with no receiver on record —
+//!   a call through a `dyn` object's table — falls back as an opaque binding
+//!   does. A walk that leaves a default through a dispatch keeps only the
+//!   types for which that dispatch selects the default ([`Crossing`]).
 //!
 //! An ENTRY of a function is any call that can run it with bindings on
 //! record: a direct call, and equally a DISPATCH site that can select it — a
@@ -770,11 +778,112 @@ fn bound_traits(program: &Program, constraint: TypeId) -> Vec<Id> {
     traits
 }
 
-/// How chasing a constraint through one call's recorded bindings ended.
+/// What one level of the entry walk resolves at each entry of its function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Subject {
+    /// A generic parameter of the function, by its constraint id: what the
+    /// entry's recorded bindings say it is.
+    Constraint(TypeId),
+    /// `Self` of the trait default the function is (B742): the type of the
+    /// receiver the entry dispatches on. A `self` call inside a default body
+    /// (`OnType(None, ..)`) dispatches on exactly that type, so the default's
+    /// entries say what it selects, as a bounded call's bindings do.
+    Receiver,
+}
+
+/// How chasing a level's subject through one entry ended.
 enum Resolution {
     Concrete(TypeId),
+    /// A generic parameter of the entry's caller, by constraint id: the
+    /// answer is that caller's own entries'.
     Parameter(TypeId),
+    /// `Self` of the trait (the id) whose default the entry's caller is — a
+    /// `self` call, or `self` handed on as a bounded argument: the answer is
+    /// that default's own entries', once the caller is confirmed to be one
+    /// of that trait's defaults ([`is_default_of`]).
+    CallerReceiver(Id),
     Opaque,
+}
+
+/// Whether `function` is one of `trait_id`'s own default bodies — the
+/// function in which a value of the bare trait type `trait_id` is `Self`.
+///
+/// Inside a trait default body `self` (and anything typed `Self`) has the
+/// bare trait type, and that is the only place a value of bare trait type
+/// exists: a parameter written `x: Trait` is an implicit generic (B186), a
+/// closure parameter so written is refused, a `let` takes its initializer's
+/// concrete type (B161), and outside a default body a dispatch on one is
+/// refused (`MethodLookup::BareTraitValue`). So a bare-`trait_id` value
+/// inside `function` is that default's `Self` — one runtime type per entry.
+fn is_default_of(program: &Program, function: Id, trait_id: Id) -> bool {
+    program.traits.get(&trait_id).is_some_and(|trait_| {
+        trait_
+            .declarations
+            .values()
+            .any(|declaration| *declaration == function)
+    })
+}
+
+/// The bare trait a receiver-less dispatch (`OnType(None, ..)`, a `self` call
+/// inside a trait default body) dispatches on: its receiver's type, when it
+/// is one. `None` for every other site, and for a receiver whose type the
+/// record does not hold.
+fn self_dispatch_trait(program: &Program, call: Id) -> Option<Id> {
+    let Some(GenericDispatch::OnType(None, _)) = crate::async_infer::dispatch_at(program, call)
+    else {
+        return None;
+    };
+    let receiver = *program.function_calls.get(&call)?.argument_ids.first()?;
+    let receiver_type = match program.entity_map.get(&receiver) {
+        Some(Expr::Local(target)) => program
+            .parameters
+            .get(target)
+            .map(|parameter| parameter.type_id)
+            .or_else(|| {
+                program
+                    .variables
+                    .get(target)
+                    .map(|variable| variable.type_id)
+            }),
+        _ => None,
+    }
+    .or_else(|| program.expr_type_ids.get(&receiver).copied())?;
+    match program.type_id_to_type_map.get(&receiver_type) {
+        Some(Type::Trait(trait_id, _)) => Some(*trait_id),
+        _ => None,
+    }
+}
+
+/// What the receiver of one ENTRY of a trait default is — the default's
+/// `Self` under that entry ([`Subject::Receiver`]), read off the entry's own
+/// dispatch record. A top-level `Plain {}.announce()` is entered directly
+/// (its subject names the default) and carries the same record as one in a
+/// function; an entry with no dispatch record — a call through a `dyn`
+/// object's table, whose receiver is erased — says nothing and answers
+/// `Opaque`.
+fn resolve_receiver(program: &Program, entry_call: Id) -> Resolution {
+    match crate::async_infer::dispatch_at(program, entry_call) {
+        // A concrete receiver: `Plain {}.announce()`.
+        Some(GenericDispatch::OnType(Some(receiver), _)) => {
+            match program.type_id_to_type_map.get(&receiver) {
+                Some(Type::Generic(inner)) => Resolution::Parameter(*inner),
+                Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
+                    Resolution::Concrete(receiver)
+                }
+                _ => Resolution::Opaque,
+            }
+        }
+        // A bounded receiver: `item.announce()` under `T: Note` — the
+        // receiver IS a `T`, so the answer is what `T` is at the caller's
+        // entries.
+        Some(GenericDispatch::OnConstraint(constraint, _)) => Resolution::Parameter(constraint),
+        // Another default's `self` call: that default's `Self`.
+        Some(GenericDispatch::OnType(None, _)) => match self_dispatch_trait(program, entry_call) {
+            Some(trait_id) => Resolution::CallerReceiver(trait_id),
+            None => Resolution::Opaque,
+        },
+        None => Resolution::Opaque,
+    }
 }
 
 /// Chase a constraint through one call's recorded bindings —
@@ -802,11 +911,111 @@ fn resolve_through(
     }
     match program.type_id_to_type_map.get(&resolved) {
         Some(Type::Generic(inner)) => Resolution::Parameter(*inner),
-        Some(Type::Any | Type::Unknown | Type::Unresolved | Type::Trait(..)) | None => {
-            Resolution::Opaque
-        }
+        // A binding to a bare trait is `Self` of the caller when the caller
+        // is one of that trait's defaults (`announced(self)` inside one) —
+        // the walk confirms it — and opaque anywhere else.
+        Some(Type::Trait(trait_id, _)) => Resolution::CallerReceiver(*trait_id),
+        Some(Type::Any | Type::Unknown | Type::Unresolved) | None => Resolution::Opaque,
         Some(_) => Resolution::Concrete(resolved),
     }
+}
+
+/// What one entry says a level's subject is.
+fn resolve_entry(program: &Program, subject: Subject, entry_call: Id) -> Resolution {
+    match subject {
+        Subject::Constraint(constraint) => resolve_through(
+            program,
+            program.method_call_substitution.get(&entry_call),
+            constraint,
+        ),
+        Subject::Receiver => resolve_receiver(program, entry_call),
+    }
+}
+
+/// The level a `Parameter` or `CallerReceiver` resolution recurses to: the
+/// entry's caller's enclosing function, with the subject it holds there.
+/// `None` when there is none to recurse to — top-level code (no parameters,
+/// no `Self`), a closure no function encloses, or a bare-trait binding whose
+/// caller is not that trait's default (then the trait type is not a `Self`
+/// the record can follow).
+fn outer_level(
+    program: &Program,
+    graph: &CallGraph,
+    path: &mut Vec<Id>,
+    caller: RefinedCaller,
+    resolution: &Resolution,
+) -> Option<(Id, Subject)> {
+    let RefinedCaller::Node(node) = caller else {
+        return None;
+    };
+    let outer = extend_hand_off_path(program, graph, path, node)?;
+    match *resolution {
+        Resolution::Parameter(parameter) => Some((outer, Subject::Constraint(parameter))),
+        Resolution::CallerReceiver(trait_id) if is_default_of(program, outer, trait_id) => {
+            Some((outer, Subject::Receiver))
+        }
+        _ => None,
+    }
+}
+
+/// A dispatch an entry walk crossed on its way out of a trait default whose
+/// `Self` it was resolving: `(the dispatching call, the function it entered)`.
+///
+/// When a [`Subject::Receiver`] level is entered through a DISPATCH, the
+/// dispatch's receiver is that level's `Self`, so every type the walk
+/// resolves further out is a receiver of that dispatch — and only a type for
+/// which the dispatch selects the level's function actually runs it. `Quiet`
+/// overriding `announce` never runs the default `announce` through
+/// `self.announce()` in `herald`, so a `self.note()` inside the default is
+/// not reached by `Quiet {}.herald()`, whatever `Quiet::note` reads. The
+/// recursion carries the same type outward (a `self` call's `Self`, a bounded
+/// receiver's parameter, a forwarded parameter), so a crossing stays a fact
+/// about every type the walk resolves past it.
+type Crossing = (Id, Id);
+
+/// One level of the entry walk: the function whose entries are read, what
+/// they resolve, the hand-off path that reached it ([`RefinedEdge::via`]),
+/// and the dispatches crossed on the way ([`Crossing`]).
+type Level = (Id, Subject, Rc<[Id]>, Rc<[Crossing]>);
+
+/// `crossed`, plus the dispatch `entry_call` into `function` when that
+/// dispatch's receiver IS the level's subject — a dispatch entry of a
+/// `Self` level. Any other entry hands the same set on.
+fn crossing(
+    crossed: &Rc<[Crossing]>,
+    subject: Subject,
+    through_dispatch: bool,
+    entry_call: Id,
+    function: Id,
+) -> Rc<[Crossing]> {
+    if subject != Subject::Receiver || !through_dispatch {
+        return crossed.clone();
+    }
+    crossed
+        .iter()
+        .copied()
+        .chain(std::iter::once((entry_call, function)))
+        .collect()
+}
+
+/// Whether `resolved`, as the receiver of every crossed dispatch, selects the
+/// function each one entered. A selection that answers nothing, or a record
+/// it cannot read, keeps the type (the conservative direction): this only
+/// drops a type the record says runs something else.
+fn crosses_all(program: &Program, crossed: &[Crossing], resolved: TypeId) -> bool {
+    crossed.iter().all(|&(call, entered)| {
+        let Some((member, traits)) = selection_terms(program, call) else {
+            return true;
+        };
+        let selected = impl_members_for_bound(
+            program,
+            program.admitting_file(call),
+            resolved,
+            member,
+            &traits,
+        );
+        selected.is_empty() || selected.contains(&entered)
+    })
 }
 
 /// The program-wide facts [`refined_edges`] reads at every site: which
@@ -1106,6 +1315,7 @@ fn refined_edges_timed(
 
     let mut edges: Vec<RefinedEdge> = Vec::new();
     let site_level: Rc<[Id]> = Rc::from([]);
+    let no_crossings: Rc<[Crossing]> = Rc::from([]);
     for site in sites {
         // B355: the fence's non-diagnostic face. Every path below that hands
         // back `site.candidates` INSTEAD of a resolution is a fallback, and
@@ -1133,43 +1343,48 @@ fn refined_edges_timed(
                 });
             }
         };
-        let (constraint, member) = match crate::async_infer::dispatch_at(program, site.call) {
-            Some(GenericDispatch::OnConstraint(constraint, member)) => (constraint, member),
-            Some(GenericDispatch::OnType(Some(_), _)) => {
-                // A concrete-receiver re-dispatch (the Gap-E shape: an
-                // inherited trait default). The receiver's HEAD cannot
-                // change under substitution, and the head is what selects
-                // among candidates, so the site narrows to the members the
-                // head selects ([`known_receiver_candidates`]) — edges from
-                // the site's owner, no entry enumeration. A receiver
-                // resolving to a generic or opaque type keeps the union, as
-                // does an empty selection.
-                match known_receiver_candidates(program, site.call) {
-                    Some(selected) => {
-                        for candidate in selected {
-                            edges.push(RefinedEdge {
-                                caller: site.owner,
-                                anchor: site.call,
-                                callee: candidate,
-                                via: site_level.clone(),
-                            });
-                        }
+        if let Some(GenericDispatch::OnType(Some(_), _)) =
+            crate::async_infer::dispatch_at(program, site.call)
+        {
+            // A concrete-receiver re-dispatch (the Gap-E shape: an inherited
+            // trait default). The receiver's HEAD cannot change under
+            // substitution, and the head is what selects among candidates, so
+            // the site narrows to the members the head selects
+            // ([`known_receiver_candidates`]) — edges from the site's owner, no
+            // entry enumeration. A receiver resolving to a generic or opaque
+            // type keeps the union, as does an empty selection.
+            match known_receiver_candidates(program, site.call) {
+                Some(selected) => {
+                    for candidate in selected {
+                        edges.push(RefinedEdge {
+                            caller: site.owner,
+                            anchor: site.call,
+                            callee: candidate,
+                            via: site_level.clone(),
+                        });
                     }
-                    None => union_fallback(&mut edges),
                 }
-                continue;
+                None => union_fallback(&mut edges),
             }
-            // `OnType(None, _)` — a `self` call inside a shared trait
-            // default body — and unrecorded sites keep the union.
-            _ => {
-                union_fallback(&mut edges);
-                continue;
-            }
+            continue;
+        }
+        // The walk's first level: the function owning the constraint (or the
+        // default owning `Self`), with the hand-off path from the site's
+        // owner up to it. Every other site — unrecorded, a top-level
+        // `OnConstraint` site (top-level code binds no constraints), a
+        // receiver-less dispatch whose receiver is not its default's `Self` —
+        // keeps the union.
+        let Some(WalkStart {
+            root,
+            path,
+            subject,
+            member,
+            traits: constraint_traits,
+        }) = walk_start(program, graph, site.owner, site.call)
+        else {
+            union_fallback(&mut edges);
+            continue;
         };
-        // The traits the bound names, with their supertraits: a call through
-        // this constraint can only reach an impl of one of them, whatever else
-        // in the program spells the member the same way.
-        let constraint_traits = bound_traits(program, constraint);
         // Concrete resolution → the impl members the type selects; an
         // empty selection (defensive — the bound audit rejects no-impl
         // types) falls back to every candidate.
@@ -1216,31 +1431,19 @@ fn refined_edges_timed(
             selection_memo.insert(key.clone(), selected.clone());
             selected
         };
-        // The walk's first level: the function owning the constraint, with
-        // the hand-off path from the site's owner up to it. A top-level
-        // `OnConstraint` site has no enclosing generic function to enumerate
-        // entries of (and should not exist — top-level code binds no
-        // constraints).
-        let mut path: Vec<Id> = Vec::new();
-        let root = match site.owner {
-            RefinedCaller::Node(owner) => extend_hand_off_path(program, graph, &mut path, owner),
-            RefinedCaller::TopLevel => None,
-        };
-        let Some(root) = root else {
-            union_fallback(&mut edges);
-            continue;
-        };
-        // A level is (function, constraint) REACHED BY a hand-off path: two
-        // forwarding routes into one function are two levels when the value
-        // crosses different nodes on the way, because a reader of
-        // [`RefinedEdge::via`] may answer them differently. A revisit of the
-        // same triple re-derives identical edges — skipping is exact. The
+        // A level is (function, subject) REACHED BY a hand-off path, past a
+        // set of crossed dispatches ([`Level`]): two forwarding routes into
+        // one function are two levels when the value crosses different nodes
+        // on the way, because a reader of [`RefinedEdge::via`] may answer
+        // them differently, or crosses different dispatches, which keep
+        // different types. A revisit of the same level re-derives identical
+        // edges — skipping is exact. The
         // path is a set in first-seen order (a recursive generic adds no node
         // twice), so the walk is finite; `MAX_LEVELS` bounds the one shape
         // that could still make it long, a deep diamond of forwarders each
         // crossing its own closure.
-        let mut visited: HashSet<(Id, TypeId, Rc<[Id]>)> = HashSet::default();
-        let mut walk: Vec<(Id, TypeId, Rc<[Id]>)> = vec![(root, constraint, Rc::from(path))];
+        let mut visited: HashSet<Level> = HashSet::default();
+        let mut walk: Vec<Level> = vec![(root, subject, Rc::from(path), no_crossings.clone())];
         let mut fell_back_at_site = false;
         // Per-level scratch, reused across the walk's levels.
         let mut dispatched: Vec<(RefinedCaller, Id, bool)> = Vec::new();
@@ -1258,7 +1461,7 @@ fn refined_edges_timed(
                 site_fallback(&mut edges);
                 break;
             }
-            let (function, constraint, via) = level.clone();
+            let (function, subject, via, crossed) = level.clone();
             visited.insert(level);
             if index.value_taken.contains(&function)
                 || dispatch_entries.unenumerable.contains(&function)
@@ -1320,24 +1523,39 @@ fn refined_edges_timed(
                 if check_repeats && !entered_at.insert(entry_call) {
                     continue;
                 }
-                let bindings = program.method_call_substitution.get(&entry_call);
-                let selected = match resolve_through(program, bindings, constraint) {
+                let resolution = resolve_entry(program, subject, entry_call);
+                let selected = match resolution {
+                    // An instantiation one of the crossed dispatches does not
+                    // send here never reaches this site.
+                    Resolution::Concrete(resolved) if !crosses_all(program, &crossed, resolved) => {
+                        continue;
+                    }
                     Resolution::Concrete(resolved) => selected_for(resolved),
-                    // A binding that is the caller's own parameter recurses to
-                    // the caller's entries — a forwarding wrapper, or one
-                    // trait default calling another. Top-level code has no
-                    // parameters to recurse into.
-                    Resolution::Parameter(parameter) => {
+                    // A binding that is the caller's own parameter — or its
+                    // own `Self`, a default's `self` call or `self` handed on —
+                    // recurses to the caller's entries: a forwarding wrapper,
+                    // one trait default calling another. Top-level code has
+                    // no parameters and no `Self` to recurse into.
+                    Resolution::Parameter(_) | Resolution::CallerReceiver(_) => {
                         let mut outer_path: Vec<Id> = via.to_vec();
-                        let outer = match caller {
-                            RefinedCaller::Node(node) => {
-                                extend_hand_off_path(program, graph, &mut outer_path, node)
+                        match outer_level(program, graph, &mut outer_path, caller, &resolution) {
+                            Some((outer, outer_subject)) => {
+                                let crossed = crossing(
+                                    &crossed,
+                                    subject,
+                                    through_dispatch,
+                                    entry_call,
+                                    function,
+                                );
+                                walk.push((outer, outer_subject, Rc::from(outer_path), crossed));
+                                continue;
                             }
-                            RefinedCaller::TopLevel => None,
-                        };
-                        match outer {
-                            Some(outer) => {
-                                walk.push((outer, parameter, Rc::from(outer_path)));
+                            // A bare-trait binding the record cannot follow
+                            // is as opaque as it ever was.
+                            None if matches!(resolution, Resolution::CallerReceiver(_))
+                                && through_dispatch =>
+                            {
+                                site_fallback(&mut edges);
                                 continue;
                             }
                             None => widened(),
@@ -1400,10 +1618,90 @@ fn extend_hand_off_path(
     }
 }
 
-/// What a listed `OnConstraint` site can select under ANY of its enclosing
-/// function's entries, or `None` when nothing narrows it — the test that
-/// keeps a bounded site from being counted as an entry of a member no
-/// instantiation of it reaches.
+/// The member a dispatch names and the traits a selection for it narrows
+/// to: a bound's traits with their supertraits (a call through it reaches
+/// only an impl of one of them); for a `self` call in a trait default, the
+/// trait DECLARING the member (inside a default the call means the trait's
+/// member, never an implementor's inherent one, B359); nothing to narrow by
+/// for a concrete receiver. `None` with no dispatch on record.
+fn selection_terms<'src>(program: &Program<'src>, call: Id) -> Option<(&'src str, Vec<Id>)> {
+    Some(match crate::async_infer::dispatch_at(program, call)? {
+        GenericDispatch::OnConstraint(constraint, member) => {
+            (member, bound_traits(program, constraint))
+        }
+        GenericDispatch::OnType(None, member) => (
+            member,
+            program
+                .bound_dispatch_traits
+                .get(&call)
+                .map(|(declaring, _)| vec![*declaring])
+                .unwrap_or_default(),
+        ),
+        GenericDispatch::OnType(Some(_), member) => (member, Vec::new()),
+    })
+}
+
+/// Where a site's entry walk starts: the function whose entries resolve the
+/// site, the hand-off path from the site's owner up to it, what the walk
+/// resolves there, and the member and traits a resolved type selects among.
+struct WalkStart<'src> {
+    root: Id,
+    path: Vec<Id>,
+    subject: Subject,
+    member: &'src str,
+    traits: Vec<Id>,
+}
+
+/// The [`WalkStart`] of a dispatch site the walk can resolve per entry, or
+/// `None` for one it cannot:
+///
+/// - an `OnConstraint` site resolves its constraint at the entries of the
+///   function owning it, narrowed to the traits the bound names (with their
+///   supertraits): a call through it reaches only an impl of one of them;
+/// - a receiver-less `OnType` site — `self.note()` inside a trait default —
+///   resolves the default's `Self` at the default's entries (B742), narrowed
+///   to the trait that declares the member: inside a default body the call
+///   means the TRAIT's member, never an implementor's inherent one (B359).
+///   Only when its receiver is that default's `Self` ([`is_default_of`]).
+///
+/// Top-level code binds no constraints and has no `Self`.
+fn walk_start<'src>(
+    program: &Program<'src>,
+    graph: &CallGraph,
+    owner: RefinedCaller,
+    call: Id,
+) -> Option<WalkStart<'src>> {
+    let RefinedCaller::Node(owner) = owner else {
+        return None;
+    };
+    let subject = match crate::async_infer::dispatch_at(program, call)? {
+        GenericDispatch::OnConstraint(constraint, _) => Subject::Constraint(constraint),
+        GenericDispatch::OnType(None, _) => Subject::Receiver,
+        GenericDispatch::OnType(Some(_), _) => return None,
+    };
+    let (member, traits) = selection_terms(program, call)?;
+    let mut path: Vec<Id> = Vec::new();
+    let root = extend_hand_off_path(program, graph, &mut path, owner)?;
+    if subject == Subject::Receiver
+        && !self_dispatch_trait(program, call)
+            .is_some_and(|trait_id| is_default_of(program, root, trait_id))
+    {
+        return None;
+    }
+    Some(WalkStart {
+        root,
+        path,
+        subject,
+        member,
+        traits,
+    })
+}
+
+/// What a listed `OnConstraint` site — or a `self` call in a trait default
+/// (B742), whose `Self` resolves the same way — can select under ANY of its
+/// enclosing function's entries, or `None` when nothing narrows it — the
+/// test that keeps a bounded site from being counted as an entry of a member
+/// no instantiation of it reaches.
 ///
 /// `t.gap(cell)` under `T: Attrs` lists `Attrs::gap`'s default among its
 /// candidates by name, and whether it runs that default is a fact about the
@@ -1411,8 +1709,8 @@ fn extend_hand_off_path(
 /// default is not entered here and its body's dispatch must not be charged to
 /// this caller. The answer is the union over the same entry walk
 /// [`refined_edges`] makes, taken toward MORE: an unenumerable level, an
-/// opaque binding, an empty selection, or any site that is not a bounded one
-/// all answer `None`, and the dispatch entries it recurses through are not
+/// opaque binding, an empty selection, or any site [`walk_start`] cannot
+/// start from all answer `None`, and the dispatch entries it recurses through are not
 /// themselves narrowed (which also keeps a recursive bound from asking for
 /// its own answer).
 fn bound_site_selection(
@@ -1424,15 +1722,13 @@ fn bound_site_selection(
     site_index: usize,
 ) -> Option<HashSet<Id>> {
     let site = &sites[site_index];
-    let Some(GenericDispatch::OnConstraint(constraint, member)) =
-        crate::async_infer::dispatch_at(program, site.call)
-    else {
-        return None;
-    };
-    let RefinedCaller::Node(owner) = site.owner else {
-        return None;
-    };
-    let root = extend_hand_off_path(program, graph, &mut Vec::new(), owner)?;
+    let WalkStart {
+        root,
+        subject,
+        member,
+        traits: constraint_traits,
+        ..
+    } = walk_start(program, graph, site.owner, site.call)?;
     let types = instantiation_types(
         program,
         graph,
@@ -1440,9 +1736,8 @@ fn bound_site_selection(
         dispatch_entries,
         sites,
         root,
-        constraint,
+        subject,
     )?;
-    let constraint_traits = bound_traits(program, constraint);
     let file = program.admitting_file(site.call);
     let mut selection: HashSet<Id> = HashSet::default();
     for resolved in types {
@@ -1455,8 +1750,9 @@ fn bound_site_selection(
     Some(selection)
 }
 
-/// The types `constraint` is instantiated with across every entry of
-/// `root` — forwarded through callers' own parameters, as
+/// The types `subject` is instantiated with across every entry of `root` —
+/// forwarded through callers' own parameters and defaults' `Self`, and kept
+/// only where every crossed dispatch selects what it entered, as
 /// [`bound_site_selection`] reads them — one id per distinct RESOLVED type,
 /// or `None` when some entry does not say (an unenumerable level, an opaque
 /// binding, a forwarding level no function encloses, an id with no resolved
@@ -1479,14 +1775,14 @@ fn instantiation_types(
     dispatch_entries: &DispatchEntries,
     sites: &[DispatchSite],
     root: Id,
-    constraint: TypeId,
+    subject: Subject,
 ) -> Option<Vec<TypeId>> {
     let mut types: Vec<TypeId> = Vec::new();
     let mut seen: HashSet<&Type> = HashSet::default();
-    let mut visited: HashSet<(Id, TypeId)> = HashSet::default();
-    let mut walk: Vec<(Id, TypeId)> = vec![(root, constraint)];
-    while let Some((function, constraint)) = walk.pop() {
-        if !visited.insert((function, constraint)) {
+    let mut visited: HashSet<(Id, Subject, Rc<[Crossing]>)> = HashSet::default();
+    let mut walk: Vec<(Id, Subject, Rc<[Crossing]>)> = vec![(root, subject, Rc::from([]))];
+    while let Some((function, subject, crossed)) = walk.pop() {
+        if !visited.insert((function, subject, crossed.clone())) {
             continue;
         }
         if index.value_taken.contains(&function)
@@ -1499,22 +1795,23 @@ fn instantiation_types(
             .get(&function)
             .into_iter()
             .flatten()
-            .map(|(caller, call)| (RefinedCaller::Node(*caller), *call));
+            .map(|(caller, call)| (RefinedCaller::Node(*caller), *call, false));
         let top_level = index
             .top_level_incoming
             .get(&function)
             .into_iter()
             .flatten()
-            .map(|call| (RefinedCaller::TopLevel, *call));
+            .map(|call| (RefinedCaller::TopLevel, *call, false));
         let dispatched = dispatch_entries
             .enumerated
             .get(&function)
             .into_iter()
             .flatten()
-            .map(|entry| (sites[*entry].owner, sites[*entry].call));
-        for (caller, entry_call) in direct.chain(top_level).chain(dispatched) {
-            let bindings = program.method_call_substitution.get(&entry_call);
-            match resolve_through(program, bindings, constraint) {
+            .map(|entry| (sites[*entry].owner, sites[*entry].call, true));
+        for (caller, entry_call, through_dispatch) in direct.chain(top_level).chain(dispatched) {
+            let resolution = resolve_entry(program, subject, entry_call);
+            match resolution {
+                Resolution::Concrete(resolved) if !crosses_all(program, &crossed, resolved) => {}
                 Resolution::Concrete(resolved) => {
                     // An id with no resolved type selects nothing, which is
                     // `impl_members_for_bound`'s own answer for it.
@@ -1522,12 +1819,12 @@ fn instantiation_types(
                         types.push(resolved);
                     }
                 }
-                Resolution::Parameter(parameter) => {
-                    let RefinedCaller::Node(node) = caller else {
-                        return None;
-                    };
-                    let outer = extend_hand_off_path(program, graph, &mut Vec::new(), node)?;
-                    walk.push((outer, parameter));
+                Resolution::Parameter(_) | Resolution::CallerReceiver(_) => {
+                    let (outer, outer_subject) =
+                        outer_level(program, graph, &mut Vec::new(), caller, &resolution)?;
+                    let crossed =
+                        crossing(&crossed, subject, through_dispatch, entry_call, function);
+                    walk.push((outer, outer_subject, crossed));
                 }
                 Resolution::Opaque => return None,
             }

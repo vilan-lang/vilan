@@ -2627,6 +2627,153 @@ fn b740_a_demoted_holder_unwraps_for_a_bare_callee_and_an_injected_call() {
     );
 }
 
+/// B742: a trait whose defaults reach a `note` that `Deep` reads strictly —
+/// through `self` (`announce`), another default (`herald`) and a bounded
+/// generic handed `self` (`hand_off`) — with `Quiet` overriding `announce`,
+/// forwarders one to three levels deep and a generic struct's method; `main`
+/// is `body`. Each program below is accepted only since the refinement
+/// resolves a default's `self` call per entry of the default.
+fn b742_notes(body: &str) -> String {
+    concat!(
+        "import std::context::Context;\n",
+        "\n",
+        "let depth: Context<i32> = Context::new();\n",
+        "\n",
+        "trait Note {\n",
+        "\tfun note(self);\n",
+        "\n",
+        "\tfun announce(self) {\n",
+        "\t\tself.note();\n",
+        "\t}\n",
+        "\n",
+        "\tfun herald(self) {\n",
+        "\t\tself.announce();\n",
+        "\t}\n",
+        "\n",
+        "\tfun hand_off(self) {\n",
+        "\t\tannounced(self);\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "struct Plain {}\n",
+        "\n",
+        "struct Deep {}\n",
+        "\n",
+        "struct Quiet {}\n",
+        "\n",
+        "impl Plain with Note {\n",
+        "\tfun note(self) {\n",
+        "\t\tprint(\"plain\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "impl Deep with Note {\n",
+        "\tfun note(self) {\n",
+        "\t\tprint(i\"deep at {depth.get()}\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "impl Quiet with Note {\n",
+        "\tfun note(self) {\n",
+        "\t\tprint(i\"quiet at {depth.get()}\");\n",
+        "\t}\n",
+        "\n",
+        "\tfun announce(self) {\n",
+        "\t\tprint(\"quiet\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "fun announced<T: Note>(item: T) {\n",
+        "\titem.announce();\n",
+        "}\n",
+        "\n",
+        "fun relayed<T: Note>(item: T) {\n",
+        "\tannounced(item);\n",
+        "}\n",
+        "\n",
+        "fun forwarded<T: Note>(item: T) {\n",
+        "\trelayed(item);\n",
+        "}\n",
+        "\n",
+        "struct Holder<T: Note> {\n",
+        "\titem: T,\n",
+        "}\n",
+        "\n",
+        "impl Holder<type T: Note> {\n",
+        "\tfun show(self) {\n",
+        "\t\tself.item.announce();\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+    )
+    .to_string()
+        + body
+        + "}\n"
+}
+
+/// B742: the repro (a default reached through a bounded generic) and the
+/// one-level form (the default on a concrete receiver).
+#[test]
+fn b742_a_default_reached_through_a_bounded_generic_runs_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_repro.vl",
+        &b742_notes(concat!(
+            "\tannounced(Plain {});\n",
+            "\tdepth.run(5, || announced(Deep {}));\n",
+            "\tPlain {}.announce();\n",
+            "\tdepth.run(6, || Deep {}.announce());\n",
+        )),
+        "plain\ndeep at 5\nplain\ndeep at 6\n",
+    );
+}
+
+/// B742: three levels of forwarding, and a generic struct's method.
+#[test]
+fn b742_forwarded_defaults_run_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_forwarded.vl",
+        &b742_notes(concat!(
+            "\tforwarded(Plain {});\n",
+            "\tdepth.run(5, || forwarded(Deep {}));\n",
+            "\tHolder { item = Plain {} }.show();\n",
+            "\tdepth.run(6, || Holder { item = Deep {} }.show());\n",
+        )),
+        "plain\ndeep at 5\nplain\ndeep at 6\n",
+    );
+}
+
+/// B742: a default calling a default, and a default handing `self` to a
+/// bounded generic.
+#[test]
+fn b742_defaults_calling_defaults_run_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_defaults.vl",
+        &b742_notes(concat!(
+            "\tPlain {}.herald();\n",
+            "\tdepth.run(5, || Deep {}.herald());\n",
+            "\tPlain {}.hand_off();\n",
+            "\tdepth.run(6, || Deep {}.hand_off());\n",
+        )),
+        "plain\ndeep at 5\nplain\ndeep at 6\n",
+    );
+}
+
+/// B742: `Quiet` overrides `announce`, so neither `herald`'s `self.announce()`
+/// nor `announced`'s `item.announce()` reaches its strict `note`.
+#[test]
+fn b742_an_override_between_two_defaults_runs_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_override.vl",
+        &b742_notes(concat!(
+            "\tQuiet {}.herald();\n",
+            "\tannounced(Quiet {});\n",
+            "\tdepth.run(5, || Deep {}.herald());\n",
+        )),
+        "quiet\nquiet\ndeep at 5\n",
+    );
+}
+
 /// B739: `Weak::get` — a VIEW of the cell's value, `Option<&T> borrows self` —
 /// natively, and the three collection cells' `peek`, which lend their own
 /// value through it: `ListCell` (before and after a write), `HashMapCell`,

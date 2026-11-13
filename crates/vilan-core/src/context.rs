@@ -3229,8 +3229,8 @@ fn analyze(
         // the whole candidate list**. A site the refinement cannot resolve —
         // an opaque binding, a level whose entries cannot be enumerated (a
         // function taken as a value, or one a dispatch outside the listed
-        // sites can select), a receiver-less `OnType` — draws an
-        // edge to EVERY candidate, so no candidate of an unresolved site is
+        // sites can select), a receiver-less `OnType` whose receiver is not
+        // on record (a `dyn` entry) — draws an edge to EVERY candidate, so no candidate of an unresolved site is
         // ever mistaken for dead. A node with no refined edge was therefore
         // excluded by a RESOLUTION at every site that lists it, which is a real
         // answer about what can run.
