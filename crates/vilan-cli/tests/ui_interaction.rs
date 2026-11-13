@@ -61,6 +61,14 @@
 //!    the reason, where AT-SPI's bus launcher or `gdbus` is missing, whatever
 //!    `VILAN_REQUIRE_GFX` says.
 //!
+//! 7. F176, element timers: the counter's `--timers` (no window) on BOTH of
+//!    a program's loops — the owned one (no display) and the window system's
+//!    (under `xvfb-run`) — a repeating timer that cancels itself on its third
+//!    call and then sets a one-shot one, a timer on an element removed before
+//!    it is due, and the window's focus told to a tree. Every step is caused by
+//!    the one before, so the order is the program's, not the clock's; the
+//!    program ends by itself once no timer is left.
+//!
 //! Ordering comes from the programs' lines — each injection waits for the
 //! line its predecessor caused — never from a sleep. No assertion reads a
 //! time: the frame times the programs print are for a person (the report's
@@ -445,6 +453,79 @@ fn the_counter_and_the_ten_thousand_row_list_run_end_to_end() {
         "closing the list ended it with {code:?}:\n{}\n--- stderr\n{stderr}",
         seen.join("\n")
     );
+}
+
+/// F176: element timers fire in their causal order on the owned loop and on
+/// the window system's, a removed element's timer never fires, and the
+/// program ends when no timer is left (an armed timer would keep it running).
+#[test]
+fn element_timers_fire_in_order_on_both_loops_and_end_with_their_element() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let counter = build_example("ui-counter", "counter_timers");
+    let expected = [
+        "removed, elements left 1",
+        "focused before false",
+        "window focus true, read back true",
+        "window focus false, read back false",
+        "timers set",
+        "tick 1",
+        "tick 2",
+        "tick 3",
+        "after fired",
+        "removed element still held, 1 element",
+        "done",
+    ];
+    // The program's own lines (`xvfb-run` may merge stderr in), and any line
+    // a wrong timer would print.
+    let program = |lines: &[String]| -> Vec<String> {
+        lines
+            .iter()
+            .filter(|line| {
+                expected.contains(&line.as_str())
+                    || line.starts_with("tick ")
+                    || line.contains("timer fired")
+            })
+            .cloned()
+            .collect()
+    };
+
+    // The owned loop: no display at all.
+    let owned = Command::new(&counter)
+        .arg("--timers")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .output()
+        .expect("run the timers mode");
+    let printed: Vec<String> = String::from_utf8_lossy(&owned.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        owned.status.success(),
+        "--timers failed:
+{}
+{}",
+        printed.join(
+            "
+"
+        ),
+        String::from_utf8_lossy(&owned.stderr)
+    );
+    assert_eq!(program(&printed), expected, "on the owned loop");
+
+    // The window system's loop: a display, no window.
+    let started = Instant::now();
+    let running = Running::start(&counter, &["--timers"], "none");
+    let (code, seen, stderr) = running.exit(started);
+    assert_eq!(
+        code,
+        Some(0),
+        "--timers under xvfb ended with {code:?}:\n{}\n--- stderr\n{stderr}",
+        seen.join("\n")
+    );
+    assert_eq!(program(&seen), expected, "on the window system's loop");
 }
 
 /// The recorded listing of an example's `--check`, compared line for line

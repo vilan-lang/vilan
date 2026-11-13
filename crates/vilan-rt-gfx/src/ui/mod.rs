@@ -80,6 +80,7 @@
 mod access;
 mod input;
 mod style;
+mod timers;
 
 use std::rc::Rc;
 
@@ -99,6 +100,7 @@ pub use input::{
     Route, Step,
 };
 pub use style::{Condition, Interaction, StyleFields};
+pub use timers::{MIN_PERIOD, TimerId};
 
 use crate::color::{Color, Fill};
 use crate::geometry::{Corners, Edges, Point, Rect, Size, Transform};
@@ -830,6 +832,8 @@ pub struct UiTree {
     caret_reveals: Vec<NodeId>,
     /// Moves when only what assistive technology reads changed (`access.rs`).
     semantics_generation: u64,
+    /// Every element's timers (`timers.rs`, F176).
+    timers: timers::Timers,
 }
 
 impl Default for UiTree {
@@ -1041,6 +1045,7 @@ impl UiTree {
             measured: Vec::new(),
             caret_reveals: Vec::new(),
             semantics_generation: 1,
+            timers: timers::Timers::default(),
         }
     }
 
@@ -1255,7 +1260,9 @@ impl UiTree {
     /// cancelled: no click follows it, and its capture ends, so the rest of
     /// the drag goes to whatever is under the pointer), and every handler of the subtree is
     /// TAKEN OUT of the tree and answered, for the caller to drop with the
-    /// tree no longer borrowed.
+    /// tree no longer borrowed — its timers' handlers with them (F176: a
+    /// timer is the same kind of thing, and never fires after its element's
+    /// removal).
     ///
     /// Dropping the handlers is what ends an element (B738): a handler that
     /// captures its own element (`on_click(|| row.focus())`) holds that
@@ -1301,6 +1308,7 @@ impl UiTree {
             {
                 handlers.push(handler);
             }
+            handlers.extend(self.timers.take_node(current));
             pending.extend(self.children(current));
         }
         if let Some(parent) = parent {
@@ -1357,6 +1365,8 @@ impl UiTree {
         let mut pending = vec![node];
         while let Some(node) = pending.pop() {
             self.drop_viewport(node);
+            // Its timers go with it, as its handlers do (in `taffy`'s data).
+            drop(self.timers.take_node(node));
             for child in self.children(node) {
                 if !self.data(child).handle {
                     pending.push(child);

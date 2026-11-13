@@ -63,6 +63,7 @@ import pkg::result::Result::{ self, Err, Ok };
 //   8     resized            width, height
 //   9     scale changed      scale factor
 //   10    close requested
+//   11    focus changed      focused (1 or 0)
 //
 // A button is 0 left, 1 right, 2 middle, 3 back, 4 forward, 5 + n other; the
 // modifiers are bits, 1 shift, 2 control, 4 alt, 8 meta; `named` is 1 for a key
@@ -92,7 +93,8 @@ external fun gfx_on_frame(window: u32, callback: || void): void;
 [extern("__gfx_on_event")]
 external fun gfx_on_event(window: u32, callback: || void): void;
 
-/// The window's width (0) and height (1) in dp, its scale factor (2).
+/// The window's width (0) and height (1) in dp, its scale factor (2), whether it
+/// has the keyboard focus (3: 1 or 0).
 [extern("__gfx_window_number")]
 external fun gfx_window_number(window: u32, which: i32): f64;
 
@@ -968,6 +970,9 @@ export enum Event {
 	/// The person asked to close the window (its close button). The window closes
 	/// after this event's turn; closing the last stops the program.
 	CloseRequested,
+	/// The window gained (`true`) or lost (`false`) the system's keyboard focus:
+	/// keys go to it now, or to another window. `Window::focused` reads it.
+	FocusChanged(bool),
 }
 
 /// A pointer button pressed or released, where the pointer was.
@@ -1141,6 +1146,7 @@ fun read_event(kind: i32): Event {
 			height = dp(gfx_event_number(1)),
 		}),
 		9 => Event::ScaleChanged(gfx_event_number(0)),
+		11 => Event::FocusChanged(gfx_event_number(0) != 0.0),
 		_ => Event::CloseRequested,
 	}
 }
@@ -1230,6 +1236,14 @@ export impl Window {
 	/// 2.0.
 	fun scale_factor(self): f64 {
 		gfx_window_number(self.id, 2)
+	}
+
+	/// Whether the window has the system's keyboard focus (`false` until the system
+	/// first says so, and once it is closed). `Event::FocusChanged` says when it
+	/// changes: a program that animates only for the person typing (a blinking
+	/// caret) stops while it is `false`.
+	fun focused(self): bool {
+		gfx_window_number(self.id, 3) != 0.0
 	}
 }
 

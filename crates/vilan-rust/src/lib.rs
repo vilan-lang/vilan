@@ -18975,6 +18975,10 @@ fn gfx_host_function(symbol: &str) -> Option<(&'static str, &'static [usize])> {
         // items, and the listing of what an assistive tool is told.
         ("__ui_set_items", "ui::set_items", &[0]),
         ("__ui_accessibility", "ui::accessibility", &[0]),
+        // F176: an element's timers, and its window's focus.
+        ("__ui_timer", "ui::timer", &[0]),
+        ("__ui_cancel_timer", "ui::cancel_timer", &[]),
+        ("__ui_window_focused", "ui::window_focused", &[0]),
     ];
     FUNCTIONS
         .iter()

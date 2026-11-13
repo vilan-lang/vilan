@@ -55,6 +55,10 @@
 // with Tab and Shift+Tab through the focusable elements in tree order, and Tab
 // scrolls the element it focuses into view.
 //
+// TIMERS (F176) belong to an element as its handlers do: `after` and `every` run a
+// handler as one turn later, and a timer ends with its element's removal or its
+// `cancel`. The window's own focus is `window_focused()` and `on_window_focus`.
+//
 // NATIVE ONLY, as `std::gfx` is: the JavaScript backend refuses a program that
 // reaches it, by name, when it builds; `vilan check` does not.
 //
@@ -120,6 +124,7 @@ import pkg::reactive::{
 	turn_scope,
 };
 import pkg::shared::Shared;
+import pkg::time::Duration;
 
 // --- The seam ------------------------------------------------------------------
 //
@@ -141,7 +146,8 @@ import pkg::shared::Shared;
 //                         widths at least / below, negative for none
 //   __ui_on               0 pointer enter, 1 pointer leave, 2 pointer move,
 //                         3 press, 4 release, 5 click, 6 scroll, 7 key, 8 key
-//                         release, 9 text, 10 focus, 11 blur, 12 resize
+//                         release, 9 text, 10 focus, 11 blur, 12 resize,
+//                         13 window focus
 //   element kinds         0 row, 1 column, 2 stack, 3 text, 4 image, 5 scroll,
 //                         6 a region's marker (never laid out, painted or hit)
 //
@@ -296,6 +302,18 @@ external fun ui_click_count(): i32;
 /// Ends the press (and the pointer's capture) held by `node` or inside it.
 [extern("__ui_release_pointer")]
 external fun ui_release_pointer(node: Node): void;
+
+/// A timer on `node` (F176): `handler` in `delay` ms, then every `period` ms when
+/// `period` is not negative. Answers its id.
+[extern("__ui_timer")]
+external fun ui_timer(node: Node, delay: f64, period: f64, handler: || void): f64;
+
+[extern("__ui_cancel_timer")]
+external fun ui_cancel_timer(id: f64): void;
+
+/// 1 when the window `node`'s tree is in has the system's focus, else 0.
+[extern("__ui_window_focused")]
+external fun ui_window_focused(node: Node): i32;
 
 /// While a resize handler runs: the size it reports, width (0) and height (1), in
 /// dp.
@@ -1066,6 +1084,65 @@ export impl Element {
 		let bits = ui_interaction(self.node);
 		Interaction { hovered = bits & 1 != 0, pressed = bits & 2 != 0, focused = bits & 4 != 0 }
 	}
+
+	/// Calls `handler` once, `delay` from now (a delay already past: at the next
+	/// turn), as one turn the way an event handler runs. The timer is the
+	/// element's: removing the element for good ends it, as `cancel` does, and an
+	/// ended timer never fires. Many timers cost the program one wake, at the
+	/// earliest.
+	fun after(
+		self,
+		delay: Duration,
+		handler: (|| void) context (turn_scope, tracking),
+	): ElementTimer {
+		ElementTimer {
+			id = ui_timer(
+				self.node,
+				delay.as_millis().as_f64(),
+				-1.0,
+				|| turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler())),
+			),
+		}
+	}
+
+	/// Calls `handler` every `period` (at least a millisecond), the first time
+	/// `period` from now, until the timer is cancelled or the element removed for
+	/// good. It keeps its phase: each call is due a whole number of periods after
+	/// the first, however late the one before ran, and a program that falls more
+	/// than a period behind skips the calls it missed rather than catching up.
+	fun every(
+		self,
+		period: Duration,
+		handler: (|| void) context (turn_scope, tracking),
+	): ElementTimer {
+		let millis = period.as_millis().as_f64();
+		ElementTimer {
+			id = ui_timer(self.node, millis, millis, || turn(FlushPolicy::AtSuspension, || tracking
+				.clear(|| handler()))),
+		}
+	}
+
+	/// Whether the window its tree is in has the system's keyboard focus: what a
+	/// blinking caret stops for. `false` in no window (a tree driven by `deliver`
+	/// is in a focused window once a `FocusChanged(true)` is delivered to it).
+	/// `on_window_focus` says when it changes.
+	fun window_focused(self): bool {
+		ui_window_focused(self.node) != 0
+	}
+}
+
+/// A timer on an element (`Element::after`, `Element::every`): a handle that calls
+/// it off. A copy is the same timer.
+export struct ElementTimer {
+	id: f64,
+}
+
+export impl ElementTimer {
+	/// The timer never fires again. A timer that already fired its last time, was
+	/// cancelled before, or ended with its element is untouched.
+	fun cancel(self) {
+		ui_cancel_timer(self.id);
+	}
 }
 
 /// One element as `Element::outline` lists it: how deep in the tree (the root is
@@ -1426,6 +1503,19 @@ export trait Attributes {
 	fun on_blur(self, handler: (|| void) context (turn_scope, tracking)): Self {
 		ui_on(self.element().node, 11, || turn(FlushPolicy::AtSuspension, || tracking
 			.clear(|| handler())));
+		self
+	}
+
+	/// The window its tree is in gained (`true`) or lost (`false`) the system's
+	/// keyboard focus: told to every element listening, in tree order, whatever has
+	/// the focus inside the window. Does not bubble. `Element::window_focused`
+	/// reads it at any time.
+	fun on_window_focus(self, handler: (|bool| void) context (turn_scope, tracking)): Self {
+		ui_on(self.element().node, 13, || {
+			if current_event() is Some(Event::FocusChanged(let focused)) {
+				turn(FlushPolicy::AtSuspension, || tracking.clear(|| handler(focused)));
+			}
+		});
 		self
 	}
 
@@ -2380,6 +2470,20 @@ export fun deliver<C: Child>(root: C, event: Event) {
 		Event::KeyPressed(let key) => deliver_key(node, 5, key),
 		Event::KeyReleased(let key) => deliver_key(node, 6, key),
 		Event::TextInput(let text) => ui_deliver(node, 7, 0.0, 0.0, 0.0, 0.0, 0.0, text),
+		Event::FocusChanged(let focused) => ui_deliver(
+			node,
+			11,
+			if focused {
+				1.0
+			} else {
+				0.0
+			},
+			0.0,
+			0.0,
+			0.0,
+			0.0,
+			"",
+		),
 		_ => {},
 	}
 }
