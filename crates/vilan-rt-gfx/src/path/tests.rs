@@ -520,6 +520,143 @@ fn a_zero_width_stroke_and_an_empty_path_have_no_mask() {
     ));
 }
 
+/// The ink of a mask in square pixels: its coverage summed.
+fn ink(mask: &RasterizedMask) -> f32 {
+    mask.pixels
+        .iter()
+        .map(|coverage| f32::from(*coverage) / 255.0)
+        .sum()
+}
+
+/// A DOT (a contour within `zeno`'s merge distance of its start, Lucide's
+/// `h.01`) is stroked with its caps, as SVG strokes a zero-length subpath:
+/// round caps a disc of half the width, square caps a square of the width,
+/// butt caps nothing. `zeno` alone draws nothing for it (the S4 sweep found
+/// 148 Lucide icons missing their dots).
+#[test]
+fn a_dot_is_stroked_with_its_caps() {
+    let round = PathPaint::Stroke(Stroke::new(2.0));
+    let square = PathPaint::Stroke(Stroke::new(2.0).with_cap(Cap::Square));
+    let butt = PathPaint::Stroke(Stroke::new(2.0).with_cap(Cap::Butt));
+    // At 8 device pixels per unit, a disc of radius 8 pixels: 201 square
+    // pixels of ink; a square 16 pixels on a side: 256 (and the dot's own
+    // length, under 0.08 of a pixel, on one side). `M2 20h.01` is Lucide's
+    // `signal-zero`: in `f32`, 2.01 - 2 is under 0.01, so `zeno` merges it
+    // (12.01 - 12 is not, and `M12 12h.01` is an ordinary short line).
+    for data in [
+        "M2 20h.01",
+        "M12 12v-.005",
+        "M12 12l.005 .005",
+        "M12 12Z",
+        "M12 12L12 12",
+    ] {
+        let path = Path::from_svg(data).expect("valid");
+        let disc = ink(&mask(&path, round, 8.0));
+        assert!(
+            // `zeno` flattens the arcs a little inside the circle: 198 of
+            // the 201 square pixels at this radius.
+            (disc - std::f32::consts::PI * 64.0).abs() < 5.0,
+            "{data}: a round-capped dot inks {disc} square pixels"
+        );
+        let squared = ink(&mask(&path, square, 8.0));
+        assert!(
+            (squared - 256.0).abs() < 2.0,
+            "{data}: a square-capped dot inks {squared} square pixels"
+        );
+        assert!(
+            matches!(
+                rasterize(
+                    &PathMaskKey::new(&path, butt, 8.0),
+                    &mut zeno::Scratch::new(),
+                    4096
+                ),
+                Rasterized::Empty
+            ),
+            "{data}: a butt-capped dot draws nothing"
+        );
+    }
+    // A square cap lies along the dot's direction: across or down, a
+    // square of the width around the same point; at 45 degrees, the same
+    // square turned, reaching further on both axes.
+    let across = mask(&Path::from_svg("M12 12h.005").expect("valid"), square, 8.0);
+    let down = mask(&Path::from_svg("M12 12v.005").expect("valid"), square, 8.0);
+    let turned = mask(
+        &Path::from_svg("M12 12l.005 .005").expect("valid"),
+        square,
+        8.0,
+    );
+    assert_eq!((across.left, across.top), (88, 88));
+    assert_eq!((down.left, down.top), (88, 88));
+    assert!(
+        turned.left < 86 && turned.top < 86,
+        "a turned square reaches {}",
+        turned.left
+    );
+    // A move alone draws nothing, with any cap.
+    let alone = Path::from_svg("M12 12").expect("valid");
+    assert!(matches!(
+        rasterize(
+            &PathMaskKey::new(&alone, round, 8.0),
+            &mut zeno::Scratch::new(),
+            4096
+        ),
+        Rasterized::Empty
+    ));
+}
+
+/// A dot's disc turns the way `zeno`'s outlines turn, so where it overlaps
+/// another stroke the non-zero rule adds them: a dot ON a line changes no
+/// pixel of the line, and a dot beside one is the dot and the line both.
+#[test]
+fn a_dot_adds_to_the_strokes_it_overlaps() {
+    let round = PathPaint::Stroke(Stroke::new(2.0));
+    let line = mask(&Path::from_svg("M4 12h16").expect("valid"), round, 4.0);
+    let on = mask(
+        &Path::from_svg("M4 12h16M12 12h.005").expect("valid"),
+        round,
+        4.0,
+    );
+    assert_eq!(
+        (line.left, line.top, line.width, line.height),
+        (on.left, on.top, on.width, on.height)
+    );
+    assert_eq!(line.pixels, on.pixels, "a dot on a line cut into it");
+    // Half on, half off: the overlap stays inked (a disc turning the other
+    // way would cancel the line there).
+    let half = mask(
+        &Path::from_svg("M4 12h16M12 13h.005").expect("valid"),
+        round,
+        4.0,
+    );
+    assert_eq!(
+        coverage(&half, 48, 48),
+        255,
+        "the overlap of a dot and a line"
+    );
+    assert_eq!(coverage(&half, 48, 54), 255, "the dot below the line");
+}
+
+/// Only a dot is drawn by its caps: a contour just past the merge distance
+/// is `zeno`'s own, and a dot beside it does not change it.
+#[test]
+fn a_contour_past_the_merge_distance_is_stroked_as_before() {
+    let round = PathPaint::Stroke(Stroke::new(2.0));
+    let short = Path::from_svg("M12 12h.5").expect("valid");
+    let mut direct = Vec::new();
+    zeno::apply(
+        &short.data.segments[..],
+        Stroke::new(2.0).zeno(),
+        None,
+        &mut direct,
+    );
+    assert_eq!(&*short.outline(&Stroke::new(2.0)), &direct[..]);
+    let with_dot = Path::from_svg("M12 12h.5M2 2h.01").expect("valid");
+    let outline = with_dot.outline(&Stroke::new(2.0));
+    assert_eq!(&outline[..direct.len()], &direct[..]);
+    assert!(outline.len() > direct.len(), "the dot's disc follows");
+    let _ = mask(&with_dot, round, 1.0);
+}
+
 #[test]
 fn a_mask_larger_than_the_largest_texture_is_refused_before_it_is_made() {
     let path = Path::from_svg("M0 0 H5000 V10 H0 Z").expect("valid");
@@ -528,4 +665,48 @@ fn a_mask_larger_than_the_largest_texture_is_refused_before_it_is_made() {
         rasterize(&key, &mut zeno::Scratch::new(), 4096),
         Rasterized::TooLarge
     ));
+}
+
+/// With round joins, a path that comes back on itself (a turn of exactly
+/// 180 degrees) is round where it turns, as a cap is: `zeno` alone drew it
+/// flat there, as if neither side were the outside (the S4 sweep found it at
+/// Lucide's cusps: `popcorn`'s top, the `3` of `numbers`).
+#[test]
+fn a_round_join_that_turns_back_is_round() {
+    let round = PathPaint::Stroke(Stroke::new(2.0));
+    // Out and back is the line itself: the same ink, round at both ends (to
+    // within the edge pixels `zeno` counts twice where the outline lies
+    // over itself: it sums coverage, 6 of 1,222 square pixels here).
+    let line = mask(&Path::from_svg("M10 4H18").expect("valid"), round, 8.0);
+    let back = mask(&Path::from_svg("M10 4H18H10").expect("valid"), round, 8.0);
+    // Inside the round end beyond the turn at (144, 32).
+    assert_eq!(coverage(&back, 150, 31), 255, "the turn's round end");
+    assert!(
+        (ink(&back) - ink(&line)).abs() < 12.0,
+        "out and back inks {} square pixels, the line {}",
+        ink(&back),
+        ink(&line)
+    );
+    // Two arcs meeting in a cusp at (14, 4), the lower one's half disc
+    // below it: the pixel just under the cusp is inked.
+    let cusp = mask(
+        &Path::from_svg("M18 4a2 2 0 0 0-4 0 2 2 0 0 0-4 0").expect("valid"),
+        round,
+        8.0,
+    );
+    assert_eq!(coverage(&cusp, 112, 38), 255, "below the cusp");
+    // Closed: a contour that comes back along its closing line.
+    let closed = mask(&Path::from_svg("M10 4H18Z").expect("valid"), round, 8.0);
+    assert_eq!(coverage(&closed, 150, 31), 255, "a closed turn's round end");
+    // A miter or a bevel join turning back is flat, as SVG draws it.
+    let mitered = mask(
+        &Path::from_svg("M10 4H18H10").expect("valid"),
+        PathPaint::Stroke(Stroke::new(2.0).with_join(Join::Miter)),
+        8.0,
+    );
+    assert_eq!(
+        mitered.left + mitered.width as i32,
+        144,
+        "a mitered turn ends at the vertex"
+    );
 }

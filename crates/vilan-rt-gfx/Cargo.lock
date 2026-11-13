@@ -2782,6 +2782,7 @@ dependencies = [
  "pollster",
  "swash",
  "taffy",
+ "tiny-skia",
  "vilan-rt",
  "vilan-rt-poll",
  "wgpu",

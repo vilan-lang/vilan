@@ -1,0 +1,17 @@
+# A row of Lucide's icons with their labels (gfx-path.md S4): the generated icon
+# package at `vilan/packages/lucide`, taken by a path dependency, drawn by
+# `std::ui`'s `icon` element in the text's colour. NATIVE ONLY: the JavaScript
+# build refuses `std::ui` by name, so it is built with the Rust backend:
+#
+#   vilan run --backend rust .                          the window
+#   vilan run --backend rust . -- --check --font <ttf>  the boxes and what an
+#                                                       assistive tool is told
+#
+# It needs a GPU adapter (any Vulkan, Metal, DirectX 12 or OpenGL driver, or
+# Mesa's software Vulkan) and, on Linux, an X11 or Wayland session.
+[package]
+name = "ui_icons"
+root = "."
+
+[package.dependencies]
+lucide = { path = "../../packages/lucide" }

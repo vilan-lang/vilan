@@ -522,6 +522,305 @@ fn segment_bounds(segments: &[Segment]) -> Option<Rect> {
     extent.map(|[left, top, right, bottom]| Rect::new(left, top, right - left, bottom - top))
 }
 
+/// How close, on both axes, a point must be to the last point `zeno`'s
+/// stroker kept for the stroker to drop the segment to it: its segment
+/// collector's `MERGE_EPSILON` (`zeno` 0.3.3, `segment.rs`), in path units.
+const ZENO_MERGE: f32 = 0.01;
+
+/// The outline of `segments` stroked with `stroke`, filled by the non-zero
+/// rule.
+///
+/// `zeno` strokes every contour but a DOT: a contour whose every point lies
+/// within [`ZENO_MERGE`] of its first point on both axes (`M2 20h.01`, the
+/// way Lucide and its kin draw a dot, or a zero-length `M2 20Z`). Its
+/// collector merges each such point into the first, so the contour has no
+/// segment left and draws nothing, where SVG draws its caps (SVG 2, 11.4:
+/// a zero-length subpath is stroked with round and square caps). So a dot is
+/// left out of what `zeno` strokes and drawn here by SVG's rule: a round cap
+/// is a stadium (a disc when it has no length) of half the width around it,
+/// a square cap a square of the width around it along its direction (the x
+/// axis when it has none), and a butt cap nothing.
+///
+/// And with ROUND joins, `zeno` draws a turn of exactly 180 degrees (a path
+/// that comes back on itself: `M10 4H18H10`, or Lucide's arcs meeting in a
+/// cusp, `popcorn`'s top) as if neither side were the outside of the turn:
+/// both offsets meet at the vertex, and the round join, half a disc beyond
+/// it, is missing (its `is_clockwise` is strict, and both sides answer no).
+/// Such a turn is given its side ([`turn_reversals`]): the segment after it
+/// leaves at a thousandth of a radian off the way back, which no pixel shows,
+/// and `zeno` draws the join. Miter and bevel joins at 180 degrees are flat,
+/// which is what `zeno` draws. Every other contour is `zeno`'s, untouched.
+fn stroke_outline(segments: &[Segment], stroke: &Stroke) -> Vec<Segment> {
+    let mut stroked: Vec<Segment> = Vec::with_capacity(segments.len());
+    let mut dots: Vec<(zeno::Point, zeno::Point)> = Vec::new();
+    for contour in contours(segments) {
+        match dot(contour) {
+            Some(ends) => dots.push(ends),
+            None if stroke.join == Join::Round => turn_reversals(contour, &mut stroked),
+            None => stroked.extend_from_slice(contour),
+        }
+    }
+    let mut outline: Vec<Segment> = Vec::new();
+    if !stroked.is_empty() {
+        zeno::apply(&stroked[..], stroke.zeno(), None, &mut outline);
+    }
+    let radius = stroke.width / 2.0;
+    for (first, last) in dots {
+        if stroke.cap == Cap::Butt {
+            continue;
+        }
+        let along = last - first;
+        let length = along.length();
+        let direction = if length > 0.0 {
+            along * (1.0 / length)
+        } else {
+            zeno::Vector::new(1.0, 0.0)
+        };
+        // To the left of the direction on screen (y down): for a dot drawn
+        // to the right, up.
+        let side = zeno::Vector::new(direction.y, -direction.x) * radius;
+        // ONE contour per dot, turning as `zeno`'s outlines turn (clockwise
+        // on screen), so it adds to a stroke it overlaps under the non-zero
+        // rule. (Two overlapping discs would be counted twice in the pixels
+        // their edges share: `zeno` sums coverage.)
+        match stroke.cap {
+            Cap::Round => {
+                outline.move_to(first + side);
+                outline.line_to(last + side);
+                half_turn(&mut outline, radius, last - side);
+                outline.line_to(first - side);
+                half_turn(&mut outline, radius, first + side);
+                outline.close();
+            }
+            Cap::Square => {
+                let reach = direction * radius;
+                outline.move_to(first - reach + side);
+                outline.line_to(last + reach + side);
+                outline.line_to(last + reach - side);
+                outline.line_to(first - reach - side);
+                outline.close();
+            }
+            Cap::Butt => {}
+        }
+    }
+    outline
+}
+
+/// Half a circle of `radius` from the current point to `to`, clockwise on
+/// screen.
+fn half_turn(outline: &mut Vec<Segment>, radius: f32, to: zeno::Point) {
+    outline.arc_to(
+        radius,
+        radius,
+        zeno::Angle::from_degrees(0.0),
+        zeno::ArcSize::Small,
+        zeno::ArcSweep::Positive,
+        to,
+    );
+}
+
+/// How far a segment after a reversal is turned, in radians: enough for
+/// `zeno`'s join test to see a side in `f32`, and far too little to see (a
+/// control point one unit from its start moves a thousandth of a unit: for
+/// a 24-unit icon at 48 dp, 0.002 of a pixel).
+const REVERSAL_TURN: f32 = 1.0e-3;
+
+/// `contour` (one move and what follows) pushed to `out`, with every turn
+/// of 180 degrees given a side: the segment after it starts turned by
+/// [`REVERSAL_TURN`]. A line that follows one becomes the cubic of the same
+/// line with its first control point turned, so no point of the path moves.
+/// A closed contour's closing segment is made explicit first, so a reversal
+/// where it meets the contour's first segment is found too. A contour with
+/// no reversal is pushed as it was.
+fn turn_reversals(contour: &[Segment], out: &mut Vec<Segment>) {
+    let Some(Segment::MoveTo(start)) = contour.first() else {
+        out.extend_from_slice(contour);
+        return;
+    };
+    let start = *start;
+    let closed = matches!(contour.last(), Some(Segment::Close));
+    // The drawing segments, the closing line explicit.
+    let mut drawn: Vec<Segment> = contour[1..]
+        .iter()
+        .filter(|segment| !matches!(segment, Segment::Close))
+        .copied()
+        .collect();
+    let mut current = start;
+    for segment in &drawn {
+        current = segment_end(segment, current);
+    }
+    if closed && current != start {
+        drawn.push(Segment::LineTo(start));
+    }
+    let count = drawn.len();
+    // The point each segment starts from.
+    let mut starts = Vec::with_capacity(count);
+    let mut current = start;
+    for segment in &drawn {
+        starts.push(current);
+        current = segment_end(segment, current);
+    }
+    let joins = if closed {
+        count
+    } else {
+        count.saturating_sub(1)
+    };
+    let mut reversed = false;
+    for join in 0..joins {
+        let (before, after) = (join, (join + 1) % count);
+        let Some(arriving) = end_tangent(&drawn[before], starts[before]) else {
+            continue;
+        };
+        let Some(leaving) = start_tangent(&drawn[after], starts[after]) else {
+            continue;
+        };
+        if reverses(arriving, leaving) {
+            drawn[after] = turned(&drawn[after], starts[after]);
+            reversed = true;
+        }
+    }
+    // A contour with no reversal is `zeno`'s exactly as written.
+    if !reversed {
+        out.extend_from_slice(contour);
+        return;
+    }
+    out.push(Segment::MoveTo(start));
+    out.extend(drawn);
+    if closed {
+        out.push(Segment::Close);
+    }
+}
+
+fn segment_end(segment: &Segment, current: zeno::Point) -> zeno::Point {
+    match segment {
+        Segment::MoveTo(to)
+        | Segment::LineTo(to)
+        | Segment::QuadTo(_, to)
+        | Segment::CurveTo(_, _, to) => *to,
+        Segment::Close => current,
+    }
+}
+
+/// The way a segment leaves its start: toward its first point that is not
+/// the start. `None` for a segment of no extent.
+fn start_tangent(segment: &Segment, from: zeno::Point) -> Option<zeno::Vector> {
+    let points: &[zeno::Point] = match segment {
+        Segment::LineTo(to) => &[*to],
+        Segment::QuadTo(control, to) => &[*control, *to],
+        Segment::CurveTo(first, second, to) => &[*first, *second, *to],
+        Segment::MoveTo(_) | Segment::Close => &[],
+    };
+    points
+        .iter()
+        .map(|point| *point - from)
+        .find(|vector| vector.length() > 0.0)
+}
+
+/// The way a segment arrives at its end: from its last point that is not
+/// the end. `None` for a segment of no extent.
+fn end_tangent(segment: &Segment, from: zeno::Point) -> Option<zeno::Vector> {
+    let (end, before): (zeno::Point, [Option<zeno::Point>; 3]) = match segment {
+        Segment::LineTo(to) => (*to, [Some(from), None, None]),
+        Segment::QuadTo(control, to) => (*to, [Some(*control), Some(from), None]),
+        Segment::CurveTo(first, second, to) => (*to, [Some(*second), Some(*first), Some(from)]),
+        Segment::MoveTo(_) | Segment::Close => return None,
+    };
+    before
+        .into_iter()
+        .flatten()
+        .map(|point| end - point)
+        .find(|vector| vector.length() > 0.0)
+}
+
+/// Whether `leaving` goes back the way `arriving` came, to within
+/// a hundredth of [`REVERSAL_TURN`].
+fn reverses(arriving: zeno::Vector, leaving: zeno::Vector) -> bool {
+    let lengths = arriving.length() * leaving.length();
+    let cross = arriving.x * leaving.y - arriving.y * leaving.x;
+    arriving.dot(leaving) < 0.0 && cross.abs() <= lengths * REVERSAL_TURN * 0.01
+}
+
+/// `segment`, starting at `from`, with the way it leaves turned by
+/// [`REVERSAL_TURN`] and its points otherwise where they were.
+fn turned(segment: &Segment, from: zeno::Point) -> Segment {
+    let (sin, cos) = REVERSAL_TURN.sin_cos();
+    let turn = |point: zeno::Point| {
+        let vector = point - from;
+        from + zeno::Vector::new(
+            vector.x * cos - vector.y * sin,
+            vector.x * sin + vector.y * cos,
+        )
+    };
+    match *segment {
+        Segment::LineTo(to) => {
+            let along = to - from;
+            Segment::CurveTo(
+                turn(from + along * (1.0 / 3.0)),
+                from + along * (2.0 / 3.0),
+                to,
+            )
+        }
+        Segment::QuadTo(control, to) => Segment::QuadTo(turn(control), to),
+        Segment::CurveTo(first, second, to) if first != from => {
+            Segment::CurveTo(turn(first), second, to)
+        }
+        // A cubic whose first control point is its start leaves toward its
+        // second.
+        Segment::CurveTo(first, second, to) => Segment::CurveTo(first, turn(second), to),
+        other => other,
+    }
+}
+
+/// A path's contours, split before every move: each starts with its move
+/// (see [`Commands`]).
+fn contours(segments: &[Segment]) -> impl Iterator<Item = &[Segment]> {
+    let mut rest = segments;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let end = rest[1..]
+            .iter()
+            .position(|segment| matches!(segment, Segment::MoveTo(_)))
+            .map_or(rest.len(), |index| index + 1);
+        let (contour, after) = rest.split_at(end);
+        rest = after;
+        Some(contour)
+    })
+}
+
+/// A dot's first and last points: a contour that draws (a move alone does
+/// not) whose every point is within [`ZENO_MERGE`] of its first point on
+/// both axes.
+fn dot(contour: &[Segment]) -> Option<(zeno::Point, zeno::Point)> {
+    let Some(Segment::MoveTo(first)) = contour.first() else {
+        return None;
+    };
+    let first = *first;
+    if contour.len() < 2 {
+        return None;
+    }
+    let near = |point: &zeno::Point| {
+        (point.x - first.x).abs() < ZENO_MERGE && (point.y - first.y).abs() < ZENO_MERGE
+    };
+    let mut last = first;
+    for segment in &contour[1..] {
+        let points: &[&zeno::Point] = match segment {
+            Segment::MoveTo(to) | Segment::LineTo(to) => &[to],
+            Segment::QuadTo(control, to) => &[control, to],
+            Segment::CurveTo(one, two, to) => &[one, two, to],
+            Segment::Close => &[],
+        };
+        if !points.iter().all(|point| near(point)) {
+            return None;
+        }
+        if let Some(end) = points.last() {
+            last = **end;
+        }
+    }
+    Some((first, last))
+}
+
 impl Path {
     fn from_segments(segments: Vec<Segment>) -> Path {
         Path {
@@ -590,9 +889,7 @@ impl Path {
             }
         }
         // Made outside the lock, inserted whole.
-        let mut outline: Vec<Segment> = Vec::new();
-        zeno::apply(&self.data.segments[..], stroke.zeno(), None, &mut outline);
-        let outline: Arc<[Segment]> = Arc::from(outline);
+        let outline: Arc<[Segment]> = Arc::from(stroke_outline(&self.data.segments, stroke));
         let mut kept = self
             .data
             .outlines
@@ -877,3 +1174,6 @@ pub(crate) mod tests_support;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod lucide_sweep;

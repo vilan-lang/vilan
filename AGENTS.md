@@ -185,7 +185,16 @@ Rust workspace, seventeen crates, plus the language's own tree:
   the inherited text size; decorative unless labelled. `host/ui/icons.rs` parses the data once
   per program per data, and malformed data FAILS the program naming the byte. Its screen in
   `ui_screen.rs` (`--icons`) has its own listing and goldens (`tests/ui/icon-rects.txt`,
-  `icons-{100,150}.png`).
+  `icons-{100,150}.png`). ICON SETS (S4, R11) are generated packages outside std: Lucide's is
+  `vilan/packages/lucide` (a `[library]`, `src/icons` its `generated` root), made by
+  `scripts/lucide-native.mjs` from a pinned `lucide-static` tarball fetched OUTSIDE the
+  repository (`generate <package dir> vilan/packages/lucide`; the README has the steps).
+  Never edit `src/icons/lib.vl` or `icons.tsv`: `vilan-cli/tests/lucide_package.rs` holds the
+  source to the script's `render` of the data, and the GPU crate's `path/lucide_sweep.rs`
+  draws every icon against `tiny-skia` (a dev-dependency). That sweep found two `zeno`
+  stroker defects, fixed before stroking in `path/mod.rs`'s `stroke_outline`: a DOT (a
+  contour within `zeno`'s 0.01 merge distance, Lucide's `h.01`) drew nothing, and a round
+  join turning back 180 degrees drew flat.
   Reactive children (R9: `each`, `when`, `swap` in `ui.vl`) keep their place through a `Marker`
   element (never laid out, painted, hit or listed) and change the tree only by `insert_before`
   (a move when the element is already there) and `remove`, which is FINAL: it drops the

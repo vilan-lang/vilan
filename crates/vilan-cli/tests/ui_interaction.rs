@@ -92,6 +92,13 @@
 //!    it is due, and the window's focus told to a tree. Every step is caused by
 //!    the one before, so the order is the program's, not the clock's; the
 //!    program ends by itself once no timer is left.
+//! 9. gfx-path.md S4, an icon set: `vilan/examples/ui-icons` draws Lucide's
+//!    icons from the generated package `vilan/packages/lucide`, taken by a
+//!    path dependency (staged beside the example at the same relative
+//!    place). Its `--check`, with no window, held to
+//!    `tests/ui/icons-check.txt`: the labelled boxes, and what an assistive
+//!    tool is told (a labelled icon is an image by its name, an unlabelled
+//!    one says nothing).
 //!
 //! Ordering comes from the programs' lines — each injection waits for the
 //! line its predecessor caused — never from a sleep. No assertion reads a
@@ -198,6 +205,58 @@ fn build_example(example: &str, entry: &str) -> PathBuf {
     let binary = target.join("debug").join(entry);
     assert!(binary.is_file(), "no binary at {}", binary.display());
     binary
+}
+
+/// [`build_example`] for an example that takes a package of this repository
+/// by a path dependency (`../../packages/<name>`): the example is staged as
+/// `examples/<entry>` and each package's `vilan.toml` and sources as
+/// `packages/<name>` under one scratch root, so the path resolves as it does
+/// in the repository.
+fn build_example_with_packages(example: &str, entry: &str, packages: &[&str]) -> PathBuf {
+    let root = scratch().join(format!("{entry}-tree"));
+    let _ = std::fs::remove_dir_all(&root);
+    let staged = root.join("examples").join(entry);
+    std::fs::create_dir_all(&staged).expect("stage the example");
+    let source = repository_root().join("vilan/examples").join(example);
+    std::fs::copy(source.join("vilan.toml"), staged.join("vilan.toml")).expect("its manifest");
+    std::fs::copy(source.join("main.vl"), staged.join(format!("{entry}.vl"))).expect("its source");
+    for package in packages {
+        let from = repository_root().join("vilan/packages").join(package);
+        let to = root.join("packages").join(package);
+        std::fs::create_dir_all(&to).expect("stage the package");
+        std::fs::copy(from.join("vilan.toml"), to.join("vilan.toml")).expect("its manifest");
+        copy_tree(&from.join("src"), &to.join("src"));
+    }
+    let target = scratch().join("target");
+    let built = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", "--backend", "rust", &format!("{entry}.vl")])
+        .current_dir(&staged)
+        .env("VILAN_RT", repository_root().join("crates/vilan-rt"))
+        .env("CARGO_TARGET_DIR", &target)
+        .output()
+        .expect("run vilan");
+    assert!(
+        built.status.success(),
+        "{example} did not build natively:\n{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let binary = target.join("debug").join(entry);
+    assert!(binary.is_file(), "no binary at {}", binary.display());
+    binary
+}
+
+/// Copies the files under `from` to `to`, directories and all.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("a directory");
+    for entry in std::fs::read_dir(from).expect("read a directory").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            copy_tree(&path, &to.join(entry.file_name()));
+        } else {
+            std::fs::copy(&path, to.join(entry.file_name())).expect("copy a file");
+        }
+    }
 }
 
 /// The XTEST injector, built from the GPU crate's examples into the shared
@@ -806,6 +865,25 @@ fn the_virtual_list_of_differing_heights_anchors_and_a_click_lands_on_its_row() 
         Some(0),
         "closing the list ended it with {code:?}:\n{}\n--- stderr\n{stderr}",
         seen.join("\n")
+    );
+}
+
+/// gfx-path.md S4: the generated Lucide package, depended on by path and
+/// drawn by `std::ui`'s `icon`: the example builds natively, lays out, and
+/// tells an assistive tool of its labelled icon as an image by its name and
+/// of its unlabelled ones nothing.
+#[test]
+fn the_lucide_icons_example_lays_out_and_labels_only_its_labelled_icon() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let icons = build_example_with_packages("ui-icons", "icons", &["lucide"]);
+    let listed = assert_check_listing(&icons, "icons-check.txt");
+    assert!(listed.contains("    Image \"Notifications\""), "{listed}");
+    assert_eq!(
+        listed.matches("Image").count(),
+        1,
+        "only the labelled icon is an image: {listed}"
     );
 }
 
