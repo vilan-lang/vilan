@@ -115,6 +115,62 @@ pub fn write_png(path: &std::path::Path, width: u32, height: u32, pixels: &[u8])
 /// written beside the build's target directory for inspection and the test
 /// fails naming it.
 pub fn assert_golden(name: &str, width: u32, height: u32, pixels: &[u8]) {
+    assert_golden_allowing(name, width, height, pixels, 0);
+}
+
+/// What a comparison found: how many channel values are past [`TOLERANCE`],
+/// the largest difference, and the first pixel past it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Differences {
+    pub differing: usize,
+    pub largest: u8,
+    pub first: Option<(u32, u32)>,
+}
+
+/// Compares two RGBA frames of one size, channel by channel.
+pub fn differences(pixels: &[u8], expected: &[u8], width: u32) -> Differences {
+    let mut found = Differences {
+        differing: 0,
+        largest: 0,
+        first: None,
+    };
+    for (index, (actual, wanted)) in pixels.iter().zip(expected).enumerate() {
+        let difference = actual.abs_diff(*wanted);
+        if difference > TOLERANCE {
+            found.differing += 1;
+            if found.first.is_none() {
+                let pixel = (index / 4) as u32;
+                found.first = Some((pixel % width, pixel / width));
+            }
+        }
+        found.largest = found.largest.max(difference);
+    }
+    found
+}
+
+/// Whether a comparison passes with `stragglers` allowed: at most that many
+/// channel values past [`TOLERANCE`], and none of them by more than one
+/// further. With no stragglers allowed this is [`TOLERANCE`] alone.
+pub fn within(found: &Differences, stragglers: usize) -> bool {
+    found.differing == 0 || (found.differing <= stragglers && found.largest <= TOLERANCE + 1)
+}
+
+/// [`assert_golden`], with up to `stragglers` channel values allowed to be
+/// one further off than [`TOLERANCE`] (and none further than that).
+///
+/// For frames whose edges are coverage blended over a background and then
+/// encoded to sRGB: two versions of one software rasteriser round the blend's
+/// last bit differently, and the encode stretches that bit to two at a dark
+/// value. CI's Mesa 25.2.8 put ONE pixel of `paths-125` (three channel
+/// values) two off a golden made on Mesa 25.0.7 (run 43492572577), with every
+/// other pixel of the three sheets inside the tolerance.
+pub fn assert_golden_allowing(
+    name: &str,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    stragglers: usize,
+) {
     let golden = crate_directory()
         .join("tests/golden")
         .join(format!("{name}.png"));
@@ -134,28 +190,22 @@ pub fn assert_golden(name: &str, width: u32, height: u32, pixels: &[u8]) {
         (width, height),
         "{name}: size differs from the golden"
     );
-    let mut differing = 0usize;
-    let mut largest = 0u8;
-    let mut first: Option<(u32, u32)> = None;
-    for (index, (actual, wanted)) in pixels.iter().zip(&expected).enumerate() {
-        let difference = actual.abs_diff(*wanted);
-        if difference > TOLERANCE {
-            differing += 1;
-            if first.is_none() {
-                let pixel = (index / 4) as u32;
-                first = Some((pixel % width, pixel / width));
-            }
-        }
-        largest = largest.max(difference);
-    }
-    if differing > 0 {
+    let found = differences(pixels, &expected, width);
+    if !within(&found, stragglers) {
+        let Differences {
+            differing,
+            largest,
+            first,
+        } = found;
         let failure = crate_directory()
             .join("target/golden-failures")
             .join(format!("{name}.png"));
         write_png(&failure, width, height, pixels);
         panic!(
             "{name}: {differing} channel values differ from the golden by more than {TOLERANCE} \
-             (largest {largest}, first at pixel {first:?}); this run's frame is at {}",
+             (largest {largest}, first at pixel {first:?}; {stragglers} allowed at {} and none \
+             past it); this run's frame is at {}",
+            TOLERANCE + 1,
             failure.display()
         );
     }

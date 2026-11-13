@@ -11,7 +11,9 @@
 mod support;
 
 use support::icons::{ICON_BOX, ICONS, IconPaint, SIZES, STROKE_WIDTH};
-use support::{assert_golden, software_context, test_text_system};
+use support::{
+    Differences, assert_golden_allowing, differences, software_context, test_text_system, within,
+};
 use vilan_rt_gfx::{
     Color, FillRule, OffscreenRenderer, Path, PathPaint, Point, Scene, SceneBuilder, Stroke, Units,
 };
@@ -97,13 +99,57 @@ fn the_seven_icons_match_their_goldens_at_every_size_and_scale() {
         assert_eq!(stats.path_mask_textures, own, "at {scale_factor}");
         assert_eq!(stats.atlas.mask_pages, 1, "at {scale_factor}");
         let pixels = target.read_rgba().expect("read back");
-        assert_golden(
+        assert_golden_allowing(
             &format!("paths-{}", (scale_factor * 100.0).round() as u32),
             width,
             height,
             &pixels,
+            EDGE_STRAGGLERS,
         );
     }
+}
+
+/// How many channel values of a sheet may be one further off than the
+/// tolerance: four pixels' worth. A sheet has some 30,000 edge pixels, each a
+/// coverage blended and then encoded to sRGB, and two versions of Mesa's
+/// software rasteriser disagreed on one of them by two (`assert_golden_allowing`
+/// has the run). A wrong mask moves hundreds of values, or one by far more.
+const EDGE_STRAGGLERS: usize = 12;
+
+/// The allowance is what it says: a few values one further off pass, one more
+/// than the allowance does not, a value two further off never does, and with
+/// no allowance the tolerance stands alone.
+#[test]
+fn a_few_edge_values_one_further_off_pass_and_nothing_else_does() {
+    let golden = vec![100u8; 4 * 8];
+    let off = |values: &[(usize, u8)]| {
+        let mut frame = golden.clone();
+        for (index, by) in values {
+            frame[*index] += by;
+        }
+        differences(&frame, &golden, 4)
+    };
+    assert_eq!(
+        off(&[(0, 1), (5, 1)]),
+        Differences {
+            differing: 0,
+            largest: 1,
+            first: None
+        },
+        "inside the tolerance"
+    );
+    assert!(within(&off(&[(0, 1), (5, 1)]), 0));
+    // CI's case: one pixel's three colour values, two off.
+    let one_pixel = off(&[(20, 2), (21, 2), (22, 2)]);
+    assert_eq!(one_pixel.first, Some((1, 1)));
+    assert!(within(&one_pixel, EDGE_STRAGGLERS));
+    assert!(!within(&one_pixel, 0), "the plain tolerance refuses it");
+    assert!(!within(&one_pixel, 2), "one value more than the allowance");
+    // Two further off is never a straggler, however few.
+    assert!(!within(&off(&[(20, 3)]), EDGE_STRAGGLERS));
+    // More of them than the allowance: a real change.
+    let many: Vec<(usize, u8)> = (0..=EDGE_STRAGGLERS).map(|index| (index, 2)).collect();
+    assert!(!within(&off(&many), EDGE_STRAGGLERS));
 }
 
 /// A path in a scene placed by `scene_at` (how `std::ui` places an
