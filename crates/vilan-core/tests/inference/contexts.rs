@@ -1075,6 +1075,77 @@ fn b742_a_dyn_receiver_keeps_every_candidate() {
     );
 }
 
+// --- B741: a refusal's trace follows the refined edges. ---
+//
+// One generic body bound to a static value and to a signal: only the signal's
+// call reaches the reactive arm's owner read. The trace climbed every call of
+// the body, so the static calls were named on the path too. (A library body
+// made each of them a refusal of its own: `macros::b741_*`.)
+
+/// `shown` binds directly, `relayed` forwards to it, and `Badge::labelled`
+/// is a trait default that binds; `calls` are `main`'s, with `cell` a signal.
+fn shown_program(calls: &str) -> String {
+    format!(
+        "import std::reactive::{{MaybeSignal, Signal, SignalCell}};
+
+fun shown<V: MaybeSignal<str>>(own value: V) {{
+\tvalue.bind(|text: str| print(text));
+}}
+
+fun relayed<V: MaybeSignal<str>>(own value: V) {{
+\tshown(value);
+}}
+
+trait Badge {{
+\tfun labelled<V: MaybeSignal<str>>(self, own value: V) {{
+\t\tvalue.bind(|text: str| print(text));
+\t}}
+}}
+
+struct Tag {{}}
+
+impl Tag with Badge {{}}
+
+fun main() {{
+\tlet cell: SignalCell<str> = Signal::new(\"signal\");
+{calls}
+}}
+"
+    )
+}
+
+#[test]
+fn b741_a_generic_bodys_refusal_names_only_its_reactive_call() {
+    assert_traces(
+        &shown_program("\tshown(\"static\");\n\tshown(cell);\n\tshown(\"static again\");"),
+        UNCOVERED_OWNER,
+        &[("shown(cell)", 0, "flows through this call")],
+    );
+}
+
+#[test]
+fn b741_a_forwarding_generics_refusal_names_only_its_reactive_path() {
+    assert_traces(
+        &shown_program("\trelayed(\"static\");\n\trelayed(cell);\n\trelayed(\"static again\");"),
+        UNCOVERED_OWNER,
+        &[
+            ("relayed(cell)", 0, "flows through this call"),
+            ("shown(value)", 0, "flows through this call"),
+        ],
+    );
+}
+
+#[test]
+fn b741_a_trait_defaults_refusal_names_only_its_reactive_call() {
+    assert_traces(
+        &shown_program(
+            "\tTag {}.labelled(\"static\");\n\tTag {}.labelled(cell);\n\tTag {}.labelled(\"static again\");",
+        ),
+        UNCOVERED_OWNER,
+        &[("labelled", 2, "dispatch may select a reader")],
+    );
+}
+
 // --- M203: what the refinement's cost work must not move. ---
 //
 // The context pass settles a per-entry edge per context only where a node on

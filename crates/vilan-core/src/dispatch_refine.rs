@@ -101,6 +101,16 @@ pub struct RefinedEdge {
     /// a `run` body, a function declaring the context — is where `callee`
     /// gets it, whatever `caller` holds.
     pub via: Rc<[Id]>,
+    /// The calls the requirement crosses between the dispatch site and
+    /// `anchor`, site outward: the site itself, then each entry call a
+    /// forwarding level recursed through. Empty for an edge charged at the
+    /// site itself (`anchor` is the site). A reader that reports WHERE a
+    /// requirement flows (the context pass's walk-back, B741) reads the path
+    /// from `caller` down to `callee` as these calls and `anchor`, in place
+    /// of every call into the nodes on `via`: those include the calls that
+    /// instantiate the generic body with another type, which select
+    /// something else.
+    pub through: Rc<[Id]>,
 }
 
 thread_local! {
@@ -1340,6 +1350,7 @@ fn refined_edges_timed(
                     anchor: site.call,
                     callee: candidate,
                     via: site_level.clone(),
+                    through: site_level.clone(),
                 });
             }
         };
@@ -1361,6 +1372,7 @@ fn refined_edges_timed(
                             anchor: site.call,
                             callee: candidate,
                             via: site_level.clone(),
+                            through: site_level.clone(),
                         });
                     }
                 }
@@ -1443,7 +1455,14 @@ fn refined_edges_timed(
         // that could still make it long, a deep diamond of forwarders each
         // crossing its own closure.
         let mut visited: HashSet<Level> = HashSet::default();
-        let mut walk: Vec<Level> = vec![(root, subject, Rc::from(path), no_crossings.clone())];
+        // Beside each level, the calls crossed to reach it
+        // ([`RefinedEdge::through`]). Not part of the level: a second route
+        // to the same level draws the same edges, and the first route's calls
+        // name one real path to them.
+        let mut walk: Vec<(Level, Rc<[Id]>)> = vec![(
+            (root, subject, Rc::from(path), no_crossings.clone()),
+            Rc::from([site.call]),
+        )];
         let mut fell_back_at_site = false;
         // Per-level scratch, reused across the walk's levels.
         let mut dispatched: Vec<(RefinedCaller, Id, bool)> = Vec::new();
@@ -1453,7 +1472,7 @@ fn refined_edges_timed(
                 union_fallback(edges);
             }
         };
-        while let Some(level) = walk.pop() {
+        while let Some((level, through)) = walk.pop() {
             if visited.contains(&level) {
                 continue;
             }
@@ -1547,7 +1566,15 @@ fn refined_edges_timed(
                                     entry_call,
                                     function,
                                 );
-                                walk.push((outer, outer_subject, Rc::from(outer_path), crossed));
+                                let through: Rc<[Id]> = through
+                                    .iter()
+                                    .copied()
+                                    .chain(std::iter::once(entry_call))
+                                    .collect();
+                                walk.push((
+                                    (outer, outer_subject, Rc::from(outer_path), crossed),
+                                    through,
+                                ));
                                 continue;
                             }
                             // A bare-trait binding the record cannot follow
@@ -1581,6 +1608,7 @@ fn refined_edges_timed(
                         anchor: entry_call,
                         callee: candidate,
                         via: via.clone(),
+                        through: through.clone(),
                     });
                 }
             }
