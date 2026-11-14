@@ -15080,6 +15080,30 @@ fn b647_a_loan_no_write_reaches_still_compiles() {
     );
 }
 
+/// B744: a call through a `dyn` object reaches every implementation of the
+/// member, as a bound's does. The write summary named a dispatch by the
+/// `generic_dispatch` record alone, so the object's call read as a call of
+/// the trait's DECLARATION: the default's body answered (or, for a bodiless
+/// requirement, nothing did) and the override the object runs was never
+/// asked. JS printed `1` and native `0`. Both declaration shapes; the twin
+/// whose implementations only read stays accepted.
+#[test]
+fn b744_a_module_binding_lent_through_a_dyn_object_to_a_writer_is_refused() {
+    let source = |declaration: &str, writer_body: &str| {
+        format!(
+            "import std::io::print;\nmut module_items: List<i32> = [];\ntrait Grower {{\n{declaration}}}\nstruct Plain {{}}\nstruct Writer {{}}\nimpl Plain with Grower {{\n\tfun lent(self, items: &List<i32>): usize {{\n\t\titems.len()\n\t}}\n}}\nimpl Writer with Grower {{\n\tfun lent(self, items: &List<i32>): usize {{\n{writer_body}\t\titems.len()\n\t}}\n}}\nfun main() {{\n\tlet grower: dyn Grower = Writer {{}};\n\tprint(grower.lent(&module_items));\n}}\nmain();\n"
+        )
+    };
+    let with_default = "\tfun lent(self, items: &List<i32>): usize {\n\t\titems.len()\n\t}\n";
+    let requirement = "\tfun lent(self, items: &List<i32>): usize;\n";
+    let writes = "\t\tmodule_items.push(1);\n";
+    let message = "`lent` writes `module_items` while `module_items` is lent to this call, so the loan and the write are two paths to one place (a write under a live view); copy it first: `let items = module_items; grower.lent(&items)`";
+    for declaration in [with_default, requirement] {
+        assert_fails_with(&source(declaration, writes), message);
+    }
+    assert_compiles_and_runs(&source(with_default, ""), "0\n");
+}
+
 /// B647's by-value twin (met on the way): a module-level `mut` binding handed
 /// BY VALUE to a callee that writes it is a copy, as rule 1 says and the
 /// native backend answered — JS handed over the binding's own object, so

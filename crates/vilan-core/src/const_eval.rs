@@ -10,7 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use crate::analyzer::{Expr, GenericDispatch, Program, SourceId};
+use crate::analyzer::{Expr, Program, SourceId};
 use crate::call_graph::{Call, CallGraph, CallTarget, IndirectReason, Node};
 use crate::dispatch_refine::{DispatchSite, RefinedCaller};
 use crate::error::{Error, Note};
@@ -2568,14 +2568,11 @@ impl<'p, 'src> State<'p, 'src> {
         // non-const one — node-owned, initializer-owned, and bare top-level —
         // and let `dispatch_refine` resolve each to the callees its recorded
         // dispatch actually selects; the reverse map joins the fixpoint below
-        // as extra caller edges.
-        let dispatched_name = |call_id: Id| -> Option<&str> {
-            match crate::async_infer::dispatch_at(self.program, call_id) {
-                Some(GenericDispatch::OnConstraint(_, name))
-                | Some(GenericDispatch::OnType(_, name)) => Some(name),
-                None => None,
-            }
-        };
+        // as extra caller edges. A site is named the one way every consumer
+        // names it ([`crate::dispatch_refine::dispatched_member`]): a call
+        // through a `dyn` object is a dispatch site too (B744).
+        let dispatched_name =
+            |call_id: Id| crate::dispatch_refine::dispatched_member(self.program, call_id);
         let is_dispatch_target = |target: CallTarget| {
             matches!(
                 target,
@@ -2605,9 +2602,20 @@ impl<'p, 'src> State<'p, 'src> {
         // (the asking file's import scope, the dispatched name): hundreds of
         // sites share a few dozen names, and the scope is `None` for every file
         // that wrote no restriction (B318 S4). Asked once per distinct pair.
+        //
+        // A call through a `dyn` object is the exception to both (B744): its
+        // list is the declaring trait's whole member list, program-wide
+        // ([`crate::dispatch_refine::object_candidates`]). Not narrower by
+        // file, because an object carries implementations the calling file
+        // never imported; and the same-named members of OTHER traits are
+        // dropped not as a guess about the receiver but because an object's
+        // table can only ever hold members of its own trait.
         let candidate_cache: RefCell<HashMap<(Option<SourceId>, String), Vec<Id>>> =
             RefCell::new(HashMap::default());
         let candidates = |call_id: Id, name: &str| -> Vec<Id> {
+            if let Some(object) = crate::dispatch_refine::object_candidates(self.program, call_id) {
+                return object;
+            }
             let scope = self
                 .program
                 .admitting_file(call_id)

@@ -1075,6 +1075,48 @@ fn b742_a_dyn_receiver_keeps_every_candidate() {
     );
 }
 
+/// B744: a call through a `dyn` object's candidates are its declaring
+/// trait's members, not every member of the same NAME. `Deep`'s strict
+/// `note` belongs to an unrelated trait, `Deepish`, and no `dyn Shown` table
+/// can hold it; the name-keyed list charged its read to `main` through
+/// `shown.note()` and refused a program whose only `Deep` call runs under a
+/// `run`. The same-trait case stays refused
+/// (`b742_a_dyn_receiver_keeps_every_candidate`).
+#[test]
+fn b744_a_dyn_call_is_not_charged_a_same_named_member_of_another_trait() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::context::Context;\n",
+            "let depth: Context<i32> = Context::new();\n",
+            "trait Shown {\n",
+            "\tfun note(self);\n",
+            "}\n",
+            "trait Deepish {\n",
+            "\tfun note(self);\n",
+            "}\n",
+            "struct Plain {}\n",
+            "struct Deep {}\n",
+            "impl Plain with Shown {\n",
+            "\tfun note(self) {\n",
+            "\t\tprint(\"plain\");\n",
+            "\t}\n",
+            "}\n",
+            "impl Deep with Deepish {\n",
+            "\tfun note(self) {\n",
+            "\t\tprint(i\"deep at {depth.get()}\");\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet shown: dyn Shown = Plain {};\n",
+            "\tshown.note();\n",
+            "\tdepth.run(5, || Deep {}.note());\n",
+            "}\n",
+            "main();\n",
+        ),
+        "plain\ndeep at 5\n",
+    );
+}
+
 // --- B741: a refusal's trace follows the refined edges. ---
 //
 // One generic body bound to a static value and to a signal: only the signal's

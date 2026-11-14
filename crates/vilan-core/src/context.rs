@@ -1818,9 +1818,12 @@ fn analyze(
             // found no need — so a top-level call threaded nothing into it
             // (`blanket-impl.vl`'s `badge("static")`: JS passed `undefined`,
             // rustc refused the arity).
+            // B744: a call through a `dyn` object reaches only its trait's
+            // members — every one of them, whatever file imported them.
             let candidates =
                 crate::dispatch_refine::known_receiver_candidates(program, call.call_id)
                     .or_else(|| crate::dispatch_refine::bound_candidates(program, call.call_id))
+                    .or_else(|| crate::dispatch_refine::object_candidates(program, call.call_id))
                     .unwrap_or_else(|| dispatch_candidates(call.call_id, name));
             for &candidate in &candidates {
                 dispatch_callers

@@ -1445,6 +1445,45 @@ fn an_implicit_await_in_a_for_mut_loop_crosses_the_loop_binding() {
     assert_fails_with(source, "cannot hold a view across the implicit 'await'");
 }
 
+/// B744: an async member called through a `dyn` object suspends like the
+/// same call through a bound. The per-site answer B119's rule reads
+/// (`suspending_calls`) named dispatches by the `generic_dispatch` record
+/// alone, so the object's call answered "never suspends" and the view crossed
+/// it unrefused. The sync twin stays legal.
+#[test]
+fn b744_an_async_member_called_through_a_dyn_object_crosses_a_live_view() {
+    let source = |asyncness: &str| {
+        format!(
+            "{}trait Ticker {{\n\t{asyncness}fun tick(self): i32;\n}}\n{}impl Clock with Ticker {{\n\t{asyncness}fun tick(self): i32 {{ 1 }}\n}}\n{}",
+            concat!(
+                "import std::io::print;\n",
+                "struct Point { x: i32, y: i32 }\n",
+            ),
+            "struct Clock {}\n",
+            concat!(
+                "async fun flow(ticker: dyn Ticker) {\n",
+                "\tmut point = Point { x = 1, y = 2 };\n",
+                "\tlet view = &mut point;\n",
+                "\tlet beat = ticker.tick();\n",
+                "\tview.x = beat;\n",
+                "\tprint(point.x);\n",
+                "}\n",
+                "fun main() {\n",
+                "\tlet clock: dyn Ticker = Clock {};\n",
+                "\tflow(clock);\n",
+                "}\n",
+                "main();\n",
+            ),
+        )
+    };
+    assert_fails_spanning(
+        &source("async "),
+        "ticker.tick()",
+        "cannot hold a view across the implicit 'await' of 'tick': 'view' (a view into 'point') is still live here",
+    );
+    assert_compiles_and_runs(&source(""), "1\n");
+}
+
 #[test]
 fn an_implicit_await_of_a_method_names_the_method_in_the_crossing() {
     // The diagnostic's voice on a receiver call: the callee is resolved

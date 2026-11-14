@@ -37888,15 +37888,17 @@ impl<'src> Analyzer<'src> {
         };
         // A DISPATCHED member reaches whatever any body of that name does —
         // every impl's declaration and every trait's default (the candidate
-        // set dispatch picks from; `hash` writes no subscriber list).
-        let dispatched_name = [call_id, function_call.subject_id]
-            .iter()
-            .find_map(|id| match self.generic_dispatch.get(id) {
-                Some(GenericDispatch::OnConstraint(_, name) | GenericDispatch::OnType(_, name)) => {
-                    Some(*name)
-                }
-                None => None,
-            });
+        // set dispatch picks from; `hash` writes no subscriber list). A call
+        // through a `dyn` object is one too (B744): named by the dispatch
+        // record alone it read as a call of the trait's DECLARATION, which
+        // answered for the default's body (or nothing, for a requirement) and
+        // never for the override the object actually runs.
+        let dispatched_name = crate::dispatch_refine::DispatchRecords {
+            dyn_method_calls: &self.dyn_method_calls,
+            generic_dispatch: &self.generic_dispatch,
+            concat_render_dispatch: &self.concat_render_dispatch,
+        }
+        .member(call_id, Some(function_call.subject_id));
         if let Some(name) = dispatched_name {
             let candidates: Vec<Id> = self
                 .implementations
