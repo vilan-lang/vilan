@@ -380,6 +380,16 @@ fun main() {
 // --- Check mode: the tree, with no window --------------------------------------------
 
 fun check(arguments: List<str>) {
+	// The clipboard's text, quoted with its line breaks escaped, or `none`.
+	let held_text = || {
+		match clipboard_text() {
+			Some(let text) => {
+				let shown = text.replace("\r", "\\r").replace("\n", "\\n");
+				i"\"{shown}\""
+			},
+			None => "none",
+		}
+	};
 	let font = match register_font(read_bytes(after(arguments, "--font"))) {
 		Ok(let families) => families[0],
 		Err(let reason) => {
@@ -841,7 +851,7 @@ fun check(arguments: List<str>) {
 	// Removed for good before the answer arrives: the paste takes nothing.
 	let spare: SignalCell<str> = Signal::new("spare");
 	let showing: SignalCell<bool> = Signal::new(true);
-	let holder = spare_screen(spare, showing);
+	let holder = column().child(when(showing, || text_input(spare).width(dp(200)).padding(dp(4))));
 	let holder_size = Size::new(dp(240), dp(60));
 	layout(holder, holder_size, 1.0);
 	let spot = Point::new(dp(20), dp(10));
@@ -863,24 +873,6 @@ fun check(arguments: List<str>) {
 	showing.set(false);
 	let after_removal = clipboard_text();
 	print(i"ctrl v, then removed before the answer: spare=\"{spare.get()}\" (the clipboard still answers: {after_removal.is_some()})");
-}
-
-/// Check mode: the clipboard's text, quoted with its line breaks escaped, or `none`. (A top-level function,
-/// not a closure in `check`: the native backend emits a local closure that
-/// awaits as one it spawns, and then awaits its `()`.)
-fun held_text(): str {
-	match clipboard_text() {
-		Some(let text) => {
-			let shown = text.replace("\r", "\\r").replace("\n", "\\n");
-			i"\"{shown}\""
-		},
-		None => "none",
-	}
-}
-
-/// Check mode: a text input that a cell can take away (removed for good).
-fun spare_screen(spare: SignalCell<str>, showing: SignalCell<bool>): Column {
-	column().child(when(showing, || text_input(spare).width(dp(200)).padding(dp(4))))
 }
 
 fun after(arguments: List<str>, flag: str): str {

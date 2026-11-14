@@ -244,6 +244,16 @@ fun main() {
 // --- Check mode: the tree, with no window --------------------------------------------
 
 fun check(arguments: List<str>) {
+	// The clipboard's text, quoted with its line breaks escaped, or `none`.
+	let held_text = || {
+		match clipboard_text() {
+			Some(let text) => {
+				let shown = text.replace("\r", "\\r").replace("\n", "\\n");
+				i"\"{shown}\""
+			},
+			None => "none",
+		}
+	};
 	let font = match register_font(read_bytes(after(arguments, "--font"))) {
 		Ok(let families) => families[0],
 		Err(let reason) => {
@@ -637,19 +647,6 @@ fun check(arguments: List<str>) {
 	click(find("lock"));
 	report(i"ctrl v, then locked before the answer: nothing [clipboard {held_text()}]");
 	click(find("lock"));
-}
-
-/// Check mode: the clipboard's text, quoted with its line breaks escaped, or `none`.
-/// (A top-level function, not a closure in `check`: the native backend emits a
-/// local closure that awaits as one it spawns, and then awaits its `()`.)
-fun held_text(): str {
-	match clipboard_text() {
-		Some(let text) => {
-			let shown = text.replace("\r", "\\r").replace("\n", "\\n");
-			i"\"{shown}\""
-		},
-		None => "none",
-	}
 }
 
 fun after(arguments: List<str>, flag: str): str {
