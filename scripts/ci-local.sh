@@ -232,10 +232,11 @@ leg_webview() {
         cargo test || exit 1
         cargo audit --deny unsound --ignore RUSTSEC-2024-0429 || exit 1
         # `--offline`: the licence texts come from the crates' own files in
-        # the lockfile's sources, which the steps above already fetched.
-        # Without it cargo-about also asks clearlydefined.io, whose answer
-        # for a crate changes when it harvests a new version, and this byte
-        # check went red on CI with nothing changed here (run 43519114590).
+        # the lockfile's sources, never from clearlydefined.io, so a byte
+        # check does not hang on a network service. (It is NOT what turned
+        # this check red on CI in runs 43519114590 and 43554792373: that was
+        # a crate with two differing texts of one licence, pinned by a
+        # `clarify` entry in the gfx crate's `about.toml`.)
         # The notices cover every platform's crates, so fetch the whole
         # lockfile first: a Linux build never downloaded the Windows ones.
         cargo fetch --locked || exit 1
@@ -291,10 +292,11 @@ leg_gfx() {
         VILAN_REQUIRE_GFX=1 cargo test || exit 1
         cargo audit --deny unsound || exit 1
         # `--offline`: the licence texts come from the crates' own files in
-        # the lockfile's sources, which the steps above already fetched.
-        # Without it cargo-about also asks clearlydefined.io, whose answer
-        # for a crate changes when it harvests a new version, and this byte
-        # check went red on CI with nothing changed here (run 43519114590).
+        # the lockfile's sources, never from clearlydefined.io, so a byte
+        # check does not hang on a network service. (It is NOT what turned
+        # this check red on CI in runs 43519114590 and 43554792373: that was
+        # a crate with two differing texts of one licence, pinned by a
+        # `clarify` entry in the gfx crate's `about.toml`.)
         # The notices cover every platform's crates, so fetch the whole
         # lockfile first: a Linux build never downloaded the Windows ones.
         cargo fetch --locked || exit 1

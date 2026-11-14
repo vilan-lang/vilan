@@ -34,3 +34,17 @@ accepted = [
 ]
 # No `targets` filter, as the compiler's: the notices cover the WHOLE lockfile,
 # every platform's crates included.
+
+# `miniz_oxide` ships TWO texts of its MIT licence, `LICENSE` and
+# `LICENSE-MIT.md`, that differ by one blank line, and cargo-about takes
+# whichever it meets first: the notices byte check went red on CI twice with
+# nothing changed (runs 43519114590 and 43554792373, byte 174807). Named here,
+# the file is `LICENSE` every time, for both locked versions (0.8.9, 0.9.1:
+# one checksum, the same text).
+[miniz_oxide.clarify]
+license = "MIT OR Zlib OR Apache-2.0"
+
+[[miniz_oxide.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b"
