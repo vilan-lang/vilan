@@ -2623,7 +2623,7 @@ fn cold_instance_record(adapt: Adapt, seeds: &HashSet<Id>) -> AsyncInstanceRecor
         key_reads.dispatches.dedup();
         for call_id in &key_reads.dispatches {
             dispatch_readers.entry(*call_id).or_default().push(position);
-            if let Some(member) = dispatched_member(program, *call_id) {
+            if let Some(member) = crate::dispatch_refine::dispatched_member(program, *call_id) {
                 let readers = record
                     .readers_by_name
                     .entry(member.to_string())
@@ -2658,18 +2658,6 @@ fn cold_instance_record(adapt: Adapt, seeds: &HashSet<Id>) -> AsyncInstanceRecor
     record.settled = cold;
     record.bytes = bytes;
     record
-}
-
-/// The member a dispatch call names, by the record that dispatches it.
-fn dispatched_member<'src>(program: &Program<'src>, call_id: Id) -> Option<&'src str> {
-    if let Some(member) = program.dyn_method_calls.get(&call_id) {
-        return Some(member);
-    }
-    match dispatch_at(program, call_id)? {
-        GenericDispatch::OnConstraint(_, member) | GenericDispatch::OnType(_, member) => {
-            Some(member)
-        }
-    }
 }
 
 /// The base fixpoint over the COLD nodes in the cold view: S3b's cold result,
@@ -3589,6 +3577,15 @@ fn call_suspends_memoized<'src>(
         call.target,
         CallTarget::Indirect(IndirectReason::GenericMember | IndirectReason::TraitDispatch)
     ) {
+        return call_suspends(program, call, held_values, View::plain(async_set));
+    }
+    // A call through a `dyn` object is a dispatch with no `generic_dispatch`
+    // record (B744): its candidates are its declaration's trait's, not a
+    // function of any record key, so it takes `call_suspends`' own answer
+    // unmemoized. Reading the record alone answered "never suspends" for it,
+    // and a view held across an async member called through an object
+    // checked clean.
+    if program.dyn_method_calls.contains_key(&call.call_id) {
         return call_suspends(program, call, held_values, View::plain(async_set));
     }
     // No dispatch record is `dispatch_candidates`' own empty answer.

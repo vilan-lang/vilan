@@ -4336,6 +4336,288 @@ fn a_shared_default_self_call_resolves_by_its_receiver() {
     );
 }
 
+// --- B744: a call through a `dyn` object is a dispatch site of the check ------
+//
+// The const-only check named its dispatch sites by the `generic_dispatch`
+// record alone, and a call through an object is recorded in
+// `dyn_method_calls` instead: such a call into an emitting implementation
+// checked clean and threw `ReferenceError: __emit_asset is not defined` at
+// run time. A `dyn` site has no receiver on record, so it charges every
+// implementation of the member under the trait that declares it.
+
+/// Two implementations of `Emitter::text`: `Token`'s reaches `emit`,
+/// `Plain`'s does not.
+const B744_EMITTERS: &str = concat!(
+    "import std::io::print;\n",
+    "import std::web::asset::emit;\n",
+    "struct Token {\n",
+    "\tvalue: str,\n",
+    "}\n",
+    "struct Plain {\n",
+    "\ttext_value: str,\n",
+    "}\n",
+    "trait Emitter {\n",
+    "\tfun text(self): str;\n",
+    "}\n",
+    "impl Token with Emitter {\n",
+    "\tfun text(self): str {\n",
+    "\t\temit(\"css\", \":root{--p:1rem}\");\n",
+    "\t\tself.value\n",
+    "\t}\n",
+    "}\n",
+    "impl Plain with Emitter {\n",
+    "\tfun text(self): str {\n",
+    "\t\tself.text_value\n",
+    "\t}\n",
+    "}\n",
+);
+
+const B744_MESSAGE: &str = "`text` (it reaches `asset::emit`) is compile-time-only; evaluate this call inside a `const` expression";
+
+#[test]
+fn b744_a_dyn_objects_dispatch_into_an_emitting_impl_is_refused() {
+    let source = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "fun main() {\n",
+            "\tlet erased: dyn Emitter = Token { value = \"emitting\" };\n",
+            "\tprint(erased.text());\n",
+            "}\n",
+            "main();\n",
+        )
+    );
+    assert_fails_spanning(&source, "erased.text()", B744_MESSAGE);
+}
+
+/// The object handed to a bounded generic: the bound's site resolves its
+/// entry to the object type, which selects no impl by type, so the site
+/// keeps every candidate.
+#[test]
+fn b744_a_dyn_object_handed_to_a_bounded_generic_is_refused() {
+    let source = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "fun render<V: Emitter>(value: V): str {\n",
+            "\tvalue.text()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet erased: dyn Emitter = Token { value = \"emitting\" };\n",
+            "\tprint(render(erased));\n",
+            "}\n",
+            "main();\n",
+        )
+    );
+    assert_fails_spanning(&source, "render(erased)", B744_MESSAGE);
+}
+
+/// The call through the object made inside a generic function: the generic
+/// function joins R, and its caller in `main` is the boundary.
+#[test]
+fn b744_a_dyn_call_inside_a_generic_function_is_refused_at_its_caller() {
+    let source = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "fun relay<T>(object: dyn Emitter, extra: T): str {\n",
+            "\tobject.text()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet erased: dyn Emitter = Token { value = \"emitting\" };\n",
+            "\tprint(relay(erased, 1));\n",
+            "}\n",
+            "main();\n",
+        )
+    );
+    assert_fails_spanning(
+        &source,
+        "relay(erased, 1)",
+        "`relay` (it reaches `asset::emit`) is compile-time-only",
+    );
+}
+
+#[test]
+fn b744_a_dyn_object_held_in_a_field_and_called_later_is_refused() {
+    let source = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "struct Holder {\n",
+            "\titem: dyn Emitter,\n",
+            "}\n",
+            "fun show(holder: Holder): str {\n",
+            "\tholder.item.text()\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet holder = Holder { item = Token { value = \"emitting\" } };\n",
+            "\tprint(show(holder));\n",
+            "}\n",
+            "main();\n",
+        )
+    );
+    assert_fails_spanning(
+        &source,
+        "show(holder)",
+        "`show` (it reaches `asset::emit`) is compile-time-only",
+    );
+}
+
+#[test]
+fn b744_a_list_of_dyn_objects_iterated_with_a_method_call_is_refused() {
+    let source = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "fun main() {\n",
+            "\tlet items: List<dyn Emitter> = [Plain { text_value = \"clean\" }, Token { value = \"emitting\" }];\n",
+            "\tfor item in items {\n",
+            "\t\tprint(item.text());\n",
+            "\t}\n",
+            "}\n",
+            "main();\n",
+        )
+    );
+    assert_fails_spanning(&source, "item.text()", B744_MESSAGE);
+}
+
+/// A SUPERTRAIT's member called through the subtrait's object: the call
+/// resolves to `Base::text`, and `Base`'s implementations are the slot's.
+#[test]
+fn b744_a_supertrait_member_called_through_the_subtraits_object_is_refused() {
+    let source = concat!(
+        "import std::io::print;\n",
+        "import std::web::asset::emit;\n",
+        "struct Token {\n",
+        "\tvalue: str,\n",
+        "}\n",
+        "trait Base {\n",
+        "\tfun text(self): str;\n",
+        "}\n",
+        "trait Loud with Base {\n",
+        "\tfun loud(self): str;\n",
+        "}\n",
+        "impl Token with Base {\n",
+        "\tfun text(self): str {\n",
+        "\t\temit(\"css\", \":root{--p:1rem}\");\n",
+        "\t\tself.value\n",
+        "\t}\n",
+        "}\n",
+        "impl Token with Loud {\n",
+        "\tfun loud(self): str {\n",
+        "\t\t\"loud\"\n",
+        "\t}\n",
+        "}\n",
+        "fun main() {\n",
+        "\tlet erased: dyn Loud = Token { value = \"emitting\" };\n",
+        "\tprint(erased.text());\n",
+        "}\n",
+        "main();\n",
+    );
+    assert_fails_spanning(source, "erased.text()", B744_MESSAGE);
+}
+
+/// The other two site scans: a top-level statement and a module-level
+/// initializer own no graph node, and a call through an object there is the
+/// boundary by itself.
+#[test]
+fn b744_a_dyn_call_in_top_level_code_is_refused() {
+    let statement = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "let erased: dyn Emitter = Token { value = \"emitting\" };\n",
+            "print(erased.text());\n",
+        )
+    );
+    assert_fails_spanning(&statement, "erased.text()", B744_MESSAGE);
+    let initializer = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "fun erase(): dyn Emitter {\n",
+            "\tToken { value = \"emitting\" }\n",
+            "}\n",
+            "let STYLED = erase().text();\n",
+            "fun main() {\n",
+            "\tprint(STYLED);\n",
+            "}\n",
+            "main();\n",
+        )
+    );
+    assert_fails_spanning(&initializer, "erase().text()", B744_MESSAGE);
+}
+
+/// What stays accepted: no implementation of the object's member emits —
+/// a same-NAMED member of an unrelated trait that does is no slot of this
+/// object's table — and a call through an object inside a `const` expression,
+/// which the interpreter makes.
+#[test]
+fn b744_a_dyn_call_no_emitting_slot_can_answer_still_runs() {
+    assert_compiles_and_runs(
+        concat!(
+            "import std::io::print;\n",
+            "import std::web::asset::emit;\n",
+            "struct Plain {\n",
+            "\ttext_value: str,\n",
+            "}\n",
+            "trait Emitter {\n",
+            "\tfun text(self): str;\n",
+            "}\n",
+            "impl Plain with Emitter {\n",
+            "\tfun text(self): str {\n",
+            "\t\tself.text_value\n",
+            "\t}\n",
+            "}\n",
+            "trait Styled {\n",
+            "\tfun text(self): str;\n",
+            "}\n",
+            "impl Plain with Styled {\n",
+            "\tfun text(self): str {\n",
+            "\t\temit(\"css\", \":root{--p:1rem}\");\n",
+            "\t\t\"styled\"\n",
+            "\t}\n",
+            "}\n",
+            "fun main() {\n",
+            "\tlet erased: dyn Emitter = Plain { text_value = \"clean\" };\n",
+            "\tprint(erased.text());\n",
+            "}\n",
+            "main();\n",
+        ),
+        "clean\n",
+    );
+    assert_compiles_and_runs(
+        &format!(
+            "{B744_EMITTERS}{}",
+            concat!(
+                "fun erase(): dyn Emitter {\n",
+                "\tToken { value = \"emitting\" }\n",
+                "}\n",
+                "fun main() {\n",
+                "\tprint(const erase().text());\n",
+                "}\n",
+                "main();\n",
+            )
+        ),
+        "emitting\n",
+    );
+}
+
+/// The conservative half, pinned as such: `Token`'s emitting `text` is a slot
+/// of every `dyn Emitter` table even though only `Plain` is ever erased here.
+/// The check does not narrow an object's candidates by the coercions on
+/// record — a value can be erased inside a generic body, where its type is a
+/// parameter — so it refuses, in the existing words, rather than risk
+/// shipping `emit` into a runtime path.
+#[test]
+fn b744_an_emitting_impl_whose_type_is_never_erased_is_still_refused() {
+    let source = format!(
+        "{B744_EMITTERS}{}",
+        concat!(
+            "fun main() {\n",
+            "\tprint(Token { value = \"concrete\" }.value);\n",
+            "\tlet erased: dyn Emitter = Plain { text_value = \"clean\" };\n",
+            "\tprint(erased.text());\n",
+            "}\n",
+            "main();\n",
+        )
+    );
+    assert_fails_spanning(&source, "erased.text()", B744_MESSAGE);
+}
+
 // --- K3: std::crypto / std::jwt / std::base64 (Kolt migration) ---------------
 // WebCrypto-backed auth primitives. HMAC/PBKDF2 run against the host
 // crypto.subtle (present in node), so these are assert_compiles_and_runs; the

@@ -1,9 +1,11 @@
 //! Refinement of the dispatch edges the shared [`CallGraph`] deliberately
 //! leaves indirect: which concrete callees a trait-dispatched call site can
 //! actually select, recovered from the analyzer's records — the dispatch kind
-//! (`generic_dispatch`, read through [`crate::async_infer::dispatch_at`]) and
-//! the per-call-site substitutions (`method_call_substitution`, the single
-//! channel every instantiation shape records into).
+//! (`generic_dispatch`, read through [`crate::async_infer::dispatch_at`], and
+//! `dyn_method_calls` for a call through an object; both named by
+//! [`dispatched_member`]) and the per-call-site substitutions
+//! (`method_call_substitution`, the single channel every instantiation shape
+//! records into).
 //!
 //! The machinery shipped inside the `context` pass as its coverage-only
 //! dispatch refinement (element-syntax H8 →
@@ -269,28 +271,129 @@ pub(crate) fn reset_refine_time() {
     REFINE_TIME.with(|time| time.set(crate::PhaseSpan::ZERO));
 }
 
-/// The trait-member name a call's dispatch record names, when the call also
-/// has a `function_calls` entry. This is the `context` pass's historical site
-/// gate — an iterator-protocol `for` loop records its dispatch on the loop id
-/// with no `function_calls` entry, so this answers `None` for it where
-/// [`crate::async_infer::dispatch_at`] alone would not; a consumer that wants
-/// those sites too reads the record directly.
-pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'src str> {
-    // A124 R3: a call through a trait OBJECT's table is a dispatch like a
-    // bound's — any implementation of the member may answer it, so a hidden
-    // context parameter one of them needs has to be threaded at the site.
-    if let Some(name) = program.dyn_method_calls.get(&call_id) {
-        return Some(name);
+/// THE name of a dispatch site: the trait member a call the graph leaves
+/// indirect dispatches, by whichever record dispatches it. `None` for a call
+/// that dispatches nothing.
+///
+/// Two records name a dispatch, and every consumer of dispatch sites reads
+/// both through here:
+///
+/// - a call through a trait OBJECT's table (`dyn_method_calls`, A124 R3) —
+///   any implementation of the member may answer it, and nothing on record
+///   says which: the object erased the receiver;
+/// - every other dispatch ([`crate::async_infer::dispatch_at`]: a bounded
+///   generic's member, a re-dispatch onto a concrete receiver or a default's
+///   `self`, an iterator-protocol `for` loop's `next`, an operator, a
+///   rendered concatenation).
+///
+/// B744 is why this is one function. The context pass named its sites by both
+/// records and the const-only check by the second alone, so a call through a
+/// `dyn` object reached an `asset::emit` that the check never saw: the
+/// program checked clean and threw at run time. A consumer still owns WHICH
+/// sites it lists (the context pass skips the record-only ones,
+/// [`member_name_at`]); it does not own how a site is named.
+pub fn dispatched_member<'src>(program: &Program<'src>, call_id: Id) -> Option<&'src str> {
+    DispatchRecords {
+        dyn_method_calls: &program.dyn_method_calls,
+        generic_dispatch: &program.generic_dispatch,
+        concat_render_dispatch: &program.concat_render_dispatch,
     }
-    let subject_id = program.function_calls.get(&call_id)?.subject_id;
-    for key in [call_id, subject_id] {
-        match program.generic_dispatch.get(&key) {
-            Some(GenericDispatch::OnConstraint(_, name))
-            | Some(GenericDispatch::OnType(_, name)) => return Some(name),
-            None => {}
+    .member(
+        call_id,
+        program
+            .function_calls
+            .get(&call_id)
+            .map(|call| call.subject_id),
+    )
+}
+
+/// The records that name a dispatch, borrowed from wherever they live: the
+/// finished [`Program`] ([`dispatched_member`]), or the analyzer while it is
+/// still filling them — its write summaries (B457/B647) name a dispatched
+/// call before a `Program` exists. One reader for both, so the name a site
+/// gets cannot differ by who asks (B744).
+pub(crate) struct DispatchRecords<'records, 'src> {
+    pub(crate) dyn_method_calls: &'records HashMap<Id, &'src str>,
+    pub(crate) generic_dispatch: &'records HashMap<Id, GenericDispatch<'src>>,
+    pub(crate) concat_render_dispatch: &'records HashMap<Id, (TypeId, Id)>,
+}
+
+impl<'src> DispatchRecords<'_, 'src> {
+    /// The member the call at `call_id` (whose subject, for a written call,
+    /// is `subject_id`) dispatches, in the emitter's precedence: a call
+    /// through an object; a record keyed by the call itself; a rendered
+    /// concatenation's `to_string` (B690); a record keyed by the subject.
+    pub(crate) fn member(&self, call_id: Id, subject_id: Option<Id>) -> Option<&'src str> {
+        if let Some(name) = self.dyn_method_calls.get(&call_id) {
+            return Some(name);
         }
+        let named = |dispatch: &GenericDispatch<'src>| match *dispatch {
+            GenericDispatch::OnConstraint(_, name) | GenericDispatch::OnType(_, name) => name,
+        };
+        if let Some(dispatch) = self.generic_dispatch.get(&call_id) {
+            return Some(named(dispatch));
+        }
+        if self.concat_render_dispatch.contains_key(&call_id) {
+            return Some(crate::analyzer::RENDER_MEMBER);
+        }
+        self.generic_dispatch.get(&subject_id?).map(named)
     }
-    None
+}
+
+/// [`dispatched_member`] for the sites that are written calls: a call
+/// through an object, or a dispatch whose call has a `function_calls` entry.
+/// This is the `context` pass's historical site gate — an iterator-protocol
+/// `for` loop records its dispatch on the loop id, and an operator or a
+/// rendered concatenation on the binary, with no `function_calls` entry, so
+/// this answers `None` for them where [`dispatched_member`] would not.
+pub fn member_name_at<'src>(program: &Program<'src>, call_id: Id) -> Option<&'src str> {
+    if !program.dyn_method_calls.contains_key(&call_id)
+        && !program.function_calls.contains_key(&call_id)
+    {
+        return None;
+    }
+    dispatched_member(program, call_id)
+}
+
+/// What a call through a `dyn` object dispatches: `(member, declaration,
+/// declaring trait)`. The analyzer resolves such a call to the member's
+/// DECLARATION — on the object's trait or on one of its supertraits — and the
+/// call's subject names it, so the declaring trait is the one whose
+/// declarations hold it. `None` for any other call.
+pub(crate) fn object_dispatch<'src>(
+    program: &Program<'src>,
+    call_id: Id,
+) -> Option<(&'src str, Id, Id)> {
+    let member = *program.dyn_method_calls.get(&call_id)?;
+    let subject_id = program.function_calls.get(&call_id)?.subject_id;
+    let Some(Expr::Local(declaration)) = program.entity_map.get(&subject_id) else {
+        return None;
+    };
+    let declaring_trait = program
+        .traits
+        .iter()
+        .find(|(_, trait_)| trait_.declarations.get(member) == Some(declaration))
+        .map(|(trait_id, _)| *trait_id)?;
+    Some((member, *declaration, declaring_trait))
+}
+
+/// B744: the candidates of a call through a `dyn` object — every member the
+/// object's table slot can run: the declaring trait's default body, when it
+/// has one, and every implementation's override of it, the blankets over a
+/// bounded generic among them. The same union B617 types the slot's
+/// declaration by ([`object_slot_declaration_unions`]).
+///
+/// No receiver is on record (the object erased it), so nothing narrows the
+/// list by type: an implementation counts whether or not its type is ever
+/// erased into this object. And it is NOT narrowed by the calling file's
+/// imports (B318 S4) either, unlike [`bound_candidates`]: an object is built
+/// wherever a value is erased and called wherever it travels, so the calling
+/// file runs implementations it never imported. `None` for any other call.
+pub fn object_candidates(program: &Program, call_id: Id) -> Option<Vec<Id>> {
+    let (member, _, declaring_trait) = object_dispatch(program, call_id)?;
+    let mut candidates = Vec::new();
+    trait_member_candidates(program, None, declaring_trait, member, &mut candidates);
+    Some(candidates)
 }
 
 /// Every candidate a dispatch of `name` selects among: for each trait
@@ -1223,17 +1326,12 @@ impl DispatchEntries {
             if accounted.contains(&call) {
                 continue;
             }
-            let name = match program.dyn_method_calls.get(&call) {
-                Some(name) => *name,
-                None => match crate::async_infer::dispatch_at(program, call) {
-                    Some(
-                        GenericDispatch::OnConstraint(_, name) | GenericDispatch::OnType(_, name),
-                    ) => name,
-                    None => continue,
-                },
+            let Some(name) = dispatched_member(program, call) else {
+                continue;
             };
             let selected = known_receiver_candidates(program, call)
                 .or_else(|| bound_candidates(program, call))
+                .or_else(|| object_candidates(program, call))
                 .unwrap_or_else(|| {
                     let scope = program
                         .admitting_file(call)
