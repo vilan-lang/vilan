@@ -650,20 +650,25 @@ fn a_default_calling_a_default_resolves_at_the_outer_call() {
 }
 
 #[test]
-fn a_receiverless_dispatch_keeps_every_member_it_may_select() {
-    // The conservative side. `Loud` overrides `gap` with a body that reads
-    // nothing, but `Loud { .. }.padded(cell())` reaches `gap` through
-    // `self.gap(..)` inside the shared default body, where the receiver is
-    // not on record: the site may select the DEFAULT, whose reactive arm
-    // reads the owner, and the call is refused for it. The same receiver
-    // calling `gap` itself is known to select the override, and compiles.
-    assert_fails_with(
+fn a_receiverless_dispatch_resolves_by_its_defaults_self() {
+    // `padded`'s `self.gap(..)` dispatches on the default's `Self`, and each
+    // entry of `padded` records what that is (B742). `Loud` overrides `gap`
+    // with a body that reads nothing, so `Loud { .. }.padded(cell())` never
+    // runs the default `gap` whose reactive arm reads the owner. This pin
+    // used to hold the opposite verdict, as the conservative posture of a
+    // refinement that kept every candidate at a receiver-less site.
+    assert_compiles_and_runs(
         &default_method_program("    let loud = Loud { id = 2 }.padded(cell());"),
-        UNCOVERED_OWNER,
+        "loud 2\n",
     );
     assert_compiles_and_runs(
         &default_method_program("    let loud = Loud { id = 2 }.gap(cell());"),
         "loud 2\n",
+    );
+    // A receiver that inherits `gap` still reaches the reactive arm.
+    assert_fails_with(
+        &default_method_program("    let row = Row { id = 1 }.padded(cell());"),
+        UNCOVERED_OWNER,
     );
 }
 
@@ -847,6 +852,297 @@ fn a_dispatch_the_consumer_did_not_list_keeps_the_fallback() {
     assert!(
         gap_bind_fallbacks(&program, true) > 0,
         "the `gap` dispatches unlisted: the site must keep every candidate"
+    );
+}
+
+// --- B742: a trait default's `self` call resolves per entry of the default. ---
+//
+// `self.note()` inside a default dispatches on the default's `Self`, and every
+// entry of the default says what that is: a concrete receiver, a bounded one
+// (whose parameter the walk follows to the bounded function's own entries),
+// another default's `Self`, or `self` handed on to a bounded generic. The
+// refinement used to keep every candidate at such a site, so a strict impl
+// that only covered code selects was charged to every uncovered entry.
+
+/// A trait whose defaults reach a `note` that `Deep` reads strictly: through
+/// `self` (`announce`), through another default (`herald`) and through a
+/// bounded generic handed `self` (`hand_off`). `Quiet` overrides `announce`
+/// and has a strict `note` nothing reaches. Forwarders one, two and three
+/// levels deep, and a generic struct's method that forwards to the default.
+fn self_note_program(body: &str) -> String {
+    format!(
+        "import std::context::Context;
+
+let depth: Context<i32> = Context::new();
+
+trait Note {{
+\tfun note(self);
+
+\tfun announce(self) {{
+\t\tself.note();
+\t}}
+
+\tfun herald(self) {{
+\t\tself.announce();
+\t}}
+
+\tfun hand_off(self) {{
+\t\tannounced(self);
+\t}}
+}}
+
+struct Plain {{}}
+
+struct Deep {{}}
+
+struct Quiet {{}}
+
+impl Plain with Note {{
+\tfun note(self) {{
+\t\tprint(\"plain\");
+\t}}
+}}
+
+impl Deep with Note {{
+\tfun note(self) {{
+\t\tprint(i\"deep at {{depth.get()}}\");
+\t}}
+}}
+
+impl Quiet with Note {{
+\tfun note(self) {{
+\t\tprint(i\"quiet at {{depth.get()}}\");
+\t}}
+
+\tfun announce(self) {{
+\t\tprint(\"quiet\");
+\t}}
+}}
+
+fun announced<T: Note>(item: T) {{
+\titem.announce();
+}}
+
+fun relayed<T: Note>(item: T) {{
+\tannounced(item);
+}}
+
+fun forwarded<T: Note>(item: T) {{
+\trelayed(item);
+}}
+
+struct Holder<T: Note> {{
+\titem: T,
+}}
+
+impl Holder<type T: Note> {{
+\tfun show(self) {{
+\t\tself.item.announce();
+\t}}
+}}
+
+fun main() {{
+{body}
+}}
+"
+    )
+}
+
+const UNCOVERED_DEPTH: &str =
+    "context `depth` is read here, but this code can be reached without an enclosing `run`";
+
+#[test]
+fn b742_a_default_reached_through_a_bounded_generic_resolves_at_the_generics_call() {
+    // The report: only the covered call selects `Deep`'s strict `note`.
+    assert_compiles_and_runs(
+        &self_note_program(
+            "\tannounced(Plain {});
+\tdepth.run(5, || announced(Deep {}));",
+        ),
+        "plain\ndeep at 5\n",
+    );
+    // The one-level form: the default called on a concrete receiver.
+    assert_compiles_and_runs(
+        &self_note_program(
+            "\tPlain {}.announce();
+\tdepth.run(5, || Deep {}.announce());",
+        ),
+        "plain\ndeep at 5\n",
+    );
+}
+
+#[test]
+fn b742_three_levels_of_forwarding_resolve_at_the_outermost_call() {
+    assert_compiles_and_runs(
+        &self_note_program(
+            "\tforwarded(Plain {});
+\tdepth.run(5, || forwarded(Deep {}));",
+        ),
+        "plain\ndeep at 5\n",
+    );
+}
+
+#[test]
+fn b742_a_default_calling_a_default_resolves_at_the_outer_call() {
+    assert_compiles_and_runs(
+        &self_note_program(
+            "\tPlain {}.herald();
+\tdepth.run(5, || Deep {}.herald());",
+        ),
+        "plain\ndeep at 5\n",
+    );
+}
+
+#[test]
+fn b742_a_default_handing_self_to_a_bounded_generic_resolves_at_the_defaults_call() {
+    assert_compiles_and_runs(
+        &self_note_program(
+            "\tPlain {}.hand_off();
+\tdepth.run(5, || Deep {}.hand_off());",
+        ),
+        "plain\ndeep at 5\n",
+    );
+}
+
+#[test]
+fn b742_a_generic_structs_method_forwarding_to_a_default_resolves_at_its_call() {
+    assert_compiles_and_runs(
+        &self_note_program(
+            "\tHolder { item = Plain {} }.show();
+\tdepth.run(5, || Holder { item = Deep {} }.show());",
+        ),
+        "plain\ndeep at 5\n",
+    );
+}
+
+#[test]
+fn b742_an_override_between_two_defaults_keeps_its_receiver_out() {
+    // `Quiet` overrides `announce`: neither `herald`'s `self.announce()` nor
+    // `announced`'s `item.announce()` runs the default for it, so the default's
+    // `self.note()` never selects `Quiet`'s strict `note` — although the same
+    // sites do run the default for `Deep`, under `run`.
+    assert_compiles_and_runs(
+        &self_note_program(
+            "\tQuiet {}.herald();
+\tannounced(Quiet {});
+\tdepth.run(5, || Deep {}.herald());",
+        ),
+        "quiet\nquiet\ndeep at 5\n",
+    );
+}
+
+#[test]
+fn b742_a_top_level_entry_resolves_its_receiver() {
+    // A top-level call enters the default directly; its dispatch record still
+    // names the receiver.
+    let program = self_note_program("\tdepth.run(5, || Deep {}.announce());");
+    assert_compiles(&program.replace("\nfun main() {", "\nPlain {}.announce();\n\nfun main() {"));
+    assert_fails_with(
+        &program.replace("\nfun main() {", "\nDeep {}.announce();\n\nfun main() {"),
+        UNCOVERED_DEPTH,
+    );
+}
+
+#[test]
+fn b742_the_strict_impl_reached_without_the_context_is_still_refused() {
+    // Every shape above, with `Deep` reached from `main` and nothing around it.
+    for body in [
+        "\tannounced(Deep {});",
+        "\tannounced(Plain {});\n\tannounced(Deep {});",
+        "\tDeep {}.announce();",
+        "\tforwarded(Deep {});",
+        "\tDeep {}.herald();",
+        "\tDeep {}.hand_off();",
+        "\tHolder { item = Deep {} }.show();",
+        "\tdepth.run(5, || Deep {}.herald());\n\tQuiet {}.herald();\n\tDeep {}.herald();",
+    ] {
+        assert_fails_with(&self_note_program(body), UNCOVERED_DEPTH);
+    }
+}
+
+#[test]
+fn b742_a_dyn_receiver_keeps_every_candidate() {
+    // A call through a `dyn` object erases the receiver: the entry says
+    // nothing about `Self`, so the default's `self.note()` keeps every
+    // candidate and `Deep`'s strict read is charged to `main`, as before.
+    assert_fails_with(
+        &self_note_program(
+            "\tlet noted: dyn Note = Plain {};
+\tnoted.announce();
+\tdepth.run(5, || Deep {}.announce());",
+        ),
+        UNCOVERED_DEPTH,
+    );
+}
+
+// --- B741: a refusal's trace follows the refined edges. ---
+//
+// One generic body bound to a static value and to a signal: only the signal's
+// call reaches the reactive arm's owner read. The trace climbed every call of
+// the body, so the static calls were named on the path too. (A library body
+// made each of them a refusal of its own: `macros::b741_*`.)
+
+/// `shown` binds directly, `relayed` forwards to it, and `Badge::labelled`
+/// is a trait default that binds; `calls` are `main`'s, with `cell` a signal.
+fn shown_program(calls: &str) -> String {
+    format!(
+        "import std::reactive::{{MaybeSignal, Signal, SignalCell}};
+
+fun shown<V: MaybeSignal<str>>(own value: V) {{
+\tvalue.bind(|text: str| print(text));
+}}
+
+fun relayed<V: MaybeSignal<str>>(own value: V) {{
+\tshown(value);
+}}
+
+trait Badge {{
+\tfun labelled<V: MaybeSignal<str>>(self, own value: V) {{
+\t\tvalue.bind(|text: str| print(text));
+\t}}
+}}
+
+struct Tag {{}}
+
+impl Tag with Badge {{}}
+
+fun main() {{
+\tlet cell: SignalCell<str> = Signal::new(\"signal\");
+{calls}
+}}
+"
+    )
+}
+
+#[test]
+fn b741_a_generic_bodys_refusal_names_only_its_reactive_call() {
+    assert_traces(
+        &shown_program("\tshown(\"static\");\n\tshown(cell);\n\tshown(\"static again\");"),
+        UNCOVERED_OWNER,
+        &[("shown(cell)", 0, "flows through this call")],
+    );
+}
+
+#[test]
+fn b741_a_forwarding_generics_refusal_names_only_its_reactive_path() {
+    assert_traces(
+        &shown_program("\trelayed(\"static\");\n\trelayed(cell);\n\trelayed(\"static again\");"),
+        UNCOVERED_OWNER,
+        &[
+            ("relayed(cell)", 0, "flows through this call"),
+            ("shown(value)", 0, "flows through this call"),
+        ],
+    );
+}
+
+#[test]
+fn b741_a_trait_defaults_refusal_names_only_its_reactive_call() {
+    assert_traces(
+        &shown_program(
+            "\tTag {}.labelled(\"static\");\n\tTag {}.labelled(cell);\n\tTag {}.labelled(\"static again\");",
+        ),
+        UNCOVERED_OWNER,
+        &[("labelled", 2, "dispatch may select a reader")],
     );
 }
 

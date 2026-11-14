@@ -1949,9 +1949,13 @@ fn analyze(
     let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
     let mut coverage_outside: HashSet<Id> = HashSet::default();
     let mut entry_coverage_edges: Vec<EntryCoverageEdges> = Vec::new();
-    for edge in
-        crate::dispatch_refine::refined_edges_over(program, graph, &refinement_sites, &refine_index)
-    {
+    let refined_edges = crate::dispatch_refine::refined_edges_over(
+        program,
+        graph,
+        &refinement_sites,
+        &refine_index,
+    );
+    for edge in &refined_edges {
         if edge.via.is_empty() {
             match edge.caller {
                 crate::dispatch_refine::RefinedCaller::Node(caller) => {
@@ -1975,7 +1979,7 @@ fn analyze(
                 group.edges.push((caller, edge.callee));
             }
             _ => entry_coverage_edges.push(EntryCoverageEdges {
-                via: edge.via,
+                via: edge.via.clone(),
                 edges: vec![(caller, edge.callee)],
             }),
         }
@@ -1987,17 +1991,43 @@ fn analyze(
     // dependency package (E84) — was caused by user code calling into that
     // library, so the diagnostic must lead with the user's call, not the
     // library's body. The reporting loops below walk from the site's owner
-    // back along the same edges the strictness climbed, and these are those
-    // edges at call-site grain.
-    let mut dispatch_incoming: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
-    for (owner, call_id, candidates) in &dispatch_sites {
-        for &candidate in candidates {
-            dispatch_incoming
-                .entry(candidate)
-                .or_default()
-                .push((*owner, *call_id));
-        }
-    }
+    // back along the edges coverage read, at call-site grain.
+    //
+    // B741: the dispatch half of those edges is the REFINED set — the one
+    // coverage reads — indexed by callee. The name-keyed candidate lists the
+    // strictness climbed are wider: they charge every call into a generic
+    // body with what any instantiation of it selects, so one real refusal was
+    // also reported at every call that instantiates the body with a type that
+    // selects nothing needy (`shown("static")` beside `shown(cell)`). A
+    // per-entry edge carries the calls it crosses (`RefinedEdge::through`)
+    // and is followed along exactly those, not along every call into the
+    // generic body it crosses. Built on the first refusal: a program that
+    // checks clean never reads it.
+    let refined_incoming: std::cell::OnceCell<HashMap<Id, Vec<usize>>> = std::cell::OnceCell::new();
+    let refined_incoming_of = |node: Id| -> &[usize] {
+        refined_incoming
+            .get_or_init(|| {
+                let mut incoming: HashMap<Id, Vec<usize>> = HashMap::default();
+                for (index, edge) in refined_edges.iter().enumerate() {
+                    incoming.entry(edge.callee).or_default().push(index);
+                }
+                incoming
+            })
+            .get(&node)
+            .map_or(&[], Vec::as_slice)
+    };
+    // The calls a trace labels as a dispatch ("may select a reader").
+    let dispatch_site_calls: std::cell::OnceCell<HashSet<Id>> = std::cell::OnceCell::new();
+    let is_dispatch_site = |call: Id| -> bool {
+        dispatch_site_calls
+            .get_or_init(|| {
+                dispatch_sites
+                    .iter()
+                    .map(|(_, call_id, _)| *call_id)
+                    .collect()
+            })
+            .contains(&call)
+    };
     // C3a's demotion domain (E84): code the user did not write — a std module
     // or a dependency package's, both disk-loaded (an overlaid buffer is live
     // user territory and anchors at itself). The anchoring walk (A2/E74) and
@@ -2011,31 +2041,6 @@ fn analyze(
         program.source_of(id).is_some_and(|source| {
             program.frozen_sources.contains(&source) || program.dependency_sources.contains(&source)
         })
-    };
-    // Whether a dispatch site can actually select `candidate` — the
-    // concrete-receiver narrowing the coverage refinement uses, applied at
-    // one site: a recorded receiver's HEAD selects among candidates, so a
-    // site whose receiver picks a different member never takes the blame for
-    // this one. `OnConstraint` sites resolve per ENTRY, not per site, so they
-    // stay admitted (the union), exactly as conservative as the union edges.
-    let dispatch_admits = |call_id: Id, candidate: Id| -> bool {
-        match crate::async_infer::dispatch_at(program, call_id) {
-            Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
-                match program.type_id_to_type_map.get(&receiver) {
-                    Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
-                        let selected = crate::dispatch_refine::impl_members_for(
-                            program,
-                            program.admitting_file(call_id),
-                            receiver,
-                            member,
-                        );
-                        selected.is_empty() || selected.contains(&candidate)
-                    }
-                    _ => true,
-                }
-            }
-            _ => true,
-        }
     };
 
     // --- E189: the closures an UNRESOLVED call was handed. ---
@@ -3229,8 +3234,8 @@ fn analyze(
         // the whole candidate list**. A site the refinement cannot resolve —
         // an opaque binding, a level whose entries cannot be enumerated (a
         // function taken as a value, or one a dispatch outside the listed
-        // sites can select), a receiver-less `OnType` — draws an
-        // edge to EVERY candidate, so no candidate of an unresolved site is
+        // sites can select), a receiver-less `OnType` whose receiver is not
+        // on record (a `dyn` entry) — draws an edge to EVERY candidate, so no candidate of an unresolved site is
         // ever mistaken for dead. A node with no refined edge was therefore
         // excluded by a RESOLUTION at every site that lists it, which is a real
         // answer about what can run.
@@ -3246,6 +3251,47 @@ fn analyze(
         // site the refinement CANNOT resolve is still refused for coverage, and
         // it goes red the moment a fallback stops widening.
 
+        // How the walk crosses one REFINED dispatch edge into the node it
+        // reaches (B741): the calls it crosses, innermost first, and the node
+        // it goes on from (`None`: a top-level entry, with nothing above it).
+        // `None` for an edge whose effective caller is covered — the same
+        // caller coverage settled it to: the first node on the hand-off path
+        // that establishes the context (handing on only the site, the one
+        // call known to be inside it), else the entry's own caller.
+        let refined_hop =
+            |edge: &crate::dispatch_refine::RefinedEdge| -> Option<(Vec<Id>, Option<Id>)> {
+                use crate::dispatch_refine::RefinedCaller;
+                if edge.via.is_empty() {
+                    return match edge.caller {
+                        RefinedCaller::Node(caller) => {
+                            (!bound.contains(&caller)).then(|| (vec![edge.anchor], Some(caller)))
+                        }
+                        RefinedCaller::TopLevel => Some((vec![edge.anchor], None)),
+                    };
+                }
+                let establishing = edge.via.iter().copied().find(|node| {
+                    run_closure_ids.contains(node)
+                        || declared_here.contains(node)
+                        || cleared_here(*node).is_some()
+                });
+                if let Some(node) = establishing {
+                    return (!bound.contains(&node))
+                        .then(|| (edge.through.iter().copied().take(1).collect(), Some(node)));
+                }
+                let chain: Vec<Id> = edge
+                    .through
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(edge.anchor))
+                    .collect();
+                match edge.caller {
+                    RefinedCaller::Node(caller) => {
+                        (!bound.contains(&caller)).then_some((chain, Some(caller)))
+                    }
+                    RefinedCaller::TopLevel => Some((chain, None)),
+                }
+            };
+
         // The A2 walk-back (E74, widened to any dependency package by
         // C3a/E84): a refused site whose own span sits in library code
         // anchors at the user-written calls that enter the library on an
@@ -3257,17 +3303,26 @@ fn analyze(
         // not merely reveal the next), returned in id order so the least-id
         // one still leads, exactly where E74 anchored. A site in user code
         // anchors at itself and returns no entries here. The walk descends
-        // the same edges the strictness climbed — direct calls, admitted
-        // dispatch calls, the capture hop — and only through UNBOUND
-        // callers: a covered caller is not on the uncovered path and must
-        // not take the blame. No user entry found (an uncovered read
-        // reachable only from a library's own load would be the library's
-        // bug, not the user's) falls back to the library anchor.
-        let user_entries_of = |site: Id, start: Id| -> Vec<Id> {
+        // the same edges COVERAGE read — direct calls, the refined dispatch
+        // edges (B741), the capture hop — and only through UNBOUND callers:
+        // a covered caller is not on the uncovered path and must not take
+        // the blame. No user entry found (an uncovered read reachable only
+        // from a library's own load would be the library's bug, not the
+        // user's) falls back to the library anchor.
+        //
+        // Each entry keeps where its trace goes on from: the calls a
+        // per-entry dispatch edge crosses beyond it (`rest`), then the node
+        // above them (`from`) — for any other entry, the frame holding it.
+        struct WalkEntry {
+            call: Id,
+            rest: Vec<Id>,
+            from: Option<Id>,
+        }
+        let user_entries_of = |site: Id, start: Id| -> Vec<WalkEntry> {
             if !library_spanned(site) {
                 return Vec::new();
             }
-            let mut entries: Vec<Id> = Vec::new();
+            let mut entries: Vec<WalkEntry> = Vec::new();
             let mut visited: HashSet<Id> = HashSet::default();
             let mut walk: Vec<Id> = vec![start];
             while let Some(node) = walk.pop() {
@@ -3281,31 +3336,46 @@ fn analyze(
                     if library_spanned(call_id) {
                         walk.push(caller);
                     } else {
-                        entries.push(call_id);
+                        entries.push(WalkEntry {
+                            call: call_id,
+                            rest: Vec::new(),
+                            from: Some(caller),
+                        });
                     }
                 }
-                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
-                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                for &index in refined_incoming_of(node) {
+                    let Some((chain, from)) = refined_hop(&refined_edges[index]) else {
                         continue;
-                    }
-                    if library_spanned(call_id) {
-                        walk.push(caller);
-                    } else {
-                        entries.push(call_id);
+                    };
+                    match chain.iter().position(|call| !library_spanned(*call)) {
+                        Some(at) => entries.push(WalkEntry {
+                            call: chain[at],
+                            rest: chain[at + 1..].to_vec(),
+                            from,
+                        }),
+                        None => walk.extend(from),
                     }
                 }
                 // A top-level call is an uncovered entry by construction; it
                 // has no node to walk onward to.
                 for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
                     if !library_spanned(call_id) {
-                        entries.push(call_id);
+                        entries.push(WalkEntry {
+                            call: call_id,
+                            rest: Vec::new(),
+                            from: None,
+                        });
                     }
                 }
                 // B458: a `clear` body's uncovered-ness came from the `clear`
                 // itself, never from its defining scope.
                 if let Some(clear_call) = cleared_here(node) {
                     if !library_spanned(clear_call) {
-                        entries.push(clear_call);
+                        entries.push(WalkEntry {
+                            call: clear_call,
+                            rest: Vec::new(),
+                            from: owner_of.get(&clear_call).map(|frame| frame.id()),
+                        });
                     }
                     continue;
                 }
@@ -3319,8 +3389,8 @@ fn analyze(
             }
             // One dispatch site reaches the walk once per visited candidate;
             // a diagnostic per site, not per candidate.
-            entries.sort_by_key(|entry| entry.0);
-            entries.dedup();
+            entries.sort_by_key(|entry| entry.call.0);
+            entries.dedup_by_key(|entry| entry.call);
             entries
         };
 
@@ -3337,19 +3407,33 @@ fn analyze(
         // depth: the closure blames its defining scope's callers directly.
         struct Hop {
             call: Id,
-            /// A dispatch edge is union-admitted (row 222's residual): the
-            /// site MAY select the needy candidate, so its label must not
-            /// overclaim.
+            /// A dispatch site on the path (row 222's residual): a site the
+            /// refinement could not resolve MAY select the needy candidate,
+            /// so its label must not overclaim, and one label serves both.
             dispatch: bool,
             /// B458: the `clear` whose body the path runs in — where the
             /// value stops, labelled as such.
             clear: bool,
             depth: usize,
         }
-        let uncovered_hops_from = |start: Id| -> Vec<Hop> {
-            let mut hops: Vec<Hop> = Vec::new();
+        // `rest` are calls already known to be on the path, innermost first
+        // (a per-entry edge's calls past its user entry); `start` is the
+        // frame above them, if any.
+        let uncovered_hops_from = |rest: &[Id], start: Option<Id>| -> Vec<Hop> {
+            let mut hops: Vec<Hop> = rest
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| !library_spanned(**call))
+                .map(|(depth, call)| Hop {
+                    call: *call,
+                    dispatch: is_dispatch_site(*call),
+                    clear: false,
+                    depth,
+                })
+                .collect();
             let mut visited: HashSet<Id> = HashSet::default();
-            let mut frontier: VecDeque<(Id, usize)> = VecDeque::from([(start, 0)]);
+            let mut frontier: VecDeque<(Id, usize)> =
+                start.map(|start| (start, rest.len())).into_iter().collect();
             while let Some((node, depth)) = frontier.pop_front() {
                 if !visited.insert(node) {
                     continue;
@@ -3368,19 +3452,25 @@ fn analyze(
                     }
                     frontier.push_back((caller, depth + 1));
                 }
-                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
-                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                // A dispatch edge, refined (B741): each call it crosses is a
+                // hop, one level further out than the last.
+                for &index in refined_incoming_of(node) {
+                    let Some((chain, from)) = refined_hop(&refined_edges[index]) else {
                         continue;
+                    };
+                    for (offset, call) in chain.iter().enumerate() {
+                        if !library_spanned(*call) {
+                            hops.push(Hop {
+                                call: *call,
+                                dispatch: is_dispatch_site(*call),
+                                clear: false,
+                                depth: depth + offset,
+                            });
+                        }
                     }
-                    if !library_spanned(call_id) {
-                        hops.push(Hop {
-                            call: call_id,
-                            dispatch: true,
-                            clear: false,
-                            depth,
-                        });
+                    if let Some(from) = from {
+                        frontier.push_back((from, depth + chain.len()));
                     }
-                    frontier.push_back((caller, depth + 1));
                 }
                 for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
                     if !library_spanned(call_id) {
@@ -3421,8 +3511,8 @@ fn analyze(
         // Past TRACE_CAP the entry side is kept and the rest elides behind
         // the honest tail. Each label follows the `Note::source` contract:
         // the file is named only when it differs from the anchor's.
-        let trace_of = |start: Id, anchor: Id| -> Vec<TraceHop> {
-            let mut hops = uncovered_hops_from(start);
+        let trace_of = |rest: &[Id], start: Option<Id>, anchor: Id| -> Vec<TraceHop> {
+            let mut hops = uncovered_hops_from(rest, start);
             hops.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.call.0.cmp(&b.call.0)));
             let mut seen: HashSet<Id> = HashSet::default();
             hops.retain(|hop| seen.insert(hop.call));
@@ -3491,20 +3581,18 @@ fn analyze(
                 let trace = if library_spanned(get.call_id) {
                     Vec::new()
                 } else {
-                    trace_of(get.owner.id(), get.call_id)
+                    trace_of(&[], Some(get.owner.id()), get.call_id)
                 };
                 errors.push(anchored_tracing(program, get.call_id, message, trace, None));
             } else {
                 for entry in entries {
-                    // The chain climbs from the frame holding the entry call;
-                    // a top-level entry has no frame and nothing above it.
-                    let trace = owner_of
-                        .get(&entry)
-                        .map(|frame| trace_of(frame.id(), entry))
-                        .unwrap_or_default();
+                    // The chain climbs from the entry call: through the calls
+                    // known to follow it, then from the frame above them; a
+                    // top-level entry has no frame and nothing above it.
+                    let trace = trace_of(&entry.rest, entry.from, entry.call);
                     errors.push(anchored_tracing(
                         program,
-                        entry,
+                        entry.call,
                         message.clone(),
                         trace,
                         Some(library_frame_note(
@@ -3513,7 +3601,7 @@ fn analyze(
                             get.call_id,
                             get.owner.id(),
                             "read",
-                            entry,
+                            entry.call,
                         )),
                     ));
                 }
@@ -3534,18 +3622,15 @@ fn analyze(
                 let trace = if library_spanned(*call_id) {
                     Vec::new()
                 } else {
-                    trace_of(owner.id(), *call_id)
+                    trace_of(&[], Some(owner.id()), *call_id)
                 };
                 errors.push(anchored_tracing(program, *call_id, message, trace, None));
             } else {
                 for entry in entries {
-                    let trace = owner_of
-                        .get(&entry)
-                        .map(|frame| trace_of(frame.id(), entry))
-                        .unwrap_or_default();
+                    let trace = trace_of(&entry.rest, entry.from, entry.call);
                     errors.push(anchored_tracing(
                         program,
-                        entry,
+                        entry.call,
                         message.clone(),
                         trace,
                         Some(library_frame_note(
@@ -3554,7 +3639,7 @@ fn analyze(
                             *call_id,
                             owner.id(),
                             "injected call",
-                            entry,
+                            entry.call,
                         )),
                     ));
                 }
@@ -3693,7 +3778,7 @@ fn analyze(
             sites.dedup_by_key(|(call_id, _)| *call_id);
             for (call_id, caller) in sites {
                 let trace = caller
-                    .map(|caller| trace_of(caller, call_id))
+                    .map(|caller| trace_of(&[], Some(caller), call_id))
                     .unwrap_or_default();
                 errors.push(anchored_tracing(
                     program,

@@ -2347,7 +2347,8 @@ impl<'p, 'src> State<'p, 'src> {
     /// call whose recorded substitution selects an R-member — so a clean
     /// instantiation of the same generic stays admitted — and every
     /// unresolvable shape (a value-taken generic, an opaque binding, a
-    /// receiver-less `OnType`) widens to the whole candidate list.
+    /// receiver-less `OnType` whose `Self` is not on record) widens to the
+    /// whole candidate list.
     /// Over-refusal is the acceptable fallback direction; an escape is not.
     ///
     /// A call THROUGH a value resolves to `CallTarget::Indirect(Value)`, which

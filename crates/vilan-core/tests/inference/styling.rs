@@ -4279,55 +4279,60 @@ fn a_module_level_initializer_entry_is_a_boundary_for_generic_dispatch() {
 }
 
 #[test]
-fn a_shared_default_self_call_refuses_conservatively_even_for_a_clean_receiver() {
-    // DELIBERATE over-refusal, pinned as the chosen posture: `loud`'s body
-    // dispatches `self.text()` with no recorded receiver (`OnType(None)` — a
-    // shared default body), so the site cannot know which impl a given
-    // receiver selects and widens to every candidate. `Token::text` reaches
-    // `emit`, so `loud` joins R, and even `Plain`'s clean receiver is refused
-    // — the fallback direction is refusal, never escape, because the failure
-    // mode being fenced is a clean compile that throws `ReferenceError` at
-    // run time. If per-receiver refinement of shared default bodies ever
-    // ships, this pin is the one to revisit.
-    let source = r##"
+fn a_shared_default_self_call_resolves_by_its_receiver() {
+    // `loud`'s body dispatches `self.text()` on the default's `Self`, and each
+    // entry of `loud` records what that is (B742): `Plain`'s clean receiver
+    // selects `Plain::text` and runs, while `Token`'s reaches `emit` and is
+    // refused. This pin used to hold a DELIBERATE over-refusal of the clean
+    // receiver too, the posture of a refinement that kept every candidate at
+    // a receiver-less site ("if per-receiver refinement of shared default
+    // bodies ever ships, this pin is the one to revisit"). The fallback
+    // direction is unchanged where the receiver is not on record.
+    let source = |body: &str| {
+        format!(
+            r##"
         import std::io::print;
         import std::web::asset::emit;
-        struct Token {
+        struct Token {{
             value: str,
-        }
-        struct Plain {
+        }}
+        struct Plain {{
             text_value: str,
-        }
-        trait Emitter {
+        }}
+        trait Emitter {{
             fun text(self): str;
-            fun loud(self): str {
+            fun loud(self): str {{
                 self.text()
-            }
-        }
-        impl Token with Emitter {
-            fun text(self): str {
-                emit("css", ":root{--p:1rem}");
+            }}
+        }}
+        impl Token with Emitter {{
+            fun text(self): str {{
+                emit("css", ":root{{--p:1rem}}");
                 self.value
-            }
-        }
-        impl Plain with Emitter {
-            fun text(self): str {
+            }}
+        }}
+        impl Plain with Emitter {{
+            fun text(self): str {{
                 self.text_value
-            }
-        }
-        fun main() {
-            print(Plain { text_value = "clean" }.loud());
-        }
+            }}
+        }}
+        fun main() {{
+            {body}
+        }}
         main();
-        "##;
-    let diagnostics = failure_diagnostics(source);
-    assert!(
-        diagnostics
-            .iter()
-            .any(|(message, _)| message.contains("compile-time-only")),
-        "the conservative posture: a shared default whose self-dispatch could select an \
-         emitting impl is refused for EVERY receiver, clean ones included — over-refusal \
-         is the deliberate fallback, an emitted `ReferenceError` is not: {diagnostics:#?}"
+        "##
+        )
+    };
+    assert_compiles_and_runs(
+        &source(r#"print(Plain { text_value = "clean" }.loud());"#),
+        "clean\n",
+    );
+    assert_fails_with(
+        &source(
+            r#"print(Plain { text_value = "clean" }.loud());
+            print(Token { value = "emitting" }.loud());"#,
+        ),
+        "compile-time-only",
     );
 }
 
