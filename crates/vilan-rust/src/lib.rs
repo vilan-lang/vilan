@@ -6556,8 +6556,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
         consuming: bool,
     ) -> Result<String, Error> {
+        // B743: a future-answering closure VALUE at a position that does not
+        // take one floats ([`Self::floating_adapter`]), and a synchronous one
+        // at a position that does is lifted ([`Self::lifting_adapter`]). Read
+        // before the value is rendered, since a literal inside it consumes
+        // the flag.
+        let floats = !self.expects_async_value && self.answers_a_floating_future(id);
+        let lifts = self.expects_async_value && self.is_a_synchronous_closure_value(id);
         let saved = std::mem::replace(&mut self.expected_type, expecting);
         let rendered = self.value_of_unerased(id, depth).and_then(|text| {
+            if floats {
+                return self.floating_adapter(id, text);
+            }
+            if lifts {
+                return self.lifting_adapter(id, text);
+            }
             let text = if consuming && !self.is_natively_copy(id) {
                 self.copy_a_consumed_place_read(id, text)
             } else {
@@ -6611,6 +6624,163 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
         }
         Ok(rendered)
+    }
+
+    /// B743: whether `id` is a closure VALUE that answers a future natively —
+    /// a read of a binding or parameter the analyzer records as async (J2's
+    /// `async_values`, declared or ADOPTED; or one this instance adapts, F22),
+    /// a read of an `async |T| U` field, or a call to a function declared to
+    /// return one — and answers `void`, so that a position which does not
+    /// await it floats it (see [`Self::floating_adapter`]).
+    ///
+    /// These are exactly the channels through which the JS backend AWAITS a
+    /// call (`async_infer`'s `value_async_in`); a closure literal is not here,
+    /// because [`Self::closure`] decides its own form from the same flag.
+    fn answers_a_floating_future(&self, id: Id) -> bool {
+        let answers_a_future = match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) => {
+                self.program.async_values.contains(binding)
+                    || self.current_adapted_bits.contains(binding)
+            }
+            Some(Expr::Field(_, struct_id, index)) => {
+                self.program.async_fields.contains(&(*struct_id, *index))
+            }
+            Some(Expr::Call(call_id)) => {
+                self.program
+                    .function_calls
+                    .get(call_id)
+                    .is_some_and(|call| {
+                        matches!(
+                            self.program.entity_map.get(&call.subject_id),
+                            Some(Expr::Local(target))
+                                if self.program.async_returning.contains(target)
+                        )
+                    })
+            }
+            _ => false,
+        };
+        answers_a_future
+            && self
+                .forwardable_closure(id)
+                .is_some_and(|(_, returns)| matches!(self.resolve(returns), Some(Type::Void)))
+    }
+
+    /// B743: a future-answering closure value handed to a position that does
+    /// not await it — a parameter declared `|T| void`, a plain field, a list,
+    /// anything outside the channels [`Self::answers_a_floating_future`]
+    /// names — becomes the closure that position's type says, one that STARTS
+    /// the body and lets it float.
+    ///
+    /// This is what the JS backend does with the same value: a call that is
+    /// not awaited runs the `async` function up to its first suspension and
+    /// drops the promise, so the rest of the body runs later, on its own. The
+    /// executor's `spawn` polls eagerly, so the body runs to the same first
+    /// suspension before the call returns, and an unhandled failure reports
+    /// through the unobserved-task path, which is node's for a rejected
+    /// floating promise. It is the same form a floating closure LITERAL takes
+    /// ([`Self::closure`]), applied to a value whose form was already chosen.
+    fn floating_adapter(&mut self, id: Id, value: String) -> Result<String, Error> {
+        let span = self.span_of(id);
+        let Some((parameters, _)) = self.forwardable_closure(id) else {
+            return Err(unsupported(
+                "a floating closure value of no closure type",
+                span,
+            ));
+        };
+        let (typed, names, signature) = self.forwarding_parameters(&parameters, span)?;
+        let origin = rust_string(self.current_origin.unwrap_or("a floating handler"));
+        Ok(format!(
+            "{{ let floated = ({value}).clone(); std::rc::Rc::new(move |{typed}| {{ \
+             vilan_rt::executor::spawn((floated)({names}), {origin}); }}) \
+             as std::rc::Rc<dyn Fn({signature}) -> ()> }}"
+        ))
+    }
+
+    /// B743: whether `id` reads a closure VALUE in its synchronous form — a
+    /// binding, parameter or field the analyzer does not record as async (the
+    /// complement of [`Self::answers_a_floating_future`]'s channels) — whose
+    /// parameters a forwarding closure can take ([`Self::forwardable_closure`]).
+    /// A literal is not here: [`Self::closure`] wraps its own body.
+    fn is_a_synchronous_closure_value(&self, id: Id) -> bool {
+        let synchronous = match self.program.entity_map.get(&id) {
+            Some(Expr::Local(binding)) => {
+                (self.program.variables.contains_key(binding)
+                    || self.program.parameters.contains_key(binding))
+                    && !self.program.async_values.contains(binding)
+                    && !self.current_adapted_bits.contains(binding)
+            }
+            Some(Expr::Field(_, struct_id, index)) => {
+                !self.program.async_fields.contains(&(*struct_id, *index))
+            }
+            _ => false,
+        };
+        synchronous && self.forwardable_closure(id).is_some()
+    }
+
+    /// The parameter and return types of the closure value `id` when a
+    /// closure that FORWARDS to it can be written: no `context` clause (whose
+    /// hidden parameters the forwarder would have to name) and no view
+    /// parameter (a loan cannot be handed to a body that outlives the call).
+    fn forwardable_closure(&self, id: Id) -> Option<(Vec<TypeId>, TypeId)> {
+        match self.type_of(id).and_then(|type_id| self.resolve(type_id)) {
+            Some(Type::Closure(parameters, returns, contexts, modes))
+                if contexts.is_empty()
+                    && modes
+                        .iter()
+                        .all(|mode| self.program.parameter_mode(*mode).view().is_none()) =>
+            {
+                Some((parameters.clone(), *returns))
+            }
+            _ => None,
+        }
+    }
+
+    /// The typed parameter list of a forwarding closure over `parameters`,
+    /// the names it forwards, and the parameter half of its `dyn Fn` type.
+    fn forwarding_parameters(
+        &mut self,
+        parameters: &[TypeId],
+        span: Span,
+    ) -> Result<(String, String, String), Error> {
+        let mut typed = Vec::with_capacity(parameters.len());
+        let mut signature = Vec::with_capacity(parameters.len());
+        let mut names = Vec::with_capacity(parameters.len());
+        for (position, parameter) in parameters.iter().enumerate() {
+            let rendered = self.rust_type(*parameter, span)?;
+            let name = format!("forwarded_{position}");
+            typed.push(format!("{name}: {rendered}"));
+            signature.push(rendered);
+            names.push(name);
+        }
+        Ok((typed.join(", "), names.join(", "), signature.join(", ")))
+    }
+
+    /// B743: a synchronous closure value handed to a position that takes a
+    /// future-answering one — a parameter declared `async |T| U`, an adapted
+    /// one, an async field, a binding the analyzer records as async — becomes
+    /// a closure that runs it at the call and answers a ready future.
+    ///
+    /// The JS backend awaits whatever the call answered, so the body runs at
+    /// the call there too, and the await's own turn is the `yield_now` every
+    /// awaited call site already carries natively. The mirror of
+    /// [`Self::floating_adapter`], and of the wrap [`Self::closure`] gives a
+    /// synchronous LITERAL at the same position.
+    fn lifting_adapter(&mut self, id: Id, value: String) -> Result<String, Error> {
+        let span = self.span_of(id);
+        let Some((parameters, returns)) = self.forwardable_closure(id) else {
+            return Err(unsupported(
+                "a lifted closure value of no closure type",
+                span,
+            ));
+        };
+        let (typed, names, signature) = self.forwarding_parameters(&parameters, span)?;
+        let returned = self.rust_type(returns, span)?;
+        Ok(format!(
+            "{{ let lifted = ({value}).clone(); std::rc::Rc::new(move |{typed}| {{ \
+             let answered = (lifted)({names}); \
+             vilan_rt::executor::pin_future(async move {{ answered }}) }}) \
+             as std::rc::Rc<dyn Fn({signature}) -> vilan_rt::executor::Boxed<{returned}>> }}"
+        ))
     }
 
     /// B721: the Rust that turns a value of type `value` into one of type
@@ -7336,6 +7506,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(hoisted) = self.hoist_compound_target(target, value, depth)? {
             return Ok(hoisted);
         }
+        // B743: the declaration's rule for every later value of the place — a
+        // binding the analyzer records as async, or an `async |T| U` field,
+        // holds a future-answering closure whatever is written into it.
+        let takes_a_future = match self.program.entity_map.get(&target) {
+            Some(Expr::Local(binding)) => self.program.async_values.contains(binding),
+            Some(Expr::Field(_, struct_id, index)) => {
+                self.program.async_fields.contains(&(*struct_id, *index))
+            }
+            _ => false,
+        };
         // The TARGET's type is the value position's expectation (B370's law on
         // the assignment path): a numeric literal takes its width from the
         // position it lands in, and an assignment is a position. Without it
@@ -7357,7 +7537,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // wrote `(1i32)` against a `u64`.
             let expecting = expecting.or_else(|| self.cell_element_type(receiver));
             let receiver_text = self.expression(receiver, depth)?;
-            let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
+            let value_text = self.assigned_value(value, expecting, depth, takes_a_future)?;
             return Ok(settled_cell_write(
                 &format!("({receiver_text})"),
                 &value_text,
@@ -7377,18 +7557,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         if let Some(binding) = named {
             if self.boxed.contains(&binding) {
-                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
+                let value_text = self.assigned_value(value, expecting, depth, takes_a_future)?;
                 return Ok(settled_cell_write(&self.binding_name(binding), &value_text));
             }
             if self.module_bindings.contains(&binding) {
                 let cell = self.ensure_module_binding(binding, span)?;
-                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
+                let value_text = self.assigned_value(value, expecting, depth, takes_a_future)?;
                 return Ok(format!(
                     "{{ let __assigned = {value_text}; {cell}.with(|cell| cell.set(__assigned)); }}"
                 ));
             }
             if self.binding_holds_a_view(binding) {
-                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
+                let value_text = self.assigned_value(value, expecting, depth, takes_a_future)?;
                 return Ok(format!("*{} = {value_text}", self.binding_name(binding)));
             }
         }
@@ -7407,12 +7587,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .hoist_subscripts(target, &mut prelude, depth)
             .and_then(|_| {
                 let target_text = self.mutable_place(target, depth)?;
-                let value_text = self.consumed_value_of_expecting(value, expecting, depth)?;
+                let value_text = self.assigned_value(value, expecting, depth, takes_a_future)?;
                 Ok((target_text, value_text))
             });
         self.hoisted = saved;
         let (target_text, value_text) = rendered?;
         Ok(self.finish_assignment(target, prelude, &target_text, &value_text))
+    }
+
+    /// One assignment's VALUE, rendered at the place's position: its type, and
+    /// whether the place holds a future-answering closure (B743).
+    fn assigned_value(
+        &mut self,
+        value: Id,
+        expecting: Option<TypeId>,
+        depth: usize,
+        takes_a_future: bool,
+    ) -> Result<String, Error> {
+        self.expects_async_value = takes_a_future;
+        let rendered = self.consumed_value_of_expecting(value, expecting, depth);
+        self.expects_async_value = false;
+        rendered
     }
 
     /// Every subscript along one place's spine into a `let`, root first — the
@@ -8114,9 +8309,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // local (B370's law): without it `mut level: u32 = 10` declared a
         // `Shared<u32>` and handed it `(10i32)`.
         let expecting = Some(variable.type_id);
-        let rendered = self.rust_type(variable.type_id, span).and_then(|rendered| {
-            self.value_of_expecting(initial, expecting, 0)
-                .map(|value| (rendered, value))
+        // B743: a binding the analyzer records as async holds a
+        // future-answering closure — its cell's type says so, and so does the
+        // literal it starts as (see [`Self::declaration`]).
+        let holds_a_future = self.program.async_values.contains(&binding);
+        self.expects_async = holds_a_future;
+        let rendered = self.rust_type(variable.type_id, span);
+        self.expects_async = false;
+        let rendered = rendered.and_then(|rendered| {
+            self.expects_async_value = holds_a_future;
+            let value = self.value_of_expecting(initial, expecting, 0);
+            self.expects_async_value = false;
+            value.map(|value| (rendered, value))
         });
         self.current_substitution = saved;
         let (rendered, value) = rendered?;
@@ -8237,11 +8441,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     ));
                 }
                 let saved = std::mem::replace(&mut self.declaring_a_view, holds_a_view);
+                // B743: a binding the analyzer records as async — declared
+                // `async |T| U`, or ADOPTED because a value it holds is an async
+                // closure (J2) — is called with an `await` at every call
+                // through it, so what it holds answers a future: the closure
+                // literal it is initialized with is a future-answering one,
+                // never the floating form a `void` one would otherwise take.
+                self.expects_async_value = self.program.async_values.contains(&binding);
                 let value = if holds_a_view {
                     self.value_of_expecting(initial, Some(variable.type_id), depth)
                 } else {
                     self.consumed_value_of_expecting(initial, Some(variable.type_id), depth)
                 };
+                self.expects_async_value = false;
                 self.declaring_a_view = saved;
                 let value = value?;
                 if self.boxed.contains(&binding) {
@@ -11331,7 +11543,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let object = self.ensure_object_trait(trait_id, &arguments, span)?;
                 format!("vilan_rt::Dyn<dyn {}>", object.name)
             }
-            _ => self.written_closure_return(&closure, is_async_closure || wants_a_future, span)?,
+            // A floating closure answers nothing: its body is spawned.
+            _ if floats => "()".to_string(),
+            _ => self.written_closure_return(&closure, wants_a_future, span)?,
         };
         let as_counted = format!(
             " as std::rc::Rc<dyn Fn({}) -> {returns}>",
@@ -11584,9 +11798,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `f = || row.name` hands `str_concat` a `&_` that Rust settles as the
     /// unsized `str` (E0277). The closure's return is known: the position
     /// [`Self::closure_body`] rendered the body at, else the type the analyzer
-    /// recorded for the literal. Written only when it is closed; never for a
-    /// future-answering or floating closure (whose cast answers a future), or
-    /// for a body that hands back a VIEW (a reference whose lifetime the cast
+    /// recorded for the literal. Written only when it is closed — for a
+    /// future-answering closure as the future's output (B743) — and never for
+    /// a body that hands back a VIEW (a reference whose lifetime the cast
     /// cannot name).
     fn written_closure_return(
         &mut self,
@@ -11594,7 +11808,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         answers_a_future: bool,
         span: Span,
     ) -> Result<String, Error> {
-        if answers_a_future || self.reads_through_a_view(closure.return_) {
+        if self.reads_through_a_view(closure.return_) {
             return Ok("_".to_string());
         }
         let recorded = self
@@ -11608,6 +11822,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .or(recorded)
             .filter(|returns| self.is_grounded(*returns))
         {
+            // B743: a future-answering closure names its future's output too.
+            // Left to inference, the output is taken from the first READER, and
+            // a reader that borrows (`&{ held() }` in an interpolation) settled
+            // it as `str`, not `Rc<str>`.
+            Some(returns) if answers_a_future => Ok(format!(
+                "vilan_rt::executor::Boxed<{}>",
+                self.rust_type(returns, span)?
+            )),
             Some(returns) => self.rust_type(returns, span),
             None => Ok("_".to_string()),
         }
@@ -17652,9 +17874,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let self_traits = self.self_traits_of(default_id);
         let saved_traits = std::mem::replace(&mut self.current_self_traits, self_traits);
         let saved = std::mem::replace(&mut self.current_substitution, substitution);
+        // B743: the default's OWN instance record, never the caller's. A trait
+        // default is emitted once per receiver type, from whichever body reaches
+        // it first, and that body's record answered "async" for it whenever the
+        // caller was async — `.width(..)` first reached inside an awaiting
+        // `check` was an `async fn` its synchronous call sites did not await.
+        let saved_instance = self.enter_instance(default_id, Vec::new());
         let emitted = self
             .function_body(&function, function.name_span, false, &name)
             .map_err(|error| self.locate_refusal(error, function.id));
+        self.restore_instance(saved_instance);
         self.current_substitution = saved;
         self.current_self_traits = saved_traits;
         self.current_self_type = saved_self;

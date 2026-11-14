@@ -13801,9 +13801,24 @@ impl<'src> Transformer<'src> {
             let saved_self = self.current_self_type.replace(type_id);
             let saved_substitution =
                 std::mem::replace(&mut self.current_substitution, substitution);
+            // B743: the default's OWN instance record, never the caller's. A
+            // default is emitted once per receiver type, from whichever body
+            // reaches it first, and that body's record answered "async" for it
+            // whenever the caller was async — an `async function` its
+            // synchronous call sites did not await (`[object Promise]`).
+            let saved_adapted = std::mem::take(&mut self.current_adapted);
+            let saved_instance = std::mem::replace(
+                &mut self.current_instance,
+                self.program
+                    .adapted_instances
+                    .get(&(default_id, Vec::new()))
+                    .cloned(),
+            );
             let frame = self.record_enter();
             let landed_before = self.monomorphized.len();
             let js_function = self.function_with_name(function, name.clone());
+            self.current_adapted = saved_adapted;
+            self.current_instance = saved_instance;
             self.current_self_type = saved_self;
             self.current_substitution = saved_substitution;
             // A trait default's body is specialized per type exactly as a

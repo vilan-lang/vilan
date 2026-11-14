@@ -18582,3 +18582,614 @@ const STR_BINDING_PROBE: &str = concat!(
     "\t}\n",
     "}\n",
 );
+
+// ---------------------------------------------------------------------------
+// B743: a closure that awaits, at every position a closure value reaches.
+// ---------------------------------------------------------------------------
+
+/// B743: one program on both backends, asserting node's lines on each. A
+/// closure whose body awaits is a future-answering one natively wherever the
+/// JS backend AWAITS a call through it (J2's channels: a binding declared or
+/// adopted async, an `async |T| U` parameter or field, an adapted parameter),
+/// and floats — runs to its first suspension, the rest later — wherever a call
+/// through it is not awaited. The lines each body prints before and after its
+/// suspension are the order a wrong choice changes.
+fn assert_async_closure_probe(file: &str, source: &str, expected: &str) {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "{file}: a closure that awaits must run in node's order on both backends"
+    );
+}
+
+/// (a) The bug as filed: a local `void` closure whose body awaits, called
+/// through its binding. The analyzer adopts the binding as async (J2), so the
+/// call awaits on both backends and the closure's body finishes before the
+/// next line.
+#[test]
+fn b743_a_local_closure_that_awaits_is_awaited_where_it_is_called() {
+    assert_async_closure_probe(
+        "native_probe_b743_local_void.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"first\");\n",
+            "\tprint(\"after first\");\n",
+            "\tboard(\"second\");\n",
+            "\tprint(\"after second\");\n",
+            "}\n",
+        ),
+        concat!(
+            "first start\n",
+            "first end\n",
+            "after first\n",
+            "second start\n",
+            "second end\n",
+            "after second\n",
+        ),
+    );
+}
+
+/// (a) The same with a VALUE: an `i32` and a `str` read in an interpolation
+/// (the `str` one is `held_text`'s shape in the ui examples, whose future
+/// output has to be written, or a borrowing reader settles it as the unsized
+/// `str`).
+#[test]
+fn b743_a_local_closure_that_awaits_answers_its_value_at_the_call() {
+    assert_async_closure_probe(
+        "native_probe_b743_local_value.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet add = |x: i32| {\n",
+            "\t\tprint(i\"add {x}\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tx + 1\n",
+            "\t};\n",
+            "\tprint(i\"got {add(1)}\");\n",
+            "\tlet quoted = || {\n",
+            "\t\tsleep(1);\n",
+            "\t\t\"held\"\n",
+            "\t};\n",
+            "\tprint(i\"[{quoted()}] {quoted().len()}\");\n",
+            "\tprint(\"after\");\n",
+            "}\n",
+        ),
+        concat!("add 1\n", "got 2\n", "[held] 4\n", "after\n",),
+    );
+}
+
+/// (a) A binding DECLARED `async |str| void` and initialized with a literal.
+#[test]
+fn b743_a_binding_declared_async_holds_a_future_answering_closure() {
+    assert_async_closure_probe(
+        "native_probe_b743_declared_async.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board: async |str| void = |what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"first\");\n",
+            "\tprint(\"after first\");\n",
+            "}\n",
+        ),
+        concat!("first start\n", "first end\n", "after first\n",),
+    );
+}
+
+/// (a) A local closure that calls another awaiting local closure is adopted
+/// too, and so is awaited where it is called.
+#[test]
+fn b743_a_closure_calling_an_awaiting_closure_awaits_it_in_turn() {
+    assert_async_closure_probe(
+        "native_probe_b743_nested_local.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tlet outer = || {\n",
+            "\t\tboard(\"inner\");\n",
+            "\t\tprint(\"outer done\");\n",
+            "\t};\n",
+            "\touter();\n",
+            "\tprint(\"after outer\");\n",
+            "}\n",
+        ),
+        concat!(
+            "inner start\n",
+            "inner end\n",
+            "outer done\n",
+            "after outer\n",
+        ),
+    );
+}
+
+/// (b) An awaiting binding answering a value, called directly and then handed
+/// to a plain `|i32| i32` parameter, which the callee's adapted instance
+/// awaits (F22).
+#[test]
+fn b743_an_awaiting_binding_answering_a_value_reaches_an_adapted_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_adapted_parameter.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun apply(f: |i32| i32): i32 {\n",
+            "\tf(1) + f(2)\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet slow = |x: i32| {\n",
+            "\t\tprint(i\"x {x}\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tx * 10\n",
+            "\t};\n",
+            "\tprint(i\"direct {slow(5)}\");\n",
+            "\tlet total = apply(slow);\n",
+            "\tprint(i\"sum {total}\");\n",
+            "}\n",
+        ),
+        concat!("x 5\n", "direct 50\n", "x 1\n", "x 2\n", "sum 30\n",),
+    );
+}
+
+/// (b) An awaiting binding called directly (awaited) and then handed to a
+/// `|str| void` parameter, whose calls do not await it on either backend:
+/// each call runs the body to its first suspension and the rest floats.
+#[test]
+fn b743_an_awaiting_binding_floats_at_a_synchronous_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_sync_parameter.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun twice(f: |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tprint(\"between\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"direct\");\n",
+            "\tprint(\"after direct\");\n",
+            "\ttwice(board);\n",
+            "\tprint(\"after twice\");\n",
+            "}\n",
+        ),
+        concat!(
+            "direct start\n",
+            "direct end\n",
+            "after direct\n",
+            "a start\n",
+            "between\n",
+            "b start\n",
+            "twice done\n",
+            "after twice\n",
+            "a end\n",
+            "b end\n",
+        ),
+    );
+}
+
+/// (b) An awaiting binding handed to an `async |str| void` parameter: every
+/// call through it awaits.
+#[test]
+fn b743_an_awaiting_binding_is_awaited_through_an_async_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_async_parameter.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun twice(f: async |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tprint(\"between\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\ttwice(board);\n",
+            "\tprint(\"after twice\");\n",
+            "}\n",
+        ),
+        concat!(
+            "a start\n",
+            "a end\n",
+            "between\n",
+            "b start\n",
+            "b end\n",
+            "twice done\n",
+            "after twice\n",
+        ),
+    );
+}
+
+/// (b) The mirror: a SYNCHRONOUS closure binding handed to an `async |str|
+/// void` parameter answers a ready future natively, the body running at the
+/// call.
+#[test]
+fn b743_a_synchronous_binding_is_lifted_at_an_async_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_lifted.vl",
+        concat!(
+            "fun twice(f: async |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet plain = |what: str| print(i\"{what} plain\");\n",
+            "\ttwice(plain);\n",
+            "\tprint(\"after twice\");\n",
+            "}\n",
+        ),
+        concat!("a plain\n", "b plain\n", "twice done\n", "after twice\n",),
+    );
+}
+
+/// (c) An awaiting binding called directly and then stored in a `|str| void`
+/// field: a call through the field floats.
+#[test]
+fn b743_an_awaiting_binding_floats_in_a_synchronous_field() {
+    assert_async_closure_probe(
+        "native_probe_b743_sync_field.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "struct Holder {\n",
+            "\trun: |str| void,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"direct\");\n",
+            "\tprint(\"after direct\");\n",
+            "\tlet holder = Holder { run = board };\n",
+            "\t(holder.run)(\"field\");\n",
+            "\tprint(\"after field\");\n",
+            "}\n",
+        ),
+        concat!(
+            "direct start\n",
+            "direct end\n",
+            "after direct\n",
+            "field start\n",
+            "after field\n",
+            "field end\n",
+        ),
+    );
+}
+
+/// (c) The same through an ASSIGNMENT to the field.
+#[test]
+fn b743_an_awaiting_binding_assigned_to_a_synchronous_field_floats() {
+    assert_async_closure_probe(
+        "native_probe_b743_assigned_field.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "struct Holder {\n",
+            "\trun: |str| void,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut holder = Holder { run = |what| print(i\"{what} plain\") };\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tholder.run = board;\n",
+            "\t(holder.run)(\"field\");\n",
+            "\tprint(\"after field\");\n",
+            "}\n",
+        ),
+        concat!("field start\n", "after field\n", "field end\n",),
+    );
+}
+
+/// (c) An awaiting binding stored in an unannotated list, pushed on a
+/// `List<|str| void>` and wrapped in `Some`: no call through any of them
+/// awaits, on either backend.
+#[test]
+fn b743_an_awaiting_binding_floats_in_a_list_and_an_option() {
+    assert_async_closure_probe(
+        "native_probe_b743_containers.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"direct\");\n",
+            "\tlet listed = [board];\n",
+            "\tfor handler in listed {\n",
+            "\t\thandler(\"listed\");\n",
+            "\t}\n",
+            "\tprint(\"after listed\");\n",
+            "\tmut typed: List<|str| void> = [];\n",
+            "\ttyped.push(board);\n",
+            "\ttyped[0](\"typed\");\n",
+            "\tprint(\"after typed\");\n",
+            "\tlet maybe = Some(board);\n",
+            "\tmatch maybe {\n",
+            "\t\tSome(let found) => found(\"maybe\"),\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "\tprint(\"after maybe\");\n",
+            "}\n",
+        ),
+        concat!(
+            "direct start\n",
+            "direct end\n",
+            "listed start\n",
+            "after listed\n",
+            "typed start\n",
+            "after typed\n",
+            "maybe start\n",
+            "after maybe\n",
+            "listed end\n",
+            "typed end\n",
+            "maybe end\n",
+        ),
+    );
+}
+
+/// (e) An awaiting binding called inside a function and then returned as its
+/// `|str| void`: the caller's call floats.
+#[test]
+fn b743_an_awaiting_binding_floats_through_a_synchronous_return() {
+    assert_async_closure_probe(
+        "native_probe_b743_sync_return.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun make(): |str| void {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"inside\");\n",
+            "\tboard\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet made = make();\n",
+            "\tmade(\"made\");\n",
+            "\tprint(\"after made\");\n",
+            "}\n",
+        ),
+        concat!(
+            "inside start\n",
+            "inside end\n",
+            "made start\n",
+            "after made\n",
+            "made end\n",
+        ),
+    );
+}
+
+/// (a) A `mut` binding that starts synchronous and is REASSIGNED an awaiting
+/// closure: adopted, so both of its values answer a future and both calls
+/// await.
+#[test]
+fn b743_a_reassigned_binding_holds_a_future_answering_closure() {
+    assert_async_closure_probe(
+        "native_probe_b743_reassigned.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut step = |what: str| print(i\"{what} plain\");\n",
+            "\tstep(\"one\");\n",
+            "\tstep = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tstep(\"two\");\n",
+            "\tprint(\"after two\");\n",
+            "}\n",
+        ),
+        concat!("one plain\n", "two start\n", "two end\n", "after two\n",),
+    );
+}
+
+/// (a) A MODULE-level binding holding an awaiting closure.
+#[test]
+fn b743_a_module_binding_that_awaits_is_awaited_where_it_is_called() {
+    assert_async_closure_probe(
+        "native_probe_b743_module_binding.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "let board = |what: str| {\n",
+            "\tprint(i\"{what} start\");\n",
+            "\tsleep(1);\n",
+            "\tprint(i\"{what} end\");\n",
+            "};\n",
+            "\n",
+            "fun main() {\n",
+            "\tboard(\"module\");\n",
+            "\tprint(\"after module\");\n",
+            "}\n",
+        ),
+        concat!("module start\n", "module end\n", "after module\n",),
+    );
+}
+
+/// (a) A `mut` MODULE-level binding reassigned an awaiting closure.
+#[test]
+fn b743_a_reassigned_module_binding_holds_a_future_answering_closure() {
+    assert_async_closure_probe(
+        "native_probe_b743_module_reassigned.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "mut step = |what: str| print(i\"{what} plain\");\n",
+            "\n",
+            "fun main() {\n",
+            "\tstep(\"one\");\n",
+            "\tstep = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tstep(\"two\");\n",
+            "\tprint(\"after two\");\n",
+            "}\n",
+        ),
+        concat!("one plain\n", "two start\n", "two end\n", "after two\n",),
+    );
+}
+
+/// The second symptom: a trait default is emitted once per receiver type,
+/// from whichever body reaches it first, and it took that body's instance
+/// record — so a default first reached inside an awaiting body was emitted
+/// `async` and its synchronous call sites did not await it (`[object
+/// Promise]` on node, a refused build natively). It is the ui-todo `when(..,
+/// || text_input(..).width(..).padding(..))` refusal.
+#[test]
+fn b743_a_trait_default_first_reached_from_an_async_body_stays_synchronous() {
+    assert_async_closure_probe(
+        "native_probe_b743_trait_default.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "trait Sized2 {\n",
+            "\tfun base(self): i32;\n",
+            "\n",
+            "\tfun doubled(self): i32 {\n",
+            "\t\tself.base() * 2\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "struct Box2 {\n",
+            "\tvalue: i32,\n",
+            "}\n",
+            "\n",
+            "impl Box2 with Sized2 {\n",
+            "\tfun base(self): i32 {\n",
+            "\t\tself.value\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun apply(f: || i32): i32 {\n",
+            "\tf() + 1\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet slow = apply(|| {\n",
+            "\t\tsleep(1);\n",
+            "\t\tBox2 { value = 3 }.doubled()\n",
+            "\t});\n",
+            "\tprint(i\"slow {slow}\");\n",
+            "\tlet four = Box2 { value = 4 };\n",
+            "\tprint(i\"direct {four.doubled()}\");\n",
+            "}\n",
+        ),
+        concat!("slow 7\n", "direct 8\n",),
+    );
+}
+
+/// (b), (c), (e) for LITERALS, which already agreed before B743 and must keep
+/// doing so: a literal at a `|str| void` parameter, in a `|str| void` field
+/// and returned as one.
+#[test]
+fn b743_closures_that_await_at_synchronous_positions_still_float() {
+    assert_async_closure_probe(
+        "native_probe_b743_literals_float.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "struct Holder {\n",
+            "\trun: |str| void,\n",
+            "}\n",
+            "\n",
+            "fun twice(f: |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun make(): |str| void {\n",
+            "\t|what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\ttwice(|what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t});\n",
+            "\tprint(\"after twice\");\n",
+            "\tlet holder = Holder { run = |what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t} };\n",
+            "\t(holder.run)(\"field\");\n",
+            "\tprint(\"after field\");\n",
+            "\tlet made = make();\n",
+            "\tmade(\"made\");\n",
+            "\tprint(\"after made\");\n",
+            "}\n",
+        ),
+        concat!(
+            "a start\n",
+            "b start\n",
+            "twice done\n",
+            "after twice\n",
+            "field start\n",
+            "after field\n",
+            "made start\n",
+            "after made\n",
+            "a end\n",
+            "b end\n",
+            "field end\n",
+            "made end\n",
+        ),
+    );
+}
