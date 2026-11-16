@@ -26,6 +26,11 @@ written down.
 ## Unreleased
 
 <!-- family: fix -->
+**Language server: an empty import set no longer takes a file's whole analysis down (E362).** `import pkg::client::channels::channel::{  };` parses, and imports nothing. A file holding one, from a module the program loads, opened to a single `internal error: the compiler panicked analyzing ..` diagnostic in place of its own, with `a parsed brace set has at least one member` on stderr: every analysis computes the add-import edit for each auto-import candidate, that edit tries to extend an existing import of the candidate's module, and the extension asserted that a brace set has a member to insert beside. The grammar never promised that. An empty set is now left alone, like any set the edit cannot extend from its members' own spans, and the name gets its own `import` line; the add-import quick fix and "add all missing imports" answer the same way. Found opening a file in Kolt.
+
+---
+
+<!-- family: fix -->
 **A call through a `dyn` object is checked like any other dispatch: an `asset::emit`, a suspension or a write it reaches is no longer missed (B744).** `let erased: dyn Emitter = Token {}; print(erased.text());`, where `Token`'s `text` calls `std::web::asset::emit`, checked clean and then failed at run time with `ReferenceError: __emit_asset is not defined`; the same call on a plain `Token` was refused. The const-only check named its dispatch sites by the generic-dispatch record alone, and a call through an object is recorded apart, so the check never saw it. Every consumer now names a dispatch site one way (`dispatch_refine::dispatched_member`), and a call through an object charges every implementation of the member under the trait that declares it, whatever type is erased into the object and whatever file imported the implementation. Two more checks had the same hole and are fixed with it: a view held across an `async` member called through an object was not refused (B119's rule; the same call through a bound was), and lending a module-level `mut` binding to a member called through an object did not ask the implementation the object runs whether it writes the binding (B647's rule; the JavaScript build printed `1` where native printed `0`). Such programs are now refused at check, on both backends, in the existing words.
 
 ---

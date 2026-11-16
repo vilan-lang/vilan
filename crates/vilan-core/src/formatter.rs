@@ -3308,7 +3308,10 @@ enum ExtendOutcome {
 /// spans, never a reprint of the whole statement. A brace set holding a
 /// non-flat member (a further `::` continuation inside the set — not a shape
 /// a plain leaf list ever takes in practice) is left alone: [`insert_import`]
-/// falls back to a new import line rather than guess at reordering it.
+/// falls back to a new import line rather than guess at reordering it. So is
+/// an EMPTY set (`import a::{  };` parses — the set's member list may be
+/// empty — and imports nothing): it has no member span to anchor an edit on,
+/// and the set itself carries none, so the new name gets its own line too.
 fn try_extend_import<'src>(
     branch: &ImportBranch<'src>,
     module_path: &[&str],
@@ -3345,6 +3348,10 @@ fn try_extend_import<'src>(
                     _ => return ExtendOutcome::NoMatch,
                 }
             }
+            // An empty set has no member to insert beside (E362).
+            let Some((_, last)) = members.last() else {
+                return ExtendOutcome::NoMatch;
+            };
             match members.iter().find(|(name, _)| *name > leaf) {
                 Some((_, span)) => ExtendOutcome::Edit(
                     Span {
@@ -3353,15 +3360,13 @@ fn try_extend_import<'src>(
                     },
                     format!("{leaf}, "),
                 ),
-                None => {
-                    // The grammar guarantees a brace set has at least one member.
-                    let end = members
-                        .last()
-                        .expect("a parsed brace set has at least one member")
-                        .1
-                        .end;
-                    ExtendOutcome::Edit(Span { start: end, end }, format!(", {leaf}"))
-                }
+                None => ExtendOutcome::Edit(
+                    Span {
+                        start: last.end,
+                        end: last.end,
+                    },
+                    format!(", {leaf}"),
+                ),
             }
         }
     }
@@ -16552,6 +16557,66 @@ mod insert {
     }
 
     // --- Brace-set extension ---------------------------------------------------
+
+    // E362: `import a::{  };` parses — a set's member list may be empty — and
+    // such a set has no member span to insert beside. The probe used to
+    // assert the opposite and panicked the whole analysis of a file holding
+    // one (the language server computes this edit for every name it can offer
+    // an import for). An empty set is left alone, like any set the probe
+    // cannot extend from leaf spans alone: the new name gets its own line.
+    #[test]
+    fn an_empty_set_is_left_alone_and_the_leaf_gets_its_own_line() {
+        // However the empty braces are spelled, the set is kept byte for byte
+        // and the new statement sorts in above it.
+        for empty in ["{  }", "{}", "{ }", "{\n}"] {
+            let source = format!("import std::json::{empty};\n\nfun main() {{}}\n");
+            assert_eq!(
+                apply(&source, &["std", "json"], "Json"),
+                Some(format!("import std::json::Json;\n{source}")),
+                "the empty set spelled {empty:?}"
+            );
+        }
+        // In the middle of a run, the new statement takes its sorted slot.
+        assert_eq!(
+            apply(
+                "import std::io::print;\nimport std::json::{  };\nimport std::math::sqrt;\n",
+                &["std", "json"],
+                "Json",
+            )
+            .as_deref(),
+            Some(concat!(
+                "import std::io::print;\n",
+                "import std::json::Json;\n",
+                "import std::json::{  };\n",
+                "import std::math::sqrt;\n",
+            )),
+        );
+        // A root-level empty set reaches the empty module path, which is the
+        // prefix of nothing a caller asks for; it is stepped over the same way.
+        assert_eq!(
+            apply("import {};\n", &["std", "json"], "Json").as_deref(),
+            Some("import std::json::Json;\nimport {};\n"),
+        );
+        // An empty set NESTED in a set is a non-flat member of the outer one,
+        // which was already left alone.
+        assert_eq!(
+            apply("import std::{ json::{}, io };\n", &["std"], "math").as_deref(),
+            Some("import std::math;\nimport std::{ json::{}, io };\n"),
+        );
+    }
+
+    // E362: the parsed entry is the one auto-import completion drives, once
+    // per candidate; it answers an empty set the same way.
+    #[test]
+    fn a_parsed_source_steps_over_an_empty_set_too() {
+        let source = "import std::json::{  };\n\nfun main() {}\n";
+        let parsed = ParsedSource::parse(source).expect("an empty set parses cleanly");
+        let edit = parsed
+            .insert_import(&["std", "json"], "Json")
+            .expect("an edit");
+        assert_eq!(edit.span.into_range(), 0..0);
+        assert_eq!(edit.replacement, "import std::json::Json;\n");
+    }
 
     // A new leaf lands at its alphabetically-sorted position inside an
     // existing brace set — in the middle...

@@ -14823,6 +14823,87 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E362: a file holding an EMPTY import set (`import pkg::lib::ui::widget::{  };`
+    // — it parses, and imports nothing) from a module the program loads. The
+    // add-import edit asserted a set has a member, and every analysis computes
+    // that edit for each auto-import candidate (M29): the panic took the
+    // file's whole analysis with it, one "internal error" diagnostic where the
+    // file's own were, on open. The empty set is stepped over and the name
+    // gets its own line, for the candidate table and the quick fix alike.
+    #[test]
+    fn an_empty_import_set_from_a_loaded_module_does_not_take_the_analysis_down() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                concat!(
+                    "import pkg::helper::run;\n",
+                    "import pkg::lib::ui::widget::{  };\n\n",
+                    "fun main() {\n\trun();\n\t\n}\n",
+                ),
+            ),
+            (
+                "helper.vl",
+                "import pkg::lib::ui::widget::greet;\n\nexport fun run() {\n\tgreet();\n}\n",
+            ),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let messages: Vec<&str> = document
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.msg.as_str())
+            .collect();
+        assert!(messages.is_empty(), "the file analyzes clean: {messages:?}");
+        let marker = "run();\n\t";
+        let offset = document.line_index.text().find(marker).unwrap() + marker.len();
+        let mut offered: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label)
+            .filter(|label| label == "farewell" || label == "greet")
+            .collect();
+        offered.sort();
+        assert_eq!(
+            offered,
+            ["farewell", "greet"],
+            "the loaded module's names are auto-import candidates"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_import_set_from_the_target_module_still_offers_the_add_import() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::lib::ui::widget::{  };\n\nfun main() {\n\tfarewell();\n}\n",
+            ),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let fixes: Vec<(String, String)> = document
+            .diagnostics
+            .iter()
+            .flat_map(|diagnostic| document.quickfixes(program, diagnostic.span))
+            .filter(|fix| fix.title.starts_with("Import `farewell`"))
+            .map(|fix| (fix.title, fix.replacement))
+            .collect();
+        assert_eq!(
+            fixes,
+            vec![(
+                "Import `farewell` from pkg::lib::ui::widget".to_string(),
+                "import pkg::lib::ui::widget::farewell;\n".to_string(),
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // …and the exemption that carries the estate: a module carrying no marker
     // anywhere offers everything it declares, exactly as it did before the bit
     // existed (visibility.md §14).
