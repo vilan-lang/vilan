@@ -21,7 +21,7 @@
 # serves nothing pays nothing.
 [package]
 name = "vilan-rt-net"
-version = "0.56.0"
+version = "0.56.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The dual-stack listening socket for server programs the vilan compiler emits as Rust."
