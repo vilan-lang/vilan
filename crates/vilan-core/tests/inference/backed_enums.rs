@@ -4021,3 +4021,289 @@ fn b118_the_witness_is_a_pattern_that_closes_the_hole() {
         "e\nef\nee\n",
     );
 }
+
+// --- B746: a backed enum written through `&mut` ------------------------------
+//
+// A backed enum lowers to a bare JS string or number — an immutable primitive,
+// like `bool` and the scalar primitives — so a view of one must be the `(base,
+// key)` place that `base[key] = v` writes through. The view classifiers knew
+// `bool` (C5.3) but not a backed enum, so its `&mut` took the aggregate path:
+// the caller passed the value itself and the callee's `slot = ..` became
+// `Object.assign(value, ..)`, which threw on a string and wrote nothing on a
+// number. One rule now (`enum_lowers_to_js_primitive`): every type whose JS form
+// is an immutable primitive is a scalar view pointee.
+
+/// The two backed enums every B746 pin writes through, one per backing.
+const B746_ENUMS: &str = r#"
+import std::io::print;
+
+[derive(PartialEq)]
+enum Named {
+    A = "a",
+    B = "b",
+}
+
+[derive(PartialEq)]
+enum Numbered {
+    One = 1,
+    Two = 2,
+}
+
+fun set_named(slot: &mut Named) {
+    slot = Named::B;
+}
+
+fun set_numbered(slot: &mut Numbered) {
+    slot = Numbered::Two;
+}
+"#;
+
+#[test]
+fn b746_a_backed_enum_local_written_through_mut_is_written() {
+    // The item's repro: a `mut` local of each backing, written by a callee
+    // through `&mut`. Before: `numbered written: false`, then `named` threw
+    // "Cannot assign to read only property '0' of object '[object String]'".
+    assert_compiles_and_runs(
+        &format!(
+            "{B746_ENUMS}
+            fun main() {{
+                mut numbered = Numbered::One;
+                set_numbered(&mut numbered);
+                print(i\"numbered written: {{numbered == Numbered::Two}}\");
+                mut named = Named::A;
+                set_named(&mut named);
+                print(i\"named written: {{named == Named::B}}\");
+            }}
+            "
+        ),
+        "numbered written: true\nnamed written: true\n",
+    );
+}
+
+#[test]
+fn b746_a_backed_enum_field_written_through_mut_is_written() {
+    // A field place passes `[holder, slot]` as a `str` field always did, at
+    // one level and through a nested struct — and the sibling fields stay put.
+    assert_compiles_and_runs(
+        &format!(
+            "{B746_ENUMS}
+            struct Inner {{
+                named: Named,
+                numbered: Numbered,
+            }}
+            struct Outer {{
+                label: str,
+                inner: Inner,
+                numbered: Numbered,
+            }}
+            fun main() {{
+                mut outer = Outer {{
+                    label = \"x\",
+                    inner = Inner {{ named = Named::A, numbered = Numbered::One }},
+                    numbered = Numbered::One,
+                }};
+                set_numbered(&mut outer.numbered);
+                print(i\"field: {{outer.numbered == Numbered::Two}}\");
+                set_named(&mut outer.inner.named);
+                print(i\"nested str: {{outer.inner.named == Named::B}}\");
+                print(i\"nested int untouched: {{outer.inner.numbered == Numbered::One}}\");
+                set_numbered(&mut outer.inner.numbered);
+                print(i\"nested int: {{outer.inner.numbered == Numbered::Two}} {{outer.label}}\");
+            }}
+            "
+        ),
+        "field: true\nnested str: true\nnested int untouched: true\nnested int: true x\n",
+    );
+}
+
+#[test]
+fn b746_a_backed_enum_list_element_written_through_mut_is_written() {
+    // `&mut list[i]` of a scalar is the `[list, i]` place (as `&mut flags[0]`
+    // is for `bool`, C5.3); the other elements stay put.
+    assert_compiles_and_runs(
+        &format!(
+            "{B746_ENUMS}
+            fun main() {{
+                mut named = [Named::A, Named::A];
+                set_named(&mut named[1]);
+                print(i\"{{named[0] == Named::A}} {{named[1] == Named::B}}\");
+                mut numbered = [Numbered::One, Numbered::One];
+                set_numbered(&mut numbered[0]);
+                print(i\"{{numbered[0] == Numbered::Two}} {{numbered[1] == Numbered::One}}\");
+                let view = &mut named[0];
+                set_named(view);
+                print(i\"through a view binding: {{named[0] == Named::B}}\");
+            }}
+            "
+        ),
+        "true true\ntrue true\nthrough a view binding: true\n",
+    );
+}
+
+#[test]
+fn b746_a_generic_mut_self_write_monomorphized_at_a_backed_enum_is_written() {
+    // The std shape the item names (`store_apply_at`'s leaf `self = ..`): a
+    // `&mut self` method writing `self`, called directly, through a generic
+    // bounded on the trait, and a generic `&mut T` write instantiated at each
+    // backing — the transformer's per-instance half of the rule.
+    assert_compiles_and_runs(
+        &format!(
+            "{B746_ENUMS}
+            trait Reset {{
+                fun reset(&mut self);
+            }}
+            impl Named with Reset {{
+                fun reset(&mut self) {{
+                    self = Named::B;
+                }}
+            }}
+            impl Numbered with Reset {{
+                fun reset(&mut self) {{
+                    self = Numbered::Two;
+                }}
+            }}
+            fun reset_any<T: Reset>(slot: &mut T) {{
+                slot.reset();
+            }}
+            fun put<T>(slot: &mut T, value: T) {{
+                slot = value;
+            }}
+            struct Holder {{
+                named: Named,
+            }}
+            fun main() {{
+                mut named = Named::A;
+                named.reset();
+                print(i\"method: {{named == Named::B}}\");
+                mut numbered = Numbered::One;
+                reset_any(&mut numbered);
+                print(i\"bounded generic: {{numbered == Numbered::Two}}\");
+                mut holder = Holder {{ named = Named::A }};
+                reset_any(&mut holder.named);
+                print(i\"bounded generic, field: {{holder.named == Named::B}}\");
+                mut other = Numbered::One;
+                put(&mut other, Numbered::Two);
+                mut text = Named::A;
+                put(&mut text, Named::B);
+                print(i\"generic put: {{other == Numbered::Two}} {{text == Named::B}}\");
+            }}
+            "
+        ),
+        "method: true\nbounded generic: true\nbounded generic, field: true\ngeneric put: true true\n",
+    );
+}
+
+#[test]
+fn b746_an_aggregate_holding_a_backed_enum_written_through_mut_is_written() {
+    // The aggregate path was always right for these: an `Option`, a tuple and a
+    // struct holding a backed enum are written whole through `&mut`.
+    assert_compiles_and_runs(
+        &format!(
+            "{B746_ENUMS}
+            struct Inner {{
+                named: Named,
+            }}
+            fun set_option(slot: &mut Option<Named>) {{
+                slot = Some(Named::B);
+            }}
+            fun set_pair(slot: &mut (Named, Numbered)) {{
+                slot = (Named::B, Numbered::Two);
+            }}
+            fun set_inner(slot: &mut Inner) {{
+                slot = Inner {{ named = Named::B }};
+            }}
+            fun main() {{
+                mut option: Option<Named> = None;
+                set_option(&mut option);
+                print(i\"option: {{option == Some(Named::B)}}\");
+                mut pair = (Named::A, Numbered::One);
+                set_pair(&mut pair);
+                print(i\"pair: {{pair.0 == Named::B}} {{pair.1 == Numbered::Two}}\");
+                mut inner = Inner {{ named = Named::A }};
+                set_inner(&mut inner);
+                print(i\"struct: {{inner.named == Named::B}}\");
+            }}
+            "
+        ),
+        "option: true\npair: true true\nstruct: true\n",
+    );
+}
+
+#[test]
+fn b746_a_match_or_is_over_a_backed_enum_view_tests_the_value() {
+    // The read side of the same rule: a view of a backed enum is a pair, so
+    // a `match` or an `is` over one tests the value read through it. std's
+    // derived `store_diff` matches `self` and `other`, both `&Self`; without
+    // the read-through it fell to its trap arm on the pair.
+    assert_compiles_and_runs(
+        &format!(
+            "{B746_ENUMS}
+            fun by_match(x: &Named): str {{
+                match x {{
+                    Named::A => \"a\",
+                    Named::B => \"b\",
+                }}
+            }}
+            fun by_deref(x: &Numbered): i32 {{
+                match *x {{
+                    Numbered::One => 1,
+                    Numbered::Two => 2,
+                }}
+            }}
+            fun by_mut(x: &mut Numbered): i32 {{
+                match x {{
+                    Numbered::One => 1,
+                    Numbered::Two => 2,
+                }}
+            }}
+            fun by_is(x: &Named): bool {{
+                x is Named::B
+            }}
+            struct Holder {{
+                named: Named,
+                numbered: Numbered,
+            }}
+            fun main() {{
+                mut holder = Holder {{ named = Named::B, numbered = Numbered::Two }};
+                print(by_match(&holder.named));
+                print(by_deref(&holder.numbered));
+                print(by_mut(&mut holder.numbered));
+                print(by_is(&holder.named));
+                let local = Named::B;
+                print(by_match(&local));
+                print(match &holder.named {{ Named::A => \"a\", Named::B => \"b\" }});
+            }}
+            "
+        ),
+        "b\n2\n2\ntrue\nb\nb\n",
+    );
+}
+
+#[test]
+fn b746_a_backed_enum_view_read_as_a_value_wants_its_star() {
+    // A backed enum's view joins the scalar views, so the transparent-
+    // references rule (C5.1, `*v` is the only way from view to value) reaches
+    // it exactly as it reaches `bool`: an operand or a by-value argument
+    // written `x` is refused and `*x` reads the value.
+    let program = |read: &str| {
+        format!(
+            "{B746_ENUMS}
+            fun takes(value: Named): bool {{
+                value == Named::B
+            }}
+            fun compared(x: &Named): bool {{
+                {read} == Named::B
+            }}
+            fun passed(x: &Named): bool {{
+                takes({read})
+            }}
+            fun main() {{
+                let named = Named::B;
+                print(i\"{{compared(&named)}} {{passed(&named)}}\");
+            }}
+            "
+        )
+    };
+    assert_fails_with(&program("x"), "a view can't be read as a value here");
+    assert_compiles_and_runs(&program("*x"), "true true\n");
+}

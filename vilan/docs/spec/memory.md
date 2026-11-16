@@ -281,7 +281,10 @@ assignment, so `let v = if c { &a } else { &b }` initializes no view
 binding, and as an argument or operand — `same(2, &2)` at a by-value
 parameter is refused with "drop the `&`") is a compile error, never
 a silent coercion to the pointee (so the `(base, key)` representation of a
-scalar view can't leak); write `*v` to copy the value out. A method call's
+scalar view can't leak); write `*v` to copy the value out. A *scalar* here
+is any type whose runtime value is an immutable host value — the numbers,
+`str`, `bool` and a backed enum (types §5.3) — and a `match` or an `is` over
+a scalar view tests the value it reads, as over `*v`. A method call's
 RECEIVER is not a value position: `v.method(..)` reads through the view to
 the referent place, a scalar's as an aggregate's (`n.abs()` with `n: &i32`,
 `s.len()` with `s: &str`). A closure's view

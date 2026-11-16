@@ -165,6 +165,12 @@ number holds exactly and the variant *is* that number: a discriminant
 past the bound would cross a host boundary as a different value than the
 source wrote. The continuation stops at the same edge.
 
+Because it is a bare host value, a backed enum is a **scalar** to a view,
+exactly like `bool`, `str` and the numbers (memory §6.3): `&mut level`
+names the place, a callee's `slot = Level::High` writes it, and the view
+is read as a value only through `*` (`*slot == Level::High`). A tagged enum
+is an aggregate to a view, as a struct is.
+
 ### Backed-enum conversions
 
 Every backed enum gets two members, synthesized by the compiler — no

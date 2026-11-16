@@ -1,6 +1,7 @@
 use crate::analyzer::{
     BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
     Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
+    enum_lowers_to_js_primitive,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
 use crate::error::{Error, Note};
@@ -6486,6 +6487,34 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// The subject of a `match` or an `is` test, as its patterns read it: the
+    /// VALUE. An aggregate view is the value's own JS reference, so it is the
+    /// subject unchanged (and a payload capture writes through it); a scalar
+    /// view is a `(base, key)` pair, which no pattern can test — `x is
+    /// Named::B` compared the pair against `"b"`, and a `match` over one fell
+    /// to its trap arm (or, over `bool`/`i32`/`str`, silently to the wrong leg).
+    /// So a scalar view subject is read through, exactly as `*subject` would
+    /// read it: a `&place` reads the place itself, anything else holding a pair
+    /// reads `pair[0][pair[1]]`. A scalar has no payload, so no leg can want
+    /// the pair (B577's wrapped views are an `Option` subject, kept by the
+    /// caller). B746 made every backed enum a scalar view, and std's derived
+    /// `store_diff` matches `self` and `other`, both `&Self`.
+    fn walk_tested_subject(
+        &mut self,
+        subject_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        if let Some(&Expr::Reference(place, _)) = self.program.entity_map.get(&subject_id)
+            && self.emits_scalar_view_ref(subject_id, place)
+        {
+            return self.walk_entity(place, block).unwrap_or(js::Node::Void);
+        }
+        let node = self
+            .walk_entity(subject_id, block)
+            .unwrap_or(js::Node::Void);
+        self.read_through_a_scalar_view(subject_id, node, block)
+    }
+
     /// Read the value out of a scalar `(base, key)` view: `view[0][view[1]]`.
     /// A view produced by a CALL is bound to a temp first, so the two reads do
     /// not evaluate it twice; a plain binding or reference is cheap to repeat.
@@ -6656,11 +6685,14 @@ impl<'src> Transformer<'src> {
     }
 
     /// Whether `type_id`, resolved under the active monomorphization substitution,
-    /// is a scalar the **view** machinery lowers to a `(base, key)` pair — a scalar
-    /// primitive (`SCALAR_PRIMITIVE_NAMES`), or `bool` (a numeric enum, so it is
-    /// not in that struct set). The analyzer's `is_scalar_view_pointee` is the
-    /// matching predicate; missing `bool` here routed a generic `&mut T` resolving
-    /// to `bool` down the aggregate `Object.assign` path — a silent no-op write.
+    /// is a scalar the **view** machinery lowers to a `(base, key)` pair — a type
+    /// that lowers to an immutable JS primitive: a scalar primitive
+    /// (`SCALAR_PRIMITIVE_NAMES`), `bool` or a backed enum
+    /// (`enum_lowers_to_js_primitive`). The analyzer's `is_scalar_view_pointee`
+    /// is the matching predicate over the same rule; missing `bool` here routed
+    /// a generic `&mut T` resolving to `bool` down the aggregate `Object.assign`
+    /// path — a silent no-op write — and missing a backed enum did the same to
+    /// a generic `&mut self` monomorphized at one (B746).
     fn resolves_to_scalar_view_pointee(&self, type_id: TypeId) -> bool {
         match self
             .program
@@ -6672,7 +6704,9 @@ impl<'src> Transformer<'src> {
                 .structs
                 .get(id)
                 .is_some_and(|struct_| SCALAR_PRIMITIVE_NAMES.contains(&struct_.name)),
-            Some(Type::Enum(id, _)) => Some(*id) == self.program.bool_enum_id,
+            Some(Type::Enum(id, _)) => {
+                enum_lowers_to_js_primitive(*id, self.program.bool_enum_id, &self.program.enums)
+            }
             _ => false,
         }
     }
@@ -9558,9 +9592,7 @@ impl<'src> Transformer<'src> {
             Expr::Is(subject_id, pattern) => {
                 // Evaluate the subject once into a temp; the test reads from it,
                 // and any captures alias its payload slots.
-                let t_subject = self
-                    .walk_entity(*subject_id, block)
-                    .unwrap_or(js::Node::Void);
+                let t_subject = self.walk_tested_subject(*subject_id, block);
                 let subject_name = self.ng.next_name();
                 block.push(js::Node::ConstVariable(js::Variable {
                     name: subject_name.clone(),
@@ -9616,9 +9648,13 @@ impl<'src> Transformer<'src> {
                     &mut self.payload_view_subject,
                     keeps_the_view.then_some(*subject_id),
                 );
-                let t_subject = self.walk_entity(*subject_id, block);
+                let t_subject = if keeps_the_view {
+                    self.walk_entity(*subject_id, block)
+                        .unwrap_or(js::Node::Void)
+                } else {
+                    self.walk_tested_subject(*subject_id, block)
+                };
                 self.payload_view_subject = outer_subject;
-                let t_subject = t_subject.unwrap_or(js::Node::Void);
                 // ...and a leg that does not capture it — a literal payload
                 // (`Some("a") =>` beside a `Some(let v) =>`) — tests the value
                 // read out of the kept subject.
@@ -14862,12 +14898,7 @@ impl<'src> Transformer<'src> {
                 matches!(struct_.name, "i32" | "u32" | "f64" | "BigInt" | "str")
             }),
             Some(Type::Enum(id, _)) => {
-                Some(*id) == self.program.bool_enum_id
-                    || self
-                        .program
-                        .enums
-                        .get(id)
-                        .is_some_and(|enum_| enum_.backing.is_some())
+                enum_lowers_to_js_primitive(*id, self.program.bool_enum_id, &self.program.enums)
             }
             _ => false,
         }

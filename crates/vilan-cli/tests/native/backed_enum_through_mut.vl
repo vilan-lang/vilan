@@ -1,0 +1,113 @@
+// B746 on both backends: a backed enum written through `&mut` - a local, a
+// field, a nested field, a list element, a `&mut self` write called directly
+// and through a generic, a generic `&mut T`, and the aggregates holding one - is
+// written; and a `match`/`is` over a view of one tests its value.
+
+import std::io::print;
+
+[derive(PartialEq)]
+enum Named {
+	A = "a",
+	B = "b",
+}
+
+[derive(PartialEq)]
+enum Numbered {
+	One = 1,
+	Two = 2,
+}
+
+trait Reset {
+	fun reset(&mut self);
+}
+
+impl Named with Reset {
+	fun reset(&mut self) {
+		self = Named::B;
+	}
+}
+
+impl Numbered with Reset {
+	fun reset(&mut self) {
+		self = Numbered::Two;
+	}
+}
+
+fun reset_any<T: Reset>(slot: &mut T) {
+	slot.reset();
+}
+
+fun put<T>(slot: &mut T, value: T) {
+	slot = value;
+}
+
+fun set_named(slot: &mut Named) {
+	slot = Named::B;
+}
+
+fun set_numbered(slot: &mut Numbered) {
+	slot = Numbered::Two;
+}
+
+struct Inner {
+	named: Named,
+	numbered: Numbered,
+}
+
+struct Outer {
+	inner: Inner,
+	numbered: Numbered,
+}
+
+fun set_option(slot: &mut Option<Named>) {
+	slot = Some(Named::B);
+}
+
+fun set_pair(slot: &mut (Named, Numbered)) {
+	slot = (Named::B, Numbered::Two);
+}
+
+fun by_match(x: &Named): str {
+	match x {
+		Named::A => "a",
+		Named::B => "b",
+	}
+}
+
+fun by_mut(x: &mut Numbered): i32 {
+	match x {
+		Numbered::One => 1,
+		Numbered::Two => 2,
+	}
+}
+
+fun main() {
+	mut numbered = Numbered::One;
+	set_numbered(&mut numbered);
+	print(i"numbered written: {numbered == Numbered::Two}");
+	mut named = Named::A;
+	set_named(&mut named);
+	print(i"named written: {named == Named::B}");
+	mut outer = Outer { inner = Inner { named = Named::A, numbered = Numbered::One }, numbered = Numbered::One };
+	set_numbered(&mut outer.numbered);
+	set_named(&mut outer.inner.named);
+	print(i"fields: {outer.numbered == Numbered::Two} {outer.inner.named == Named::B} {outer.inner.numbered == Numbered::One}");
+	mut kinds = [Named::A, Named::A];
+	set_named(&mut kinds[1]);
+	print(i"element: {kinds[0] == Named::A} {kinds[1] == Named::B}");
+	mut method = Named::A;
+	method.reset();
+	mut bounded = Numbered::One;
+	reset_any(&mut bounded);
+	mut generic = Named::A;
+	put(&mut generic, Named::B);
+	print(i"generic: {method == Named::B} {bounded == Numbered::Two} {generic == Named::B}");
+	mut option: Option<Named> = None;
+	set_option(&mut option);
+	mut pair = (Named::A, Numbered::One);
+	set_pair(&mut pair);
+	print(i"aggregates: {option == Some(Named::B)} {pair.0 == Named::B} {pair.1 == Numbered::Two}");
+	print(i"matched: {by_match(&outer.inner.named)} {by_mut(&mut outer.numbered)}");
+}
+
+main();
