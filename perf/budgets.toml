@@ -124,8 +124,8 @@ measured_at = "v0.54.0's seal"
 subject = "genapp:46"
 counter = "instructions:u"
 class = "reference"
-ceiling = 7_386_514_048
-measured_at = "v0.54.0's seal"
+ceiling = 7_516_332_480
+measured_at = "v0.56.0's seal"
 
 [[row]]
 subject = "example:math"
@@ -139,88 +139,88 @@ tolerance = 0.005
 subject = "example:watch"
 counter = "callgrind"
 class = "ci"
-ceiling = 330_710_277
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 333_074_145
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:browser"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_438_025_974
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 1_446_221_315
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:fullstack"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_008_654_855
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 3_024_379_680
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:router"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_570_762_250
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 1_578_024_354
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:reactive-ui"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_598_751_195
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 1_606_768_316
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:ssr"
 counter = "callgrind"
 class = "ci"
-ceiling = 3_414_418_750
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 3_445_099_287
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:canvas"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_450_748_347
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 1_460_244_070
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:rpc"
 counter = "callgrind"
 class = "ci"
-ceiling = 1_638_764_101
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 1_648_276_069
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:todo"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_100_030_241
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 4_129_096_903
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "example:walkthrough"
 counter = "callgrind"
 class = "ci"
-ceiling = 4_297_355_471
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 4_335_707_077
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[row]]
 subject = "genapp:46"
 counter = "callgrind"
 class = "ci"
-ceiling = 7_664_854_438
-measured_at = "v0.54.0's seal (ci rows from CI's perf job at 16a4da0533)"
+ceiling = 7_800_794_839
+measured_at = "v0.56.0's seal (ci rows from CI's perf job at eca174d439)"
 tolerance = 0.005
 
 [[growth]]
@@ -232,7 +232,7 @@ max_ratio = 2.3
 scenario = "leaf keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 1500
-green_seals = 4
+green_seals = 5
 blocking = true
 mandate = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
@@ -241,7 +241,7 @@ series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x 
 scenario = "shared.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 500
-green_seals = 4
+green_seals = 5
 blocking = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
 
@@ -249,7 +249,7 @@ series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x 
 scenario = "model.vl keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 600
-green_seals = 4
+green_seals = 5
 blocking = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - re-anchored in the same method body, `Channel::create` - the keystroke is at `get_client().get_safe()!.create_channel(org, name)` (the org parameter arrived with organizations, kolt@38a7ac9), hover on `create_channel(org, name)`, and the Find References probe moved from `fun global()` (gone) to `fun ids(talk` (`Channel::ids`, the mirrored store's key-set reader, used in four files none open); the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
 
@@ -257,7 +257,7 @@ series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x 
 scenario = "model.vl keystroke, importers open"
 metric = "cpu_ms"
 target_ms = 3000
-green_seals = 4
+green_seals = 5
 blocking = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the model.vl keystroke's new anchor (`create_channel(org, name)` in `Channel::create`) with client.vl, channel.vl and views.vl open beside it as before; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
 
@@ -265,7 +265,7 @@ series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x 
 scenario = "css keystroke"
 metric = "diagnostics_cpu_ms"
 target_ms = 1300
-green_seals = 4
+green_seals = 5
 blocking = true
 mandate = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - the anchors are unchanged; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program), so the figures start a new series."
@@ -274,98 +274,7 @@ series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x 
 scenario = "parse break"
 metric = "diagnostics_cpu_ms"
 target_ms = 2500
-green_seals = 4
+green_seals = 5
 blocking = true
 mandate = true
 series = "Order 56 (N186): target RULED 2026-11-03 by the owner (interim, ~1.1x the quiet estimate; re-taken at the Order 56 seal; the 500 ms mandate stays the arc's goal) - re-anchored from `channel_name.adopt(channel.current_name());` (gone from channel.vl with organizations, kolt@38a7ac9) to `let name = Channel { id }.current_name(g.talk());` in the same channel.vl (the hover card's channel arm) - a statement over the `talk.channels().at(id)` boundary, the `(` opened before it as before; the repair row (`parse repair`) is the undo of the same edit; the exhibit moved from kolt@46c5b59 (the Order 55 seal's pinned copy) to the owner's kolt@2684c70 (2026-11-02, organizations, editor, documents, tasks, desktop: about three times the program)."
-
-[[bump]]
-subject = "example:walkthrough"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (db-58 M175/F149/M195, http-58 F151/F152, peer-58 F163): std grew for every program - the SqlValue trait and the optional row readers in std::sqlite, ServerTimeouts and the keep-alive surface in std::http, Request::peer_address; every ci row rose x1.0006-x1.0031 and the walkthrough, the widest reader of std, crossed its limit (CI read x1.0052 of the ceiling at next 09032e8f where the limit stood at x1.0050; x1.0037 at 46ff5439, x1.0005 at 9e09acf0 before db-58)"
-item = "M175"
-
-[[bump]]
-subject = "example:ssr"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0057 of the ceiling at next 7ca039b0 where the limit stood at x1.0050"
-item = "M199"
-
-[[bump]]
-subject = "example:todo"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0056 of the ceiling at next 7ca039b0 where the limit stood at x1.0050"
-item = "M199"
-
-[[bump]]
-subject = "example:canvas"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0049 of the ceiling at next 7ca039b0 where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
-item = "M199"
-
-[[bump]]
-subject = "example:fullstack"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0047 of the ceiling at next 7ca039b0 where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
-item = "M199"
-
-[[bump]]
-subject = "example:watch"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (the std growth the example:walkthrough row carries, plus M199's cell-borrow analysis, about x1.0025 on every row): CI read x1.0042 of the ceiling at next 7ca039b0 where the limit stood at x1.0050 - under it, bumped with the two red rows so the row does not flip on the next small change"
-item = "M199"
-
-[[bump]]
-subject = "example:browser"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0006 at next 85ce6095, x1.0011 with M202's fix; a build with the element recording taken out entirely read the same, so the residual is not the per-head work (most likely code layout under one codegen unit, M116)"
-item = "M202"
-
-[[bump]]
-subject = "genapp:46"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0054 at next 85ce6095, x1.0008 with M202's fix (no tag resolved in a world with no [element] function, heads recorded by a push, Function back to 264 bytes); about x1.0034 of the ceiling, under the limit, but more than +0.05% over the pre-merge count"
-item = "M202"
-
-[[bump]]
-subject = "example:reactive-ui"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0008 at next 85ce6095, x1.0012 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
-item = "M202"
-
-[[bump]]
-subject = "example:router"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0012 at next 85ce6095, x1.0012 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
-item = "M202"
-
-[[bump]]
-subject = "example:rpc"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (typed elements, native-ui.md section 12): callgrind against next e15985d2 (before typed elements): x1.0013 at next 85ce6095, x1.0011 with M202's fix (the fix leaves these rows where next had them, so their residual is not the per-head work)"
-item = "M202"
-
-[[bump]]
-subject = "genapp:46"
-class = "ci"
-ratio = 1.01
-reason = "Order 58 (B740, a miscompile fix: a hidden context parameter is bare only where every entry has the value, 67372fb4): callgrind on one machine 7,492,274,724 at next 9cf4669e to 7,613,935,515 with the fix (x1.0162). The context analysis itself moved by 3.6M; the rest is downstream of 815 strict but uncovered functions in genapp-46 that now hold an Option and take a `Some(..)` wrap or a `None` argument per call, where the base passed `undefined`. That is the cost of passing the right value; M204 asks whether the wraps can be cheaper"
-item = "M204"
-
-[[bump]]
-subject = "genapp:46"
-class = "reference"
-ratio = 1.01
-reason = "Order 58's seal (next ceb5b6ff against the ceiling of v0.54.0's seal): x1.0176 in instructions:u. The order's costs on this subject, each measured when it landed: typed elements x1.0008 (M202), B740's Option contexts x1.0162 to x1.0170 (a miscompile fix; 815 strict but uncovered functions in genapp-46 now take a wrap or a None per call), B742 and B741 x1.0007. Every other reference row is inside its limit (x1.0045 to x1.0094)"
-item = "M204"

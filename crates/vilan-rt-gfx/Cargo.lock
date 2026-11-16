@@ -2766,11 +2766,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vilan-rt"
-version = "0.55.1"
+version = "0.56.0"
 
 [[package]]
 name = "vilan-rt-gfx"
-version = "0.55.1"
+version = "0.56.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2793,7 +2793,7 @@ dependencies = [
 
 [[package]]
 name = "vilan-rt-poll"
-version = "0.55.1"
+version = "0.56.0"
 dependencies = [
  "libc",
  "vilan-rt",

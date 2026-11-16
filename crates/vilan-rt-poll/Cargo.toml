@@ -20,7 +20,7 @@
 # FFI call per platform, with its reason.
 [package]
 name = "vilan-rt-poll"
-version = "0.55.1"
+version = "0.56.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The readiness wait behind the event loop of programs the vilan compiler emits as Rust."

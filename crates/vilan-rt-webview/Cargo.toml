@@ -29,7 +29,7 @@
 # native chapter says what that does and does not hold.
 [package]
 name = "vilan-rt-webview"
-version = "0.55.1"
+version = "0.56.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The desktop window of programs the vilan compiler emits as Rust."
