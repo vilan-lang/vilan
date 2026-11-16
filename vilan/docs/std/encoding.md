@@ -167,6 +167,7 @@ value.kind(): JsonKind
 value.is_null(): bool
 value.field(name: str): JsonValue
 value.has_field(name: str): bool
+value.keys(): List<str>  // an object's keys; empty for anything else
 value.elements(): List<JsonValue>
 value.tag(): str         // an enum discriminator, NOT a type — see below
 ```
@@ -185,6 +186,13 @@ none of the six — `==` answers `false` for it, as it always did, and an
 exhaustive `match` over `JsonKind` panics naming it. `has_field` is the
 check that keeps you out of that case.
 
+`keys()` is how an object whose keys are DATA is walked — a map sent as
+JSON, a set of named settings — where `field` needs the name up front. The
+keys come in JavaScript's order, `Object.keys`'s: integer-like keys
+ascending first, then the rest as they were written. Anything that is not
+an object answers the empty list, so an array, a string, `null` and a
+missing field all have no keys rather than their indices or a throw.
+
 `tag()` answers a different question and is not a spelling of `kind()`: it
 reads an **externally-tagged enum's discriminator** — the string itself for a
 bare `"Variant"`, the single key for a `{"Variant":…}` object. That is what a
@@ -200,6 +208,10 @@ fun main() {
 	print(value.kind() == JsonKind::Object);        // true
 	print(value.field("name").kind().value());      // string
 	print(value.has_field("age"));                  // false
+	for key in value.keys() {
+		print(key);                                 // name, then tags
+	}
+	print(value.field("tags").keys().len());        // 0 — an array has no keys
 
 	for element in value.field("tags").elements() {
 		if element.kind() == JsonKind::String {
@@ -464,11 +476,41 @@ reader's are.
 
 ## Base64 (`std::base64`)
 
-URL-safe alphabet, no padding (the JWT flavor):
+Two flavours. The URL-safe alphabet with no padding (the JWT flavor), and
+the standard alphabet, padded — what a file upload, a data URL or an email
+part carries, and what node's `Buffer.toString("base64")` writes:
 
 ```vilan,fragment
 fun encode_url(bytes: Bytes): str
 fun decode_url(text: str): Option<Bytes>
+fun encode(bytes: Bytes): str             // standard alphabet (`+`, `/`), padded with `=`
+fun decode(text: str): Option<Bytes>      // strict: `None` unless `encode` could have written it
+```
+
+`decode` is strict where node's `Buffer.from(text, "base64")` is not: node
+skips characters it does not know, accepts the URL-safe pair, and decodes a
+truncated or unpadded tail into fewer bytes. Here the length must be a
+multiple of four, every character must be in the standard alphabet — no
+`-`/`_`, no whitespace or line breaks — the `=` padding may only end the
+text, and the bits it leaves over must be zero. So every text `decode`
+accepts is the one encoding of its bytes, and a mangled upload is `None`
+instead of different data. Strip line breaks first if a source wraps its
+base64 (MIME does, at 76 columns).
+
+```vilan
+import std::base64::{ decode, encode };
+import std::bytes::{ decode_utf8, encode_utf8 };
+
+fun main() {
+	let encoded = encode(encode_utf8("héllo"));
+	print(encoded);                               // aMOpbGxv
+	match decode(encoded) {
+		Some(let bytes) => print(decode_utf8(bytes)), // héllo
+		None => print("not base64"),
+	}
+	print(decode("aMOpbGxv\n").is_none());          // true — a line break is refused
+	print(decode("aMOpbGx").is_none());            // true — the length is not a multiple of four
+}
 ```
 
 ## Percent-encoding (`std::url`)

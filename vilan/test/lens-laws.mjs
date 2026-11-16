@@ -2013,6 +2013,7 @@ function insert_at2(self, at4, value, $y) {
 }
 function audit(self, before, changes) {
 	const $cm = self[0].v[6];
+	const check = $cm[1];
 	if ($cm[0] === 0) {
 
 	} else {
@@ -2025,7 +2026,7 @@ function audit(self, before, changes) {
 		return;
 	}
 	const problem = peek2(self, (held2) => {
-		return $cm[1]($cn[1], held2, changes);
+		return check($cn[1], held2, changes);
 	});
 	const $cs = problem;
 	if ($cs[0] === 0) {
@@ -2036,6 +2037,7 @@ function audit(self, before, changes) {
 }
 function update(self, change4, $cd) {
 	const $ce = self[0].v[6];
+	const _check = $ce[1];
 	let $cj = null;
 	if ($ce[0] === 0) {
 		$cj = [ 0, peek2(self, (held2) => {
@@ -4935,8 +4937,9 @@ function entries2(self, $ju) {
 				record2(log, [ 2, entries_of(storage) ]);
 			} else {
 				const $jL = leaving.v;
+				const value = __clone($jL[1]);
 				if ($jL[0] === 0) {
-					record2(log, [ 1, __clone(key6), $jL[1] ]);
+					record2(log, [ 1, __clone(key6), value ]);
 				}
 			}
 			$jz = undefined;
@@ -4960,6 +4963,7 @@ function cursor4(self) {
 }
 function update2(self, change4, $cd) {
 	const $jM = self[0].v[6];
+	const _check = $jM[1];
 	let $jN = null;
 	if ($jM[0] === 0) {
 		$jN = [ 0, peek2(self, (held2) => {
@@ -5054,6 +5058,7 @@ function length4(self) {
 }
 function audit2(self, before, changes) {
 	const $ku = self[0].v[6];
+	const check = $ku[1];
 	if ($ku[0] === 0) {
 
 	} else {
@@ -5066,7 +5071,7 @@ function audit2(self, before, changes) {
 		return;
 	}
 	const problem = peek(self, (held2) => {
-		return $ku[1]($kv[1], held2, changes);
+		return check($kv[1], held2, changes);
 	});
 	const $kw = problem;
 	if ($kw[0] === 0) {
@@ -5077,6 +5082,7 @@ function audit2(self, before, changes) {
 }
 function update3(self, change4, $cd) {
 	const $kq = self[0].v[6];
+	const _check = $kq[1];
 	let $kr = null;
 	if ($kq[0] === 0) {
 		$kr = [ 0, peek2(self, (held2) => {

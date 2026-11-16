@@ -1,0 +1,15 @@
+# A todo list on `std::ui::kit` (native-ui.md part P4's exit test): a text input
+# adds an item (Enter, or the Add button), a checkbox checks it off, a button
+# removes it — with every colour, radius and spacing supplied by the app, none by
+# the kit. NATIVE ONLY — the JavaScript build refuses `std::ui` by name — so it
+# is built with the Rust backend:
+#
+#   vilan run --backend rust .              the window
+#   vilan run --backend rust . -- --check   the tree driven without a window
+#
+# It needs a GPU adapter (any Vulkan, Metal, DirectX 12 or OpenGL driver, or
+# Mesa's software Vulkan) and, on Linux, an X11 or Wayland session. See the
+# native guide's "Components" section.
+[package]
+name = "ui_todo"
+root = "."

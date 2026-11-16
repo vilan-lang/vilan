@@ -1,0 +1,176 @@
+// `std::ui::kit`'s single-line text input (native-ui.md P4), bound both ways to a
+// `str` signal.
+//
+// THE SHAPE. A focusable row (the app's look, its padding, its width) around a
+// horizontal `scroll` that clips and moves the text, around a stack of the text
+// and, while the value is empty, the placeholder. The caret, the selection, the
+// keys, the pointer and undo are the kit's editor (`editing.vl`), shared with the
+// text area; its head says how indices count and how undo coalesces.
+//
+// THE KEYS: Left and Right move a grapheme (with Ctrl or Alt, a word), Home and End
+// to the ends, each extending the selection with Shift; Left or Right with a
+// selection and no Shift collapse it to that side; Backspace and Delete remove the
+// selection, or a grapheme (with Ctrl or Alt, a word) before or after the caret;
+// Ctrl+A (or Cmd+A) selects everything; Ctrl+Z undoes, Ctrl+Shift+Z and Ctrl+Y
+// redo; Enter runs `on_submit`. Typed text arrives as text events (`on_text`) and
+// replaces the selection. A press places the caret (with Shift, extends the
+// selection to it) and a drag while the button is down extends it — off the input
+// and off the window too (the press captured the pointer): past the field's left or
+// right edge each move extends the selection one grapheme beyond what shows, and
+// the caret's reveal scrolls the field by it; held still out there, a timer keeps
+// stepping (`editing.vl`'s head). A double click selects the word under
+// the pointer (a run of word graphemes, or of the others: a double click on a space
+// selects the spaces), and a drag from it extends by whole words; a triple click
+// selects everything, and a drag from it changes nothing.
+//
+// The caret blinks while the input, its window and nothing else hold it still
+// (`editing.vl`'s head says when; no timer otherwise).
+//
+// Cut, copy and paste are the editor's (`editing.vl`'s head); a pasted line break
+// becomes a space here.
+//
+// Not here: an input method's composition (P5: the text carries no preedit run;
+// see the docs).
+
+[platform("@process")] mod self;
+
+import pkg::gfx::{ Color, Dp, KeyPress };
+import pkg::option::Option::{ None, Some };
+import pkg::reactive::{ Signal, SignalCell, turn_scope };
+import pkg::ui::kit::editing::{ Editor, Selection };
+import pkg::ui::{
+	Attributes,
+	Bindable,
+	Child,
+	Element,
+	Role,
+	ScrollAxis,
+	Style,
+	row,
+	scroll,
+	stack,
+	stop_event,
+	style,
+	text,
+	when,
+};
+
+/// A single-line text input. See `text_input(..)`.
+export struct TextInput {
+	element: Element,
+	editor: Editor,
+	placeholder: SignalCell<str>,
+	placeholder_look: SignalCell<Style>,
+}
+
+/// A single-line text input over `value`: what it shows is the cell's value, and
+/// every edit writes the cell. Its role is `Role::TextField`; its look, its size
+/// and its label are the app's (`style`, `padding`, `width`, `label`), and so are
+/// the caret's and the selection's colours (`caret`, `selection_color`), which
+/// otherwise follow the text's. The text style it inherits, or is given with
+/// `style`, is the text's.
+///
+/// A text wider than the input scrolls sideways to keep the caret in view; the
+/// caret and the selection show while the input has the focus.
+export fun text_input(value: SignalCell<str>): TextInput {
+	let placeholder: SignalCell<str> = Signal::new("");
+	let placeholder_look: SignalCell<Style> = Signal::new(style());
+	let field = text().child(value);
+	let empty = value.derive(|now: str| now.is_empty());
+	let shell = row().role(Role::TextField).focusable().child(scroll()
+		.axis(ScrollAxis::Horizontal)
+		.grow(1.0)
+		// Its own width, never the field's: a scroll's child keeps its size along
+		// the axis it scrolls, so a long value stays on one line and scrolls.
+		.child(stack()
+			.child(when(empty, || text().style(placeholder_look).child(placeholder)))
+			.child(field)));
+	let editor = Editor::new(value, field.element.node, shell.element(), false, None, None);
+	editor.wire();
+	TextInput { element = shell.element(), editor, placeholder, placeholder_look }
+}
+
+export impl TextInput with Attributes {
+	fun element(self): Element {
+		self.element
+	}
+}
+
+export impl TextInput with Child {
+	fun into_element(self): Element {
+		self.element
+	}
+}
+
+export impl TextInput {
+	/// What it shows while its value is empty: a `str`, or a signal of one.
+	fun placeholder<V: Bindable<str>>(self, own placeholder: V): TextInput {
+		let cell = self.placeholder;
+		placeholder.bind(|now: str| cell.set(now));
+		self
+	}
+
+	/// The placeholder's style (over the text style it inherits): a `Style`, or a
+	/// signal of one.
+	fun placeholder_style<V: Bindable<Style>>(self, own look: V): TextInput {
+		let cell = self.placeholder_look;
+		look.bind(|now: Style| cell.set(now));
+		self
+	}
+
+	/// The caret's colour and width.
+	fun caret(self, color: Color, width: Dp): TextInput {
+		self.editor.set_caret_look(color, width);
+		self
+	}
+
+	/// The selection's colour (drawn under the selected text).
+	fun selection_color(self, color: Color): TextInput {
+		self.editor.set_selection_color(color);
+		self
+	}
+
+	/// Enter, while it has the focus, runs `handler` with the value (and goes no
+	/// further up the tree).
+	fun on_submit(self, handler: (|str| void) context turn_scope): TextInput {
+		let editor = self.editor;
+		self.on_key(|key: KeyPress| {
+			if editor.submits(key) {
+				handler(editor.value.get());
+				stop_event();
+			}
+		})
+	}
+
+	/// Disabled while `disabled` (a `bool`, or a signal of one) holds: no edit, no
+	/// caret, and Tab and a press pass it by.
+	fun disabled<V: Bindable<bool>>(self, own disabled: V): TextInput {
+		let editor = self.editor;
+		disabled.bind(|value: bool| editor.set_disabled(value));
+		self
+	}
+
+	/// Whether it is disabled now.
+	fun is_disabled(self): bool {
+		self.editor.is_disabled()
+	}
+
+	/// Whether its caret is drawn now: it has the focus and is enabled, and the
+	/// caret is in the shown half of its blink. The caret blinks only while its
+	/// window has the focus too, and shows again at every edit and caret move.
+	fun caret_shown(self): bool {
+		self.editor.caret_shown()
+	}
+
+	/// The selection now (both ends at the caret when nothing is selected), kept
+	/// within the value.
+	fun selection(self): Selection {
+		self.editor.selection()
+	}
+
+	/// Selects from `anchor` to `caret` (kept within the value; the tree moves an
+	/// index inside a grapheme to its start when it draws it).
+	fun select(self, anchor: usize, caret: usize) {
+		self.editor.select(anchor, caret);
+	}
+}

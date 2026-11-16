@@ -3,11 +3,14 @@
 Read this fully before touching code. `CLAUDE.md` states the contract (correctness over
 speed of delivery, refactor-first, proven-before-implemented, root causes over
 symptoms); this file is the map and the accumulated scar tissue. Where the two seem to
-conflict, `CLAUDE.md` wins.
+conflict, `CLAUDE.md` wins. `WISDOM.md` is the method behind both: symptoms mapped to
+likely causes, the principles (C1 onward) with when they hold and how to check them, and
+the cases they came from, by tracker id and commit. Start there when a golden moves, a leg
+is red only in CI, the backends disagree, or an answer is wrong only after an edit.
 
 ## The lay of the land
 
-Rust workspace, fifteen crates, plus the language's own tree:
+Rust workspace, seventeen crates, plus the language's own tree:
 
 - `crates/vilan-core` — the whole compiler as a library. Pipeline order: `lexing.rs` /
   `token.rs` → `parsing.rs` (a handwritten recursive-descent frontend; replaced
@@ -74,6 +77,12 @@ Rust workspace, fifteen crates, plus the language's own tree:
   CLI's) lives here and routes the signals to `vilan_rt::http::request_termination`; the
   crate's own code is `forbid(unsafe_code)`, and a generated cargo project names it only
   when the program starts an HTTP server.
+- `crates/vilan-rt-net` — a native server's IPv6 listening socket, bound DUAL-STACK as node's
+  (F164): `IPV6_V6ONLY` is cleared between `socket()` and `bind()`, which std cannot reach, so
+  the `setsockopt` is FFI (`libc`/`windows-sys`) here. It depends on nothing of vilan's and
+  answers a std `TcpListener`; `vilan-rt-signal::install` registers it through
+  `vilan_rt::http::set_ipv6_binder`, so it rides every program that starts a server, and
+  `vilan-rt`'s unit tests take it as a dev-dependency.
 - `crates/vilan-rt-term` — the terminal MODE behind `std::process::keys()` for emitted Rust
   (A173 S2, terminal.md Q3): raw mode is FFI (`tcsetattr` on unix, `SetConsoleMode` on
   Windows), so `libc`/`windows-sys` live here, with a signal handler that restores the
@@ -81,6 +90,169 @@ Rust workspace, fifteen crates, plus the language's own tree:
   `keys()`. The KEYS are not here — std's `KeyDecoder` (vilan) decodes the bytes
   `vilan-rt`'s stdin pump reads, the same on both backends. Unlike its three siblings it
   cannot be `forbid(unsafe_code)`: every `unsafe` block carries its reason.
+- `crates/vilan-rt-poll` — the event loop's readiness WAIT for emitted Rust (F160): blocking
+  until one of several sockets is ready is FFI (`poll(2)` on unix, `WSAPoll` on Windows), so
+  `libc`/`windows-sys` live here behind one call, `vilan_rt::executor::install_readiness`.
+  Which sockets, which deadline and the loopback bell another thread rings are `vilan-rt`'s
+  (`IoSource::interest`, `LoopWaker`); a generated cargo project names this crate only when
+  the program starts a server, dials a WebSocket or reads stdin — without it the loop keeps
+  its 1 ms tick. Its `unsafe` is the one FFI call per platform, with its reason.
+  The loop can also be HOSTED (native-ui.md R8): `vilan_rt::executor::turn` /
+  `Program::turn` run everything runnable and return what to wait for instead of
+  blocking, the host's wake (`install_host`) is called by every `LoopWaker`, a
+  termination and the socket helper, and `vilan_rt_poll::install_hosted` adds
+  that helper (`Poller`), a thread that exists only while sockets are watched and
+  waits only BETWEEN turns — so program code (window events included) runs only
+  inside a turn. The owned loop (`block_on`, `run_pending`) is the same `drive`
+  in the mode that blocks; `vilan-rt-poll/tests/support` is the reference host.
+- `crates/vilan-rt-webview` — `std::window` for emitted Rust (F1 M2, native-objective.md
+  D2/D2a): a desktop window showing a web page in the OS webview, through `wry` + `tao`. NOT a
+  workspace member — the root manifest EXCLUDES it, and it keeps its own `Cargo.lock`,
+  because the Linux half is the gtk3 stack, which carries an unsound advisory with no gtk3
+  fix (RUSTSEC-2024-0429), licences outside the compiler's `about.toml` (MPL-2.0, Apache-2.0
+  WITH LLVM-exception) and a pin that would drag the compiler's own `toml` back. So no
+  workspace gate reaches it: `scripts/ci-local.sh webview` (ci.yml's `webview` job) runs
+  its fmt, clippy, tests, audit (that advisory ignored by name), its own notices
+  (`crates/vilan-rt-webview/about.toml`, `THIRD-PARTY-NOTICES.txt`) and the xvfb end-to-end
+  proof (`crates/vilan-cli/tests/desktop_shell.rs`), and the `windows` leg cross-lints it. It
+  is still embedded like its siblings, with its lockfile (`RT_WEBVIEW_LOCK`), which seeds a
+  desktop program's generated project. Threading: the platform loop owns the main thread
+  (`vilan_rt_webview::run`), the program and its executor run on a second one, and an open
+  window is an `IoSource` the shell wakes through a `LoopWaker`. Building or running it
+  locally needs `libwebkit2gtk-4.1-dev` and `libgtk-3-dev` (and `xvfb` for the proof).
+- `crates/vilan-rt-gfx` — the GPU graphics layer, the Rust half of `std::gfx` (native-ui.md
+  part P1; its section 9 RULED): a `Scene` of primitives in dp (rounded rectangle with
+  gradient and per-side border, analytic shadow, text run, underline, image; clip, transform,
+  opacity layer), drawn by a renderer of its own on `wgpu` (instanced quads, shapes from a
+  signed distance in the shader, paint order by an overlap test, R14) into a `winit` window or
+  an offscreen texture read back as RGBA; text shaped by `parley` and rasterised by `swash`
+  behind a crate-private interface (R15) into a glyph atlas with mask and colour pages that
+  evicts. NOT a workspace member (R11: weight, 368 packages in its lockfile; the audit is clean, and
+  every licence is on the compiler's list but BSL-1.0, accepted in its own `about.toml` for
+  `arboard`'s two Windows-only packages `clipboard-win` and `error-code`, to revisit under F181),
+  so it keeps its own `Cargo.lock`, `about.toml` and
+  `THIRD-PARTY-NOTICES.txt`, and `scripts/ci-local.sh gfx` (ci.yml's `gfx` job) runs its fmt,
+  clippy, tests, audit and notices; the `windows` leg cross-lints it. LINKED BY USE: a program
+  that reaches `std::gfx` (`vilan/std/src/gfx.vl`, every extern `__gfx_*`) names it in its
+  generated project, seeded with its `Cargo.lock` (`RT_GFX_LOCK`); the embed carries its
+  `.wgsl` shader with its `.rs` files. PATHS (gfx-path.md, RULED; `src/path/`) are coverage
+  masks `zeno` makes at the device size, kept in the glyph atlas under `AtlasKey::Path` (over
+  256 pixels a side, a texture of their own) and drawn as a tinted sprite; the SVG parser is
+  the crate's own (`path/svg.rs`), because `zeno`'s validator drops truncated data silently.
+  Its `src/host/` is the program's side: the extern
+  functions (a window crosses as its id, a frame as a token, a primitive as numbers, an event
+  as a kind code and numbers read one at a time) and the HOST (R8): the emitted `main` calls
+  `vilan_rt_gfx::host::install()` first and the host's `run_pending` / `block_on` in place of
+  the executor's, so `winit`'s loop owns the main thread and turns the program inside its
+  handlers — program code only inside a turn, a window event queued on the window's
+  `IoSource` first, frames only on demand, a failure out of a turn raised again after the
+  loop. Never keep a `wgpu` object in a `thread_local!` that drops: wgpu reads thread-local
+  storage of its own while dropping, and at thread exit the process aborted. A program
+  reaching both `std::window` and `std::gfx` is refused by name. The end-to-end proof is
+  `crates/vilan-cli/tests/gfx_window.rs` (the example under xvfb with pointer input injected
+  through XTEST by `examples/x11_input.rs`, and its offscreen goldens in
+  `crates/vilan-cli/tests/gfx/`), run by the `gfx` leg, which builds the compiler. Its golden images
+  (`tests/golden/`, tolerance one per channel) and the window example's xvfb proof skip with a
+  printed reason where there is no software adapter (Mesa's `mesa-vulkan-drivers`) or no
+  `xvfb`, and are REQUIRED under `VILAN_REQUIRE_GFX=1`; regenerate the goldens with
+  `VILAN_REGENERATE_GFX_GOLDENS=1` and LOOK at every image before committing it. Its test
+  font (Noto Mono, OFL-1.1, `tests/fonts/`) is test data; the crate bundles no font.
+  Its `src/ui/` is `std::ui`'s element tree (native-ui.md P2): the RETAINED tree lives here, in
+  one `taffy` tree per program with the solver (flexbox for rows and columns, a one-cell grid for
+  stacks), and a vilan element is a handle on it (`host::ui`'s `Node`, freed when it has neither
+  a handle nor a parent); text measures itself through the text system during layout, layout and
+  paint are separate passes, and every box is snapped with `Units`' rule, the renderer's. Part P3
+  made it incremental and interactive: every element keeps its subtree's nested `Scene` and a
+  change invalidates the one element and the chain above it. That scene is in the element's OWN
+  coordinates, placed by its parent's (`SceneBuilder::scene_at`: a whole-pixel offset the encoder
+  adds after snapping, so the pixels are the window-coordinate ones), and a box that only moved
+  invalidates its parent, not itself (F170; `scene_reads_size` says when a one-pixel change of
+  snapped size repaints it). The solver re-runs only taffy's dirty
+  chains and the snap visits only those (pinned against a full snap); the root's viewport cell is
+  a FIXED grid track — an `auto` one made every re-solve ask the root's content sizes, which taffy
+  keys by the parent's size, so the first re-solve after a resize re-measured every leaf. Style
+  is LAYERS per `style(..)` call (`ui/style.rs`, conditions resolved host-side), and hit testing,
+  routing with bubbling, focus and scrolling are `ui/input.rs`; the tree answers a `Route` and the
+  HOST calls the vilan handlers with nothing borrowed (`host::ui::run_route`, `stop`). A change to
+  a mounted tree asks its window for a frame (`host::ui`'s `change`). `vilan/std/src/ui.vl`'s
+  `__ui_*` externs ride `std::gfx`'s host table and reach; its end-to-end proofs are
+  `crates/vilan-cli/tests/ui_screen.rs` (recorded rectangles, goldens, a window) and
+  `ui_interaction.rs` (the counter with no window against a recorded listing, then by XTEST
+  pointer and keyboard; the 10,000-row list scrolled and clicked), in the same `gfx` leg.
+  `crates/vilan-rt-gfx/examples/ui_measure.rs` prints the layout and paint costs (release).
+  ICONS (gfx-path.md S3; `ui/icon.rs` has the rules): the `icon` element draws an `Icon` (path
+  data, box, paint) through the path primitive, in the inherited TEXT colour, at its `size` or
+  the inherited text size; decorative unless labelled. `host/ui/icons.rs` parses the data once
+  per program per data, and malformed data FAILS the program naming the byte. Its screen in
+  `ui_screen.rs` (`--icons`) has its own listing and goldens (`tests/ui/icon-rects.txt`,
+  `icons-{100,150}.png`). ICON SETS (S4, R11) are generated packages outside std: Lucide's is
+  `vilan/packages/lucide` (a `[library]`, `src/icons` its `generated` root), made by
+  `scripts/lucide-native.mjs` from a pinned `lucide-static` tarball fetched OUTSIDE the
+  repository (`generate <package dir> vilan/packages/lucide`; the README has the steps).
+  Never edit `src/icons/lib.vl` or `icons.tsv`: `vilan-cli/tests/lucide_package.rs` holds the
+  source to the script's `render` of the data, and the GPU crate's `path/lucide_sweep.rs`
+  draws every icon against `tiny-skia` (a dev-dependency). That sweep found two `zeno`
+  stroker defects, fixed before stroking in `path/mod.rs`'s `stroke_outline`: a DOT (a
+  contour within `zeno`'s 0.01 merge distance, Lucide's `h.01`) drew nothing, and a round
+  join turning back 180 degrees drew flat.
+  Reactive children (R9: `each`, `when`, `swap` in `ui.vl`) keep their place through a `Marker`
+  element (never laid out, painted, hit or listed) and change the tree only by `insert_before`
+  (a move when the element is already there) and `remove`, which is FINAL: it drops the
+  subtree's handlers (B738), so the host drops them with the tree no longer borrowed. The xvfb
+  suites share `crates/vilan-cli/tests/support/xvfb.rs`, whose `Running` ends its run's whole
+  process group on drop (N198). `std::ui::kit` (P4) is vilan in `vilan/std/src/ui/kit/`, one
+  PLURAL-named file per component (`buttons.vl` for `button`, `lists.vl` for `virtual_list`: a
+  module and an item of one name are ambiguous) re-exported by `ui/kit.vl`. The controls' only
+  host part is an EDITED text (`UiTree::text_edit`): a text shaped with each grapheme's box
+  (`text/editing.rs`, recorded only when asked) that paints its own caret and selection and
+  answers where a point or a step lands, in the program's UTF-16 indices.
+  `vilan/examples/ui-todo` is their exit test, in `ui_interaction.rs` with its own recorded
+  listing (`tests/ui/todo-check.txt`). The text input and the text area (P5,
+  `text_areas.vl`) share ONE editor, `ui/kit/editing.vl` (keys, pointer, undo); an index
+  at a soft wrap is on the LOWER visual line (`text/editing.rs`'s head is the rule), and the
+  tree's caret questions read the layout at the laid-out width (`laid_out_at`, set by the
+  snap), never only the painted one. `vilan/examples/ui-notes` is the area's exit test
+  (`tests/ui/notes-check.txt`). The virtual list is plain vilan over a `scroll` (a column
+  as tall as every row, the rows above the window as its top padding, the window an `each` over
+  a cell of its items); what it needed from the host is `on_resize` (told after a layout, and
+  `__ui_layout` lays out again when a handler changed the tree), an offset kept unclamped while
+  a layout is pending (`ScrollState::measured_at`), and Tab's reveal of an element with no box
+  yet waiting for the next layout (`pending_reveal`). Its ESTIMATED form (F174) measures each
+  built row by its solver height before snapping (`__ui_node_number(node, 7)`), keeps the heights
+  in `ui/kit/heights.vl` (two Fenwick trees, unmeasured rows at the measured mean), anchors the
+  offset by `lists.vl`'s `Hold` rule, and past 4,194,304 dp lays the column out relative to a base
+  kept in `f64` so no box carries a large `f32`; its exit test is the example's `--varied` mode
+  (`tests/ui/virtual-list-varied-check.txt`). POINTER CAPTURE (F172, `ui/input.rs`'s
+  module doc is the rule): the press's target (`UiTree::pressed`) gets every move and the release
+  until the button comes up; `pressed` holds on its chain, `hovered` stays geometric, the click is
+  decided by where the release lands; removal and `release_pointer` end it. Presses in a row are
+  counted in the tree by the time the input CARRIES (`Input::Pressed { time }`, stamped by the
+  shell; a delivered press carries 0), so the tree's pins choose the clock. The host asks
+  `UiTree::refresh_hover` after every layout pass, so content moving under a still pointer moves
+  the hover in the same frame. ELEMENT TIMERS (F176, `ui/timers.rs`'s module doc is the rule) live
+  in the tree beside the handlers and end with them (`remove`, `free`); the tree reads no clock,
+  and `host/ui/timers.rs` arms ONE executor timer for the earliest, so the shell's `wait_for`
+  needs no timer input of its own. The window's focus (winit's `Focused`) is event kind 11.
+  The kit's editor uses them for the caret's BLINK (a host flag on the edited text,
+  `text_caret_shown`: a repaint of its chain, no layout) and a drag held past the edge;
+  a `--check` listing STOPS the timers' clock with `ui::advance_clock` and steps it, so
+  no listing reads the wall clock (`host/ui/timers.rs`, "A stopped clock").
+  Cut, copy and paste are the editor's too; a `--check` listing pastes through
+  `gfx::use_memory_clipboard` (an in-memory backend behind the same worker), never the
+  system's. A key with Ctrl or Super held types no text (`host/input.rs`'s `types_text`).
+  THE CLIPBOARD (F173) is `host/clipboard.rs` over `arboard` (its only user), one object on a
+  thread of its own; its xvfb proof is `gfx_window.rs`'s, through `x11_input clipboard`. Never run
+  a clipboard-touching mode against the session's display: tests run it under `xvfb-run` only.
+  ACCESSIBILITY (P5): `ui/access.rs` turns the tree into an `accesskit` tree (pure; pinned by
+  `ui/access/tests.rs` and by the examples' `--check` listings through
+  `Element::accessibility()`) and plans an assistive tool's action as the focus, reveal,
+  pointer, key and text input a person would give; `host/access.rs` keeps one
+  `accesskit_winit` adapter per window (a window is made hidden, given its adapter, then
+  shown), publishes after a turn only while a tool listens, and carries actions out in a
+  turn. Its AT-SPI proof is `ui_interaction.rs`'s accessibility test on a private bus
+  (`tests/support/atspi.rs`), skipped without at-spi2-core. Never start AT-SPI's launcher
+  without a private `XDG_RUNTIME_DIR` and `GSETTINGS_BACKEND=memory`: it takes the user's
+  `$XDG_RUNTIME_DIR/at-spi/bus` and writes the accessibility switch into their dconf.
 - `crates/vilan-image` — `std::image`'s codec core (M185, proposal/image.md): decode with a
   header-checked pixel limit and EXIF orientation, a Lanczos3 resampler of its own (sines from
   additions and multiplications, so both backends get the same bits), crop, encode — over the

@@ -1,0 +1,60 @@
+// F156: `std::fs`'s four calls over the host options object print the same
+// lines on both backends — `create_dir_all` (and again over what it made),
+// `scan_dir`'s kinds, `read_dir_all`'s relative paths, `copy_dir`'s merge (an
+// overwritten file, a file with no counterpart left alone), and
+// `remove_dir_all` over a tree, a file and a path that is not there. The
+// listings are sorted, since neither host promises an order, and read with `/`
+// whatever the host's separator.
+import std::compare::Ord;
+import std::display::Display;
+import std::fs::{
+	copy_dir,
+	create_dir_all,
+	read_dir_all,
+	read_file_to_str,
+	remove_dir_all,
+	scan_dir,
+	stat,
+	write_file,
+};
+
+fun show_all(path: str): str {
+	read_dir_all(path).map(|entry| entry.replace("\\", "/")).sort().join(" ")
+}
+
+fun show_scan(path: str) {
+	let entries = scan_dir(path).sort_by(|a, b| a.name.compare(b.name));
+	for entry in entries {
+		print(
+			i"  {entry.name} dir={entry.is_directory} file={entry.is_file} link={entry.is_symlink}",
+		);
+	}
+}
+
+fun main() {
+	let root = "fs-options-probe";
+	remove_dir_all(root);
+	create_dir_all(root + "/src/sub/deeper");
+	create_dir_all(root + "/src/sub");
+	print(i"made: {stat(root + "/src/sub/deeper").is_some()}");
+	write_file(root + "/src/a.txt", "A");
+	write_file(root + "/src/sub/b.txt", "B");
+	print("scan src:");
+	show_scan(root + "/src");
+	print(i"all: {show_all(root + "/src")}");
+	create_dir_all(root + "/dst/deep");
+	write_file(root + "/dst/deep/extra.txt", "kept");
+	write_file(root + "/dst/deep/a.txt", "old");
+	copy_dir(root + "/src", root + "/dst/deep");
+	print(i"copied a: {read_file_to_str(root + "/dst/deep/a.txt")}");
+	print(i"copied b: {read_file_to_str(root + "/dst/deep/sub/b.txt")}");
+	print(i"extra: {read_file_to_str(root + "/dst/deep/extra.txt")}");
+	copy_dir(root + "/src", root + "/fresh/one/two");
+	print(i"fresh: {show_all(root + "/fresh")}");
+	remove_dir_all(root + "/src/a.txt");
+	remove_dir_all(root + "/src/missing");
+	print("scan src after:");
+	show_scan(root + "/src");
+	remove_dir_all(root);
+	print(i"gone: {stat(root).is_none()}");
+}

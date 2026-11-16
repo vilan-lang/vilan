@@ -93,6 +93,11 @@ export impl Duration {
 		Duration { millis = count * 86400000i53 }
 	}
 
+	/// The whole span in milliseconds — the unit it is kept in.
+	fun as_millis(self): i53 {
+		self.millis
+	}
+
 	/// Whole units, truncated toward zero (i53 division).
 	fun as_seconds(self): i53 {
 		self.millis / 1000i53

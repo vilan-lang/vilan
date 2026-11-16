@@ -1,0 +1,16 @@
+# A desktop app by the short road (F1 M2): ONE native binary that serves its
+# page from an in-process `std::http` server and shows it in the operating
+# system's webview through `std::window`. NATIVE ONLY — the JavaScript build
+# refuses `std::window` by name — so it is built with the Rust backend:
+#
+#   vilan run --backend rust .              a window on the app
+#   vilan run --backend rust . -- --smoke   the window quits itself once the
+#                                           page has loaded (the end-to-end
+#                                           test's mode)
+#
+# Linux needs WebKitGTK to build and run it (`libwebkit2gtk-4.1-dev` and
+# `libgtk-3-dev` on Debian and Ubuntu); macOS and Windows use the webview the
+# system already has. See the native guide's "A desktop window" section.
+[package]
+name = "desktop"
+root = "."

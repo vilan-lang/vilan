@@ -18,6 +18,7 @@ use crate::type_::{
 use crate::util::{join_with, plural};
 
 mod auto_annotations;
+mod cell_borrows;
 mod dbg_stack;
 mod held_tables;
 mod hint_labels;
@@ -34,6 +35,7 @@ mod r11_records;
 mod retain_tables;
 mod row_families;
 mod written_types;
+pub use cell_borrows::{PendingCellBorrow, settle_cell_borrows};
 
 pub use dbg_stack::{
     DbgStackBinding, DbgStackInvalidation, DbgStackMove, DbgStackSite, DbgStackValue,
@@ -4310,6 +4312,62 @@ type ExposeFieldCheck<'src> = (
     Exposure<'src>,
 );
 
+/// native-ui.md §12: one named element's head as the walk saw it — the web
+/// chain `elements.rs` built, `view("tag")` — recorded so the element can be
+/// lowered onto an `[element]` function once its tag resolves
+/// ([`Analyzer::lower_typed_element`]).
+///
+/// Every named element of every program is recorded, because the walk cannot
+/// know yet whether an `[element]` function is in reach (one declared later,
+/// or in a module loaded after this one, still types the tag). So the record
+/// is a PUSH and nothing else (M202): no lookup, no hashing. The drain reads
+/// the records only when the world declares an `[element]` function
+/// (`Analyzer::element_functions`), and drops them unread when it does not.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+struct ElementHead<'src> {
+    /// The `view` callee's entity: the std item the drain decides.
+    callee: Id,
+    /// The `view("tag")` call's entity.
+    call: Id,
+    tag: &'src str,
+    /// The `"tag"` argument's entity, which a typed head does not pass.
+    tag_argument: Id,
+    /// Where the call's `CallSubject` constraint and its
+    /// `written_call_arguments` row sit, to take the argument out of both.
+    call_constraint: Option<usize>,
+    call_written_arguments: Option<usize>,
+}
+
+/// One link of a named element's chain: a link `elements.rs` generated, or one
+/// the head wrote. Recorded by a push, like [`ElementHead`]; the drain finds
+/// its head through `subject` ([`Analyzer::typed_element_candidates`]).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+struct ElementChainLink<'src> {
+    id: Id,
+    /// The entity the link is called on: the head's call, or the link before
+    /// it in the chain.
+    subject: Id,
+    /// What `elements.rs` generated it from, or `None` for a `.method(..)`
+    /// link the head wrote (B620's), spanned by `written`.
+    generated: Option<crate::elements::GeneratedLink<'src>>,
+    written: Span,
+    /// Where its member constraint (`MethodCall`, or a `FieldAccessor` for a
+    /// written bare `.name`) and its `written_call_arguments` row sit.
+    constraint: Option<usize>,
+    written_arguments: Option<usize>,
+}
+
+/// One named element a drain may lower ([`Analyzer::lower_typed_element`]):
+/// its head and its chain's links in source order, assembled from the walk's
+/// records by [`Analyzer::typed_element_candidates`].
+#[derive(Debug)]
+struct ElementCandidate<'src> {
+    head: ElementHead<'src>,
+    links: Vec<ElementChainLink<'src>>,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct Analyzer<'src> {
@@ -6029,6 +6087,8 @@ pub struct Analyzer<'src> {
     /// tree is final, and read by rule 2's cell-aware elision. Empty until
     /// then, which names no cell and so elides nothing.
     shared_cells: SharedCells,
+    /// M199: the `Shared::read` declarations ([`Analyzer::is_shared_read_call`]).
+    shared_read_callees: HashSet<Id>,
     /// B267: the bindings whose `Shared` read may ALIAS the cell instead of
     /// copying it. Two readers, and they pull opposite ways, which is the whole
     /// of the rule: rule 1's binding copy is skipped at these sites, and rule
@@ -6092,6 +6152,29 @@ pub struct Analyzer<'src> {
     // element back (`resolve_method_call`'s `Found` arm reads it); the same
     // call written after the element is not in here and takes any method.
     element_head_links: HashMap<Id, (&'src str, Span)>,
+    // native-ui.md §12: every function declared `[element]` — an element
+    // constructor: a tag whose name resolves to one is a TYPED element,
+    // lowered onto what it returns (`lower_typed_element`). Filled at the one
+    // place a `Function` is inserted, so it rides every clone and every
+    // stored world (the std prefix, a base-cache world) with the functions it
+    // names. A set beside `functions` rather than a flag on `Function` (M202):
+    // the flag grew every `Function` by a word, which every lookup in that
+    // map paid on every program; and while the set is empty the drain decides
+    // every element head is the web one without resolving a tag.
+    element_functions: HashSet<Id>,
+    // native-ui.md §12: every NAMED element head the walk met since the last
+    // drain, in walk order — what `lower_typed_element` needs to rewrite the
+    // element's web chain into the typed one once its tag resolves.
+    element_heads: Vec<ElementHead<'src>>,
+    // native-ui.md §12: every link of those heads' chains (generated by
+    // `elements.rs` or written in the head), in walk order: a link is pushed
+    // after its subject, so the drain finds each link's head in one pass.
+    element_links: Vec<ElementChainLink<'src>>,
+    // native-ui.md §12: the links of a TYPED element that are web-only forms,
+    // refused by name when the element lowered. Each resolves to an
+    // `Expr::Error` without a second diagnostic, which keeps the rest of the
+    // chain quiet as B620's refused links do.
+    refused_element_links: HashSet<Id>,
     // E309: every `L <M>(args)` the walk met — E291 reads a spaced `<` after
     // a name as a comparison, so the shape is `(L < M) > (args)` — keyed by
     // the outer `>` binary. Decided after solving: when `L` names a generic
@@ -8503,6 +8586,7 @@ impl<'src> Analyzer<'src> {
             reference_count: HashMap::default(),
             last_use: liveness::LastUse::default(),
             shared_cells: SharedCells::default(),
+            shared_read_callees: HashSet::default(),
             shared_read_bindings: HashSet::default(),
             elided_shared_reads: HashSet::default(),
             donated_projections: HashSet::default(),
@@ -8512,6 +8596,10 @@ impl<'src> Analyzer<'src> {
             tuple_element_types: HashMap::default(),
             entry_labels: HashMap::default(),
             element_head_links: HashMap::default(),
+            element_functions: HashSet::default(),
+            element_heads: Vec::new(),
+            element_links: Vec::new(),
+            refused_element_links: HashSet::default(),
             spaced_generic_calls: HashMap::default(),
             spaced_generic_operands: HashSet::default(),
             deferred_not_a_value: HashMap::default(),
@@ -15393,29 +15481,37 @@ impl<'src> Analyzer<'src> {
     /// data (the `Program` is not built until analysis finishes), so the loan-only
     /// rule and later emission agree on which bindings are module-level.
     fn module_level_binding_ids(&self) -> HashSet<Id> {
-        let mut module_scopes: HashSet<Id> = self
-            .scopes
-            .values()
-            .filter(|scope| scope.parent_id.is_none())
-            .map(|scope| scope.id)
-            .collect();
-        for module in self.modules.values() {
-            module_scopes.insert(module.body.1);
-        }
+        let module_bodies = self.module_body_scope_ids();
         self.variables
             .keys()
             .copied()
-            .filter(|variable_id| {
-                self.expr_id_to_scope_id_map
-                    .get(variable_id)
-                    .is_some_and(|scope_id| {
-                        module_scopes.contains(&expansion_home_scope(
-                            &self.generated_expansion_scopes,
-                            *scope_id,
-                        ))
-                    })
-            })
+            .filter(|variable_id| self.is_module_level_binding(*variable_id, &module_bodies))
             .collect()
+    }
+
+    /// The body scopes of every `mod` — with the root scopes, the scopes a
+    /// module-level binding is declared in ([`Self::is_module_level_binding`]).
+    fn module_body_scope_ids(&self) -> HashSet<Id> {
+        self.modules.values().map(|module| module.body.1).collect()
+    }
+
+    /// Whether ONE binding is module-level — [`Self::module_level_binding_ids`]'
+    /// test, asked of a single id so a pass that meets a handful of roots does
+    /// not pay for the whole table. `module_bodies` is
+    /// [`Self::module_body_scope_ids`].
+    fn is_module_level_binding(&self, binding_id: Id, module_bodies: &HashSet<Id>) -> bool {
+        if !self.variables.contains_key(&binding_id) {
+            return false;
+        }
+        let Some(scope_id) = self.expr_id_to_scope_id_map.get(&binding_id) else {
+            return false;
+        };
+        let home = expansion_home_scope(&self.generated_expansion_scopes, *scope_id);
+        module_bodies.contains(&home)
+            || self
+                .scopes
+                .get(&home)
+                .is_some_and(|scope| scope.parent_id.is_none())
     }
 
     fn check_resource_moves(&mut self) {
@@ -28324,6 +28420,14 @@ impl<'src> Analyzer<'src> {
         self.shared_cells.reads.contains_key(&expr_id)
     }
 
+    /// The same question asked of the callee rather than of the cell table
+    /// (M199), so it answers while the held rows are being collected — before
+    /// `shared_cells` exists — and after, alike.
+    fn is_shared_read_call(&self, expr_id: Id) -> bool {
+        self.call_callee_and_receiver(expr_id)
+            .is_some_and(|(callee_id, _)| self.shared_read_callees.contains(&callee_id))
+    }
+
     /// Whether a pattern's subject names existing storage, so its captures bind
     /// pieces of something with another owner — [`Self::is_place_expr`] plus
     /// **`*view`**.
@@ -28344,9 +28448,18 @@ impl<'src> Analyzer<'src> {
     /// pieces of something with another owner and both rules apply. An OWNED
     /// call result needs no rule: its elements have no other owner, which is
     /// what B53 §2's "destructuring a FRESH value binds without copying" says.
+    ///
+    /// M199: a bare **`Shared.read()`** is admitted too, for B256's reason —
+    /// it lowers to the cell's own slot, so its captures bind pieces of the
+    /// CELL's storage. It had been read as an owned call, and its captures
+    /// aliased the cell outright: `if cell.read() is (let xs, let n) {
+    /// cell.write().0.push(9); xs.len() }` answered 3 on JS where rule 1 (and
+    /// the native backend) answer 2. A field of a read (`cell.read().value`)
+    /// was always a place.
     fn is_capture_subject_place(&self, expr_id: Id) -> bool {
         match self.expr_id_to_expr_map.get(&expr_id) {
             Some(Expr::Dereference(_)) => true,
+            Some(Expr::Call(_)) if self.is_shared_read_call(expr_id) => true,
             Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
             Some(Expr::Tuple(_)) => self.tuple_of_capture_places(expr_id).is_some(),
             _ => self.is_place_expr(expr_id),
@@ -28512,10 +28625,21 @@ impl<'src> Analyzer<'src> {
     /// Whether a returned place is storage the returning frame does not own, so
     /// rule 1's return clause owes a copy of it. `declared_inside` is the
     /// closure's own bindings when the seam is a closure's (B64).
+    ///
+    /// B735: a place rooted at a MODULE-LEVEL binding is never the returning
+    /// frame's. The binding outlives every call, exactly as a loaned
+    /// parameter's storage does, so a by-value return of it (`fun get():
+    /// List<i32> { registry }`, `plain.read()` through a module-level
+    /// `Shared`, a field or element of a module-level aggregate) copies —
+    /// read as a local's dead owner, the caller's result had been the binding's
+    /// live storage, so `mut b = get(); b.push(3)` grew the module binding and
+    /// a later write of it showed through `b`. `module_bodies` is
+    /// [`Self::module_body_scope_ids`].
     fn returned_place_owes_a_copy(
         &self,
         place_id: Id,
         declared_inside: Option<&HashSet<Id>>,
+        module_bodies: &HashSet<Id>,
     ) -> bool {
         let Some(root) = self.place_root(place_id) else {
             return false;
@@ -28536,8 +28660,15 @@ impl<'src> Analyzer<'src> {
             // returning it and it belongs to the frame around the closure, which
             // does not die here and can be handed the same storage again on the
             // next call.
-            Some(Convention::Own) | None => {
+            Some(Convention::Own) => {
                 declared_inside.is_some_and(|declared| !declared.contains(&root))
+            }
+            // B735: a module-level binding is no frame's — asked only of a
+            // root that is not a parameter, so the common local return pays
+            // two map lookups and nothing more.
+            None => {
+                declared_inside.is_some_and(|declared| !declared.contains(&root))
+                    || self.is_module_level_binding(root, module_bodies)
             }
         }
     }
@@ -28685,12 +28816,22 @@ impl<'src> Analyzer<'src> {
     /// reasoning and is deliberately NOT admitted here: it elides copies no
     /// resource program pays for, and widening it moves goldens for a gain
     /// nothing has asked for.
+    ///
+    /// M199: a subject read out of a `Shared` cell — the read itself, or a
+    /// field, slot or element of one — is the CELL's storage, so it is stable
+    /// exactly when no write mutates that cell in place anywhere (B267's own
+    /// first shape: a rebind installs a fresh value and leaves the storage
+    /// the capture names alone). The narrower, per-construct answer for a
+    /// cell some write does mutate is [`Self::cell_borrow_candidates`]'.
     fn share_subject_is_stable(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
         // B691: a tuple of places is stable when every element is.
         if let Some(element_ids) = self.tuple_of_capture_places(subject_id) {
             return element_ids
                 .iter()
                 .all(|element_id| self.share_subject_is_stable(*element_id, written_roots));
+        }
+        if let Some(cell) = self.shared_read_spine_cell(subject_id) {
+            return !self.shared_cells.mutated.contains(&cell);
         }
         if self.readonly_root(subject_id).is_some() {
             return true;
@@ -28769,7 +28910,25 @@ impl<'src> Analyzer<'src> {
     /// [`Self::collect_written_roots`] records. Narrowing it to the ARM would
     /// not be sound without that root step — `let v = &mut t` outside the arm
     /// and `v.1 = 9` inside it is a write whose own root is `v`.
+    ///
+    /// M199: a subject read out of a `Shared` cell names the CELL's storage,
+    /// which no root walk reaches (the read is a call): it is mutated in place
+    /// when some write mutates that cell in place. `if cell.read() is (_, let
+    /// n) { cell.write().1 = 99; n }` read the slot after the write.
     fn subject_is_mutated_in_place(&self, subject_id: Id, written_roots: &WrittenRoots) -> bool {
+        if let Some(element_ids) = self.tuple_of_capture_places(subject_id)
+            && element_ids
+                .iter()
+                .any(|element_id| self.subject_is_mutated_in_place(*element_id, written_roots))
+        {
+            return true;
+        }
+        if self
+            .shared_read_spine_cell(subject_id)
+            .is_some_and(|cell| self.shared_cells.mutated.contains(&cell))
+        {
+            return true;
+        }
         self.capture_subject_places(subject_id)
             .into_iter()
             .filter_map(|place_id| self.place_root(place_id))
@@ -36634,15 +36793,16 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Rule 1's RETURN clause (`proposal/element-clones.md` §3): a place a body
-    /// hands back that it does not own — one rooted at a by-value PARAMETER —
-    /// copies. Without it a call hands the caller a live alias into the
+    /// hands back that it does not own — one rooted at a by-value PARAMETER, or
+    /// at a MODULE-LEVEL binding (B735) — copies. Without it a call hands the caller a live alias into the
     /// caller's own argument (`fun identity(c: List<i32>): List<i32> { c }`),
     /// which breaks the invariant every other elision here rests on, spelled
     /// out in `compute_clone_sites`' own doc: *calls own their result*. It is
     /// also what makes `List::map` share elements — its `push` is handed
     /// `fn(item)`, a call result, and trusts it.
     ///
-    /// A place rooted at a LOCAL is left alone: the frame dies at the return,
+    /// A place rooted at a LOCAL of the returning frame is left alone: the
+    /// frame dies at the return,
     /// so the local is a dead owner and donates its storage (`mut result = …;
     /// result`, which is how every list-producing method ends). Views are
     /// excluded by the type filter — a `borrows` projection returns an alias on
@@ -36701,6 +36861,7 @@ impl<'src> Analyzer<'src> {
         );
         let mut candidates: Vec<(Id, TypeId)> = Vec::new();
         let mut view_reads: HashSet<Id> = HashSet::default();
+        let module_bodies = self.module_body_scope_ids();
         for (seam, closure_id, returns_view) in seams {
             let declared_inside = closure_id.map(|id| self.closure_declared_bindings(id));
             let mut leaves = Vec::new();
@@ -36712,9 +36873,13 @@ impl<'src> Analyzer<'src> {
                 // itself (B109).
                 let mut named = Vec::new();
                 self.returned_value_places(leaf, &mut named);
-                let owes_copy = named
-                    .iter()
-                    .any(|place| self.returned_place_owes_a_copy(*place, declared_inside.as_ref()));
+                let owes_copy = named.iter().any(|place| {
+                    self.returned_place_owes_a_copy(
+                        *place,
+                        declared_inside.as_ref(),
+                        &module_bodies,
+                    )
+                });
                 if !owes_copy {
                     continue;
                 }
@@ -36813,7 +36978,16 @@ impl<'src> Analyzer<'src> {
     /// classification, 158–342 ms of a 5.7 s debug checks phase on kolt's
     /// client leg against the drop planner's gate at 950–1230 ms in the same
     /// phase. It is named residue rather than left unmentioned.
-    fn compute_capture_clone_sites(&mut self, held: &held_tables::HeldFold) -> CapturePlan {
+    fn compute_capture_clone_sites(
+        &mut self,
+        held: &held_tables::HeldFold,
+        pending_borrows: &mut [cell_borrows::PendingCellBorrow],
+    ) -> CapturePlan {
+        let pending_by_subject: HashMap<Id, usize> = pending_borrows
+            .iter()
+            .enumerate()
+            .map(|(index, borrow)| (borrow.subject, index))
+            .collect();
         // Phase 1: candidate (capture, subject) pairs from place-subject
         // patterns, plus the VALUE-SEAM roots — every expression whose value
         // leaves its scope (a function/closure tail, a `ret` value, a match
@@ -36848,13 +37022,18 @@ impl<'src> Analyzer<'src> {
             // (M149 moved the restored regions' first classification here
             // from the move scan's binding walk, which anchored it).
             self.id_windows.set_anchor(capture_id);
-            let Some((type_id, capture_is_mutable)) = self
+            let Some((type_id, capture_is_mutable, capture_name)) = self
                 .variables
                 .get(&capture_id)
-                .map(|variable| (variable.type_id, variable.mutable))
+                .map(|variable| (variable.type_id, variable.mutable, variable.name))
             else {
                 continue;
             };
+            // M199: `let _` binds nothing anyone can read, so there is nothing
+            // to copy and nothing to read at the match.
+            if capture_name == "_" {
+                continue;
+            }
             // B81/B88, and asked FIRST because it is orthogonal to every
             // filter below: whether a capture must be READ at the match is
             // settled by the subject alone, where whether it must be COPIED is
@@ -36912,6 +37091,18 @@ impl<'src> Analyzer<'src> {
             {
                 shared.insert(capture_id);
                 continue;
+            }
+            // M199: a capture of a `Shared` read under a construct no write of
+            // the cell reaches shares too — once the construct is known not
+            // to suspend, which only `settle_cell_borrows` can say. Until
+            // then it keeps its copy site (the conservative answer) and is
+            // already SHARED for rule 2, which must not move out of storage
+            // the settle may leave it aliasing.
+            if let Some(&index) = pending_by_subject.get(&subject_id)
+                && self.shares_under_a_cell_borrow(capture_id, capture_is_mutable, seam_roots)
+            {
+                shared.insert(capture_id);
+                pending_borrows[index].shared_captures.push(capture_id);
             }
             classified.push((capture_id, subject_id, copy));
         }
@@ -37547,6 +37738,29 @@ impl<'src> Analyzer<'src> {
             })
     }
 
+    /// M199: whether ANY write of `cell` — a rebind as much as an in-place
+    /// write — lies inside `expr_id`'s source span. The span half of
+    /// [`WriteSubject::CellAny`], as [`Self::spans_an_in_place_write`] is
+    /// [`WriteSubject::Cell`]'s.
+    fn spans_a_cell_write(&self, expr_id: Id, cell: CellSlot) -> bool {
+        let (Some(source), Some(span)) = (self.source_of_id(expr_id), self.span_map.get(&expr_id))
+        else {
+            return true;
+        };
+        let (start, end) = (span.start, span.end);
+        self.shared_cells
+            .writes
+            .iter()
+            .any(|(write_id, (written, _))| {
+                *written == cell
+                    && self.source_of_id(*write_id) == Some(source)
+                    && self.one_span_space(expr_id, *write_id)
+                    && self.span_map.get(write_id).is_some_and(|write_span| {
+                        write_span.start >= start && write_span.end <= end
+                    })
+            })
+    }
+
     /// Whether two entities' spans are offsets into ONE text, so span
     /// containment says one lies inside the other. Every `[derive(..)]`
     /// expansion shares [`DERIVED_SOURCE`] while its spans are offsets into
@@ -37674,15 +37888,17 @@ impl<'src> Analyzer<'src> {
         };
         // A DISPATCHED member reaches whatever any body of that name does —
         // every impl's declaration and every trait's default (the candidate
-        // set dispatch picks from; `hash` writes no subscriber list).
-        let dispatched_name = [call_id, function_call.subject_id]
-            .iter()
-            .find_map(|id| match self.generic_dispatch.get(id) {
-                Some(GenericDispatch::OnConstraint(_, name) | GenericDispatch::OnType(_, name)) => {
-                    Some(*name)
-                }
-                None => None,
-            });
+        // set dispatch picks from; `hash` writes no subscriber list). A call
+        // through a `dyn` object is one too (B744): named by the dispatch
+        // record alone it read as a call of the trait's DECLARATION, which
+        // answered for the default's body (or nothing, for a requirement) and
+        // never for the override the object actually runs.
+        let dispatched_name = crate::dispatch_refine::DispatchRecords {
+            dyn_method_calls: &self.dyn_method_calls,
+            generic_dispatch: &self.generic_dispatch,
+            concat_render_dispatch: &self.concat_render_dispatch,
+        }
+        .member(call_id, Some(function_call.subject_id));
         if let Some(name) = dispatched_name {
             let candidates: Vec<Id> = self
                 .implementations
@@ -38771,6 +38987,61 @@ impl<'src> Analyzer<'src> {
     /// generic or a `let` annotation's existential —
     /// so its elements must all be ONE type, and values of two types need the
     /// trait object there.
+    /// M175: a value landing at a `dyn Trait` position whose type does not
+    /// implement the trait — `.run([id, point])` at a `List<dyn SqlValue>` —
+    /// is told so by name, with the types that DO implement it, which for a
+    /// trait like `std::db::SqlValue` is the whole answer to "what can go
+    /// here" (a number, a `str`, a `bool`, `Bytes`, an `Option` of one). The
+    /// list is the program's impls of the trait in declaration order, a
+    /// blanket (`impl type S: ..`) left out; it is cut short past sixteen.
+    /// `None` when the position is not an object or the value is one.
+    fn unimplemented_object_steer(&self, expected: Option<&Type>, got: &Type) -> Option<String> {
+        const LISTED: usize = 16;
+        let Some(Type::Dyn(trait_id, _)) = expected else {
+            return None;
+        };
+        if matches!(
+            got,
+            Type::Dyn(..) | Type::Unknown | Type::Unresolved | Type::Generic(_)
+        ) || self.type_implements_trait(got, *trait_id)
+        {
+            return None;
+        }
+        let name = self.traits.get(trait_id)?.name;
+        let empty = HashMap::default();
+        let got = self.pretty_print_type(got, &empty);
+        let mut subjects: Vec<String> = Vec::new();
+        for implementation in &self.implementations {
+            if !implementation.trait_ids.contains(trait_id) {
+                continue;
+            }
+            let subject = implementation.subject.borrow_type(self);
+            if matches!(subject, Type::Generic(_)) {
+                continue;
+            }
+            let rendered = format!("`{}`", self.pretty_print_type(subject, &empty));
+            if !subjects.contains(&rendered) {
+                subjects.push(rendered);
+            }
+        }
+        let implementors = match subjects.len() {
+            0 => String::new(),
+            count if count > LISTED => format!(
+                "; the types that do are {} and {} more",
+                subjects[..LISTED].join(", "),
+                count - LISTED
+            ),
+            1 => format!("; the type that does is {}", subjects[0]),
+            _ => {
+                let last = subjects.pop().unwrap_or_default();
+                format!("; the types that do are {} and {last}", subjects.join(", "))
+            }
+        };
+        Some(format!(
+            " `{got}` does not implement `{name}`, so it cannot become a `dyn {name}`{implementors}."
+        ))
+    }
+
     fn bare_trait_element_steer(
         &self,
         literal: Id,
@@ -42367,7 +42638,51 @@ impl<'src> Analyzer<'src> {
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
             }
         }
+        // native-ui.md §12: a link of a named element's chain — one
+        // `elements.rs` generated, or one the head wrote. A link written AFTER
+        // the element (`<div />.f()`) is neither: the element's value,
+        // whichever lowering, is that call's receiver like any other.
+        let generated = crate::elements::generated_link(member);
+        if generated.is_some() || head_tag.is_some() {
+            self.record_element_link(id, subject_id, member.1, generated);
+        }
         None
+    }
+
+    /// native-ui.md §12: the record of a link of a named element's chain, for
+    /// the typed lowering — a push, read only by a drain whose world declares
+    /// an `[element]` function (M202). Out of the walk's recursion: the member
+    /// and its arguments are already walked.
+    fn record_element_link(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        written: Span,
+        generated: Option<crate::elements::GeneratedLink<'src>>,
+    ) {
+        // The member's constraint is the last one its arm pushed.
+        let constraint =
+            self.constraints
+                .len()
+                .checked_sub(1)
+                .filter(|&index| match &self.constraints[index] {
+                    Constraint::MethodCall { id: call, .. } => *call == id,
+                    Constraint::FieldAccessor(accessor) => accessor.id == id,
+                    _ => false,
+                });
+        let written_arguments = self
+            .written_call_arguments
+            .len()
+            .checked_sub(1)
+            .filter(|&index| self.written_call_arguments[index].0 == id);
+        self.element_links.push(ElementChainLink {
+            id,
+            subject: subject_id,
+            generated,
+            written,
+            constraint,
+            written_arguments,
+        });
     }
 
     /// `walk_expr_node_inner`'s `Node::Let` arm, out of line (N169): its
@@ -43167,6 +43482,22 @@ impl<'src> Analyzer<'src> {
         // lexical parent.
         self.written_call_arguments
             .push((id, subject_id, argument_ids.clone()));
+        // native-ui.md §12: a named element's head, recorded for the typed
+        // lowering — the web walk itself is untouched.
+        if let Node::StdItem(module, item) = subject.0
+            && crate::elements::is_view_head(module, item)
+            && let ([(Node::String(tag), _)], [tag_argument]) =
+                (arguments.0.as_slice(), argument_ids.as_slice())
+        {
+            self.element_heads.push(ElementHead {
+                callee: subject_id,
+                call: id,
+                tag,
+                tag_argument: *tag_argument,
+                call_constraint: Some(self.constraints.len()),
+                call_written_arguments: Some(self.written_call_arguments.len() - 1),
+            });
+        }
         // Defer call type-checking to constraint solving.
         self.constraints
             .push(Constraint::CallSubject(CallSubjectConstraint::from_walk(
@@ -44336,6 +44667,9 @@ impl<'src> Analyzer<'src> {
                 }
             }
             let borrows = self.resolve_borrows_annotation(function.borrows, &parameters);
+            if function.element {
+                self.element_functions.insert(id);
+            }
             self.functions.insert(
                 id,
                 Function {
@@ -48987,6 +49321,18 @@ impl<'src> Analyzer<'src> {
                     | Expr::StructInitializer(..)
                     | Expr::Dereference(_)
                     | Expr::Ascribe(_)
+                    // M175: the scalar leaves erase too — a literal, an
+                    // operator's result — so `[id, 1.5, "label", count + 1]`
+                    // at a `List<dyn SqlValue>` builds a pair per element. An
+                    // operator does not forward an object expectation to its
+                    // operands (the `Unary` and `Binary` arms of
+                    // `infer_type_path`), so the operator is the one wrap.
+                    | Expr::Number(..)
+                    | Expr::String(_)
+                    | Expr::MultilineString(_)
+                    | Expr::Bool(_)
+                    | Expr::Unary(..)
+                    | Expr::Binary(..)
             )
         ) {
             return;
@@ -49680,7 +50026,14 @@ impl<'src> Analyzer<'src> {
                 }
                 Type::Unresolved
             }
+            // M175: an object position is not the operand's expectation — the
+            // operator's RESULT is what erases (`note_dyn_coercion`), so the
+            // operand is typed as if no context had been given.
             Expr::Unary(_, operand_id) => {
+                let constraint = match constraint.as_ref() {
+                    Type::Dyn(..) => std::borrow::Cow::Owned(Type::Unknown),
+                    _ => constraint,
+                };
                 self.infer_type_inner(*operand_id, &constraint, substitution_context, exprs_seen)
             }
             // A view (`&x` / `&mut x`) and a deref (`*v`) both carry the operand's
@@ -50098,6 +50451,15 @@ impl<'src> Analyzer<'src> {
                                 // the object.
                                 let steer = self
                                     .bare_trait_element_steer(expr_id, expected_element.as_ref())
+                                    .or_else(|| {
+                                        // The established element type is the
+                                        // object when the list is one, whether
+                                        // the position or a first element said so.
+                                        self.unimplemented_object_steer(
+                                            Some(&element_type),
+                                            &item_type,
+                                        )
+                                    })
                                     .unwrap_or_else(|| {
                                         // E285: a fragment written straight
                                         // inside a fragment (`<><i>…</i><>…</></>`)
@@ -51095,6 +51457,11 @@ impl<'src> Analyzer<'src> {
             ) => self.bool_type(),
             Expr::Binary(op, lhs_id, rhs_id) => {
                 let (op, lhs_id, rhs_id) = (*op, *lhs_id, *rhs_id);
+                // M175: as `Unary` above — the result erases, not the operands.
+                let constraint = match constraint.as_ref() {
+                    Type::Dyn(..) => std::borrow::Cow::Owned(Type::Unknown),
+                    _ => constraint,
+                };
                 // B370: this is the ONE place a context's type flows into an
                 // arithmetic expression, so it is where the expression's
                 // settled type is recorded for the emission verdicts
@@ -57213,7 +57580,14 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got {got} instead. There are no implicit numeric \
                  conversions; convert with `.as_{target}()`"
             ),
-            None => format!("Expected {expected}, but got {got} instead."),
+            // M175: a value at an object position whose type does not
+            // implement the trait (`params.push(point)` on a
+            // `List<dyn SqlValue>`) names the trait and its implementors.
+            None => format!(
+                "Expected {expected}, but got {got} instead.{}",
+                self.unimplemented_object_steer(Some(expected_type), got_type)
+                    .unwrap_or_default()
+            ),
         }
     }
 
@@ -59951,6 +60325,12 @@ impl<'src> Analyzer<'src> {
             // the providers labelled at the arguments this receiver
             // instantiates them with. No call spelling names which.
             AmbiguousDefaultHomes(Vec<String>),
+        }
+        // native-ui.md §12: a web-only form on a typed element, refused by
+        // name when the element lowered.
+        if self.refused_element_links.contains(&id) {
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
         }
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         // A method on a `List::new()` whose element slot is still unknown but has a
@@ -64145,9 +64525,16 @@ impl<'src> Analyzer<'src> {
     /// path: only a failed resolution asks). Empty when the file is unreadable —
     /// a steer degrades, it never fails.
     fn web_prelude_names(&self) -> Vec<String> {
-        let module = crate::manifest::WEB_PRELUDE
-            .strip_prefix("std::")
-            .unwrap_or_default();
+        self.std_module_names(
+            crate::manifest::WEB_PRELUDE
+                .strip_prefix("std::")
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The importable names std module `module` (a path below `std::`, as
+    /// `web::ui`) declares; empty when there is no such module.
+    fn std_module_names(&self, module: &str) -> Vec<String> {
         let Some(path) = self
             .std_module_files
             .iter()
@@ -64172,7 +64559,9 @@ impl<'src> Analyzer<'src> {
     /// AT `dom`; `std::web` resolves (it is the namespace now), so the old web
     /// prelude path shows only as a miss one segment deeper, and only for a
     /// name the prelude exports (`std::web::Signal`) — a typo under the
-    /// namespace (`std::web::dmo`) is an ordinary miss.
+    /// namespace (`std::web::dmo`) is an ordinary miss. A reclaimed path
+    /// ([`crate::parsing::RECLAIMED_STD_MODULES`], `std::ui`) is the same
+    /// shape: a miss under it for a name the module it moved to declares.
     fn moved_std_segment(
         &self,
         root: &str,
@@ -64191,10 +64580,24 @@ impl<'src> Analyzer<'src> {
                 .map(|(module, _)| (*module, part_span));
         }
         let (previous, previous_span, previous_at_root) = previous?;
-        (previous == "web"
-            && previous_at_root
-            && self.web_prelude_names().iter().any(|name| name == part))
-        .then_some(("web", previous_span))
+        if !previous_at_root {
+            return None;
+        }
+        if previous == "web" {
+            return self
+                .web_prelude_names()
+                .iter()
+                .any(|name| name == part)
+                .then_some(("web", previous_span));
+        }
+        let reclaimed = crate::parsing::RECLAIMED_STD_MODULES
+            .iter()
+            .find(|module| **module == previous)?;
+        let new = crate::parsing::moved_std_module(reclaimed)?;
+        self.std_module_names(new)
+            .iter()
+            .any(|name| name == part)
+            .then_some((*reclaimed, previous_span))
     }
 
     /// The B4 import steer for a PATH whose resolution missed in scope (E103) —
@@ -69130,6 +69533,12 @@ impl<'src> Analyzer<'src> {
         let id = constraint.id;
         let subject_id = constraint.subject_id;
         let member_name = constraint.member_name;
+        // native-ui.md §12: a `.name` link written in a typed element's head,
+        // refused by name when the element lowered.
+        if self.refused_element_links.contains(&id) {
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        }
         if !self.expr_id_to_expr_map.contains_key(&subject_id) {
             return Resolution::Deferred;
         }
@@ -69861,6 +70270,194 @@ impl<'src> Analyzer<'src> {
         self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
     }
 
+    /// native-ui.md §12 (M202): the named elements this drain may lower, keyed
+    /// by their `view` callee's entity. Only a function declared `[element]`
+    /// can make a tag typed, so in a world that declares none the answer is
+    /// empty without a tag resolved or a record read: every element is the
+    /// web one, as it would have resolved to anyway. Either way the walk's
+    /// records are spent — every head they describe is decided by this drain.
+    fn typed_element_candidates(&mut self) -> HashMap<Id, ElementCandidate<'src>> {
+        if self.element_functions.is_empty() {
+            self.element_heads.clear();
+            self.element_links.clear();
+            return HashMap::default();
+        }
+        // The head each entity of a chain belongs to — the head's call, then
+        // each link in turn — valued by the head's callee. A link was
+        // recorded after its subject, so one pass in walk order finds every
+        // link's head.
+        let mut chain_heads: HashMap<Id, Id> = HashMap::default();
+        let mut candidates: HashMap<Id, ElementCandidate<'src>> = HashMap::default();
+        for head in std::mem::take(&mut self.element_heads) {
+            chain_heads.insert(head.call, head.callee);
+            candidates.insert(
+                head.callee,
+                ElementCandidate {
+                    head,
+                    links: Vec::new(),
+                },
+            );
+        }
+        for link in std::mem::take(&mut self.element_links) {
+            let Some(&callee) = chain_heads.get(&link.subject) else {
+                continue;
+            };
+            chain_heads.insert(link.id, callee);
+            if let Some(candidate) = candidates.get_mut(&callee) {
+                candidate.links.push(link);
+            }
+        }
+        candidates
+    }
+
+    /// native-ui.md §12: lower the named element `candidate` describes
+    /// onto the `[element]` function its tag names, when it names one —
+    /// `true` if it did, and `false` (nothing touched) for a web element.
+    ///
+    /// The tag resolves as a name written at the tag would, in the element's
+    /// scope at the tag's offset, so a local binding shadows an outer
+    /// `[element]` function and an import or a renamed import reaches one.
+    /// Only a function declared `[element]` makes the element typed: a
+    /// `fun button()` without the marker leaves `<button>` the web element
+    /// it has always been.
+    ///
+    /// The element was walked as its web chain (`elements.rs`); lowering
+    /// rewrites that chain in place into the typed one, before any of it has
+    /// resolved:
+    ///
+    /// - the head `view("row")` becomes `row()` — the callee resolves to the
+    ///   function, spanned by the tag, and the `"row"` argument is dropped;
+    /// - an attribute `.attr("gap", value)` becomes `.gap(value)`, and a bare
+    ///   one `.attr("wrap", "")` becomes `.wrap()`, its method spanned by the
+    ///   written name so an unknown attribute is reported there;
+    /// - a `.child(value)` is already the typed form;
+    /// - an `on:event(..)` item, a `.method(..)` link written in the head and
+    ///   a hyphenated attribute name are web-only forms, each refused by name.
+    fn lower_typed_element(&mut self, candidate: &ElementCandidate<'src>) -> bool {
+        let ElementCandidate { head, links } = candidate;
+        let callee = head.callee;
+        let tag = head.tag;
+        let scope_id = self.get_scope_id_for_entity(callee);
+        let Some(tag_span) = self.span_map.get(&head.tag_argument).copied() else {
+            return false;
+        };
+        let Some(function_id) = self.resolve_value_name_at(tag, scope_id, tag_span.start) else {
+            return false;
+        };
+        if !self.element_functions.contains(&function_id) {
+            return false;
+        }
+        // The callee: the function, spanned by the tag the author wrote.
+        let reference_count = self.reference_count.entry(function_id).or_insert(0);
+        *reference_count += 1;
+        self.expr_id_to_expr_map
+            .insert(callee, Expr::Local(function_id));
+        self.span_map.insert(callee, tag_span);
+        // The call passes no arguments.
+        if let Some(index) = head.call_constraint
+            && let Some(Constraint::CallSubject(constraint)) = self.constraints.get_mut(index)
+            && constraint.call_id == head.call
+        {
+            constraint.argument_ids.clear();
+        }
+        if let Some(index) = head.call_written_arguments
+            && let Some(row) = self.written_call_arguments.get_mut(index)
+        {
+            row.2.clear();
+        }
+        let source = self.source_of_id(callee);
+        for link in links {
+            let diagnostics_before = self.diagnostics.len();
+            match link.generated {
+                Some(crate::elements::GeneratedLink::Child) => continue,
+                Some(crate::elements::GeneratedLink::Attribute {
+                    name,
+                    name_span,
+                    bare,
+                }) => {
+                    if !name.contains('-') {
+                        self.retarget_element_attribute(link, name, name_span, bare);
+                        continue;
+                    }
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: name_span,
+                        msg: format!(
+                            "`{name}` is a hyphenated attribute, which only a web element \
+                             takes: on `<{tag}>`, an attribute is a method of what \
+                             `{tag}()` returns, and no method is named `{name}`"
+                        ),
+                    });
+                }
+                Some(crate::elements::GeneratedLink::Event { span }) => {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg: format!(
+                            "`on:` is the web element's event form: on `<{tag}>`, an event is \
+                             a method of what `{tag}()` returns, written as an attribute \
+                             (`on_press(|| …)`)"
+                        ),
+                    });
+                }
+                None => {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: link.written,
+                        msg: format!(
+                            "a `.method(…)` link is the web element's head form: on \
+                             `<{tag}>`, every head item is an attribute, a method of what \
+                             `{tag}()` returns, written without the dot"
+                        ),
+                    });
+                }
+            }
+            if let Some(source) = source {
+                self.attribute_new_diagnostics(diagnostics_before, source);
+            }
+            self.refused_element_links.insert(link.id);
+        }
+        true
+    }
+
+    /// One attribute of a typed element: `.attr("name", value)` becomes
+    /// `.name(value)`, or `.name()` for a bare attribute (native-ui.md §12).
+    fn retarget_element_attribute(
+        &mut self,
+        link: &ElementChainLink<'src>,
+        name: &'src str,
+        name_span: Span,
+        bare: bool,
+    ) {
+        if let Some(index) = link.constraint
+            && let Some(Constraint::MethodCall {
+                id,
+                member_name,
+                argument_ids,
+                ..
+            }) = self.constraints.get_mut(index)
+            && *id == link.id
+        {
+            *member_name = name;
+            argument_ids.remove(0);
+            if bare {
+                argument_ids.clear();
+            }
+        }
+        if let Some(index) = link.written_arguments
+            && let Some(row) = self.written_call_arguments.get_mut(index)
+        {
+            row.2.remove(0);
+            if bare {
+                row.2.clear();
+            }
+        }
+        self.member_name_spans.insert(link.id, name_span);
+    }
+
     /// `std::<module…>::<item>`'s entity, or `None` when std does not have it.
     /// The modules are walked in order, so `["style", "prelude"]` descends
     /// `std::web::style` and then its `style/prelude.vl` child — the same walk
@@ -70546,9 +71143,29 @@ impl<'src> Analyzer<'src> {
         // B270's drain runs FIRST: a std reference has no scope to wait for, and
         // resolving it before the locals means an `Expr::Local` is already in
         // place when the ordinary pass walks the same chain.
+        let mut element_candidates = self.typed_element_candidates();
+        let mut guarded_element_heads = Vec::new();
         for (id, module, item) in std::mem::take(&mut self.prepped_std_items) {
             // M110 S6: what the drain mints for a row belongs to the row's item.
             self.id_windows.set_drain_anchor(id);
+            // native-ui.md §12: an element head whose tag names an `[element]`
+            // function is that function's call, not std's `view`. Decided
+            // here, where every import has bound and no local has resolved
+            // yet — the head's callee is about to become one or the other.
+            // A tag a guard clause may publish a capture over is decided with
+            // the held-back locals below, once the guard verdict is in: the
+            // capture, a value, shadows the function as a `let` would (B222).
+            if !element_candidates.is_empty()
+                && let Some(candidate) = element_candidates.remove(&id)
+            {
+                if self.guard_may_publish(id, candidate.head.tag) {
+                    guarded_element_heads.push((id, module, item, candidate));
+                    continue;
+                }
+                if self.lower_typed_element(&candidate) {
+                    continue;
+                }
+            }
             self.resolve_prepped_std_item(id, module, item);
         }
         let mut guarded_locals = Vec::new();
@@ -72873,6 +73490,14 @@ impl<'src> Analyzer<'src> {
         // about.
         for (id, name) in guarded_locals {
             self.resolve_prepped_local(id, name);
+        }
+        // native-ui.md §12: and the element heads held back with them, their
+        // tags resolving in the same complete scope.
+        for (id, module, item, candidate) in guarded_element_heads {
+            self.id_windows.set_drain_anchor(id);
+            if !self.lower_typed_element(&candidate) {
+                self.resolve_prepped_std_item(id, module, item);
+            }
         }
 
         // B237: and the assignments to those names, wired now that their
@@ -77430,6 +78055,10 @@ enum WriteSubject<'a> {
     /// A `Shared` cell, written IN PLACE (B457: a rebind installs a fresh
     /// value and leaves the storage a read handed out alone).
     Cell(CellSlot),
+    /// A `Shared` cell, written AT ALL — a rebind as much as an in-place
+    /// write (M199): what a live BORROW of the cell's storage cannot survive,
+    /// where a read that only aliases the storage survives a rebind.
+    CellAny(CellSlot),
     /// A module-level `mut` binding, written at all — an assignment to it or
     /// to a place under it, or a call lending such a place `&mut` (B647).
     Module(Id, &'a ModuleWrites),
@@ -77453,6 +78082,7 @@ impl WriteSubject<'_> {
     fn spans_a_write(&self, analyzer: &Analyzer<'_>, expr_id: Id) -> bool {
         match self {
             WriteSubject::Cell(cell) => analyzer.spans_an_in_place_write(expr_id, *cell),
+            WriteSubject::CellAny(cell) => analyzer.spans_a_cell_write(expr_id, *cell),
             WriteSubject::Module(binding, writes) => {
                 analyzer.spans_a_module_write(expr_id, *binding, writes)
             }
@@ -77463,7 +78093,7 @@ impl WriteSubject<'_> {
     /// runs code: a cell's `read()`/`write()`.
     fn is_the_access(&self, analyzer: &Analyzer<'_>, call_id: Id) -> bool {
         match self {
-            WriteSubject::Cell(_) => {
+            WriteSubject::Cell(_) | WriteSubject::CellAny(_) => {
                 analyzer.shared_cells.reads.contains_key(&call_id)
                     || analyzer.shared_cells.writes.contains_key(&call_id)
             }
@@ -77475,6 +78105,7 @@ impl WriteSubject<'_> {
     fn unknown(&self, analyzer: &Analyzer<'_>) -> bool {
         match self {
             WriteSubject::Cell(cell) => analyzer.shared_cells.mutated.contains(cell),
+            WriteSubject::CellAny(cell) => analyzer.shared_cells.written.contains(cell),
             WriteSubject::Module(binding, writes) => writes.through_values.contains(binding),
         }
     }
@@ -77500,6 +78131,11 @@ struct SharedCells {
     /// outside this set can never be aliased into by a later write, whatever
     /// calls run in between.
     mutated: HashSet<CellSlot>,
+    /// Component representatives SOME write reaches at all, a rebind included
+    /// (M199): a read nothing writes is safe to BORROW natively, where
+    /// [`Self::mutated`] is only the JS backend's aliasing question.
+    #[serde(default)]
+    written: HashSet<CellSlot>,
     /// Every `Shared.read()` call expression, and the slot it reads through.
     reads: HashMap<Id, CellSlot>,
     /// Every `Shared.write()` call expression: the slot it writes through, and
@@ -77722,6 +78358,9 @@ pub struct Program<'src> {
     pub entity_scope_map: HashMap<Id, Id>,
     pub function_calls: IndexMap<Id, FunctionCall>,
     pub functions: IndexMap<Id, Function<'src>>,
+    /// The functions declared `[element]` (native-ui.md §12): a tag whose
+    /// name resolves to one lowers to a typed chain on what it returns.
+    pub element_functions: HashSet<Id>,
     pub external_functions: IndexMap<Id, ExternalFunction<'src>>,
     pub traits: IndexMap<Id, Trait<'src>>,
     pub generic_dispatch: HashMap<Id, GenericDispatch<'src>>,
@@ -78072,7 +78711,8 @@ pub struct Program<'src> {
     /// rather than the context's bare `T` — the parameter's FLAVOUR
     /// (`reactive-turns.md` §5.1), recorded where the pass MINTS the parameter
     /// and known there exactly: a parameter holds the bare value when its
-    /// provider is a strict node or a `run` closure, and `Option<T>` otherwise.
+    /// provider is a `run` closure, or a strict node every entry into which
+    /// has a value to hand (covered, B740), and `Option<T>` otherwise.
     ///
     /// The parameter itself stays record-less for the reason above, so the
     /// flavour cannot live on a `parameters` entry. It is a separate marker for
@@ -78081,6 +78721,15 @@ pub struct Program<'src> {
     /// keyed on `parameters` sees plumbing dressed as source. Membership is the
     /// bool: absent means bare.
     pub context_optional_hidden_parameters: HashSet<Id>,
+    /// B740: the reads of an `Option`-flavoured hidden parameter
+    /// ([`Program::context_optional_hidden_parameters`]) that stand where the
+    /// BARE value is wanted — a strict `get()` in an `Option` holder, or the
+    /// argument such a holder threads to a bare callee — by the read's own
+    /// entity (an `Expr::Local` of the parameter). Both emitters unwrap the
+    /// `Option` there. The context pass records one only in a node every entry
+    /// into which hands it `Some` (it is covered), so the unwrap never meets a
+    /// `None`.
+    pub context_unwrapped_reads: HashSet<Id>,
     /// papers-54's B?2: the context arguments the context pass threads to a
     /// `for x in subject` loop's implicit `next` call, by the loop's id. The
     /// call graph records that call as an edge keyed by the loop (no
@@ -78676,6 +79325,15 @@ pub struct Program<'src> {
     /// WHETHER TO COPY, and a resource capture is in this set and never in
     /// that map (R1).
     pub materialized_captures: HashSet<Id>,
+    /// M199: the `Shared`-read constructs waiting on the suspension verdict
+    /// ([`cell_borrows::settle_cell_borrows`] empties it).
+    pub pending_cell_borrows: Vec<cell_borrows::PendingCellBorrow>,
+    /// M199: the pattern subjects — a `Shared` read, or a field / slot spine
+    /// over one — the native backend binds BY REFERENCE into the cell: the
+    /// `match` / `if` no write of the cell reaches and nothing suspends, and
+    /// every capture only views what it binds. Filled by
+    /// [`cell_borrows::settle_cell_borrows`].
+    pub borrowed_cell_subjects: HashSet<Id>,
     /// Every interned type id that classifies as a RESOURCE (destruction.md §3),
     /// so the transformer can re-ask the question about a type it only learns
     /// per monomorphization — a generic capture bound at `T` copies for a
@@ -78784,6 +79442,10 @@ pub struct Program<'src> {
     /// every pass that refines dispatch (M97). Derived data, like the graph.
     bound_selection_memo:
         std::sync::Mutex<HashMap<crate::dispatch_refine::BoundSelectionKey, Vec<Id>>>,
+    /// The impls each [`crate::dispatch_refine::impl_members_for_bound`]
+    /// selection can read, by member name and by trait (M203). Derived data,
+    /// like the graph.
+    member_impls: std::sync::OnceLock<crate::dispatch_refine::MemberImpls>,
     /// [`crate::impl_select`]'s answers — which impls apply to a type (M98),
     /// the bound proofs under them and the arguments a type provides a trait at
     /// (M111). Derived data, like the graph.
@@ -79343,6 +80005,12 @@ impl<'src> Program<'src> {
         self.receiver_dispatch_memo
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// [`crate::dispatch_refine::MemberImpls`], built on first use.
+    pub(crate) fn member_impls(&self) -> &crate::dispatch_refine::MemberImpls {
+        self.member_impls
+            .get_or_init(|| crate::dispatch_refine::MemberImpls::build(self))
     }
 
     /// [`crate::dispatch_refine::impl_members_for_bound`]'s memo (M97). A
@@ -92490,6 +93158,14 @@ fn analyze_over_world<'src>(
     // — folded from the live regions' contributions (one walk) and the
     // restored regions' rows (`held_tables.rs`); each decision below is then
     // taken over every candidate, so no output row is ever served.
+    // M199: the `Shared::read` declarations, for the capture plan's subject
+    // test — asked while the held rows are collected, before `shared_cells`
+    // (whose reads would otherwise answer it) exists.
+    analyzer.shared_read_callees = intrinsics
+        .iter()
+        .filter(|(_, intrinsic)| matches!(intrinsic, Intrinsic::SharedValue))
+        .map(|(id, _)| *id)
+        .collect();
     let held_live = analyzer.collect_held_rows();
     crate::phase_pass_mark("analyzer.collect_held_rows()");
     let mut held = analyzer.fold_held(&held_live);
@@ -92512,7 +93188,11 @@ fn analyze_over_world<'src>(
     // B53: the capture pass runs FIRST — its share elision decides which
     // captures own nothing, and rule 2's move elision (inside
     // `compute_clone_sites`) must refuse to move out of those.
-    let capture_plan = analyzer.compute_capture_clone_sites(&held);
+    // M199: the `Shared`-read constructs no write of their cell reaches,
+    // before the capture plan that shares under them.
+    let mut pending_cell_borrows = analyzer.cell_borrow_candidates(&held, &calls_index);
+    crate::phase_pass_mark("analyzer.cell_borrow_candidates()");
+    let capture_plan = analyzer.compute_capture_clone_sites(&held, &mut pending_cell_borrows);
     crate::phase_pass_mark("analyzer.compute_capture_clone_sites()");
     let resource_types = analyzer.compute_resource_types();
     crate::phase_pass_mark("analyzer.compute_resource_types()");
@@ -93604,6 +94284,7 @@ fn analyze_over_world<'src>(
         entity_scope_map: analyzer.expr_id_to_scope_id_map,
         function_calls: analyzer.function_calls,
         functions: analyzer.functions,
+        element_functions: analyzer.element_functions,
         external_functions: analyzer.external_functions,
         traits: analyzer.traits,
         generic_dispatch: analyzer.generic_dispatch,
@@ -93686,6 +94367,7 @@ fn analyze_over_world<'src>(
         unwired_method_calls: analyzer.unwired_method_calls,
         context_hidden_parameters: HashMap::default(),
         context_optional_hidden_parameters: HashSet::default(),
+        context_unwrapped_reads: HashSet::default(),
         for_each_context_arguments: HashMap::default(),
         cleared_clause_contexts: HashSet::default(),
         context_bindings: Vec::new(),
@@ -93819,6 +94501,8 @@ fn analyze_over_world<'src>(
         parameter_entry_clones,
         capture_clone_sites: capture_plan.sites,
         materialized_captures: capture_plan.materialized,
+        pending_cell_borrows,
+        borrowed_cell_subjects: HashSet::default(),
         resource_types,
         dropped_bindings: std::mem::take(&mut analyzer.dropped_bindings),
         drop_extents: std::mem::take(&mut analyzer.drop_extents),
@@ -93842,6 +94526,7 @@ fn analyze_over_world<'src>(
         hmr_bindings,
         call_graph_memo: std::sync::OnceLock::new(),
         bound_selection_memo: std::sync::Mutex::default(),
+        member_impls: std::sync::OnceLock::new(),
         selection_memos: crate::impl_select::SelectionMemos::default(),
         trait_subject_memo: std::sync::Mutex::default(),
         trait_method_memo: std::sync::Mutex::default(),

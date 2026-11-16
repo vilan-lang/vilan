@@ -1,0 +1,89 @@
+// The app: a server bound to loopback on a port the OS picks, and a window on
+// it. The page is the server's; the window only shows it, and everything the
+// page does reaches the server over the real socket, as a browser's would.
+//
+// The server prints a line for each thing it sees — the page served, the page
+// reporting it LOADED (its script ran in the webview), the quit — which is
+// what the end-to-end test reads. Closing the window (by hand, or through the
+// page's Quit button) stops the program the way SIGTERM does: the server
+// drains and the process exits with code 0.
+
+import std::http::{ Request, Response, Server };
+import std::process::args;
+import std::shared::Shared;
+import std::window::Window;
+
+let page: str = """
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>vilan desktop</title></head>
+<body>
+<h1>Served by the program, shown by the system's webview</h1>
+<p id="status">loading…</p>
+<button id="quit">Quit</button>
+<script>
+const quit = () => fetch('/quit', { method: 'POST' });
+document.getElementById('quit').onclick = quit;
+fetch('/loaded', { method: 'POST' })
+	.then((response) => response.text())
+	.then((text) => {
+		document.getElementById('status').textContent = text;
+		if (location.hash === '#smoke') quit();
+	});
+</script>
+</body>
+</html>
+""";
+
+fun main() {
+	// Where the window's handle lands once it is open, for `/quit` to close.
+	let shown: Shared<Option<Window>> = Shared::new(None);
+	let smoke = args().contains("--smoke");
+	Server::builder()
+		.port(0)
+		.host("127.0.0.1")
+		.on_request(|request| answer(request, shown))
+		.on_start(|server| open_window(server.url(), shown, smoke))
+		.build()
+		.start();
+}
+
+fun open_window(url: str, shown: Shared<Option<Window>>, smoke: bool) {
+	let address = if smoke { i"{url}#smoke" } else { url };
+	match Window::builder(address).title("vilan desktop").size(640, 400).open() {
+		Ok(let window) => {
+			print(i"window open on {url}");
+			shown.write() = Some(window);
+		},
+		// No display, no webview: say why. The server keeps serving, so the
+		// page is still a browser away.
+		Err(let reason) => print(i"no window: {reason} (the app is at {url})"),
+	}
+}
+
+fun answer(request: Request, shown: Shared<Option<Window>>): Response {
+	match request.path() {
+		"/" => {
+			print("served the page");
+			Response::builder()
+				.set_header("Content-Type", "text/html; charset=utf-8")
+				.body(page)
+				.build()
+		},
+		"/loaded" => {
+			print("the page loaded");
+			Response::builder().body("loaded from the program's own server").build()
+		},
+		"/quit" => {
+			print("quit");
+			match shown.read() {
+				Some(let window) => window.close(),
+				None => {},
+			}
+			Response::builder().body("bye").build()
+		},
+		_ => Response::builder().code(404).body("not found").build(),
+	}
+}
+
+main();

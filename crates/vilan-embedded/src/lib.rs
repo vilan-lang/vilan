@@ -97,9 +97,20 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
         staging.join("vilan-rt-signal").join("Cargo.toml"),
         RT_SIGNAL_MANIFEST,
     ));
+    // F164: the dual-stack listener, reached by `vilan-rt-signal`'s manifest
+    // as `../vilan-rt-net`.
+    written.push((
+        staging.join("vilan-rt-net").join("Cargo.toml"),
+        RT_NET_MANIFEST,
+    ));
     written.push((
         staging.join("vilan-rt-term").join("Cargo.toml"),
         RT_TERM_MANIFEST,
+    ));
+    // F160: the loop's readiness wait.
+    written.push((
+        staging.join("vilan-rt-poll").join("Cargo.toml"),
+        RT_POLL_MANIFEST,
     ));
     // M185: the image glue and, beside it, the codec core its manifest
     // reaches as `../vilan-image`.
@@ -110,6 +121,16 @@ pub fn materialize_rt_into(cache_root: &Path) -> Result<PathBuf, String> {
     written.push((
         staging.join("vilan-image").join("Cargo.toml"),
         IMAGE_CORE_MANIFEST,
+    ));
+    // F1 M2: `std::window`'s webview.
+    written.push((
+        staging.join("vilan-rt-webview").join("Cargo.toml"),
+        RT_WEBVIEW_MANIFEST,
+    ));
+    // native-ui.md P1: `std::gfx`'s GPU window.
+    written.push((
+        staging.join("vilan-rt-gfx").join("Cargo.toml"),
+        RT_GFX_MANIFEST,
     ));
     for (path, contents) in written {
         let parent = path.parent().expect("every embedded file has a parent");

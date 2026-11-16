@@ -19,6 +19,18 @@
 //! The pass is the identity on element-free trees: a cheap `contains_element`
 //! prefilter (riding `for_each_child`, like lift's mark detection) leaves
 //! untouched nodes unrebuilt.
+//!
+//! TYPED elements (native-ui.md §12) are not decided here. Whether `<row>`
+//! means std's `view("row")` or an `[element] fun row()` in scope is a NAME
+//! RESOLUTION question, and this pass runs per file, before any file's
+//! imports are known — its output is even cached by source text. So every
+//! named element lowers to the web chain, as it always has, and the analyzer
+//! re-reads that chain once names resolve: a head whose tag names an
+//! `[element]` function has its `view` callee, its attribute links and its
+//! refusals rewritten there (`Analyzer::lower_typed_element`). That is what
+//! keeps every web element's lowering byte for byte what it was. The
+//! analyzer finds the pieces by the shapes this pass alone builds —
+//! [`is_view_head`] and [`generated_link`] are those shapes' one statement.
 
 use crate::node::{
     Closure, ElementBody, ElementChild, ElementHeadItem, If, Node, NodeIfBranch, NodeList,
@@ -126,7 +138,7 @@ fn build_chain<'src>(
     let head_span: Span = (span.start..tag.end).into();
     let mut chain: Spanned<Node<'src>> = (
         Node::Call(
-            Box::new((Node::StdItem("web::ui", "view"), head_span)),
+            Box::new((Node::StdItem(VIEW_MODULE, VIEW_ITEM), head_span)),
             None,
             (vec![(Node::String(tag_text), tag)], tag),
         ),
@@ -207,6 +219,68 @@ fn build_chain<'src>(
         chain = attach(chain, member);
     }
     (chain.0, span)
+}
+
+/// The std module and item every named element's head calls,
+/// `std::web::ui::view` (B270).
+const VIEW_MODULE: &str = "web::ui";
+const VIEW_ITEM: &str = "view";
+
+/// Whether a `StdItem` reference is the callee this pass gives every named
+/// element's head. Only this pass builds a `StdItem` node, and only this one
+/// names `view`, so the answer identifies an element head wherever the
+/// analyzer meets it.
+pub fn is_view_head(module: &str, item: &str) -> bool {
+    module == VIEW_MODULE && item == VIEW_ITEM
+}
+
+/// One link of a named element's chain that this pass GENERATED, as the
+/// analyzer reads it back (native-ui.md §12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+pub enum GeneratedLink<'src> {
+    /// `.attr("name", value)` — an attribute. `name_span` is the written
+    /// name's; `bare` says no value was written (`<row wrap>`), so the web
+    /// chain's `""` is scaffolding rather than an argument.
+    Attribute {
+        name: &'src str,
+        name_span: Span,
+        bare: bool,
+    },
+    /// `.on("event", handler)` / `.on_event(..)` — an `on:event(..)` item,
+    /// spanning the item.
+    Event { span: Span },
+    /// `.child(value)` — a child, which a typed element takes unchanged.
+    Child,
+}
+
+/// The generated link `member` is, if it is one. Every link this pass
+/// generates names its method through an accessor with a ZERO-WIDTH span (see
+/// `build_chain`), and no written method name has one, so the test cannot
+/// take a link the author wrote after the element (`<div />.attr(..)`) for
+/// one of these.
+pub fn generated_link<'src>(member: &Spanned<Node<'src>>) -> Option<GeneratedLink<'src>> {
+    let Node::Call(callee, None, arguments) = &member.0 else {
+        return None;
+    };
+    let (Node::Accessor(method), accessor_span) = &**callee else {
+        return None;
+    };
+    if accessor_span.start != accessor_span.end {
+        return None;
+    }
+    match (*method, arguments.0.as_slice()) {
+        ("attr", [(Node::String(name), name_span), (value, value_span)]) => {
+            Some(GeneratedLink::Attribute {
+                name,
+                name_span: *name_span,
+                bare: matches!(value, Node::String("")) && value_span == name_span,
+            })
+        }
+        ("on" | "on_event", [_, _]) => Some(GeneratedLink::Event { span: member.1 }),
+        ("child", [_]) => Some(GeneratedLink::Child),
+        _ => None,
+    }
 }
 
 /// One chain link: `MemberAccessor(subject, member)` with the grown span,

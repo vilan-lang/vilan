@@ -1,0 +1,30 @@
+// M195: a `Bytes` binds as a BLOB and reads back through `Row::bytes` as the
+// bytes bound, on both backends - a NUL and a high byte inside, `typeof` blob,
+// an empty buffer - and a TEXT column read through `bytes` is the UTF-8 of its
+// text, SQLite's own `CAST(value AS BLOB)`. Natively the bind was rustc's E0277
+// (`vilan_rt::Any` had no BLOB arm) and a BLOB column read back as TEXT.
+import std::bytes::Bytes;
+import std::db::Database;
+
+fun main() {
+	let db = Database::open(":memory:");
+	db.exec("CREATE TABLE b (label TEXT, data BLOB)");
+	let insert = db.prepare("INSERT INTO b (label, data) VALUES (?, ?)");
+	let blob = Bytes::alloc(5);
+	blob.set(0, 0);
+	blob.set(1, 255);
+	blob.set(2, 128);
+	blob.set(3, 0);
+	blob.set(4, 7);
+	insert.run(["blob", blob]);
+	insert.run(["empty", Bytes::alloc(0)]);
+	insert.run(["text", "héllo"]);
+	for row in db
+		.prepare("SELECT label, data, typeof(data) AS kind FROM b ORDER BY rowid")
+		.all([]) {
+		let data = row.bytes("data");
+		print(i"{row.text("label")} {row.text("kind")} {data.len()} {data.to_hex()}");
+	}
+	let found = db.prepare("SELECT label FROM b WHERE data = ?").first([blob]);
+	print(found.map_or(|row| row.text("label"), "none"));
+}

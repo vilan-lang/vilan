@@ -46,6 +46,7 @@ pub mod process;
 pub mod show;
 pub mod time;
 pub mod url;
+pub mod ws;
 
 // ---------------------------------------------------------------- strings ---
 
@@ -691,7 +692,9 @@ fn run_guarded_main(body: impl FnOnce()) -> bool {
     }));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     std::panic::set_hook(previous);
-    outcome.is_err()
+    // F157: a termination that ended the loop under a suspended `main` is the
+    // program's end, not its failure.
+    outcome.is_err_and(|payload| !payload.is::<executor::TerminationStop>())
 }
 
 // How many CATCHING regions the current thread is inside (F25). A counter
@@ -1047,6 +1050,44 @@ impl<T: Js> Js for Weak<T> {
 /// later item that measurement pays for. This is a plain alias of [`Shared`],
 /// named separately so the emitted source says which rule put it there.
 pub type Captured<T> = Shared<T>;
+
+/// B724: a `&mut` parameter some closure captures, as the body sees it — a
+/// [`Captured`] cell filled from the caller's place on entry, and written back
+/// to that place when the guard drops: at every return, and on a panic's
+/// unwind, so a caller that catches the panic reads what the body wrote, as it
+/// does on the JS backend, where the place IS the object.
+///
+/// A closure cannot hold the loan itself: every closure is an `Rc<dyn Fn>`,
+/// which owns its captures for as long as any handle lives. The copy is the
+/// place observably because the place is loaned exclusively to the body for
+/// the call, and no closure that captures it outlives the call (C16).
+pub struct WriteBack<'a, T: Clone> {
+    target: &'a mut T,
+    cell: Captured<T>,
+}
+
+impl<'a, T: Clone> WriteBack<'a, T> {
+    pub fn new(target: &'a mut T) -> Self {
+        let cell = Captured::new(target.clone());
+        WriteBack { target, cell }
+    }
+
+    /// Another handle to the cell — what the body names the parameter by.
+    pub fn cell(&self) -> Captured<T> {
+        self.cell.clone()
+    }
+}
+
+impl<T: Clone> Drop for WriteBack<'_, T> {
+    fn drop(&mut self) {
+        // Not [`Shared::get`]: a write back during an unwind that met the
+        // cell still borrowed would panic inside a panic. The place keeps
+        // the value it had at the last settled write instead.
+        if let Ok(value) = self.cell.inner.value.try_borrow() {
+            *self.target = value.clone();
+        }
+    }
+}
 
 // ------------------------------------------------------- reference equality ---
 
@@ -1985,11 +2026,14 @@ impl<T: Js + std::hash::Hash + Eq + Clone> Js for Set<T> {
 /// `any` — a value whose vilan type is open at the position it fills.
 ///
 /// It exists for ONE shape today and the scope is deliberate: `std::db`'s
-/// `Statement::run(parameters: List<any>)`, where a query's bind list is
-/// heterogeneous by nature (`["ada", 1.5]`) and the schema, not the type
-/// system, says what each slot means. On the JS backend such a list is just a
-/// JS array; natively it needs a value type, and this is the smallest one that
-/// covers what a bind list can hold.
+/// bind list, where a query's parameters are heterogeneous by nature
+/// (`["ada", 1.5]`) and the schema, not the type system, says what each slot
+/// means. Since M175 the public list is a `List<dyn SqlValue>`, and each
+/// element's `sql_value()` answers one of these for the host binder. On the JS
+/// backend such a value is just a JS value; natively it needs a value type,
+/// and this is the smallest one that covers what SQLite stores: its five
+/// storage classes (NULL, INTEGER, REAL, TEXT, BLOB), plus `bool`, which the
+/// binder writes as 0 or 1.
 ///
 /// Not a dynamic type system. There is no downcast, no reflection and no
 /// `is`-test over it — a program reads an `any` back through the accessor of
@@ -2005,6 +2049,9 @@ pub enum Any {
     Integer(i64),
     Float(f64),
     Text(Str),
+    /// A BLOB: a `Bytes` bound or read back (M195). The buffer is SHARED, as
+    /// every `Bytes` is — it is the same `Uint8Array` on the other backend.
+    Blob(bytes::Bytes),
 }
 
 macro_rules! any_from_integer {
@@ -2049,6 +2096,12 @@ impl From<&str> for Any {
     }
 }
 
+impl From<bytes::Bytes> for Any {
+    fn from(value: bytes::Bytes) -> Any {
+        Any::Blob(value)
+    }
+}
+
 impl<T: Into<Any>> From<Option<T>> for Any {
     fn from(value: Option<T>) -> Any {
         match value {
@@ -2066,6 +2119,7 @@ impl Js for Any {
             Any::Integer(value) => value.js(),
             Any::Float(value) => value.js(),
             Any::Text(value) => value.js(),
+            Any::Blob(value) => value.js(),
         }
     }
 
@@ -2089,6 +2143,7 @@ impl Json for Any {
             Any::Integer(value) => value.json(),
             Any::Float(value) => value.json(),
             Any::Text(value) => value.json(),
+            Any::Blob(value) => value.json(),
         }
     }
 }
@@ -2840,6 +2895,30 @@ pub fn str_code_at(text: &str, index: usize) -> u32 {
     0
 }
 
+/// `indexOf` — the UTF-16 code-unit position of the FIRST occurrence of
+/// `needle`, or `-1` (F156). `std::string`'s `index_of` promises the unit
+/// `substring` and `len` count, so the byte offset Rust's `find` answers is
+/// converted: the units of every character before it. An empty needle is at
+/// `0`, as it is in JavaScript. A match can only start on a character
+/// boundary in a valid string (no vilan string holds a lone surrogate — see
+/// [`str_len`]), so the conversion is exact.
+pub fn str_index_of(text: &str, needle: &str) -> i64 {
+    match text.find(needle) {
+        Some(offset) => str_len(&text[..offset]) as i64,
+        None => -1,
+    }
+}
+
+/// `lastIndexOf` — [`str_index_of`] from the other end. An empty needle is at
+/// the text's length, where JavaScript puts it (`rfind("")` is the byte
+/// length, which converts to exactly that).
+pub fn str_last_index_of(text: &str, needle: &str) -> i64 {
+    match text.rfind(needle) {
+        Some(offset) => str_len(&text[..offset]) as i64,
+        None => -1,
+    }
+}
+
 pub fn parse_i32(text: &str) -> Option<i32> {
     text.trim().parse::<i32>().ok()
 }
@@ -3204,6 +3283,24 @@ mod tests {
             guarded(move || with_finally(|| panic_with("boom"), || *flag.borrow_mut() = true));
         assert!(caught.is_err());
         assert!(*ran.borrow());
+    }
+
+    /// F156: `indexOf`/`lastIndexOf` count UTF-16 code units, as node does —
+    /// a two-byte `é` is one unit, an emoji two — and answer `-1` for absence,
+    /// `0` and the length for an empty needle.
+    #[test]
+    fn index_of_counts_utf16_units_the_way_index_of_does() {
+        let text = "héllo wörld 😀 wörld";
+        assert_eq!(str_index_of(text, "wörld"), 6);
+        assert_eq!(str_last_index_of(text, "wörld"), 15);
+        assert_eq!(str_index_of(text, "😀"), 12);
+        assert_eq!(str_index_of(text, "zz"), -1);
+        assert_eq!(str_last_index_of(text, "zz"), -1);
+        assert_eq!(str_index_of(text, ""), 0);
+        assert_eq!(str_last_index_of(text, ""), 20);
+        assert_eq!(str_last_index_of("abc", "c"), 2);
+        assert_eq!(str_index_of("", ""), 0);
+        assert_eq!(str_last_index_of("", "a"), -1);
     }
 
     #[test]

@@ -76,3 +76,52 @@ fn m138_the_adaptation_decisions_run_once_however_many_rounds() {
          decisions read each pass's last round only (M138)"
     );
 }
+
+/// B743: a trait default is emitted once per receiver type, from whichever
+/// body reaches it first, and it must be emitted under its OWN instance
+/// record. It took the caller's, so a default first reached inside an async
+/// body (here an awaiting closure, inside an async `main`) came out an
+/// `async function` while its synchronous call sites did not await it: the
+/// second line printed `direct [object Promise]`.
+#[test]
+fn b743_a_trait_default_first_reached_from_an_async_body_stays_synchronous() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::time::sleep;
+
+        trait Sized2 {
+            fun base(self): i32;
+
+            fun doubled(self): i32 {
+                self.base() * 2
+            }
+        }
+
+        struct Box2 {
+            value: i32,
+        }
+
+        impl Box2 with Sized2 {
+            fun base(self): i32 {
+                self.value
+            }
+        }
+
+        fun apply(f: || i32): i32 {
+            f() + 1
+        }
+
+        fun main() {
+            let slow = apply(|| {
+                sleep(1);
+                Box2 { value = 3 }.doubled()
+            });
+            print(i"slow {slow}");
+            let four = Box2 { value = 4 };
+            print(i"direct {four.doubled()}");
+        }
+        "#,
+        "slow 7\ndirect 8\n",
+    );
+}

@@ -79,32 +79,41 @@ fn tracked_files_under(directory: &str) -> Vec<String> {
         .collect()
 }
 
-/// Copies `directory`'s tracked files into a fresh temp tree and returns its
-/// root, preserving the layout below `directory` so relative paths inside the
-/// example (a workspace member, a sibling module) still resolve.
-fn stage(directory: &str) -> PathBuf {
+/// Where `directory` is staged: a fresh temp tree of its own.
+fn stage_root(directory: &str) -> PathBuf {
     let tag = directory.rsplit('/').next().expect("example name");
-    let staged =
-        support::scratch_root().join(format!("vilan_example_{tag}_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&staged);
+    support::scratch_root().join(format!("vilan_example_{tag}_{}", std::process::id()))
+}
+
+/// Copies `directory`'s tracked files into a fresh temp tree and returns the
+/// example's directory in it. The tree keeps the repository's layout, so
+/// relative paths inside the example (a workspace member, a sibling module)
+/// still resolve — and so does a path dependency on a package of this
+/// repository (`ui-icons` takes `vilan/packages/lucide` as
+/// `../../packages/lucide`): an example whose manifest names `packages/` has
+/// the tracked files under `vilan/packages` staged beside it.
+fn stage(directory: &str) -> PathBuf {
+    let staged_root = stage_root(directory);
+    let _ = std::fs::remove_dir_all(&staged_root);
 
     let root = repo_root();
-    let files = tracked_files_under(directory);
+    let mut files = tracked_files_under(directory);
     assert!(
         !files.is_empty(),
         "{directory} has no tracked files — an example that exists only in the \
          working tree is not one a clone can build"
     );
+    let manifest =
+        std::fs::read_to_string(root.join(directory).join("vilan.toml")).unwrap_or_default();
+    if manifest.contains("packages/") {
+        files.extend(tracked_files_under("vilan/packages"));
+    }
     for file in &files {
-        let relative = file
-            .strip_prefix(directory)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .expect("tracked path sits under the example");
-        let destination = staged.join(relative);
+        let destination = staged_root.join(file);
         std::fs::create_dir_all(destination.parent().expect("a parent")).unwrap();
         std::fs::copy(root.join(file), &destination).unwrap();
     }
-    staged
+    staged_root.join(directory)
 }
 
 /// What a built example must additionally prove — E22's decide-at-take-up
@@ -125,6 +134,14 @@ enum PostBuild {
     /// non-empty at their documented paths.
     Artifacts(&'static [&'static str]),
     BuildOnly,
+    /// F1 M2: a NATIVE-ONLY example (it reaches `module`, which only the Rust
+    /// backend builds). Here it must CHECK clean and its JavaScript build must
+    /// refuse it by the module's name; the native build and run are
+    /// `desktop_shell.rs`'s and `gfx_window.rs`'s, which need a window system
+    /// this gate does not.
+    NativeOnly {
+        module: &'static str,
+    },
 }
 
 fn post_build(directory: &str) -> PostBuild {
@@ -173,6 +190,36 @@ fn post_build(directory: &str) -> PostBuild {
         "reactive-ui" => PostBuild::Artifacts(&["app.js", "app.css"]),
         "router" => PostBuild::Artifacts(&["app.js"]),
         "todo" => PostBuild::Artifacts(&["dist/server.mjs", "dist/client.js", "dist/client.css"]),
+        "desktop" => PostBuild::NativeOnly {
+            module: "std::window",
+        },
+        // native-ui.md P1: the GPU window's counter; its native build and its
+        // run are `gfx_window.rs`'s.
+        "gfx" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P2: a screen laid out by `std::ui`; its native build,
+        // its recorded rectangles and its goldens are `ui_screen.rs`'s. It
+        // reaches `std::gfx` too (its window, its test font), and the refusal
+        // names the first native-only module the build reaches, which is
+        // that one; `std::ui`'s own refusal is pinned in `std_surface.rs`.
+        "ui" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P3's exit test: the counter and the 10,000-row list;
+        // their native builds and their runs are `ui_interaction.rs`'s. Both
+        // reach `std::gfx` first, as `ui` does.
+        "ui-counter" | "ui-list" => PostBuild::NativeOnly { module: "std::gfx" },
+        // P4's exit test: the todo list on `std::ui::kit`, run by
+        // `ui_interaction.rs`; it reaches `std::gfx` first too.
+        "ui-todo" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P4's exit test: the virtual list of 100,000 rows; its
+        // native build and runs are `ui_interaction.rs`'s.
+        "ui-virtual-list" => PostBuild::NativeOnly { module: "std::gfx" },
+        // native-ui.md P5, text editing: the notes pad on the kit's text area;
+        // its native build and runs are `ui_interaction.rs`'s.
+        "ui-notes" => PostBuild::NativeOnly { module: "std::gfx" },
+        // gfx-path.md S4: Lucide's icons from the generated package
+        // `vilan/packages/lucide`, taken by a path dependency (staged beside
+        // it); its native build and its recorded `--check` are
+        // `ui_interaction.rs`'s.
+        "ui-icons" => PostBuild::NativeOnly { module: "std::gfx" },
         _ => PostBuild::BuildOnly,
     }
 }
@@ -180,7 +227,7 @@ fn post_build(directory: &str) -> PostBuild {
 /// Runs the post-build check; a failure message, or `None` when it holds.
 fn check_post_build(directory: &str, staged: &std::path::Path) -> Option<String> {
     match post_build(directory) {
-        PostBuild::BuildOnly => None,
+        PostBuild::BuildOnly | PostBuild::NativeOnly { .. } => None,
         PostBuild::Artifacts(artifacts) => {
             let missing: Vec<&str> = artifacts
                 .iter()
@@ -339,6 +386,9 @@ fn unlinked_stylesheets(directory: &str, staged: &std::path::Path) -> Option<Str
 /// One example staged, built and checked: its failure, or `None` when it holds.
 fn build_example(directory: &str) -> Option<String> {
     let staged = stage(directory);
+    if let PostBuild::NativeOnly { module } = post_build(directory) {
+        return check_native_only(directory, &staged, module);
+    }
     let output = Command::new(env!("CARGO_BIN_EXE_vilan"))
         .args(["build", staged.to_str().expect("utf-8 temp path")])
         .output()
@@ -371,7 +421,41 @@ fn build_example(directory: &str) -> Option<String> {
             dangling.join("\n")
         ));
     }
-    let _ = std::fs::remove_dir_all(&staged);
+    let _ = std::fs::remove_dir_all(stage_root(directory));
+    None
+}
+
+/// [`PostBuild::NativeOnly`]: checks clean, and the JavaScript build refuses
+/// it naming `module`. Its failure, or `None` when both hold.
+fn check_native_only(directory: &str, staged: &std::path::Path, module: &str) -> Option<String> {
+    let path = staged.to_str().expect("utf-8 temp path");
+    let checked = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["check", path])
+        .output()
+        .expect("run vilan");
+    if !checked.status.success() {
+        return Some(format!(
+            "--- {directory}: `vilan check` failed (staged at {})\n{}{}",
+            staged.display(),
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr),
+        ));
+    }
+    let built = Command::new(env!("CARGO_BIN_EXE_vilan"))
+        .args(["build", path])
+        .output()
+        .expect("run vilan");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&built.stdout),
+        String::from_utf8_lossy(&built.stderr)
+    );
+    if built.status.success() || !said.contains(&format!("reaches `{module}`")) {
+        return Some(format!(
+            "--- {directory}: the JavaScript build must refuse it naming `{module}`; it said:\n{said}"
+        ));
+    }
+    let _ = std::fs::remove_dir_all(stage_root(directory));
     None
 }
 

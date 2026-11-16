@@ -407,11 +407,33 @@ fn a154_every_moved_module_is_refused_at_its_old_path_and_resolves_at_its_new_on
         if *old == "null" {
             continue;
         }
-        if *old != "web" {
+        // A reclaimed path is a live module again: its old meaning is pinned
+        // by name below.
+        if *old != "web" && !vilan_core::parsing::RECLAIMED_STD_MODULES.contains(old) {
             assert_fails_once_with(&format!("import std::{old};\n\nfun main() {{}}\n"), &steer);
         }
         assert_compiles(&format!("import std::{new};\n\nfun main() {{}}\n"));
     }
+}
+
+/// native-ui.md P2 reclaimed `std::ui` (the web UI's old path) for the native
+/// UI framework: the web UI's names under it still steer to `std::web::ui`,
+/// alone or in a brace list, while `std::ui`'s own names resolve and a name
+/// neither declares is an ordinary miss.
+#[test]
+fn a154_the_reclaimed_ui_path_steers_the_web_uis_names_and_resolves_its_own() {
+    let steer = vilan_core::parsing::moved_std_module_message("ui", "web::ui");
+    for import in ["import std::ui::view;", "import std::ui::{ Slot };"] {
+        assert_fails_once_with(&format!("{import}\n\nfun main() {{}}\n"), &steer);
+    }
+    // One refusal per name reached, as `std::web::{ Signal, SignalCell }` has.
+    assert_fails_with("import std::ui::{ View, view };\n\nfun main() {}\n", &steer);
+    assert_compiles("import std::ui::{ column, row, style, text };\n\nfun main() {}\n");
+    assert_compiles("import std::ui;\n\nfun main() {}\n");
+    assert_fails_with(
+        "import std::ui::no_such_name;\n\nfun main() {}\n",
+        "cannot find 'no_such_name' in the imported path",
+    );
 }
 
 #[test]
@@ -9302,5 +9324,680 @@ fun main() {
 }
 ",
         "3\n2\n0\n😀\n-a-😀-b-\n",
+    );
+}
+
+// --- F1 M2: `std::window` (native-objective.md D2, D4) -------------------------
+//
+// A desktop window is the operating system's webview, linked only into a
+// native binary (`vilan-rt-webview`). The JavaScript backend has no twin, so
+// an EMITTING build refuses a program that reaches it, by the module's name;
+// `vilan check` (the emitter's diagnose walk) does not, because a check is the
+// same for both backends; and a browser build refuses it at the platform
+// fence, as every process module. The native lowering is pinned by
+// `native_differential`'s `f1_m2_*`, the real window by `desktop_shell.rs`.
+
+fn f1_m2_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::result::Result::{{ Err, Ok }};
+        import std::window::{{ Window, WindowBuilder }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+/// What `vilan check` answers: analysis, then the emitter's diagnose walk.
+fn f1_m2_check(source: &str) -> Result<(), Vec<String>> {
+    let source = source.to_string();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let (program, errors) = vilan_core::analyze_source(
+                leaked,
+                &std_spec(),
+                std::path::Path::new("."),
+                std::path::Path::new("test.vl"),
+                Some(vilan_core::Platform::default()),
+                &vilan_core::Workspace::default(),
+            );
+            match program {
+                Some(program) if errors.is_empty() => {
+                    vilan_core::diagnose(&program, &vilan_core::BuildOptions::default())
+                        .map_err(|error| vec![error.msg])
+                }
+                _ => Err(errors.into_iter().map(|error| error.msg).collect()),
+            }
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("the check finished")
+}
+
+const F1_M2_OPEN: &str = r#"
+    match Window::builder("http://127.0.0.1:8080/").title("app").size(640, 480).open() {
+        Ok(let window) => window.close(),
+        Err(let reason) => print(reason),
+    }
+"#;
+
+#[test]
+fn f1_m2_the_javascript_build_refuses_a_window_by_the_modules_name() {
+    assert_fails_with(
+        &f1_m2_program(F1_M2_OPEN),
+        "this program reaches `std::window` (its `__window_open`), which only the native \
+         backend builds",
+    );
+}
+
+#[test]
+fn f1_m2_a_window_program_checks_clean() {
+    if let Err(errors) = f1_m2_check(&f1_m2_program(F1_M2_OPEN)) {
+        panic!("`vilan check` must accept a window program: {errors:#?}");
+    }
+}
+
+/// The refusal is by REACH, as every capability is: naming the module and
+/// building a `WindowBuilder` that is never opened reaches no host call.
+#[test]
+fn f1_m2_a_builder_never_opened_reaches_no_window() {
+    assert_compiles(&f1_m2_program(
+        r#"
+        let builder: WindowBuilder = Window::builder("about:blank").size(1, 1);
+        print("built, never opened");
+        "#,
+    ));
+}
+
+/// A browser entry is refused at the platform fence, before any backend.
+#[test]
+fn f1_m2_a_browser_build_cannot_reach_a_window() {
+    assert_fails_browser_with(&f1_m2_program(F1_M2_OPEN), "@process");
+}
+
+// --- native-ui.md P1: `std::gfx` -----------------------------------------------
+//
+// A GPU window is drawn by `vilan-rt-gfx`, linked only into a native binary.
+// The JavaScript backend has no twin, so an EMITTING build refuses a program
+// that reaches a `__gfx_*` extern, by the module's name; `vilan check` does
+// not; a browser build refuses it at the platform fence. What is plain vilan —
+// lengths, geometry, colour, the builders — runs on either backend, and its
+// semantics are pinned here by running it. The native lowering is pinned by
+// `native_differential`'s `gfx_p1_*`, the real window by `gfx_window.rs`.
+
+fn gfx_p1_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::result::Result::{{ Err, Ok }};
+        import std::gfx::{{
+            Border, Color, Corners, Frame, Point, Rect, Rectangle, TextLayout, TextStyle, Window,
+            WindowBuilder, dp,
+        }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+const GFX_P1_OPEN: &str = r#"
+    match Window::builder().title("app").size(dp(320), dp(200)).open() {
+        Ok(let window) => window.on_frame(|frame: Frame| {
+            frame.rectangle(Rectangle::new(Rect::new(dp(0), dp(0), dp(8), dp(8)), Color::white()));
+        }),
+        Err(let reason) => print(reason),
+    }
+"#;
+
+#[test]
+fn gfx_p1_the_javascript_build_refuses_gfx_by_the_modules_name() {
+    assert_fails_with(
+        &gfx_p1_program(GFX_P1_OPEN),
+        "this program reaches `std::gfx` (its `__gfx_",
+    );
+    assert_fails_with(
+        &gfx_p1_program(GFX_P1_OPEN),
+        "which only the native backend builds: a GPU window is drawn by a renderer linked into \
+         a native binary, and a JavaScript build has none",
+    );
+}
+
+/// Shaping text is a `std::gfx` host call too: reaching it alone is refused.
+#[test]
+fn gfx_p1_shaping_text_alone_reaches_the_gfx_host() {
+    assert_fails_with(
+        &gfx_p1_program(r#"print(TextLayout::new("hi", TextStyle::new()).line_count());"#),
+        "this program reaches `std::gfx` (its `__gfx_text_layout`)",
+    );
+}
+
+#[test]
+fn gfx_p1_a_gfx_program_checks_clean() {
+    if let Err(errors) = f1_m2_check(&gfx_p1_program(GFX_P1_OPEN)) {
+        panic!("`vilan check` must accept a GPU window program: {errors:#?}");
+    }
+}
+
+/// A browser entry is refused at the platform fence, before any backend.
+#[test]
+fn gfx_p1_a_browser_build_cannot_reach_gfx() {
+    assert_fails_browser_with(&gfx_p1_program(GFX_P1_OPEN), "@process");
+}
+
+/// The refusal is by REACH: lengths, geometry, colours and a builder never
+/// opened are plain vilan, and run on the JavaScript backend.
+#[test]
+fn gfx_p1_lengths_geometry_and_colour_are_plain_values() {
+    assert_compiles_and_runs(
+        &gfx_p1_program(
+            r#"
+            let a = dp(10) + dp(6) * 2.0 - dp(4) / 2.0;
+            print(a.value());
+            print(dp(3) < dp(4));
+            print(dp(5) == dp(5));
+            print(dp(2).max(dp(7)).value());
+            let button = Rect::new(dp(100), dp(50), dp(40), dp(20));
+            print(button.contains(Point::new(dp(100), dp(50))));
+            print(button.contains(Point::new(dp(140), dp(60))));
+            print(button.contains(Point::new(dp(139), dp(69))));
+            print(button.inset(dp(5)).width.value());
+            print(button.right().value());
+            let color = Color::rgb(255, 0, 51);
+            print(color.blue);
+            print(color.faded(0.5).alpha);
+            print(Corners::all(dp(4)).bottom_left.value());
+            let card = Rectangle::new(button, Color::white()).radius(dp(8)).border(Border::all(dp(1), color));
+            print(card.corners.top_right.value());
+            print(card.border.widths.left.value());
+            let builder: WindowBuilder = Window::builder().title("never opened").size(dp(1), dp(1));
+            print("built, never opened");
+            "#,
+        ),
+        "20\ntrue\ntrue\n7\ntrue\nfalse\ntrue\n30\n140\n0.2\n0.5\n4\n8\n1\nbuilt, never opened\n",
+    );
+}
+
+// --- gfx-path.md S2: paths -----------------------------------------------------
+//
+// A `Path` and a `PathBuilder` are host values made by `vilan-rt-gfx`: making
+// one is a `__gfx_*` call, so the JavaScript build refuses a program that
+// parses or builds a path, by the module's name, as it refuses shaping text.
+// A `Stroke`, a `PathPaint` and the enums are plain vilan. Parsing and drawing
+// are pinned by `vilan-rt-gfx`'s unit tests and goldens, the native lowering
+// by `native_differential`'s `gfx_path_*`, the drawn path and the byte of a
+// malformed one by `gfx_window.rs`.
+
+fn gfx_path_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::gfx::{{ Cap, FillRule, Join, Path, PathPaint, Stroke }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn gfx_path_parsing_a_path_reaches_the_gfx_host() {
+    assert_fails_with(
+        &gfx_path_program(
+            r#"match Path::from_svg("M0 0 L1 1") { Ok(let path) => print(path.bounds().width.value()), Err(let reason) => print(reason), }"#,
+        ),
+        "this program reaches `std::gfx` (its `__gfx_path_parse`)",
+    );
+    assert_fails_with(
+        &gfx_path_program(
+            r#"print(Path::builder().move_to(0.0, 0.0).finish().bounds().x.value());"#,
+        ),
+        "this program reaches `std::gfx` (its `__gfx_path_",
+    );
+}
+
+#[test]
+fn gfx_path_a_path_program_checks_clean() {
+    let program = gfx_path_program(
+        r#"
+        let check = Path::builder().move_to(20.0, 6.0).line_to(9.0, 17.0).line_to(4.0, 12.0).finish();
+        let parsed = match Path::from_svg("M20 6 9 17l-5-5") { Ok(let path) => path, Err(let reason) => check, };
+        print(parsed.bounds().width.value());
+        "#,
+    );
+    if let Err(errors) = f1_m2_check(&program) {
+        panic!("`vilan check` must accept a path program: {errors:#?}");
+    }
+}
+
+/// A stroke is plain vilan: `Stroke::new` is an icon set's stroke (round
+/// joins and caps, SVG's miter limit of 4), and its builder methods replace
+/// one field each.
+#[test]
+fn gfx_path_a_stroke_is_a_plain_value_with_an_icon_sets_defaults() {
+    assert_compiles_and_runs(
+        &gfx_path_program(
+            r#"
+            let stroke = Stroke::new(2.0);
+            print(stroke.width);
+            print(stroke.miter_limit);
+            print(match stroke.join { Join::Round => "round", Join::Miter => "miter", Join::Bevel => "bevel", });
+            print(match stroke.cap { Cap::Round => "round", Cap::Butt => "butt", Cap::Square => "square", });
+            let sharp = stroke.join(Join::Miter).cap(Cap::Square).miter_limit(10.0);
+            print(match sharp.join { Join::Miter => "miter", _ => "other", });
+            print(match sharp.cap { Cap::Square => "square", _ => "other", });
+            print(sharp.miter_limit);
+            let paint = PathPaint::Fill(FillRule::EvenOdd);
+            print(match paint { PathPaint::Fill(FillRule::EvenOdd) => "even-odd", _ => "other", });
+            "#,
+        ),
+        "2\n4\nround\nround\nmiter\nsquare\n10\neven-odd\n",
+    );
+}
+
+// --- native-ui.md P2: `std::ui` ------------------------------------------------
+//
+// Elements are laid out and drawn by `vilan-rt-gfx`, linked only into a native
+// binary: an EMITTING JavaScript build refuses a program that makes one, by the
+// module's name; `vilan check` does not; a browser build refuses it at the
+// platform fence. A `Style` and its `+`, a `fraction`, the enums are plain
+// vilan and run anywhere. The element tree's layout is pinned by
+// `vilan-rt-gfx`'s own unit tests, the native lowering by `native_differential`'s
+// `ui_p2_*`, the example screen by `ui_screen.rs`.
+
+fn ui_p2_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::result::Result::{{ Err, Ok }};
+        import std::gfx::{{ Border, Color, Corners, FontFamily, Frame, Size, Window, dp }};
+        import std::ui::{{
+            Align, Anchor, DropShadow, Element, Fit, Justify, Length, Role, Style, column, draw,
+            fraction, image, layout, mount, row, stack, style, text,
+        }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+const UI_P2_SCREEN: &str = r#"
+    let screen = column()
+        .padding(dp(16))
+        .gap(dp(8))
+        .style(style().background(Color::white()).radius(dp(8)))
+        .child(text().child("Title").style(style().text_size(dp(20)).weight(700)).role(Role::Heading))
+        .child(row().gap(dp(4)).align(Align::Center).justify(Justify::SpaceBetween).wrap().child("a").child("b"))
+        .child(stack().child(text().child("badge").anchor(Anchor::TopRight)).label("card"));
+    layout(screen, Size::new(dp(320), dp(200)), 1.5);
+    print(screen.element().bounds().width.value());
+"#;
+
+#[test]
+fn ui_p2_the_javascript_build_refuses_ui_by_the_modules_name() {
+    assert_fails_with(
+        &ui_p2_program(UI_P2_SCREEN),
+        "this program reaches `std::ui` (its `__ui_",
+    );
+    assert_fails_with(
+        &ui_p2_program(UI_P2_SCREEN),
+        "which only the native backend builds: its elements are laid out and drawn by the GPU \
+         renderer linked into a native binary, and a JavaScript build has none",
+    );
+}
+
+/// Making one element is a host call: reaching it alone is refused.
+#[test]
+fn ui_p2_making_one_element_alone_reaches_the_ui_host() {
+    assert_fails_with(
+        &ui_p2_program(r#"let element: Element = text().child("hi").element();"#),
+        "this program reaches `std::ui` (its `__ui_",
+    );
+}
+
+#[test]
+fn ui_p2_a_ui_program_checks_clean() {
+    if let Err(errors) = f1_m2_check(&ui_p2_program(UI_P2_SCREEN)) {
+        panic!("`vilan check` must accept a std::ui program: {errors:#?}");
+    }
+}
+
+/// The window entry points check too: `mount` and `draw` in a frame callback.
+#[test]
+fn ui_p2_mount_and_draw_check_clean() {
+    let body = r#"
+        match Window::builder().title("app").size(dp(320), dp(200)).open() {
+            Ok(let window) => {
+                let root = column().child("hello");
+                mount(window, root);
+                window.on_frame(|frame: Frame| draw(frame, root));
+            },
+            Err(let reason) => print(reason),
+        }
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_p2_program(body)) {
+        panic!("`vilan check` must accept mount and draw: {errors:#?}");
+    }
+}
+
+/// A browser entry is refused at the platform fence, before any backend.
+#[test]
+fn ui_p2_a_browser_build_cannot_reach_ui() {
+    assert_fails_browser_with(&ui_p2_program(UI_P2_SCREEN), "@process");
+}
+
+/// An attribute a kind does not have is an unknown method on its builder, as
+/// the element contract (native-ui.md section 12) says it must be: a text has
+/// no `gap`, an image no `child`, a stack no `wrap`.
+#[test]
+fn ui_p2_an_attribute_the_kind_lacks_is_an_unknown_method() {
+    for (body, method) in [
+        ("text().gap(dp(4));", "gap"),
+        ("image().child(\"x\");", "child"),
+        ("stack().wrap();", "wrap"),
+    ] {
+        let errors = f1_m2_check(&ui_p2_program(body))
+            .expect_err("an attribute the kind lacks must be refused");
+        assert!(
+            errors.iter().any(|error| error.contains(method)),
+            "{body}: {errors:#?}"
+        );
+    }
+}
+
+/// `+` composes styles field by field, the right side winning where it sets a
+/// field; a field neither sets stays unset. Plain vilan: it runs on the
+/// JavaScript backend.
+#[test]
+fn ui_p2_style_plus_takes_the_right_sides_fields() {
+    assert_compiles_and_runs(
+        &ui_p2_program(
+            r#"
+            let card = style().background(Color::white()).radius(dp(8)).text_size(dp(14)).weight(400);
+            let warning = style().background(Color::rgb(255, 0, 0)).weight(700);
+            let both = card + warning;
+            print(both.background.unwrap().green);
+            print(both.radius.unwrap().top_left.value());
+            print(both.text_size.unwrap().value());
+            print(both.weight.unwrap());
+            print(both.opacity.is_none());
+            let reversed = warning + card;
+            print(reversed.background.unwrap().green);
+            print(reversed.weight.unwrap());
+            let empty = style() + style();
+            print(empty.background.is_none() && empty.font.is_none());
+            let font = style().font(FontFamily::Monospace) + style().italic(true);
+            print(font.font.is_some() && font.italic.unwrap());
+            "#,
+        ),
+        "0\n8\n14\n700\ntrue\n1\n400\ntrue\ntrue\n",
+    );
+}
+
+/// The other plain values: a fraction, a shadow's builder, the lengths a size
+/// attribute takes.
+#[test]
+fn ui_p2_lengths_and_shadows_are_plain_values() {
+    assert_compiles_and_runs(
+        &ui_p2_program(
+            r#"
+            match fraction(1.0, 4.0) {
+                Length::Fraction(let value) => print(value),
+                _ => print("not a fraction"),
+            }
+            let shadow = DropShadow::new(dp(0), dp(2), dp(10), Color::black()).spread(dp(3));
+            print(shadow.y.value() + shadow.spread.value());
+            let look: Style = style().shadow(shadow).opacity(0.5);
+            print(look.opacity.unwrap());
+            "#,
+        ),
+        "0.25\n5\n0.5\n",
+    );
+}
+
+// ------------------------------------------------- native-ui.md part P3 ---
+
+fn ui_p3_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::gfx::{{ Border, Color, KeyPress, Point, Scroll, Size, Window, dp }};
+        import std::reactive::{{ Signal, SignalCell }};
+        import std::ui::{{
+            Align, Element, Length, ScrollAxis, Style, column, deliver, focused, hovered,
+            layout, mount, mount_root, pressed, row, scroll, stop_event, style, text,
+            window_at_least, window_below,
+        }};
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+/// The six constructors are `[element]` functions: their tags lower onto
+/// std::ui's builders — a bare attribute, an event, a signal hole, a scroll —
+/// and the program checks.
+#[test]
+fn ui_p3_std_uis_tags_lower_onto_its_builders_and_check_clean() {
+    let body = r#"
+        let count: SignalCell<i32> = Signal::new(0);
+        let offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));
+        let gap: SignalCell<Length> = Signal::new(Length::Auto);
+        let screen = <column padding(dp(16)) gap(dp(8)) align(Align::Center)>
+            <text style(style().when(hovered(), |look: Style| look.weight(700)))>{count.derive(|value: i32| i"{value}")}</text>
+            <row width(gap) focusable tab_index(2) on_click(|| count.set(count.get() + 1)) on_key(|key: KeyPress| stop_event())>
+                "Add one"
+            </row>
+            <scroll axis(ScrollAxis::Vertical) offset(offset) on_scroll(|wheel: Scroll| print(wheel.y.value()))>
+                <column wrap>"a" "b"</column>
+            </scroll>
+        </column>;
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+        print(screen.element().interaction().hovered);
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_p3_program(body)) {
+        panic!("std::ui's tags must check: {errors:#?}");
+    }
+}
+
+/// A handler of the wrong shape is the attribute method's ordinary mismatch:
+/// `on_key` hands its handler the key.
+#[test]
+fn ui_p3_an_event_attribute_takes_a_handler_of_its_shape() {
+    let errors = f1_m2_check(&ui_p3_program(
+        r#"let button = <row on_key(|| print("key"))>"x"</row>;"#,
+    ))
+    .expect_err("a key handler must take the key");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("on_key") || error.contains("KeyPress")),
+        "{errors:#?}"
+    );
+}
+
+/// A tag in a file that imports none of std::ui's constructors keeps the web
+/// lowering, byte for byte: `<text>` and `<image>` are the web UI's there.
+#[test]
+fn ui_p3_a_file_that_imports_no_ui_constructor_keeps_text_and_image_web() {
+    let web =
+        "fun main() {\n\tlet a = <text>\"hi\"</text>;\n\tlet b = <image src(\"x.png\") />;\n}\n";
+    assert_compiles(web);
+    // The same `<text>` with std::ui's `text` imported is the typed element:
+    // a native program, refused by the JavaScript build by name.
+    assert_fails_with(
+        "import std::ui::text;\n\nfun main() {\n\tlet a = <text>\"hi\"</text>;\n}\n",
+        "this program reaches `std::ui` (its `__ui_",
+    );
+}
+
+/// `when` adds a conditional style; a `when` inside a `when` applies while
+/// both hold; `+` keeps both sides' conditions in order. Plain vilan: it runs
+/// on the JavaScript backend.
+#[test]
+fn ui_p3_style_conditions_are_plain_values_and_compose() {
+    assert_compiles_and_runs(
+        &ui_p3_program(
+            r#"
+            let look = style()
+                .background(Color::white())
+                .when(hovered(), |look: Style| look
+                    .background(Color::rgb(0, 0, 255))
+                    .when(pressed(), |inner: Style| inner.weight(700)))
+                .when(window_below(dp(400)), |look: Style| look.radius(dp(0)));
+            print(look.conditions.len());
+            print(look.conditions[1].conditions.len());
+            print(look.conditions[1].style.weight.unwrap());
+            print(look.conditions[0].style.conditions.len());
+            let both = look + style().when(focused(), |look: Style| look.border(Border::all(dp(2), Color::black())));
+            print(both.conditions.len());
+            print(both.conditions[3].style.border.is_some());
+            print(style().when(window_at_least(dp(600)), |look: Style| look).unconditional().conditions.len());
+            "#,
+        ),
+        "3\n2\n700\n0\n4\ntrue\n0\n",
+    );
+}
+
+// ----------------------------------------- native-ui.md R9: reactive children ---
+//
+// A child position of `std::ui`'s tree can be REACTIVE — `each`, `each_by`,
+// `each_values`, `when`, `swap` — written in a hole as the web UI writes them
+// (`child` takes anything `ChildSlot`). What they do to the tree (insert,
+// remove, move; state across a reorder; handlers dropped on removal) is pinned
+// by `vilan-rt-gfx`'s unit tests and `ui_interaction.rs`'s keyed list; these
+// pin the surface.
+
+fn ui_r9_program(body: &str) -> String {
+    format!(
+        r#"
+        import std::io::print;
+        import std::gfx::{{ Size, dp }};
+        import std::reactive::{{ ListCell, Signal, SignalCell }};
+        import std::ui::{{
+            ChildSlot, Element, column, each, each_by, each_values, layout, row, swap, text, when,
+        }};
+        struct Item {{
+            id: i32,
+            name: str,
+        }}
+        fun main() {{
+            {body}
+        }}
+        "#
+    )
+}
+
+/// Every reactive form fills a hole among static siblings, and an `Option` of
+/// an element fills one statically; the program checks.
+#[test]
+fn ui_r9_every_reactive_child_fills_a_hole_and_checks_clean() {
+    let body = r#"
+        let items: ListCell<i32> = ListCell::of([1, 2, 3]);
+        let named: SignalCell<List<Item>> = Signal::new([Item { id = 1, name = "a" }]);
+        let shown: SignalCell<bool> = Signal::new(true);
+        let mode: SignalCell<i32> = Signal::new(0);
+        let badge: Option<Element> = None;
+        let screen = <column>
+            "head"
+            {each(items, |item: i32| item, |item: i32| <row>{i"{item}"}</row>)}
+            {each_values(items, |item: i32| <text>{i"{item}"}</text>)}
+            {each_by(named, |item: Item| item.id, |item: SignalCell<Item>| <text>{item.derive(|now: Item| now.name)}</text>)}
+            {when(shown, || <text>"on"</text>)}
+            {swap(mode, |value: i32| if value == 0 { <text>"zero"</text>.element() } else { <row>"many"</row>.element() })}
+            {badge}
+            "tail"
+        </column>;
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_r9_program(body)) {
+        panic!("std::ui's reactive children must check: {errors:#?}");
+    }
+}
+
+/// A row is ONE element: a render closure answers anything `Child` (an
+/// element of any kind, a `str`), and a value that is none is the bound's
+/// ordinary refusal at the call.
+#[test]
+fn ui_r9_a_row_is_one_element_and_anything_else_is_refused() {
+    let errors = f1_m2_check(&ui_r9_program(
+        r#"
+        let items: ListCell<i32> = ListCell::of([1]);
+        let screen = column().child(each(items, |item: i32| item, |item: i32| item));
+        "#,
+    ))
+    .expect_err("a row that is not an element must be refused");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("does not implement trait 'Child'")),
+        "{errors:#?}"
+    );
+}
+
+/// The reactive forms are ChildSlot VALUES: a helper can answer one, naming
+/// its type, and `child` places it at the parent's current end.
+#[test]
+fn ui_r9_a_reactive_child_is_a_value_a_helper_can_answer() {
+    let body = r#"
+        let shown: SignalCell<bool> = Signal::new(false);
+        let screen = column().child("first").child(badge(shown)).child("last");
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+    "#;
+    let program = ui_r9_program(body).replace("ChildSlot, ", "ChildSlot, Text, When, ")
+        + concat!(
+            "\nfun badge(shown: SignalCell<bool>): When<SignalCell<bool>, Text> {\n",
+            "\twhen(shown, || text().child(\"new\"))\n",
+            "}\n",
+        );
+    if let Err(errors) = f1_m2_check(&program) {
+        panic!("a reactive child must be a value: {errors:#?}");
+    }
+}
+
+/// Item 2 of the R9 lane (`Bindable` against `std::reactive`'s `MaybeSignal`):
+/// `std::ui` KEEPS `Bindable` — a binding with no ambient owner belongs to its
+/// source — and the reactive children follow the same rule, so a tree with
+/// signal-bound attributes, a keyed list and a conditional can be built at the
+/// top of `main`, with no owner, and checks. (Under `MaybeSignal` this tree is
+/// refused: a reactive binding with no ambient owner is the one ruled
+/// difference. A static one — `.gap(dp(8))` from code with no owner — checks
+/// and, since F168, builds natively too: an instance declares only the
+/// context parameters its body names; `native_differential`'s F168 pins.)
+#[test]
+fn ui_r9_a_bound_tree_needs_no_owner_at_the_top_of_main() {
+    let body = r#"
+        let count: SignalCell<i32> = Signal::new(0);
+        let items: ListCell<i32> = ListCell::of([1, 2]);
+        let screen = column()
+            .gap(count.derive(|value: i32| dp(value.as_f64())))
+            .child(text().child(count.derive(|value: i32| i"{value}")))
+            .child(each(items, |item: i32| item, |item: i32| <text>{i"{item}"}</text>))
+            .child(when(count.derive(|value: i32| value > 0), || <text>"some"</text>));
+        layout(screen, Size::new(dp(320), dp(200)), 1.0);
+    "#;
+    if let Err(errors) = f1_m2_check(&ui_r9_program(body)) {
+        panic!("a bound tree must check with no owner: {errors:#?}");
+    }
+}
+
+/// A program reaching a reactive child reaches `std::ui`: the JavaScript build
+/// refuses it by the module's name, as it does any element.
+#[test]
+fn ui_r9_the_javascript_build_refuses_a_reactive_child_by_the_modules_name() {
+    assert_fails_with(
+        &ui_r9_program(
+            r#"
+            let shown: SignalCell<bool> = Signal::new(true);
+            let screen = column().child(when(shown, || <text>"on"</text>));
+            "#,
+        ),
+        "this program reaches `std::ui` (its `__ui_",
     );
 }

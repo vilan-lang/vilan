@@ -479,12 +479,12 @@ function renew(self) {
 	const $M = self[0].v[3];
 	let $N = null;
 	if ($M[0] === 0) {
-		const nursery2 = __clone($M[1]);
+		const nursery2 = $M[1];
 		let $O = null;
 		if (has_spawned(nursery2)) {
 			$O = [ 1 ];
 		} else {
-			$O = [ 0, nursery2 ];
+			$O = [ 0, __clone(nursery2) ];
 		}
 		$N = $O;
 	} else {
@@ -832,7 +832,7 @@ function ensure_wired($b) {
 }
 function current_path($a) {
 	ensure_wired($a);
-	return path_signal;
+	return __clone(path_signal);
 }
 function navigate(path, $bt) {
 	navigate_with(path, "", $bt);
@@ -964,14 +964,14 @@ function on_event(self, event, handler) {
 	return __clone(self);
 }
 function chunk_pending() {
-	return chunk_pending_signal;
+	return __clone(chunk_pending_signal);
 }
 function chunk_failure() {
-	return chunk_error_signal;
+	return __clone(chunk_error_signal);
 }
 function set_chunk_pending(busy, $cr) {
 	if (get(chunk_pending_signal) !== busy) {
-		set3(chunk_pending_signal, busy, $cr, "std/src/browser/web/ui.vl:669:24");
+		set3(chunk_pending_signal, busy, $cr, "std/src/browser/web/ui.vl:670:24");
 	}
 }
 function clear_chunk_error($ci) {
@@ -979,7 +979,7 @@ function clear_chunk_error($ci) {
 	let $ck = null;
 	if ($cj[0] === 0) {
 		const _reason = $cj[1];
-		$ck = set3(chunk_error_signal, [ 1 ], $ci, "std/src/browser/web/ui.vl:677:43");
+		$ck = set3(chunk_error_signal, [ 1 ], $ci, "std/src/browser/web/ui.vl:678:43");
 	} else {
 		$ck = undefined;
 	}
@@ -1039,7 +1039,7 @@ function close_with(self, disposal) {
 function is_leaving(node) {
 	let at = 0;
 	while (at < leaving_runs.v.length) {
-		if (__dom_run_holds(__at(leaving_runs.v, at, "std/src/browser/web/ui.vl:975:16"), node)) {
+		if (__dom_run_holds(__at(leaving_runs.v, at, "std/src/browser/web/ui.vl:976:16"), node)) {
 			return true;
 		}
 		at = at + 1;
@@ -1063,7 +1063,7 @@ function mount_target(id) {
 	const element = document.getElementById(id);
 	if (__is_null(element)) {
 		(() => {
-			throw __panic("mount: no element with id \'" + id + "\'", "std/src/browser/web/ui.vl:2553:3");
+			throw __panic("mount: no element with id \'" + id + "\'", "std/src/browser/web/ui.vl:2444:3");
 		})();
 	}
 	return element;
@@ -1676,12 +1676,12 @@ function follow3(flow, observer, $bF, $bG, caller) {
 	take(get_owner($bG), sub3(flow, observer, caller), $bF);
 }
 function swap_split(source, render, $cd) {
-	const gated = new4(get(source), "std/src/browser/web/ui.vl:1337:41");
+	const gated = new4(get(source), "std/src/browser/web/ui.vl:1338:41");
 	const armed = __shared_new(false);
 	const generation = __shared_new(0);
 	const advance2 = (value, $ce) => {
 		armed.v = true;
-		set3(gated, value, [ 0, $ce ], "std/src/browser/web/ui.vl:1349:9");
+		set3(gated, value, [ 0, $ce ], "std/src/browser/web/ui.vl:1350:9");
 		return;
 	};
 	const wire = ($cf) => {
@@ -1708,7 +1708,7 @@ function swap_split(source, render, $cd) {
 						return turn([ 1 ], ($cz) => {
 							if (generation.v === mine) {
 								set_chunk_pending(false, [ 0, $cz ]);
-								set3(chunk_error_signal, [ 0, reason ], [ 0, $cz ], "std/src/browser/web/ui.vl:1384:26");
+								set3(chunk_error_signal, [ 0, reason ], [ 0, $cz ], "std/src/browser/web/ui.vl:1385:26");
 							}
 							return;
 						});
@@ -1716,7 +1716,7 @@ function swap_split(source, render, $cd) {
 				}
 				return;
 			});
-		}, $cd, $cf, "std/src/browser/web/ui.vl:1361:3");
+		}, $cd, $cf, "std/src/browser/web/ui.vl:1362:3");
 		return;
 	};
 	return [ [ 1 ], render, [ 0, __clone(gated) ], armed, wire ];
@@ -1728,7 +1728,7 @@ function open_row_before(self, content, end, $dc, $dd) {
 	const marker = document.createTextNode("");
 	host(self).insertBefore(marker, end);
 	const staging = document.createDocumentFragment();
-	place(content, [ __clone(staging) ], $dc, $dd, "std/src/browser/web/ui.vl:801:11");
+	place(content, [ __clone(staging) ], $dc, $dd, "std/src/browser/web/ui.vl:802:11");
 	host(self).insertBefore(staging, end);
 	return [ marker ];
 }
@@ -1868,8 +1868,8 @@ const run_nurseries_allocated_count = __shared_new(0);
 const path_signal = new4("", "std/src/web/router.vl:77:48");
 const entry_signal = new4([ "", "", false ], "std/src/web/router.vl:79:58");
 const wired = __shared_new(false);
-const chunk_pending_signal = new4(false, "std/src/browser/web/ui.vl:615:58");
-const chunk_error_signal = new4([ 1 ], "std/src/browser/web/ui.vl:620:63");
+const chunk_pending_signal = new4(false, "std/src/browser/web/ui.vl:616:58");
+const chunk_error_signal = new4([ 1 ], "std/src/browser/web/ui.vl:621:63");
 const leaving_runs = __shared_new([  ]);
 const BASE = announce("BASE", 2);
 const SCALED = announce("SCALED", BASE * 3);

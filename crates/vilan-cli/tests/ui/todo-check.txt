@@ -1,0 +1,155 @@
+column todo 0 0 420 480
+    row new item 20 60 313 34
+    row add 341 60 59 34
+  scroll list 20 106 380 323
+  text count 20 441 380 19
+start: draft="" caret=0 anchor=0 items=[] focus=- log=[]
+accessibility at the start:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="" placeholder="What needs doing?" selection=0..0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  Button "add" disabled
+  ScrollView "list" scroll_y=0/0
+  Label "count" value="0 items"
+add while empty: draft="" caret=0 anchor=0 items=[] focus=- log=[]
+focus: draft="" caret=0 anchor=0 items=[] focus=input log=[]
+typed milk: draft="milk" caret=4 anchor=4 items=[] focus=input log=[]
+accessibility typed milk:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="milk" focused selection=4..4 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="milk" graphemes=4
+  Button "add" [click focus]
+  ScrollView "list" scroll_y=0/0
+  Label "count" value="0 items"
+left twice: draft="milk" caret=2 anchor=2 items=[] focus=input log=[]
+typed X: draft="miXlk" caret=3 anchor=3 items=[] focus=input log=[]
+backspace: draft="milk" caret=2 anchor=2 items=[] focus=input log=[]
+delete: draft="mik" caret=2 anchor=2 items=[] focus=input log=[]
+home: draft="mik" caret=0 anchor=0 items=[] focus=input log=[]
+shift end: draft="mik" caret=3 anchor=0 items=[] focus=input log=[]
+left collapses: draft="mik" caret=0 anchor=0 items=[] focus=input log=[]
+shift right twice: draft="mik" caret=2 anchor=0 items=[] focus=input log=[]
+ctrl a: draft="mik" caret=3 anchor=0 items=[] focus=input log=[]
+typed over the selection: draft="milk and eggs" caret=13 anchor=13 items=[] focus=input log=[]
+ctrl left: draft="milk and eggs" caret=9 anchor=9 items=[] focus=input log=[]
+ctrl shift left: draft="milk and eggs" caret=5 anchor=9 items=[] focus=input log=[]
+ctrl backspace: draft="milk eggs" caret=5 anchor=5 items=[] focus=input log=[]
+ctrl backspace at the end: draft="milk " caret=5 anchor=5 items=[] focus=input log=[]
+home, ctrl right: draft="milk " caret=4 anchor=4 items=[] focus=input log=[]
+ctrl delete: draft="milk" caret=4 anchor=4 items=[] focus=input log=[]
+shift home, right collapses: draft="milk" caret=4 anchor=4 items=[] focus=input log=[]
+select all, delete: draft="" caret=0 anchor=0 items=[] focus=input log=[]
+typed graphemes: draft="é👍🏽🇫🇷z" caret=11 anchor=11 items=[] focus=input log=[]
+left over z: draft="é👍🏽🇫🇷z" caret=10 anchor=10 items=[] focus=input log=[]
+left over the flag: draft="é👍🏽🇫🇷z" caret=6 anchor=6 items=[] focus=input log=[]
+backspace the thumbs-up: draft="é🇫🇷z" caret=2 anchor=2 items=[] focus=input log=[]
+delete the accented e: draft="🇫🇷z" caret=0 anchor=0 items=[] focus=input log=[]
+press at the input's left edge: draft="bread" caret=0 anchor=0 items=[] focus=input log=[]
+shift press inside the text: draft="bread" caret=3 anchor=0 items=[] focus=input log=[]
+drag across: draft="bread" caret=5 anchor=0 items=[] focus=input log=[]
+drag off the input, below it: draft="bread" caret=0 anchor=5 items=[] focus=input log=[]
+drag out of the window: draft="bread" caret=5 anchor=0 items=[] focus=input log=[]
+double click on the first word: draft="milk and eggs" caret=4 anchor=0 items=[] focus=input log=[]
+double click past the end: the last word: draft="milk and eggs" caret=13 anchor=9 items=[] focus=input log=[]
+triple click: draft="milk and eggs" caret=13 anchor=0 items=[] focus=input log=[]
+double click on milk, drag to the end: draft="milk and eggs" caret=13 anchor=0 items=[] focus=input log=[]
+double click on eggs, drag out of the window to the left: draft="milk and eggs" caret=0 anchor=13 items=[] focus=input log=[]
+triple click, then a drag: draft="milk and eggs" caret=13 anchor=0 items=[] focus=input log=[]
+a long line, home: draft="a line of text long enough to be wider than the field it is typed in" caret=0 anchor=0 items=[] focus=input log=[]
+the long line keeps the input one line tall: true
+past the right edge, once: draft="a line of text long enough to be wider than the field it is typed in" caret=33 anchor=0 items=[] focus=input log=[]
+past the right edge, twice: draft="a line of text long enough to be wider than the field it is typed in" caret=34 anchor=0 items=[] focus=input log=[]
+past the right edge, three times: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=0 items=[] focus=input log=[]
+released out of the window: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=0 items=[] focus=input log=[]
+enter: draft="" caret=0 anchor=0 items=[[ ] bread] focus=input log=[add bread]
+add button: draft="" caret=0 anchor=0 items=[[ ] bread, [ ] milk] focus=- log=[add milk]
+accessibility with two items:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="" placeholder="What needs doing?" selection=0..0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  Button "add" disabled focused
+  ScrollView "list" scroll_y=0/0
+    CheckBox "check bread" unchecked [click focus]
+    Label value="bread"
+    Button "remove bread" [click focus]
+    CheckBox "check milk" unchecked [click focus]
+    Label value="milk"
+    Button "remove milk" [click focus]
+  Label "count" value="2 items"
+check marks: 2 icons
+tab, space: draft="" caret=0 anchor=0 items=[[x] bread, [ ] milk] focus=- log=[screen key]
+accessibility with bread checked and focused:
+Group "todo"
+  Label value="Todo"
+  TextInput "new item" value="" placeholder="What needs doing?" selection=0..0 [focus set_value replace_selected_text set_text_selection]
+    TextRun value="" graphemes=0
+  Button "add" disabled
+  ScrollView "list" scroll_y=0/0
+    CheckBox "check bread" checked focused [click focus]
+    Label value="bread"
+    Button "remove bread" [click focus]
+    CheckBox "check milk" unchecked [click focus]
+    Label value="milk"
+    Button "remove milk" [click focus]
+  Label "count" value="2 items"
+click check bread: draft="" caret=0 anchor=0 items=[[ ] bread, [ ] milk] focus=- log=[]
+click check milk: draft="" caret=0 anchor=0 items=[[ ] bread, [x] milk] focus=- log=[]
+remove milk: draft="" caret=0 anchor=0 items=[[ ] bread] focus=- log=[remove milk]
+remove bread: draft="" caret=0 anchor=0 items=[] focus=- log=[remove bread]
+nothing focused: caret_shown=false timers=0
+focused, in an unfocused window: caret_shown=true timers=0
+two seconds on: steady: caret_shown=true timers=0
+the window focused: caret_shown=true timers=1
+529 ms: caret_shown=true timers=1
+530 ms: off: caret_shown=false timers=1
+1060 ms: on: caret_shown=true timers=1
+1590 ms: off: caret_shown=false timers=1
+typed while off: on again: caret_shown=true timers=1
+529 ms after the edit: caret_shown=true timers=1
+530 ms after the edit: off: caret_shown=false timers=1
+a caret move: on again: caret_shown=true timers=1
+the window unfocused: caret_shown=true timers=0
+two seconds on: steady: caret_shown=true timers=0
+disabled: caret_shown=false timers=0
+enabled, focused again: caret_shown=true timers=1
+the focus taken away: caret_shown=false timers=0
+a long line again, home: draft="a line of text long enough to be wider than the field it is typed in" caret=0 anchor=0 items=[] focus=input log=[]
+held 10 dp past the right edge: draft="a line of text long enough to be wider than the field it is typed in" caret=33 anchor=0 items=[] focus=input log=[]
+the edge timer armed beside the blink: caret_shown=true timers=2
+99 ms: no step yet: draft="a line of text long enough to be wider than the field it is typed in" caret=33 anchor=0 items=[] focus=input log=[]
+100 ms: one step: draft="a line of text long enough to be wider than the field it is typed in" caret=34 anchor=0 items=[] focus=input log=[]
+200 ms: another: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=0 items=[] focus=input log=[]
+80 dp out: draft="a line of text long enough to be wider than the field it is typed in" caret=36 anchor=0 items=[] focus=input log=[]
+25 ms later: a step: draft="a line of text long enough to be wider than the field it is typed in" caret=37 anchor=0 items=[] focus=input log=[]
+50 ms: another: draft="a line of text long enough to be wider than the field it is typed in" caret=38 anchor=0 items=[] focus=input log=[]
+back inside: draft="a line of text long enough to be wider than the field it is typed in" caret=9 anchor=0 items=[] focus=input log=[]
+the edge timer gone: caret_shown=true timers=1
+500 ms inside: nothing moves: draft="a line of text long enough to be wider than the field it is typed in" caret=9 anchor=0 items=[] focus=input log=[]
+released past the edge: caret_shown=true timers=1
+500 ms after the release: nothing moves: draft="a line of text long enough to be wider than the field it is typed in" caret=39 anchor=0 items=[] focus=input log=[]
+home: draft="a line of text long enough to be wider than the field it is typed in" caret=0 anchor=0 items=[] focus=input log=[]
+held until the end (36 steps): draft="a line of text long enough to be wider than the field it is typed in" caret=68 anchor=0 items=[] focus=input log=[]
+the edge timer ended at the end: caret_shown=true timers=1
+end: draft="a line of text long enough to be wider than the field it is typed in" caret=68 anchor=68 items=[] focus=input log=[]
+held past the left edge: caret_shown=true timers=2
+disabled while held: caret_shown=false timers=0
+500 ms disabled: nothing moves: draft="a line of text long enough to be wider than the field it is typed in" caret=35 anchor=68 items=[] focus=input log=[]
+at the end: caret_shown=false timers=0
+ctrl c: milk copied [clipboard "milk"]: draft="milk and eggs" caret=4 anchor=0 items=[] focus=input log=[]
+ctrl c with nothing selected: nothing copied, the key goes on [clipboard "milk"]: draft="milk and eggs" caret=13 anchor=13 items=[] focus=input log=[screen key]
+ctrl v at the end [clipboard "milk"]: draft="milk and eggs milk" caret=18 anchor=18 items=[] focus=input log=[]
+undo the paste [clipboard "milk"]: draft="milk and eggs " caret=14 anchor=14 items=[] focus=input log=[]
+ctrl v over the selection (milk over milk) [clipboard "milk"]: draft="milk and eggs " caret=4 anchor=4 items=[] focus=input log=[]
+ctrl x: and cut [clipboard "and "]: draft="milk eggs " caret=5 anchor=5 items=[] focus=input log=[]
+undo the cut [clipboard "and "]: draft="milk and eggs " caret=9 anchor=5 items=[] focus=input log=[]
+redo the cut [clipboard "and "]: draft="milk eggs " caret=5 anchor=5 items=[] focus=input log=[]
+shift insert: line breaks pasted as spaces [clipboard "two\nlines\r\nand\rthree"]: draft="milk eggs two lines and three" caret=29 anchor=29 items=[] focus=input log=[]
+undo, select all, ctrl insert copies [clipboard "milk eggs "]: draft="milk eggs " caret=0 anchor=10 items=[] focus=input log=[]
+shift delete cuts the last letter [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[]
+ctrl v, then disabled before the answer: nothing [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[]
+disabled: ctrl v does nothing [clipboard " "]: draft="milk eggs" caret=9 anchor=9 items=[] focus=input log=[screen key]
+enabled again: ctrl v [clipboard " "]: draft="milk eggs " caret=10 anchor=10 items=[] focus=input log=[]
+ctrl v, then removed before the answer: spare="spare" (the clipboard still answers: true)

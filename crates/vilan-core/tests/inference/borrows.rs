@@ -15080,6 +15080,30 @@ fn b647_a_loan_no_write_reaches_still_compiles() {
     );
 }
 
+/// B744: a call through a `dyn` object reaches every implementation of the
+/// member, as a bound's does. The write summary named a dispatch by the
+/// `generic_dispatch` record alone, so the object's call read as a call of
+/// the trait's DECLARATION: the default's body answered (or, for a bodiless
+/// requirement, nothing did) and the override the object runs was never
+/// asked. JS printed `1` and native `0`. Both declaration shapes; the twin
+/// whose implementations only read stays accepted.
+#[test]
+fn b744_a_module_binding_lent_through_a_dyn_object_to_a_writer_is_refused() {
+    let source = |declaration: &str, writer_body: &str| {
+        format!(
+            "import std::io::print;\nmut module_items: List<i32> = [];\ntrait Grower {{\n{declaration}}}\nstruct Plain {{}}\nstruct Writer {{}}\nimpl Plain with Grower {{\n\tfun lent(self, items: &List<i32>): usize {{\n\t\titems.len()\n\t}}\n}}\nimpl Writer with Grower {{\n\tfun lent(self, items: &List<i32>): usize {{\n{writer_body}\t\titems.len()\n\t}}\n}}\nfun main() {{\n\tlet grower: dyn Grower = Writer {{}};\n\tprint(grower.lent(&module_items));\n}}\nmain();\n"
+        )
+    };
+    let with_default = "\tfun lent(self, items: &List<i32>): usize {\n\t\titems.len()\n\t}\n";
+    let requirement = "\tfun lent(self, items: &List<i32>): usize;\n";
+    let writes = "\t\tmodule_items.push(1);\n";
+    let message = "`lent` writes `module_items` while `module_items` is lent to this call, so the loan and the write are two paths to one place (a write under a live view); copy it first: `let items = module_items; grower.lent(&items)`";
+    for declaration in [with_default, requirement] {
+        assert_fails_with(&source(declaration, writes), message);
+    }
+    assert_compiles_and_runs(&source(with_default, ""), "0\n");
+}
+
 /// B647's by-value twin (met on the way): a module-level `mut` binding handed
 /// BY VALUE to a callee that writes it is a copy, as rule 1 says and the
 /// native backend answered — JS handed over the binding's own object, so
@@ -15355,5 +15379,647 @@ fun main() {
     assert!(
         copies < 100,
         "a derived `==` over an enum and a fresh `None` copied {copies} values"
+    );
+}
+
+// --- M199: a pattern over a `Shared` read copies only when it must ----------
+
+/// The JS text of one emitted function, from its `function name(` line to the
+/// closing brace at column zero.
+fn m199_function<'a>(js: &'a str, name: &str) -> &'a str {
+    let start = js
+        .find(&format!("function {name}("))
+        .unwrap_or_else(|| panic!("no `{name}` in:\n{js}"));
+    let end = js[start..]
+        .find("\n}")
+        .map_or(js.len(), |offset| start + offset + 2);
+    &js[start..end]
+}
+
+#[test]
+fn m199_a_capture_of_a_bare_shared_read_holds_what_the_match_found() {
+    // A bare `cell.read()` subject was read as an OWNED call, so its captures
+    // aliased the cell: the in-place push showed through `xs` (3).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(([1, 2], 3));
+            if cell.read() is (let xs, let n) {
+                cell.write().0.push(9);
+                print(i"{xs.len()} {n}");
+            }
+        }
+        "#,
+        "2 3\n",
+    );
+}
+
+#[test]
+fn m199_a_scalar_capture_of_a_shared_read_is_read_at_the_match() {
+    // The scalar owes no copy, but it was an accessor re-read after the
+    // component write (99).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(([1, 2], 3));
+            if cell.read() is (_, let n) {
+                cell.write().1 = 99;
+                print(n);
+            }
+        }
+        "#,
+        "3\n",
+    );
+}
+
+#[test]
+fn m199_a_match_capture_keeps_its_value_across_a_call_that_writes_the_cell() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun poke(cell: Shared<(List<i32>, i32)>) {
+            cell.write().0.push(9);
+        }
+        fun main() {
+            let cell = Shared::new(([1, 2], 3));
+            match cell.read() {
+                (let xs, _) => {
+                    poke(cell);
+                    print(i"{xs.len()} {cell.read().0.len()}");
+                }
+            }
+        }
+        "#,
+        "2 3\n",
+    );
+}
+
+#[test]
+fn m199_a_destructuring_let_of_a_shared_read_copies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(([1, 2], 3));
+            let (xs, _) = cell.read();
+            cell.write().0.push(9);
+            print(xs.len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn m199_a_guard_clause_capture_of_a_shared_read_copies() {
+    // R15's guard publishes `xs` past the statement, beyond any construct the
+    // per-construct proof could survey, so only the whole-program answer
+    // applies — and this cell is written in place.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun guarded(cell: Shared<Option<List<i32>>>): usize {
+            cell.read() is Some(let xs) else ret 0;
+            cell.write().some_view().push(9);
+            xs.len()
+        }
+        fun main() {
+            print(guarded(Shared::new(Some([1, 2]))));
+        }
+        "#;
+    assert_compiles_and_runs(source, "2\n");
+    let js = compile(source).expect("compiles");
+    assert!(
+        m199_function(&js, "guarded").contains("__clone("),
+        "the guard's capture must copy:\n{js}"
+    );
+}
+
+#[test]
+fn m199_a_viewed_only_match_over_a_shared_read_field_copies_nothing() {
+    // The M199 repro's `project`: the arm only lends `item` (`&item`), and
+    // nothing in the program writes the cell, so the capture shares it.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Task { title: str, tags: List<str> }
+        struct Holder<T> { value: Option<T> }
+        fun project<T, F>(cell: Shared<Holder<T>>, read: sync |&T| F): Option<F> {
+            match cell.read().value {
+                Some(let item) => Some(read(&item)),
+                None => None,
+            }
+        }
+        fun main() {
+            let cell = Shared::new(Holder { value = Some(Task { title = "a", tags = ["x"] }) });
+            print(project(cell, |t| t.title).debug());
+        }
+        "#;
+    assert_compiles_and_runs(source, "Some(\"a\")\n");
+    let js = compile(source).expect("compiles");
+    assert!(
+        !m199_function(&js, "project").contains("__clone("),
+        "a viewed-only capture must not copy:\n{js}"
+    );
+}
+
+#[test]
+fn m199_an_underscore_capture_copies_nothing() {
+    // `let _` binds nothing anyone can read: no copy, no declaration.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Holder { value: Option<List<i32>> }
+        fun has(cell: Shared<Holder>): bool {
+            cell.read().value is Some(let _)
+        }
+        fun main() {
+            let cell = Shared::new(Holder { value = Some([1]) });
+            print(has(cell));
+            cell.write().value = None;
+            print(has(cell));
+        }
+        "#;
+    assert_compiles_and_runs(source, "true\nfalse\n");
+    let js = compile(source).expect("compiles");
+    let has = m199_function(&js, "has");
+    assert!(
+        !has.contains("__clone(") && !has.contains("const _"),
+        "`let _` must neither copy nor declare:\n{has}"
+    );
+}
+
+#[test]
+fn m199_a_construct_no_write_reaches_shares_though_the_cell_is_written_elsewhere() {
+    // The cell IS written in place (`grow`), so the whole-program answer says
+    // copy; but nothing inside `count`'s `if` can reach that write, and
+    // nothing in it suspends, so the per-construct proof shares.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun grow(cell: Shared<Option<List<i32>>>) {
+            cell.write().some_view().push(9);
+        }
+        fun count(cell: Shared<Option<List<i32>>>): usize {
+            if cell.read() is Some(let items) {
+                ret items.len();
+            }
+            0
+        }
+        fun main() {
+            let cell = Shared::new(Some([1, 2]));
+            grow(cell);
+            print(count(cell));
+        }
+        "#;
+    assert_compiles_and_runs(source, "3\n");
+    let js = compile(source).expect("compiles");
+    assert!(
+        !m199_function(&js, "count").contains("__clone("),
+        "the write-free construct must share:\n{js}"
+    );
+}
+
+#[test]
+fn m199_a_construct_that_suspends_keeps_its_copy() {
+    // The same shape with a suspension point in the arm: another turn may
+    // write the cell in place while `count` waits (spec §6.6), so the capture
+    // keeps the value the match found.
+    let source = r#"
+        import std::io::print;
+        import std::shared::Shared;
+        import std::time::sleep;
+        fun grow(cell: Shared<Option<List<i32>>>) {
+            cell.write().some_view().push(9);
+        }
+        fun count(cell: Shared<Option<List<i32>>>) {
+            if cell.read() is Some(let items) {
+                sleep(300);
+                print(items.len());
+            }
+        }
+        fun main() {
+            let cell = Shared::new(Some([1, 2]));
+            let _writer = async {
+                sleep(10);
+                grow(cell);
+            };
+            count(cell);
+        }
+        "#;
+    assert_compiles_and_runs(source, "2\n");
+    let js = compile(source).expect("compiles");
+    assert!(
+        m199_function(&js, "count").contains("__clone("),
+        "a suspending construct must copy:\n{js}"
+    );
+}
+
+#[test]
+fn m199_a_capture_at_a_value_seam_copies() {
+    // Handed out of the frame, the capture would carry the cell's storage:
+    // the caller's in-place push would grow the cell.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun stores(cell: Shared<Option<List<i32>>>): Option<List<i32>> {
+            if cell.read() is Some(let xs) {
+                ret Some(xs);
+            }
+            None
+        }
+        fun taken(cell: Shared<Option<List<i32>>>): List<i32> {
+            match cell.read() {
+                Some(let xs) => xs,
+                None => [],
+            }
+        }
+        fun main() {
+            let cell = Shared::new(Some([1, 2]));
+            mut out = stores(cell);
+            if &mut out is Some(let xs) {
+                xs.push(3);
+            }
+            mut whole = taken(cell);
+            whole.push(4);
+            print(i"{out.debug()} {whole.debug()} {cell.read().debug()}");
+        }
+        "#,
+        "Some([1, 2, 3]) [1, 2, 4] Some([1, 2])\n",
+    );
+}
+
+#[test]
+fn m199_a_mutable_capture_of_a_shared_read_copies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(Some([1, 2]));
+            match cell.read() {
+                Some(mut xs) => {
+                    xs.push(1);
+                    print(xs.len());
+                }
+                None => {}
+            }
+            print(cell.read().debug());
+        }
+        "#,
+        "3\nSome([1, 2])\n",
+    );
+}
+
+#[test]
+fn m199_a_capture_an_escaping_closure_reads_keeps_the_old_value() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun escapes(cell: Shared<Option<List<i32>>>): || usize {
+            if cell.read() is Some(let xs) {
+                ret || xs.len();
+            }
+            ret || 0;
+        }
+        fun grow(cell: Shared<Option<List<i32>>>) {
+            cell.write().some_view().push(9);
+        }
+        fun main() {
+            let cell = Shared::new(Some([1, 2]));
+            let count = escapes(cell);
+            grow(cell);
+            print(count());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn m199_a_rebind_inside_the_arm_leaves_the_capture_alone() {
+    // A rebind installs a fresh value: on JS the shared capture keeps naming
+    // the old storage, and natively (where a borrow could not survive the
+    // rebind) the construct is refused the borrow and copies.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        fun main() {
+            let cell = Shared::new(Some([1, 2]));
+            if cell.read() is Some(let xs) {
+                cell.write() = Some([]);
+                print(xs.len());
+            }
+            print(cell.read().debug());
+        }
+        "#,
+        "2\nSome([])\n",
+    );
+}
+
+// --- B735: a by-value return of a module-level binding copies --------------
+//
+// Rule 1's return clause read a place rooted at a MODULE-LEVEL binding as a
+// local's dead owner, so a function handing back a module-level cell's read
+// (or the binding itself, or a piece of it) gave the caller the binding's live
+// storage: the caller's push grew the module binding, and a later write of it
+// showed through the caller's result. A module-level binding outlives every
+// call, as a loaned parameter's storage does, and copies like one.
+
+#[test]
+fn b735_a_module_cell_read_at_a_function_tail_copies() {
+    // Both directions: the caller's push (3 before the fix) and a later write
+    // of the cell seen through the caller's result (3 before the fix).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        let plain: Shared<List<i32>> = Shared::new([1, 2]);
+        fun from_plain(): List<i32> {
+            plain.read()
+        }
+        fun main() {
+            mut b = from_plain();
+            b.push(3);
+            let held = from_plain();
+            plain.write().push(4);
+            print(i"{plain.read().len()} {b.len()} {held.len()}");
+        }
+        "#,
+        "3 3 2\n",
+    );
+}
+
+#[test]
+fn b735_a_module_cell_read_at_an_explicit_ret_copies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        let plain: Shared<List<i32>> = Shared::new([1, 2]);
+        fun from_plain(flag: bool): List<i32> {
+            if flag {
+                ret plain.read();
+            }
+            []
+        }
+        fun main() {
+            mut b = from_plain(true);
+            b.push(3);
+            let held = from_plain(true);
+            plain.write().push(4);
+            print(i"{plain.read().len()} {held.len()}");
+        }
+        "#,
+        "3 2\n",
+    );
+}
+
+#[test]
+fn b735_a_lazy_module_cell_read_at_a_function_tail_copies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        lazy let loaded: Shared<List<i32>> = Shared::new([1, 2]);
+        fun from_lazy(): List<i32> {
+            loaded.read()
+        }
+        fun main() {
+            mut b = from_lazy();
+            b.push(3);
+            let held = from_lazy();
+            loaded.write().push(4);
+            print(i"{loaded.read().len()} {held.len()}");
+        }
+        "#,
+        "3 2\n",
+    );
+}
+
+#[test]
+fn b735_a_cell_in_a_module_level_struct_field_copies_at_the_return() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Holder { cell: Shared<List<i32>>, n: i32 }
+        let holder: Holder = Holder { cell = Shared::new([1, 2]), n = 0 };
+        fun from_field(): List<i32> {
+            holder.cell.read()
+        }
+        fun main() {
+            mut b = from_field();
+            b.push(3);
+            let held = from_field();
+            holder.cell.write().push(4);
+            print(i"{holder.cell.read().len()} {held.len()}");
+        }
+        "#,
+        "3 2\n",
+    );
+}
+
+#[test]
+fn b735_a_cell_in_a_module_level_collection_copies_at_the_return() {
+    // An element of a list, a slot of a tuple, and an element of a list held
+    // in a module-level struct's field.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        struct Registry { cells: List<Shared<List<i32>>> }
+        let cells: List<Shared<List<i32>>> = [Shared::new([1, 2])];
+        let pair: (Shared<List<i32>>, i32) = (Shared::new([1, 2]), 0);
+        let registry: Registry = Registry { cells = [Shared::new([1, 2])] };
+        fun from_list(): List<i32> {
+            cells[0].read()
+        }
+        fun from_tuple(): List<i32> {
+            pair.0.read()
+        }
+        fun from_registry(): List<i32> {
+            registry.cells[0].read()
+        }
+        fun main() {
+            mut a = from_list();
+            a.push(3);
+            mut b = from_tuple();
+            b.push(3);
+            mut c = from_registry();
+            c.push(3);
+            print(i"{cells[0].read().len()} {pair.0.read().len()} {registry.cells[0].read().len()}");
+        }
+        "#,
+        "2 2 2\n",
+    );
+}
+
+#[test]
+fn b735_a_module_cell_read_through_a_cloned_handle_copies() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        let plain: Shared<List<i32>> = Shared::new([1, 2]);
+        let alias: Shared<List<i32>> = plain.clone();
+        fun from_alias(): List<i32> {
+            alias.read()
+        }
+        fun main() {
+            mut b = from_alias();
+            b.push(3);
+            print(plain.read().len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b735_a_plain_module_level_aggregate_copies_at_the_return() {
+    // The rule is about the ROOT, not the cell: a module-level `let`, a `mut`,
+    // a field of a module-level struct and an element of a module-level list
+    // alias the same way when handed back by value.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        struct Registry { items: List<i32> }
+        let xs: List<i32> = [1, 2];
+        mut ys: List<i32> = [1, 2];
+        let registry: Registry = Registry { items = [1, 2] };
+        mut nested: List<List<i32>> = [[1, 2]];
+        fun get_xs(): List<i32> {
+            xs
+        }
+        fun get_ys(): List<i32> {
+            ys
+        }
+        fun items(): List<i32> {
+            registry.items
+        }
+        fun first(): List<i32> {
+            nested[0]
+        }
+        fun main() {
+            mut a = get_xs();
+            a.push(3);
+            mut b = get_ys();
+            b.push(3);
+            let held = get_ys();
+            ys.push(4);
+            mut c = items();
+            c.push(3);
+            mut d = first();
+            d.push(3);
+            print(i"{xs.len()} {ys.len()} {held.len()} {registry.items.len()} {nested[0].len()}");
+        }
+        "#,
+        "2 3 2 2 2\n",
+    );
+}
+
+#[test]
+fn b735_a_capture_of_a_module_cell_read_at_a_value_seam_copies() {
+    // Already copied by the capture plan before B735 (M199's place subject);
+    // pinned beside the return clause it now agrees with.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        let plain: Shared<Option<List<i32>>> = Shared::new(Some([1, 2]));
+        fun taken(): List<i32> {
+            match plain.read() {
+                Some(let xs) => xs,
+                None => [],
+            }
+        }
+        fun stores(): Option<List<i32>> {
+            if plain.read() is Some(let xs) {
+                ret Some(xs);
+            }
+            None
+        }
+        fun main() {
+            mut b = taken();
+            b.push(3);
+            mut out = stores();
+            if &mut out is Some(let xs) {
+                xs.push(5);
+            }
+            let held = taken();
+            plain.write() = Some([1, 2, 4]);
+            print(i"{plain.read().debug()} {held.len()} {out.debug()}");
+        }
+        "#,
+        "Some([1, 2, 4]) 2 Some([1, 2, 5])\n",
+    );
+}
+
+#[test]
+fn b735_a_closure_returning_a_module_cell_read_copies() {
+    // A closure's return already copied a binding declared outside it (B64);
+    // pinned beside the function form, a nested closure included.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        let plain: Shared<List<i32>> = Shared::new([1, 2]);
+        fun main() {
+            let get = || plain.read();
+            mut a = get();
+            a.push(3);
+            let outer = || {
+                let inner = || plain.read();
+                inner()
+            };
+            mut b = outer();
+            b.push(3);
+            print(plain.read().len());
+        }
+        "#,
+        "2\n",
+    );
+}
+
+#[test]
+fn b735_a_module_level_return_copies_and_a_local_return_does_not() {
+    // The copy is the module binding's alone: a local is still a dead owner at
+    // the return and donates its storage.
+    let js = compile(
+        r#"
+        import std::io::print;
+        import std::shared::Shared;
+        let plain: Shared<List<i32>> = Shared::new([1, 2]);
+        fun from_plain(): List<i32> {
+            plain.read()
+        }
+        fun from_local(): List<i32> {
+            mut result = [1];
+            result.push(2);
+            result
+        }
+        fun main() {
+            print(i"{from_plain().len()} {from_local().len()}");
+        }
+        "#,
+    )
+    .expect("compiles");
+    assert!(
+        m199_function(&js, "from_plain").contains("return __clone(plain.v)"),
+        "{js}"
+    );
+    assert!(
+        !m199_function(&js, "from_local").contains("__clone"),
+        "{js}"
     );
 }

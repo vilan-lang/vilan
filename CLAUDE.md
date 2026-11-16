@@ -22,6 +22,13 @@ and it can afford to — there is no deadline pressure. Hold the bar high:
   over a failure with a special-case patch that handles one input — find why the *general* path is
   wrong and fix that. Special cases are a smell; prefer general code that subsumes them.
 
+`WISDOM.md` gives these rules, and the ones below, their history: a diagnosis table from
+symptoms (a moved golden, a red CI leg, native and JS disagreeing, a stale incremental answer)
+to likely causes, principles C1 onward in Ask / Usually / Why / Except / Check form, and the
+real cases (tracker ids, commits) they came from. Read it before a fix whose cause you can't
+yet name in one sentence. Its sibling for people writing Vilan programs is the book's
+`vilan/docs/guide/wisdom.md`.
+
 ## Conventions
 
 - Use 4 spaces for indentation.

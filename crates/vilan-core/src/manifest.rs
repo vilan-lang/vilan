@@ -813,6 +813,11 @@ pub fn moved_prelude_path(path: &str) -> Option<(&'static str, &'static str, Str
     if *old == "web" && segments.len() > 2 {
         return None;
     }
+    // A reclaimed path is a live module again (`std::ui`): a prelude naming it
+    // means the module it names now.
+    if crate::parsing::RECLAIMED_STD_MODULES.contains(old) {
+        return None;
+    }
     let rewritten = std::iter::once("std")
         .chain(std::iter::once(*new))
         .chain(segments[2..].iter().copied())
@@ -4373,11 +4378,13 @@ mod tests {
                 );
             }
         }
-        // The new paths, and a namespace's child that is not the prelude, pass.
+        // The new paths, and a namespace's child that is not the prelude, pass;
+        // so does `std::ui`, a reclaimed path (the native UI, native-ui.md P2).
         for path in [
             "std::web::prelude",
             "std::web::style::prelude",
             "std::prelude",
+            "std::ui",
         ] {
             let errors = parse(&format!(
                 "[package]\nname = \"app\"\nprelude = \"{path}\"\n"

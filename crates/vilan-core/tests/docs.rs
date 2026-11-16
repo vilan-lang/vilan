@@ -7,6 +7,10 @@
 //! - ```vilan           — complete program, node target
 //! - ```vilan,browser   — complete program, browser target
 //! - ```vilan,norun     — compiles (node) but isn't runnable standalone
+//! - ```vilan,native    — a NATIVE-only program (it reaches `std::window`, which
+//!   the JavaScript build refuses by name): checked as `vilan check` checks it
+//!   — analysis plus the emitter's diagnose walk, which every backend shares
+//!   (F1 M2)
 //! - ```vilan,fragment  — NOT compiled (a signature, a diff, a deliberate error)
 //!
 //! Failures report `file — nearest heading` so a broken example is a one-jump
@@ -21,7 +25,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use vilan_core::{BuildOptions, PackageSpec, Platform, Workspace, analyze_source, transform};
+use vilan_core::{
+    BuildOptions, PackageSpec, Platform, Workspace, analyze_source, diagnose, transform,
+};
 
 mod test_pool;
 
@@ -64,6 +70,8 @@ struct Example {
     line: usize,
     source: String,
     platform: Platform,
+    /// `vilan,native`: checked, not built — see the header.
+    native: bool,
 }
 
 fn collect_markdown_files(dir: &Path, into: &mut Vec<PathBuf>) {
@@ -90,6 +98,7 @@ fn collect_markdown_files(dir: &Path, into: &mut Vec<PathBuf>) {
 struct OpenFence {
     platform: Platform,
     compile: bool,
+    native: bool,
     opened_at: usize,
     indent: usize,
     body: String,
@@ -147,6 +156,7 @@ fn extract_examples_from(text: &str, path: &Path) -> Vec<Example> {
                             line: open.opened_at + 1,
                             source: std::mem::take(&mut open.body),
                             platform: open.platform,
+                            native: open.native,
                         });
                     }
                     fence = None;
@@ -160,7 +170,7 @@ fn extract_examples_from(text: &str, path: &Path) -> Vec<Example> {
                 if let Some(info) = line[indent..].strip_prefix("```") {
                     let info = info.trim();
                     let (platform, compile) = match info {
-                        "vilan" | "vilan,norun" => (Platform::default(), true),
+                        "vilan" | "vilan,norun" | "vilan,native" => (Platform::default(), true),
                         "vilan,browser" => (Platform::Browser, true),
                         "vilan,fragment" => (Platform::default(), false),
                         // Non-vilan fences (sh, toml, text, js …) are prose.
@@ -169,6 +179,7 @@ fn extract_examples_from(text: &str, path: &Path) -> Vec<Example> {
                     fence = Some(OpenFence {
                         platform,
                         compile,
+                        native: info == "vilan,native",
                         opened_at: index,
                         indent,
                         body: String::new(),
@@ -186,7 +197,7 @@ fn extract_examples_from(text: &str, path: &Path) -> Vec<Example> {
 /// Compile one example through the full pipeline on a large-stack worker
 /// (mirroring the CLI and the `inference` suite); a panic becomes an error rather
 /// than aborting the suite.
-fn compile(source: &str, platform: Platform) -> Result<(), Vec<String>> {
+fn compile(source: &str, platform: Platform, native: bool) -> Result<(), Vec<String>> {
     let source = source.to_string();
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -206,6 +217,13 @@ fn compile(source: &str, platform: Platform) -> Result<(), Vec<String>> {
                     // trait in scope is refused like any other error since
                     // v0.45.0 (it warned, and this gate refused it, for one
                     // release).
+                    // F1 M2: a native-only program is held to what `vilan
+                    // check` holds it to; its JavaScript build is a refusal
+                    // by design.
+                    Some(program) if errors.is_empty() && native => {
+                        diagnose(&program, &BuildOptions::default())
+                            .map_err(|error| vec![error.msg])
+                    }
                     Some(program) if errors.is_empty() => {
                         transform(&program, &BuildOptions::default())
                             .map(|_| ())
@@ -254,7 +272,9 @@ fn every_doc_example_compiles() {
                 scope.spawn(move || {
                     let mut failures = Vec::new();
                     for example in chunk {
-                        if let Err(errors) = compile(&example.source, example.platform) {
+                        if let Err(errors) =
+                            compile(&example.source, example.platform, example.native)
+                        {
                             failures.push(format!(
                                 "{}:{} — {} — {:?}",
                                 example.file.display(),

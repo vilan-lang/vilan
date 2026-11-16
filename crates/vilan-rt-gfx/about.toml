@@ -1,0 +1,50 @@
+# cargo-about config for THIS crate's notices (native-ui.md R11): the crate is
+# outside the compiler's workspace with a lockfile of its own, so its notices
+# are its own file. The accepted list is the compiler's (the root
+# `about.toml`) plus ONE licence accepted here by name, with its reason
+# (BSL-1.0, below), as `vilan-rt-webview/about.toml` does for its two; a crate
+# that would add another turns the `gfx` CI leg (`scripts/ci-local.sh gfx`)
+# red until it is accepted here the same way.
+#
+#   cd crates/vilan-rt-gfx
+#   cargo about generate --offline -c about.toml ../../about.hbs -o notices.txt
+#   tr -d '\r' <notices.txt >THIRD-PARTY-NOTICES.txt && rm notices.txt
+#
+# (Some licence texts arrive with Windows line endings; the leg compares with
+# carriage returns removed, so the committed file has none.)
+#
+# The notices are what a program linking this crate ships; the test font
+# (`tests/fonts/`, OFL-1.1) is test data, never linked, and carries its own
+# licence file beside it.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "CC0-1.0",
+    # F173 (`arboard`'s Windows half): `clipboard-win` and its `error-code` are
+    # the Boost Software License 1.0 alone, a permissive licence (OSI and FSF
+    # approved, no attribution in binaries required) outside the compiler's
+    # list. Accepted FOR NOW by the owner on 2026-11-13, for those two
+    # Windows-only packages; to be revisited under F181.
+    "BSL-1.0",
+]
+# No `targets` filter, as the compiler's: the notices cover the WHOLE lockfile,
+# every platform's crates included.
+
+# `miniz_oxide` ships TWO texts of its MIT licence, `LICENSE` and
+# `LICENSE-MIT.md`, that differ by one blank line, and cargo-about takes
+# whichever it meets first: the notices byte check went red on CI twice with
+# nothing changed (runs 43519114590 and 43554792373, byte 174807). Named here,
+# the file is `LICENSE` every time, for both locked versions (0.8.9, 0.9.1:
+# one checksum, the same text).
+[miniz_oxide.clarify]
+license = "MIT OR Zlib OR Apache-2.0"
+
+[[miniz_oxide.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "4108245a1f2df9d4e94df8abed5b4ba0759bb2f9b40a6b939f1be141077ae50b"

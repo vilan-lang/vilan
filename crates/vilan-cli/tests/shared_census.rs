@@ -290,6 +290,49 @@ const CENSUS: &[(&str, usize, &str)] = &[
          `<cycle>` (E283)",
     ),
     ("time.vl", 3, "O: the debouncer's pending/running/timer"),
+    (
+        "ui.vl",
+        6,
+        "O: the native tree's regions (native-ui.md R9) — `when`'s shown \
+         element, `swap`'s shown element and last value, and a keyed run's keys, \
+         items and rows, the web's `each` bookkeeping for one element a row",
+    ),
+    (
+        "ui/kit/buttons.vl",
+        1,
+        "E: a button's disabled flag (native-ui.md P4) — minted by the builder, \
+         read by the element's click and key handlers the tree keeps and by the \
+         `Button` value's own methods, written by the bound `disabled` signal",
+    ),
+    (
+        "ui/kit/checkboxes.vl",
+        1,
+        "E: a checkbox's disabled flag, as the button's",
+    ),
+    (
+        "ui/kit/editing.vl",
+        20,
+        "E: the kit's editor behind the text input (P4) and the text area (P5) — \
+         its caret, anchor, focus, disabled flag and caret and selection colours \
+         and width, the unit a press drags by with the word or paragraph it \
+         selected (F172), the goal x of a run of vertical moves, undo's done \
+         and undone changes, merge flag and expected value, and the blink's and \
+         the held drag's timers, phase, pace and point (F176) — minted by \
+         `Editor::new`, read and written by the element's handlers the tree keeps \
+         and by the `TextInput` and `TextArea` values' methods, which the program \
+         calls long after the builder returned",
+    ),
+    (
+        "ui/kit/lists.vl",
+        3,
+        "E: a virtual list's window (native-ui.md P4) — the kept copy of its \
+         source's items, the numbers of where the window stands (the rows \
+         built, the offset, the viewport, the overscan) and the rows' measured \
+         and estimated heights (F174), minted by `virtual_list` and read and \
+         written by the source's subscription, the offset's, the resize and key \
+         handlers, every built row's resize handler and every copy of the list's \
+         handle (`reveal`, `built`)",
+    ),
     ("web/router.vl", 1, "R: the module-level `wired` latch"),
     ("ws.vl", 4, "O: the frame decoder's state"),
 ];
@@ -414,7 +457,7 @@ fn the_shared_census_matches_the_committed_table() {
 
     let total: usize = measured.iter().map(|(_, count)| count).sum();
     assert_eq!(
-        total, 279,
+        total, 310,
         "the total number of `Shared` construction sites in std changed"
     );
 

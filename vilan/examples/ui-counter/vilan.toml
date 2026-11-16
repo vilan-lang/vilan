@@ -1,0 +1,16 @@
+# The counter of native-ui.md section 4.1, on `std::ui` (part P3's exit test):
+# a count bound to a signal and two buttons whose looks — hovered, pressed,
+# focused — the app supplies as style conditions. Built from element tags;
+# clicks, Tab, Shift+Tab, Enter and Space all work. NATIVE ONLY — the
+# JavaScript build refuses `std::ui` by name — so it is built with the Rust
+# backend:
+#
+#   vilan run --backend rust .              the window
+#   vilan run --backend rust . -- --check   the tree driven without a window
+#
+# It needs a GPU adapter (any Vulkan, Metal, DirectX 12 or OpenGL driver, or
+# Mesa's software Vulkan) and, on Linux, an X11 or Wayland session. See the
+# native guide's "Interaction" section.
+[package]
+name = "ui_counter"
+root = "."

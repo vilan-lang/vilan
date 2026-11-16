@@ -535,12 +535,12 @@ function renew(self) {
 	const $be = self[0].v[3];
 	let $bf = null;
 	if ($be[0] === 0) {
-		const nursery2 = __clone($be[1]);
+		const nursery2 = $be[1];
 		let $bg = null;
 		if (has_spawned(nursery2)) {
 			$bg = [ 1 ];
 		} else {
-			$bg = [ 0, nursery2 ];
+			$bg = [ 0, __clone(nursery2) ];
 		}
 		$bf = $bg;
 	} else {

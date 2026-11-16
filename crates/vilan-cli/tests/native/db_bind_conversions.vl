@@ -1,10 +1,10 @@
-// M165: a bind list converts at the `any` it lands at, as the native backend's
-// `Any::from` does - an `Option` is its payload or NULL, at every depth and in
-// every form a `List<any>` is filled (a literal element, a value built in
-// place, an `if` element, `push`) - and a `bool` binds as 0 or 1. `print` and
-// `canonical_hash` take an `Option` as it is; a vilan function's `any`
-// parameter receives the payload.
-import std::db::Database;
+// M165: a bind list binds an `Option` as its payload or NULL, at every depth
+// and in every form the list is filled (a literal element, a value built in
+// place, an `if` element, `push`), and a `bool` as 0 or 1. Since M175 the list
+// is a `List<dyn SqlValue>` and the conversion is `Option`'s own `SqlValue`
+// impl. `print` and `canonical_hash` take an `Option` as it is; a vilan
+// function's `any` parameter receives the payload.
+import std::db::{ Database, SqlValue };
 import std::hash::canonical_hash;
 
 fun shown(value: any) {
@@ -24,7 +24,7 @@ fun main() {
 	insert.run(["deep", deep, flag]);
 	insert.run(["built", Some(4), Some(false)]);
 	insert.run(["branch", if true { some } else { none }, true]);
-	mut pushed: List<any> = [];
+	mut pushed: List<dyn SqlValue> = [];
 	pushed.push("pushed");
 	pushed.push(some);
 	pushed.push(flag);

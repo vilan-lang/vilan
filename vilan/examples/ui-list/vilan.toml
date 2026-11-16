@@ -1,0 +1,15 @@
+# A list of 10,000 rows in a `std::ui` scroll (native-ui.md part P3's exit
+# test): the wheel scrolls it without laying out or repainting a row, and a
+# click on a row changes that one row. Every row is a real element — list
+# virtualisation is a `std::ui::kit` component (part P4), not this. NATIVE
+# ONLY — the JavaScript build refuses `std::ui` by name — so it is built with
+# the Rust backend:
+#
+#   vilan run --backend rust .                the window
+#   vilan run --backend rust . -- --smoke     a line per frame, with its times
+#
+# It needs a GPU adapter (any Vulkan, Metal, DirectX 12 or OpenGL driver, or
+# Mesa's software Vulkan) and, on Linux, an X11 or Wayland session.
+[package]
+name = "ui_list"
+root = "."

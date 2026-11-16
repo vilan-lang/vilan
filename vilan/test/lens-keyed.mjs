@@ -1596,8 +1596,9 @@ function entries(self, $ag) {
 				record(log, [ 2, entries_of(storage) ]);
 			} else {
 				const $aB = leaving.v;
+				const value = __clone($aB[1]);
 				if ($aB[0] === 0) {
-					record(log, [ 1, __clone(key5), $aB[1] ]);
+					record(log, [ 1, __clone(key5), value ]);
 				}
 			}
 			$ap = undefined;
@@ -3539,6 +3540,7 @@ function splice2(self, at3, removed, inserted) {
 }
 function audit(self, before2, changes) {
 	const $fN = self[0].v[6];
+	const check = $fN[1];
 	if ($fN[0] === 0) {
 
 	} else {
@@ -3551,7 +3553,7 @@ function audit(self, before2, changes) {
 		return;
 	}
 	const problem = peek2(self, (held) => {
-		return $fN[1]($fO[1], held, changes);
+		return check($fO[1], held, changes);
 	});
 	const $fP = problem;
 	if ($fP[0] === 0) {
@@ -3692,6 +3694,7 @@ function landed_one2(self, change2, $m) {
 }
 function plan(self, change2, write, $fI) {
 	const $fJ = self[0].v[6];
+	const _check = $fJ[1];
 	let $fK = null;
 	if ($fJ[0] === 0) {
 		$fK = [ 0, peek2(self, (held) => {
@@ -3752,6 +3755,7 @@ function on_change3(self, observer, caller) {
 }
 function update(self, change2, $gw) {
 	const $gx = self[0].v[6];
+	const _check = $gx[1];
 	let $gy = null;
 	if ($gx[0] === 0) {
 		$gy = [ 0, peek2(self, (held) => {
@@ -3782,6 +3786,7 @@ function update(self, change2, $gw) {
 }
 function plan2(self, change2, write, $fI) {
 	const $gG = self[0].v[6];
+	const _check = $gG[1];
 	let $gH = null;
 	if ($gG[0] === 0) {
 		$gH = [ 0, peek2(self, (held) => {

@@ -1,0 +1,114 @@
+// Lucide's icons in a row, each above its caption, from the generated package
+// `lucide` (`vilan/packages/lucide`, a path dependency in `vilan.toml`): one
+// function per icon, `lucide::search()`. Every icon takes the text's colour, and
+// the row's size; the last one is red because its column says so. Above the row,
+// a check beside the word it stands for.
+//
+// Accessibility: an icon is decorative unless it has a label. The captions under
+// the row's icons already say what each is, so the icons stay decorative, and an
+// assistive tool reads the captions; the bell, alone with no caption, carries
+// the label. The check beside "Saved" says nothing: the word does.
+//
+// Modes, for the end-to-end test:
+//
+//   --check --font <ttf>
+//                   no window: the screen laid out at 100%, every labelled
+//                   element's box, then what an assistive tool is told of it
+
+import std::fs::read_bytes;
+import std::gfx::{ Color, FontFamily, Size, Window, dp, register_font };
+import std::io::print;
+import std::process::{ args, exit };
+import std::range::Range;
+import std::ui::{ Align, Element, Icon, column, icon, layout, mount, row, style, text };
+import lucide;
+
+/// One icon above its caption.
+fun captioned(shape: Icon, caption: str): Element {
+	<column gap(dp(6)) align(Align::Center) label(caption)>
+		<icon of(shape) size(dp(24)) />
+		<text>{caption}</text>
+	</column>.element()
+}
+
+/// The screen: a saved line, then the row.
+fun screen(font: str): Element {
+	mut look = style()
+		.background(Color::white())
+		.text_color(Color::rgb(33, 36, 46))
+		.text_size(dp(14));
+	if font != "" {
+		look = look.font(FontFamily::Named(font));
+	}
+	<column padding(dp(20)) gap(dp(20)) align(Align::Start) style(look) label("icons")>
+		<row gap(dp(8)) align(Align::Center) label("saved")>
+			<icon of(lucide::check()) />
+			<text>"Saved"</text>
+		</row>
+		<row gap(dp(24)) align(Align::End) label("row")>
+			{captioned(lucide::search(), "Search")}
+			{captioned(lucide::settings(), "Settings")}
+			{captioned(lucide::type_(), "Type")}
+			{captioned(lucide::trash(), "Delete")}
+			<icon of(lucide::bell()) size(dp(24)) label("Notifications") />
+			<icon of(lucide::heart()) size(dp(24)) color(Color::rgb(220, 50, 70)) />
+		</row>
+	</column>.element()
+}
+
+/// The screen's size, in dp.
+fun screen_size(): Size {
+	Size::new(dp(480), dp(160))
+}
+
+fun main() {
+	let arguments = args();
+	if arguments.contains("--check") {
+		check(arguments);
+		ret;
+	}
+	let window = match Window::builder().title("vilan ui icons").size(dp(480), dp(160)).open() {
+		Ok(let window) => window,
+		// No display, no GPU: say why.
+		Err(let reason) => {
+			print(i"no window: {reason}");
+			ret;
+		},
+	};
+	mount(window, screen(""));
+}
+
+/// Check mode: the labelled boxes, then the accessibility tree.
+fun check(arguments: List<str>) {
+	let font = match register_font(read_bytes(after(arguments, "--font"))) {
+		Ok(let families) => families[0],
+		Err(let reason) => {
+			print(i"font: {reason}");
+			exit(2);
+			""
+		},
+	};
+	let root = screen(font);
+	layout(root, screen_size(), 1.0);
+	for entry in root.outline() {
+		if entry.label != "" {
+			print(i"{"  ".repeat(entry.depth)}{entry.kind} {entry.label} {entry.bounds.x.value()} {entry.bounds.y.value()} {entry.bounds.width.value()} {entry.bounds.height.value()}");
+		}
+	}
+	print("accessibility:");
+	print(root.accessibility().trim());
+}
+
+/// The argument after `flag`, or the program ends.
+fun after(arguments: List<str>, flag: str): str {
+	for index in Range::new(0, arguments.len().as_i32() - 1) {
+		if arguments[index.as_usize()] == flag {
+			ret arguments[index.as_usize() + 1];
+		}
+	}
+	print(i"{flag} needs a value");
+	exit(2);
+	""
+}
+
+main();

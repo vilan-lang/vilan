@@ -31,6 +31,7 @@
 - [The dev loop](guide/dev-loop.md)
 - [Debugging](guide/debugging.md)
 - [Native binaries](guide/native.md)
+- [Writing Vilan programs well](guide/wisdom.md)
 
 # The std reference
 
@@ -57,6 +58,9 @@
 - [Dev / HMR](std/dev.md)
 - [Process modules](std/process.md)
 - [Images](std/image.md)
+- [Windows](std/window.md)
+- [GPU graphics](std/gfx.md)
+- [Elements and layout](std/ui.md)
 - [Misc](std/misc.md)
 
 # The specification

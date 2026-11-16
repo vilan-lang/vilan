@@ -34,6 +34,17 @@ members = [
     # `windows-sys` (both already the CLI's) live in a fourth optional crate,
     # linked only by a program that reaches `keys()`.
     "crates/vilan-rt-term",
+    # F164: node binds `::` with `IPV6_V6ONLY` cleared, so its listener is
+    # dual-stack on every OS; the option is set between `socket()` and `bind()`,
+    # which std cannot reach, so the `setsockopt` is FFI (`libc`/`windows-sys`,
+    # already the CLI's) in a crate of its own. `vilan-rt-signal` links it, so
+    # it rides every program that starts an HTTP server and no other.
+    "crates/vilan-rt-net",
+    # F160: the loop's readiness wait — `poll(2)` on unix, `WSAPoll` on
+    # Windows — is FFI, so `libc` and `windows-sys` (both already the CLI's)
+    # live in a seventh optional crate, linked only by a program that does I/O
+    # the loop waits on (a server, a WebSocket dial, a stdin read).
+    "crates/vilan-rt-poll",
     # M185 (proposal/image.md): `std::image`'s codec core over the `image`
     # crate, kept free of vilan types so ONE implementation serves both
     # backends — `vilan-rt-image` links it natively (a fifth optional crate,
@@ -44,6 +55,20 @@ members = [
     "crates/vilan-rt-image",
     "crates/vilan-image-wasm",
 ]
+# F1 M2 (native-objective.md D2a, RULED 2026-11-10): `std::window`'s runtime
+# crate is NOT a member. `wry` + `tao` bring the gtk3 stack on Linux, with an
+# unsound advisory that has no gtk3 fix, licences outside `about.toml`'s list,
+# and a `toml_datetime` pin that would force the compiler's own `toml` from
+# 0.8.23 down to 0.8.2 — so the crate keeps its own `Cargo.lock` and its own CI job
+# (`scripts/ci-local.sh webview`), and is still embedded for user builds.
+#
+# native-ui.md P1 (R11, RULED 2026-11-10): `std::gfx`'s runtime crate is NOT a
+# member either, for WEIGHT this time: `wgpu` + `winit` + `parley` are 304
+# packages the compiler does not need, every one of them clean of advisories
+# and on `about.toml`'s licence list. It keeps its own `Cargo.lock`, notices and
+# CI job (`scripts/ci-local.sh gfx`), and is not yet embedded or linked by
+# anything (no `std::gfx` surface exists yet).
+exclude = ["crates/vilan-rt-webview", "crates/vilan-rt-gfx"]
 
 # The clippy gate's exception list (backlog N21). `cargo clippy --workspace
 # --all-targets -- -D warnings` is a CI leg, so every finding is an error and an

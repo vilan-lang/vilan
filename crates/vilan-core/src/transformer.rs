@@ -1312,6 +1312,71 @@ fn image_codec_refusal(helpers: &BTreeSet<&'static str>) -> Option<Error> {
     })
 }
 
+/// A std module only the NATIVE backend implements (F1 M2, native-ui.md P1):
+/// its name, and why a JavaScript build has none of it — the clause the
+/// refusal ([`native_only_refusal`]) gives.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeOnly {
+    pub(crate) module: &'static str,
+    why: &'static str,
+}
+
+/// The `__`-named free externs only the NATIVE backend implements, by the std
+/// module that declares them: `std::window`'s desktop window (F1 M2), which is
+/// the operating system's webview, `std::gfx`'s GPU window (native-ui.md P1),
+/// which is drawn by a renderer linked into the binary, and `std::ui`'s
+/// elements (P2), laid out and drawn by that same renderer — none has a
+/// JavaScript twin. Keyed by PREFIX: each module's externs share one, and only
+/// that module declares names with it. The interpreter refuses them as host
+/// capabilities too.
+pub(crate) fn native_only_extern(symbol: &str) -> Option<NativeOnly> {
+    const NATIVE_ONLY: &[(&str, NativeOnly)] = &[
+        (
+            "__window_",
+            NativeOnly {
+                module: "std::window",
+                why: "a desktop window is the operating system's webview, linked into a native \
+                      binary, and a JavaScript build has none",
+            },
+        ),
+        (
+            "__gfx_",
+            NativeOnly {
+                module: "std::gfx",
+                why: "a GPU window is drawn by a renderer linked into a native binary, and a \
+                      JavaScript build has none",
+            },
+        ),
+        (
+            "__ui_",
+            NativeOnly {
+                module: "std::ui",
+                why: "its elements are laid out and drawn by the GPU renderer linked into a \
+                      native binary, and a JavaScript build has none",
+            },
+        ),
+    ];
+    NATIVE_ONLY
+        .iter()
+        .find(|(prefix, _)| symbol.starts_with(prefix))
+        .map(|(_, native_only)| *native_only)
+}
+
+/// The JavaScript backend's refusal of a program that reaches a native-only
+/// module (F1 M2) — never a bundle that calls a helper it does not define.
+fn native_only_refusal(symbol: &str, native_only: NativeOnly) -> Error {
+    let NativeOnly { module, why } = native_only;
+    Error {
+        trace: Vec::new(),
+        note: None,
+        span: Span::default(),
+        msg: format!(
+            "this program reaches `{module}` (its `{symbol}`), which only the native backend \
+             builds: {why}. Build it with `vilan build --backend rust`"
+        ),
+    }
+}
+
 /// The `__`-named free externs whose implementations live in the helper table:
 /// a std module binds `[extern("__name")]`, and transforming a call through
 /// one marks its helper for emission. Returns the canonical `'static` name.
@@ -1327,6 +1392,8 @@ fn extern_helper(symbol: &str) -> Option<&'static str> {
         "__db_run",
         "__db_all",
         "__db_get",
+        "__db_null",
+        "__db_bytes",
         "__db_column",
         "__db_is_null",
         "__db_close",
@@ -1762,9 +1829,8 @@ fn helper_source(name: &str) -> &'static str {
         // listeners go, the request pauses, and `__http_linger` stops the
         // socket and keeps the answer from being overtaken by a reset. The
         // status goes out with `Connection: close` — node destroys the socket
-        // once it is flushed — and RFC 9110's phrase for a `413` (node's table
-        // still says `Payload Too Large`; the native server says the RFC's, so
-        // the two answer one status line). A response already under way cannot
+        // once it is flushed — with node's own reason phrase, which the native
+        // server's table follows (F151). A response already under way cannot
         // become a refusal, so its socket is cut instead. A `5xx` is the
         // server's own fault and is written to stderr too. Answers the
         // cancellation the caller rejects (or throws) with, after failing a
@@ -1776,7 +1842,6 @@ fn helper_source(name: &str) -> &'static str {
              \tif (status >= 500) console.error(\"std::http: \" + message);\n\
              \tif (!response.headersSent) {\n\
              \t\tresponse.statusCode = status;\n\
-             \t\tif (status === 413) response.statusMessage = \"Content Too Large\";\n\
              \t\tresponse.setHeader(\"Content-Type\", \"text/plain\");\n\
              \t\tresponse.setHeader(\"Connection\", \"close\");\n\
              \t\t__http_linger(request);\n\
@@ -2127,12 +2192,13 @@ fn helper_source(name: &str) -> &'static str {
         }
         // M165: the bind list as SQLite takes it, the native binder's rule
         // (`vilan-rt-sqlite`'s `bind`): a `bool` is the integer 0 or 1 (node
-        // refuses a JS boolean), and an `Option` already arrived as its payload
-        // or `null` (`__any_option`, at the `any` position it landed at). A
-        // value SQLite cannot hold is refused HERE, naming its index in the
-        // list, rather than by node's own sentence — an array was read as named
-        // parameters ("Unknown named parameter '0'"). The JS value is all that
-        // reaches this far, so the sentence names its shape, not its vilan type.
+        // refuses a JS boolean), an `Option` already arrived as its payload or
+        // `null`, and a `Bytes` is the BLOB it already is. Since M175 the public
+        // bind list is `List<dyn SqlValue>`, which the checker types, and its
+        // elements arrive here through their own `sql_value()`; so typed code
+        // cannot reach the refusal below. It stays as the backstop for std's
+        // internal `List<any>` caller (the migrator's guarded run), naming the
+        // index rather than node's own sentence ("Unknown named parameter '0'").
         "__db_bind" => {
             "function __db_bind(parameters) {\n\
              \treturn parameters.map((value, index) => {\n\
@@ -2148,7 +2214,7 @@ fn helper_source(name: &str) -> &'static str {
              \t\t\treturn value;\n\
              \t\t}\n\
              \t\tconst shape = Array.isArray(value) ? \"a struct, tuple, list or enum value\" : typeof value === \"function\" ? \"a closure\" : value === undefined ? \"an absent value\" : \"a host object\";\n\
-             \t\tthrow new Error(\"std::db: cannot bind the parameter at index \" + index + \" of \" + parameters.length + \": \" + shape + \" is not a SQLite value (bind a number, a str, a bool, or an Option of one)\");\n\
+             \t\tthrow new Error(\"std::db: cannot bind the parameter at index \" + index + \" of \" + parameters.length + \": \" + shape + \" is not a SQLite value (bind a number, a str, a bool, Bytes, or an Option of one)\");\n\
              \t});\n\
              }"
         }
@@ -2164,6 +2230,17 @@ fn helper_source(name: &str) -> &'static str {
              \t\tvalue = value[1];\n\
              \t}\n\
              \treturn value;\n\
+             }"
+        }
+        // M175: SQL's NULL, as `Option`'s `SqlValue` impl answers it for `None`.
+        "__db_null" => "function __db_null() {\n\treturn null;\n}",
+        // M195: a BLOB column is the `Uint8Array` node answers; any other
+        // column reads as the UTF-8 of its text, SQLite's `CAST(value AS BLOB)`
+        // (`vilan-rt-sqlite`'s `Row::bytes` answers the same).
+        "__db_bytes" => {
+            "function __db_bytes(row, name) {\n\
+             \tconst value = row[name];\n\
+             \treturn value instanceof Uint8Array ? value : new TextEncoder().encode(String(value));\n\
              }"
         }
         "__db_column" => "function __db_column(row, name) {\n\treturn row[name];\n}",
@@ -4000,6 +4077,13 @@ struct Transformer<'src> {
     // (backlog M34). `false` for every emitting transform, which is what keeps
     // the emitted text byte-identical.
     diagnose_only: bool,
+    // F1 M2: the first NATIVE-ONLY host helper a call reached (a `std::window`
+    // `__window_*` or a `std::gfx` `__gfx_*` extern), with the module that
+    // declares it. The JavaScript backend has no implementation to emit, so
+    // an emitting build refuses the program by the module's name
+    // ([`native_only_refusal`]); a check does not, because `vilan check` is
+    // the same for both backends.
+    native_only_reached: Option<(&'src str, NativeOnly)>,
     // E257 S5: leave source-map marks in the tree — a `Mark` before each
     // statement and tail, an `At` around each call. Set only by
     // [`transform_with_source_map`]; every other walk (a plain build, a
@@ -4446,6 +4530,7 @@ impl<'src> Transformer<'src> {
             gate_call_names: BTreeMap::new(),
             recorder: None,
             diagnose_only: false,
+            native_only_reached: None,
             source_marks: false,
             debug_recorder: None,
         }
@@ -5115,6 +5200,12 @@ impl<'src> Transformer<'src> {
         // where the helper set is final: every emission is done.
         if let Some(error) = image_codec_refusal(&self.used_helpers) {
             return Err(error);
+        }
+        // F1 M2: a native-only module, refused by name — except by a check.
+        if !self.diagnose_only
+            && let Some((symbol, native_only)) = self.native_only_reached
+        {
+            return Err(native_only_refusal(symbol, native_only));
         }
         let mut helpers = self.used_helpers.into_iter().collect::<Vec<_>>();
         close_helper_dependencies(&mut helpers);
@@ -7564,6 +7655,20 @@ impl<'src> Transformer<'src> {
             return Some(hoisted.clone());
         }
         let entity = self.program.entity_map.get(&id).unwrap();
+        // B740: a read of an `Option`-flavoured hidden context parameter that
+        // stands where the bare value is wanted takes the `Some`'s payload —
+        // `[0, value]`, slot 1. The context pass records one only where every
+        // entry handed `Some`.
+        if self.program.context_unwrapped_reads.contains(&id)
+            && let Expr::Local(parameter) = entity
+        {
+            let parameter = *parameter;
+            self.referenced_globals.insert(parameter);
+            return Some(js::Node::PropertyIndex(
+                Box::new(js::Node::Local(self.ng.name_for(parameter))),
+                Box::new(js::Node::Number("1".to_string(), None)),
+            ));
+        }
 
         Some(match entity {
             Expr::Error => unreachable!(),
@@ -11463,6 +11568,10 @@ impl<'src> Transformer<'src> {
                 // lives in the helper table (glue for shapes the extern binding
                 // forms can't express — option-object arguments, `??`
                 // flattening, global property reads).
+                if let Some(native_only) = native_only_extern(symbol) {
+                    self.native_only_reached
+                        .get_or_insert((symbol, native_only));
+                }
                 if let Some(helper) = extern_helper(symbol) {
                     self.used_helpers.insert(helper);
                     // `__nursery_new_detached` builds on the base `__Nursery`
@@ -13692,9 +13801,24 @@ impl<'src> Transformer<'src> {
             let saved_self = self.current_self_type.replace(type_id);
             let saved_substitution =
                 std::mem::replace(&mut self.current_substitution, substitution);
+            // B743: the default's OWN instance record, never the caller's. A
+            // default is emitted once per receiver type, from whichever body
+            // reaches it first, and that body's record answered "async" for it
+            // whenever the caller was async — an `async function` its
+            // synchronous call sites did not await (`[object Promise]`).
+            let saved_adapted = std::mem::take(&mut self.current_adapted);
+            let saved_instance = std::mem::replace(
+                &mut self.current_instance,
+                self.program
+                    .adapted_instances
+                    .get(&(default_id, Vec::new()))
+                    .cloned(),
+            );
             let frame = self.record_enter();
             let landed_before = self.monomorphized.len();
             let js_function = self.function_with_name(function, name.clone());
+            self.current_adapted = saved_adapted;
+            self.current_instance = saved_instance;
             self.current_self_type = saved_self;
             self.current_substitution = saved_substitution;
             // A trait default's body is specialized per type exactly as a

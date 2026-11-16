@@ -1,0 +1,44 @@
+icons 420 x 200 dp at 1
+column icons 0 0 420 200
+  row saved 16 16 68 19
+    icon  16 18 15 15
+    text  39 16 45 19
+  row sizes 16 49 246 32
+    icon  16 57 16 16
+    icon  42 53 24 24
+    icon done 76 49 32 32
+    text  118 55 144 19
+  row menu 16 95 84 31
+    text  28 101 36 19
+    icon  70 101 18 18
+  row filled 16 140 320 24
+    icon  16 140 24 24
+    icon  50 140 24 24
+    text  84 142 252 19
+icons 420 x 200 dp at 1.5
+column icons 0 0 630 300
+  row saved 24 24 102 28
+    icon  24 27 23 22
+    text  59 24 67 28
+  row sizes 24 73 369 48
+    icon  24 85 24 24
+    icon  63 79 36 36
+    icon done 114 73 48 48
+    text  177 83 216 28
+  row menu 24 142 126 46
+    text  42 151 54 28
+    icon  105 152 27 27
+  row filled 24 209 480 36
+    icon  24 209 36 36
+    icon  75 209 36 36
+    text  126 213 378 28
+accessibility:
+Group "icons"
+  Group "saved"
+    Label value="Saved"
+  Group "sizes"
+    Image "done"
+    Label value="16, 24 and 32 dp"
+  Button "menu" [click]
+  Group "filled"
+    Label value="Filled, and an even-odd hole"

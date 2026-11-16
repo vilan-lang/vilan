@@ -1691,6 +1691,1133 @@ fn n149_a_generic_print_of_negative_zero_is_identical_on_both_backends() {
     }
 }
 
+/// A blanket over a blanket (`RowFeed` over `DeltaFeed`, which a `ListCell`
+/// has through `Source<List<T>>` and `DeltaSource<List<T>, SeqOp<T>>`): the
+/// inner provider grounds its arguments one step deep, `List<T'>` in its own
+/// binder, and the native emitter met `open_rows`'s element unbound — every
+/// generic consumer of a `ListCell` (`std::ui`'s `each`) was refused. A cell
+/// with one blanket between (`SignalCell<List<str>>`) always worked; both are
+/// held here.
+#[test]
+fn a_blanket_over_a_blanket_binds_the_element_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_row_feed_over_list_cell.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::reactive::{ ListCell, RowFeed, Signal, SignalCell };\n",
+            "\n",
+            "fun opened<T, S: RowFeed<T>>(own source: S): i32 {\n",
+            "\tlet instance = source.open_rows();\n",
+            "\t(instance.snapshot)().len().as_i32()\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet numbers: ListCell<i32> = ListCell::of([1, 2, 3]);\n",
+            "\tprint(opened(numbers));\n",
+            "\tlet names: SignalCell<List<str>> = Signal::new([\"a\"]);\n",
+            "\tprint(opened(names));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "3\n1\n", "{backend:?}");
+    }
+}
+
+/// The same blanket chain over a cell built INSIDE a generic function, of that
+/// function's own `T` (`ListCell<T>`, `SignalCell<List<T>>`): the providers
+/// answer the receiver's `T`, still a generic where the impl is selected, and
+/// selection skipped every generic answer as if it were a provider's own
+/// unbound binder — so `open_rows`'s element stayed unbound and the native
+/// emitter refused the instance. A generic component that keys rows of its own
+/// (`std::ui::kit::virtual_list`'s window) is the shape; the instance's
+/// substitution grounds the receiver's `T`.
+#[test]
+fn a_blanket_over_a_cell_of_a_generic_functions_own_parameter_binds_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_row_feed_over_a_generic_cell.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::reactive::{ ListCell, RowFeed, Signal, SignalCell };\n",
+            "\n",
+            "fun opened<T, S: RowFeed<T>>(own source: S): i32 {\n",
+            "\tlet instance = source.open_rows();\n",
+            "\t(instance.snapshot)().len().as_i32()\n",
+            "}\n",
+            "\n",
+            "fun counted<T>(items: List<T>): i32 {\n",
+            "\tlet listed: ListCell<T> = ListCell::of(items);\n",
+            "\tlet held: SignalCell<List<T>> = Signal::new(listed.get());\n",
+            "\topened(listed) * 10 + opened(held)\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(counted([1, 2, 3]));\n",
+            "\tprint(counted([\"a\", \"b\"]));\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "33\n22\n", "{backend:?}");
+    }
+}
+
+/// A cell around a bare `None` under a written annotation: natively the `None`
+/// names no `T`, and Rust took the cell's element from its first reader — a
+/// generic one in `std::ui`'s `when` and `swap`, which could not settle it
+/// (E0282), or none at all. The annotation is written, as it is for a cell
+/// around an empty list (F74).
+#[test]
+fn a_cell_around_a_bare_none_is_typed_by_its_annotation_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_cell_around_none.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::shared::Shared;\n",
+            "\n",
+            "fun describe<T>(value: Option<T>): str {\n",
+            "\tmatch value {\n",
+            "\t\tSome(let _held) => \"some\",\n",
+            "\t\tNone => \"none\",\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun held<T>(value: T): str {\n",
+            "\tlet live: Shared<Option<T>> = Shared::new(None);\n",
+            "\tlet before = describe(live.read());\n",
+            "\tlive.write() = Some(value);\n",
+            "\tbefore + \" \" + describe(live.read())\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tprint(held(7));\n",
+            "\tprint(held(\"text\"));\n",
+            "\tlet unread: Shared<Option<i32>> = Shared::new(None);\n",
+            "\tprint(\"done\");\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "none some\nnone some\ndone\n", "{backend:?}");
+    }
+}
+
+/// F168: the context pass mints a hidden `Owner` parameter on a FUNCTION when
+/// one candidate of a dispatch inside it reads the owner — `MaybeSignal`'s
+/// reactive arm does — and a caller with no owner threads none to it. The
+/// checker resolves the site per call (B737) and accepts the program;
+/// JavaScript passes `undefined`; natively the INSTANCE a static argument
+/// selects declares only the hidden parameters its body names, which is none,
+/// so the call passes nothing and needs nothing. (It was refused by name.)
+#[test]
+fn f168_a_static_maybe_signal_through_a_generic_needs_no_owner_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_f168_static_maybe_signal.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::reactive::MaybeSignal;\n",
+            "\n",
+            "fun shown<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tvalue.bind(|text: str| print(text));\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tshown(\"static\");\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, "static\n", "{backend:?}");
+    }
+}
+
+/// F168: one program, its probe written beside the staged corpus, run on both
+/// backends and held to `expected` on each.
+fn f168_agrees(file: &str, source: &str, expected: &str) {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(run.stdout, expected, "{backend:?}");
+    }
+}
+
+/// A literal handed to a closure VALUE takes the closure's parameter type, not
+/// the expectation around the call: `let x = half(3)` with `half: |i32| f64`
+/// emitted `half(3.0f64)` natively — the literal took the call's `f64` result
+/// type — and rustc refused the build (lane list-extents). Negated, nested in
+/// an `f64` position, and beside a value argument of another type.
+#[test]
+fn a_literal_handed_to_a_closure_value_takes_the_parameters_type() {
+    f168_agrees(
+        "native_probe_closure_literal.vl",
+        concat!(
+            "import std::io::print;\n",
+            "\n",
+            "fun near(a: f64, b: f64): bool {\n",
+            "\t(a - b).abs() < 1.0\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet half = |id: i32| id.as_f64() / 2.0;\n",
+            "\tlet x = half(3);\n",
+            "\tlet scaled = |count: usize, by: f64| count.as_f64() * by;\n",
+            "\tprint(i\"{x} {half(-2)} {near(half(1000), 500.0)} {scaled(4, 1.5)}\");\n",
+            "}\n",
+        ),
+        "1.5 -1 true 6\n",
+    );
+}
+
+/// F168: ONE generic reached with a static argument and with a reactive one,
+/// from code with an ambient owner and from code with none. Two instances: the
+/// static one declares no hidden parameter, so the calls that hold an owner
+/// pass none to it and the call from `main` needs none; the reactive one
+/// declares the owner and is reached only where there is one. A forwarding
+/// generic resolves the same way through its own instance.
+#[test]
+fn f168_one_generic_at_a_static_and_a_reactive_argument_with_and_without_an_owner() {
+    f168_agrees(
+        "native_probe_f168_static_and_reactive.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "fun shown<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tvalue.bind(|text: str| print(text));\n",
+            "}\n",
+            "\n",
+            "fun forwarded<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tshown(value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tshown(\"top\");\n",
+            "\tforwarded(\"forwarded top\");\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tshown(\"inside\");\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tshown(cell);\n",
+            "\t\tlet other: SignalCell<str> = Signal::new(\"forwarded signal\");\n",
+            "\t\tforwarded(other);\n",
+            "\t\tforwarded(\"forwarded inside\");\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "top\nforwarded top\ninside\nsignal\nforwarded signal\nforwarded inside\n",
+    );
+}
+
+/// F168, B737's shape: a trait DEFAULT method generic over `MaybeSignal`,
+/// called on a concrete receiver and through a bounded one (`T: Labeled`).
+/// Each default instance declares what its own binding reads.
+#[test]
+fn f168_a_trait_default_and_a_bounded_receiver_need_no_owner_for_a_static_value() {
+    f168_agrees(
+        "native_probe_f168_trait_default.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "trait Labeled {\n",
+            "\tfun name(self): str;\n",
+            "\n",
+            "\tfun label<V: MaybeSignal<str>>(self, own value: V) {\n",
+            "\t\tlet name = self.name();\n",
+            "\t\tvalue.bind(|text: str| print(i\"{name}: {text}\"));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "struct Badge {\n",
+            "\tid: i32,\n",
+            "}\n",
+            "\n",
+            "impl Badge with Labeled {\n",
+            "\tfun name(self): str {\n",
+            "\t\ti\"badge {self.id}\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun decorate<T: Labeled>(item: T) {\n",
+            "\titem.label(\"decorated\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet badge = Badge { id = 1 };\n",
+            "\tbadge.label(\"static\");\n",
+            "\tdecorate(Badge { id = 2 });\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tBadge { id = 3 }.label(cell);\n",
+            "\t\tdecorate(Badge { id = 4 });\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "badge 1: static\nbadge 2: decorated\nbadge 3: signal\nbadge 4: decorated\n",
+    );
+}
+
+/// F168: recursion. A recursive call reaches its own instance while that
+/// instance is still being walked, so the emitter assumes what it declares and
+/// walks the program again when the assumption fails (`vilan_rust::emit`).
+/// The static instances only hand the owner to themselves and declare nothing
+/// (the least answer: `main` calls them with no owner); the reactive ones read
+/// it, which the first round assumed they did not — so this program is the one
+/// that needs the second round, through self-recursion and through a mutual
+/// recursion alike.
+#[test]
+fn f168_a_recursion_declares_the_owner_only_where_an_instance_reads_it() {
+    f168_agrees(
+        "native_probe_f168_recursion.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "fun repeated<V: MaybeSignal<str>>(own value: V, times: i32) {\n",
+            "\tif times > 1 {\n",
+            "\t\trepeated(value, times - 1);\n",
+            "\t} else {\n",
+            "\t\tvalue.bind(|text: str| print(text));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun ping<V: MaybeSignal<str>>(own value: V, times: i32) {\n",
+            "\tif times > 0 {\n",
+            "\t\tpong(value, times - 1);\n",
+            "\t} else {\n",
+            "\t\tvalue.bind(|text: str| print(i\"ping {text}\"));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun pong<V: MaybeSignal<str>>(own value: V, times: i32) {\n",
+            "\tping(value, times);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\trepeated(\"static\", 3);\n",
+            "\tping(\"static\", 2);\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\trepeated(cell, 2);\n",
+            "\t\tlet other: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tping(other, 2);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "static\nping static\nsignal\nping signal\n",
+    );
+}
+
+/// F168: a context other than the owner — a user-declared one, strict, read by
+/// one impl of the trait a generic dispatches through. The instance at the
+/// impl that reads nothing declares nothing, whether its caller holds the
+/// context (inside `run`) or not (`main`).
+#[test]
+fn f168_a_user_declared_context_is_declared_per_instance_too() {
+    f168_agrees(
+        "native_probe_f168_user_context.vl",
+        concat!(
+            "import std::context::Context;\n",
+            "\n",
+            "let depth_context: Context<i32> = Context::new();\n",
+            "\n",
+            "trait Describe {\n",
+            "\tfun describe(self): str;\n",
+            "}\n",
+            "\n",
+            "impl i32 with Describe {\n",
+            "\tfun describe(self): str {\n",
+            "\t\ti\"plain {self}\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl bool with Describe {\n",
+            "\tfun describe(self): str {\n",
+            "\t\ti\"{self} at depth {depth_context.get()}\"\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun told<T: Describe>(value: T) {\n",
+            "\tprint(value.describe());\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\ttold(3);\n",
+            "\tdepth_context.run(2, || told(true));\n",
+            "\tdepth_context.run(5, || told(4));\n",
+            "}\n",
+        ),
+        "plain 3\ntrue at depth 2\nplain 4\n",
+    );
+}
+
+/// F168: a closure inside the generic captures the hidden parameter its body
+/// hands to the dispatch. At the static instance that argument is not passed,
+/// so the closure does not capture the parameter and the instance does not
+/// declare it; and a closure in `main` calling the generic reaches the same
+/// instance it names.
+#[test]
+fn f168_a_closure_captures_the_owner_only_where_its_body_names_it() {
+    f168_agrees(
+        "native_probe_f168_closure.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "fun later<V: MaybeSignal<str>>(own value: V) {\n",
+            "\tlet go = |inner: V| inner.bind(|text: str| print(text));\n",
+            "\tgo(value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlater(\"closure\");\n",
+            "\tlet show = |text: str| later(text);\n",
+            "\tshow(\"stored\");\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tlater(cell);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "closure\nstored\nsignal\n",
+    );
+}
+
+/// F168: a `for` loop's implicit `next` is handed the context arguments the
+/// pass threaded to it (`for_each_context_arguments`), and passes only those
+/// the `next` instance declares — none at the static one, though the loop
+/// stands where an owner is held.
+#[test]
+fn f168_a_for_loops_next_takes_only_the_contexts_its_instance_declares() {
+    f168_agrees(
+        "native_probe_f168_for_each.vl",
+        concat!(
+            "import std::iterator::Iterator;\n",
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "struct Spoken<V> {\n",
+            "\tvalue: Option<V>,\n",
+            "}\n",
+            "\n",
+            "impl Spoken<type V: MaybeSignal<str>> with Iterator<i32> {\n",
+            "\tfun next(&mut self): Option<i32> {\n",
+            "\t\tmatch self.value.take() {\n",
+            "\t\t\tSome(let value) => {\n",
+            "\t\t\t\tvalue.bind(|text: str| print(text));\n",
+            "\t\t\t\tSome(1)\n",
+            "\t\t\t},\n",
+            "\t\t\tNone => None,\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet inside = Spoken { value = Some(\"inside\") };\n",
+            "\t\tfor count in inside {\n",
+            "\t\t\tprint(count);\n",
+            "\t\t}\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tlet bound = Spoken { value = Some(cell) };\n",
+            "\t\tfor count in bound {\n",
+            "\t\t\tprint(count);\n",
+            "\t\t}\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "inside\n1\nsignal\n1\n",
+    );
+}
+
+/// F168: a `dyn` object's slot keeps the DECLARATION's signature — every
+/// context any implementation reads (B617) — and forwards to the selected
+/// implementation's instance only the hidden parameters that instance
+/// declares.
+#[test]
+fn f168_a_dyn_slot_forwards_only_the_contexts_its_instance_declares() {
+    f168_agrees(
+        "native_probe_f168_dyn_slot.vl",
+        concat!(
+            "import std::reactive::{MaybeSignal, Signal, SignalCell, comp};\n",
+            "\n",
+            "trait Speaker {\n",
+            "\tfun speak(own self);\n",
+            "}\n",
+            "\n",
+            "struct Holder<V> {\n",
+            "\tvalue: V,\n",
+            "}\n",
+            "\n",
+            "impl Holder<type V: MaybeSignal<str>> with Speaker {\n",
+            "\tfun speak(own self) {\n",
+            "\t\tself.value.bind(|text: str| print(text));\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tlet speakers: List<dyn Speaker> = [Holder { value = \"static\" }, Holder { value = cell }];\n",
+            "\t\tfor speaker in speakers {\n",
+            "\t\t\tspeaker.speak();\n",
+            "\t\t}\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "static\nsignal\n",
+    );
+}
+
+/// B740, the repro: `noted` dispatches to a SAFE `str` impl and a STRICT
+/// `SignalCell` one, so its hidden parameter was strict for every instance,
+/// and `main` handed `noted("top")` nothing: JavaScript printed `top: owned`
+/// (a `Some(undefined)`), and the native emitter refused the call.
+#[test]
+fn b740_a_safe_read_behind_a_strict_candidate_answers_none_without_an_owner() {
+    f168_agrees(
+        "native_probe_b740_repro.vl",
+        concat!(
+            "import std::reactive::{Signal, SignalCell, comp, owner_scope};\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(own self);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(own self) {\n",
+            "\t\tmatch owner_scope.get_safe() {\n",
+            "\t\t\tSome(_) => print(i\"{self}: owned\"),\n",
+            "\t\t\tNone => print(i\"{self}: free\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl SignalCell<str> with Note {\n",
+            "\tfun note(own self) {\n",
+            "\t\tlet owner = owner_scope.get();\n",
+            "\t\tprint(i\"{self.get()}: strict\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun noted<V: Note>(own value: V) {\n",
+            "\tvalue.note();\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tnoted(\"top\");\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tnoted(\"inside\");\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tnoted(cell);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "top: free\ninside: owned\nsignal: strict\n",
+    );
+}
+
+/// B740: the safe candidate is called DIRECTLY from `main` and from under an
+/// owner, and is a candidate of the mixed site in `noted` all the same — the
+/// promotion that made it strict left `main` handing it nothing.
+#[test]
+fn b740_a_safe_candidate_called_directly_without_an_owner_answers_none() {
+    f168_agrees(
+        "native_probe_b740_direct.vl",
+        concat!(
+            "import std::reactive::{Signal, SignalCell, comp, owner_scope};\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(own self);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(own self) {\n",
+            "\t\tmatch owner_scope.get_safe() {\n",
+            "\t\t\tSome(_) => print(i\"{self}: owned\"),\n",
+            "\t\t\tNone => print(i\"{self}: free\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl SignalCell<str> with Note {\n",
+            "\tfun note(own self) {\n",
+            "\t\tlet owner = owner_scope.get();\n",
+            "\t\tprint(i\"{self.get()}: strict\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun noted<V: Note>(own value: V) {\n",
+            "\tvalue.note();\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\t\"direct\".note();\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\t\"direct inside\".note();\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tnoted(cell);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "direct: free\ndirect inside: owned\nsignal: strict\n",
+    );
+}
+
+/// B740: a generic forwarding to the dispatching one holds the `Option` too,
+/// reached with and without an owner.
+#[test]
+fn b740_a_forwarding_generic_hands_on_the_option_it_holds() {
+    f168_agrees(
+        "native_probe_b740_forward.vl",
+        concat!(
+            "import std::reactive::{Signal, SignalCell, comp, owner_scope};\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(own self);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(own self) {\n",
+            "\t\tmatch owner_scope.get_safe() {\n",
+            "\t\t\tSome(_) => print(i\"{self}: owned\"),\n",
+            "\t\t\tNone => print(i\"{self}: free\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl SignalCell<str> with Note {\n",
+            "\tfun note(own self) {\n",
+            "\t\tlet owner = owner_scope.get();\n",
+            "\t\tprint(i\"{self.get()}: strict\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun noted<V: Note>(own value: V) {\n",
+            "\tvalue.note();\n",
+            "}\n",
+            "\n",
+            "fun forwarded<V: Note>(own value: V) {\n",
+            "\tnoted(value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tforwarded(\"top\");\n",
+            "\tlet (_, owner) = comp(|| {\n",
+            "\t\tforwarded(\"inside\");\n",
+            "\t\tlet cell: SignalCell<str> = Signal::new(\"signal\");\n",
+            "\t\tforwarded(cell);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "top: free\ninside: owned\nsignal: strict\n",
+    );
+}
+
+/// B740: a trait DEFAULT method that reads safely, an override of it that
+/// reads strictly, and a generic over the trait reached with and without the
+/// context.
+#[test]
+fn b740_a_trait_default_and_a_strict_override_of_it() {
+    f168_agrees(
+        "native_probe_b740_default.vl",
+        concat!(
+            "import std::context::Context;\n",
+            "\n",
+            "let depth_context: Context<i32> = Context::new();\n",
+            "\n",
+            "trait Describe {\n",
+            "\tfun describe(self) {\n",
+            "\t\tmatch depth_context.get_safe() {\n",
+            "\t\t\tSome(let depth) => print(i\"default at depth {depth}\"),\n",
+            "\t\t\tNone => print(\"default without depth\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "struct Plain {}\n",
+            "\n",
+            "struct Deep {}\n",
+            "\n",
+            "impl Plain with Describe {}\n",
+            "\n",
+            "impl Deep with Describe {\n",
+            "\tfun describe(self) {\n",
+            "\t\tprint(i\"deep at depth {depth_context.get()}\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun told<T: Describe>(value: T) {\n",
+            "\tvalue.describe();\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\ttold(Plain {});\n",
+            "\tdepth_context.run(2, || told(Plain {}));\n",
+            "\tdepth_context.run(3, || told(Deep {}));\n",
+            "}\n",
+        ),
+        "default without depth\ndefault at depth 2\ndeep at depth 3\n",
+    );
+}
+
+/// B740, B737's shape: a trait default generic over the dispatching trait,
+/// called on a concrete receiver and through a bounded one (`T: Labeled`),
+/// with and without the context.
+#[test]
+fn b740_a_default_dispatching_through_a_bounded_receiver() {
+    f168_agrees(
+        "native_probe_b740_bounded.vl",
+        concat!(
+            "import std::context::Context;\n",
+            "\n",
+            "let depth_context: Context<i32> = Context::new();\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(self);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tmatch depth_context.get_safe() {\n",
+            "\t\t\tSome(let depth) => print(i\"{self} at depth {depth}\"),\n",
+            "\t\t\tNone => print(i\"{self} without depth\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl i32 with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tprint(i\"{self} at depth {depth_context.get()}\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "trait Labeled {\n",
+            "\tfun label<V: Note>(self, value: V) {\n",
+            "\t\tvalue.note();\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "struct Badge {}\n",
+            "\n",
+            "impl Badge with Labeled {}\n",
+            "\n",
+            "fun decorate<T: Labeled, V: Note>(item: T, value: V) {\n",
+            "\titem.label(value);\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tBadge {}.label(\"concrete\");\n",
+            "\tdecorate(Badge {}, \"bounded\");\n",
+            "\tdepth_context.run(2, || {\n",
+            "\t\tBadge {}.label(\"concrete inside\");\n",
+            "\t\tdecorate(Badge {}, \"bounded inside\");\n",
+            "\t\tdecorate(Badge {}, 3);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "concrete without depth\nbounded without depth\nconcrete inside at depth 2\nbounded inside at depth 2\n3 at depth 2\n",
+    );
+}
+
+/// B740: closures calling the generic — one made in `main` (no context: it
+/// captures from its creator), two made under `run`.
+#[test]
+fn b740_a_closure_calling_the_generic_takes_its_creators_context() {
+    f168_agrees(
+        "native_probe_b740_closure.vl",
+        concat!(
+            "import std::context::Context;\n",
+            "\n",
+            "let depth_context: Context<i32> = Context::new();\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(self);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tmatch depth_context.get_safe() {\n",
+            "\t\t\tSome(let depth) => print(i\"{self} at depth {depth}\"),\n",
+            "\t\t\tNone => print(i\"{self} without depth\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl i32 with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tprint(i\"{self} at depth {depth_context.get()}\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun noted<V: Note>(value: V) {\n",
+            "\tvalue.note();\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet show = |text: str| noted(text);\n",
+            "\tshow(\"top\");\n",
+            "\tdepth_context.run(6, || {\n",
+            "\t\tlet inner = |text: str| noted(text);\n",
+            "\t\tinner(\"inside\");\n",
+            "\t\tlet count = |value: i32| noted(value);\n",
+            "\t\tcount(8);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "top without depth\ninside at depth 6\n8 at depth 6\n",
+    );
+}
+
+/// B740: a user-declared context, and the same function — the generic's
+/// instance and the safe impl itself — reached with and without it in one
+/// program, in both orders.
+#[test]
+fn b740_one_function_reached_with_and_without_a_user_context() {
+    f168_agrees(
+        "native_probe_b740_user.vl",
+        concat!(
+            "import std::context::Context;\n",
+            "\n",
+            "let depth_context: Context<i32> = Context::new();\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(self);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tmatch depth_context.get_safe() {\n",
+            "\t\t\tSome(let depth) => print(i\"{self} at depth {depth}\"),\n",
+            "\t\t\tNone => print(i\"{self} without depth\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl i32 with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tprint(i\"{self} at depth {depth_context.get()}\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun noted<V: Note>(value: V) {\n",
+            "\tvalue.note();\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tnoted(\"top\");\n",
+            "\t\"direct\".note();\n",
+            "\tdepth_context.run(1, || {\n",
+            "\t\tnoted(\"inside\");\n",
+            "\t\t\"direct inside\".note();\n",
+            "\t\tnoted(9);\n",
+            "\t});\n",
+            "\tnoted(\"top again\");\n",
+            "}\n",
+        ),
+        "top without depth\ndirect without depth\ninside at depth 1\ndirect inside at depth 1\n9 at depth 1\ntop again without depth\n",
+    );
+}
+
+/// B740: `turn_scope` is a context like any other, and takes the same rule.
+#[test]
+fn b740_turn_scope_shares_the_rule() {
+    f168_agrees(
+        "native_probe_b740_turn.vl",
+        concat!(
+            "import std::reactive::{batch, turn_scope};\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(self);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tmatch turn_scope.get_safe() {\n",
+            "\t\t\tSome(_) => print(i\"{self}: in a turn\"),\n",
+            "\t\t\tNone => print(i\"{self}: no turn\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "impl i32 with Note {\n",
+            "\tfun note(self) {\n",
+            "\t\tlet turn = turn_scope.get();\n",
+            "\t\tprint(i\"{self}: strict\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun noted<V: Note>(value: V) {\n",
+            "\tvalue.note();\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tnoted(\"top\");\n",
+            "\tbatch(|| {\n",
+            "\t\tnoted(\"inside\");\n",
+            "\t\tnoted(3);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "top: no turn\ninside: in a turn\n3: strict\n",
+    );
+}
+
+/// B740: the strict candidate is demoted to the `Option` by the mixed site; it
+/// hands a strict helper (a direct call) and the closure it was given (an
+/// injected call) the unwrapped value.
+#[test]
+fn b740_a_demoted_holder_unwraps_for_a_bare_callee_and_an_injected_call() {
+    f168_agrees(
+        "native_probe_b740_unwraps.vl",
+        concat!(
+            "import std::context::Context;\n",
+            "\n",
+            "let depth_context: Context<i32> = Context::new();\n",
+            "\n",
+            "trait Note {\n",
+            "\tfun note(self, body: (sync || void) context depth_context);\n",
+            "}\n",
+            "\n",
+            "impl str with Note {\n",
+            "\tfun note(self, body: (sync || void) context depth_context) {\n",
+            "\t\tmatch depth_context.get_safe() {\n",
+            "\t\t\tSome(let depth) => print(i\"{self} at depth {depth}\"),\n",
+            "\t\t\tNone => print(i\"{self} without depth\"),\n",
+            "\t\t}\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun helper(value: i32) {\n",
+            "\tprint(i\"{value} helped at depth {depth_context.get()}\");\n",
+            "}\n",
+            "\n",
+            "impl i32 with Note {\n",
+            "\tfun note(self, body: (sync || void) context depth_context) {\n",
+            "\t\thelper(self);\n",
+            "\t\tbody();\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun noted<V: Note>(value: V) {\n",
+            "\tvalue.note(|| print(i\"body at depth {depth_context.get()}\"));\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tnoted(\"top\");\n",
+            "\tdepth_context.run(1, || {\n",
+            "\t\tnoted(\"inside\");\n",
+            "\t\tnoted(2);\n",
+            "\t});\n",
+            "}\n",
+        ),
+        "top without depth\ninside at depth 1\n2 helped at depth 1\nbody at depth 1\n",
+    );
+}
+
+/// B742: a trait whose defaults reach a `note` that `Deep` reads strictly —
+/// through `self` (`announce`), another default (`herald`) and a bounded
+/// generic handed `self` (`hand_off`) — with `Quiet` overriding `announce`,
+/// forwarders one to three levels deep and a generic struct's method; `main`
+/// is `body`. Each program below is accepted only since the refinement
+/// resolves a default's `self` call per entry of the default.
+fn b742_notes(body: &str) -> String {
+    concat!(
+        "import std::context::Context;\n",
+        "\n",
+        "let depth: Context<i32> = Context::new();\n",
+        "\n",
+        "trait Note {\n",
+        "\tfun note(self);\n",
+        "\n",
+        "\tfun announce(self) {\n",
+        "\t\tself.note();\n",
+        "\t}\n",
+        "\n",
+        "\tfun herald(self) {\n",
+        "\t\tself.announce();\n",
+        "\t}\n",
+        "\n",
+        "\tfun hand_off(self) {\n",
+        "\t\tannounced(self);\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "struct Plain {}\n",
+        "\n",
+        "struct Deep {}\n",
+        "\n",
+        "struct Quiet {}\n",
+        "\n",
+        "impl Plain with Note {\n",
+        "\tfun note(self) {\n",
+        "\t\tprint(\"plain\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "impl Deep with Note {\n",
+        "\tfun note(self) {\n",
+        "\t\tprint(i\"deep at {depth.get()}\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "impl Quiet with Note {\n",
+        "\tfun note(self) {\n",
+        "\t\tprint(i\"quiet at {depth.get()}\");\n",
+        "\t}\n",
+        "\n",
+        "\tfun announce(self) {\n",
+        "\t\tprint(\"quiet\");\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "fun announced<T: Note>(item: T) {\n",
+        "\titem.announce();\n",
+        "}\n",
+        "\n",
+        "fun relayed<T: Note>(item: T) {\n",
+        "\tannounced(item);\n",
+        "}\n",
+        "\n",
+        "fun forwarded<T: Note>(item: T) {\n",
+        "\trelayed(item);\n",
+        "}\n",
+        "\n",
+        "struct Holder<T: Note> {\n",
+        "\titem: T,\n",
+        "}\n",
+        "\n",
+        "impl Holder<type T: Note> {\n",
+        "\tfun show(self) {\n",
+        "\t\tself.item.announce();\n",
+        "\t}\n",
+        "}\n",
+        "\n",
+        "fun main() {\n",
+    )
+    .to_string()
+        + body
+        + "}\n"
+}
+
+/// B742: the repro (a default reached through a bounded generic) and the
+/// one-level form (the default on a concrete receiver).
+#[test]
+fn b742_a_default_reached_through_a_bounded_generic_runs_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_repro.vl",
+        &b742_notes(concat!(
+            "\tannounced(Plain {});\n",
+            "\tdepth.run(5, || announced(Deep {}));\n",
+            "\tPlain {}.announce();\n",
+            "\tdepth.run(6, || Deep {}.announce());\n",
+        )),
+        "plain\ndeep at 5\nplain\ndeep at 6\n",
+    );
+}
+
+/// B742: three levels of forwarding, and a generic struct's method.
+#[test]
+fn b742_forwarded_defaults_run_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_forwarded.vl",
+        &b742_notes(concat!(
+            "\tforwarded(Plain {});\n",
+            "\tdepth.run(5, || forwarded(Deep {}));\n",
+            "\tHolder { item = Plain {} }.show();\n",
+            "\tdepth.run(6, || Holder { item = Deep {} }.show());\n",
+        )),
+        "plain\ndeep at 5\nplain\ndeep at 6\n",
+    );
+}
+
+/// B742: a default calling a default, and a default handing `self` to a
+/// bounded generic.
+#[test]
+fn b742_defaults_calling_defaults_run_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_defaults.vl",
+        &b742_notes(concat!(
+            "\tPlain {}.herald();\n",
+            "\tdepth.run(5, || Deep {}.herald());\n",
+            "\tPlain {}.hand_off();\n",
+            "\tdepth.run(6, || Deep {}.hand_off());\n",
+        )),
+        "plain\ndeep at 5\nplain\ndeep at 6\n",
+    );
+}
+
+/// B742: `Quiet` overrides `announce`, so neither `herald`'s `self.announce()`
+/// nor `announced`'s `item.announce()` reaches its strict `note`.
+#[test]
+fn b742_an_override_between_two_defaults_runs_on_both_backends() {
+    f168_agrees(
+        "native_probe_b742_override.vl",
+        &b742_notes(concat!(
+            "\tQuiet {}.herald();\n",
+            "\tannounced(Quiet {});\n",
+            "\tdepth.run(5, || Deep {}.herald());\n",
+        )),
+        "quiet\nquiet\ndeep at 5\n",
+    );
+}
+
+/// B739: `Weak::get` — a VIEW of the cell's value, `Option<&T> borrows self` —
+/// natively, and the three collection cells' `peek`, which lend their own
+/// value through it: `ListCell` (before and after a write), `HashMapCell`,
+/// `HashSetCell`, and a direct `match` on a weak handle's view reading two
+/// fields of a struct in place. It was refused by name (`WeakGet`).
+#[test]
+fn b739_a_weak_view_and_every_cells_peek_read_in_place_on_both_backends() {
+    f168_agrees(
+        "native_probe_b739_weak_get.vl",
+        concat!(
+            "import std::hash_map::HashMap;\n",
+            "import std::hash_set::HashSet;\n",
+            "import std::reactive::{HashMapCell, HashSetCell, ListCell};\n",
+            "import std::shared::Shared;\n",
+            "\n",
+            "struct Pair {\n",
+            "\tleft: i32,\n",
+            "\tright: str,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet rows: ListCell<i32> = ListCell::of([4, 5, 6]);\n",
+            "\tprint(rows.peek(|list: &List<i32>| list.len()));\n",
+            "\tprint(rows.peek(|list: &List<i32>| list[1]));\n",
+            "\trows.push(7);\n",
+            "\tprint(rows.peek(|list: &List<i32>| list[3]));\n",
+            "\tlet ages: HashMapCell<str, i32> = HashMapCell::new();\n",
+            "\tages.insert(\"ada\", 36);\n",
+            "\tprint(ages.peek(|map: &HashMap<str, i32>| map.len()));\n",
+            "\tlet online: HashSetCell<str> = HashSetCell::new();\n",
+            "\tonline.insert(\"ada\");\n",
+            "\tprint(online.peek(|set: &HashSet<str>| set.contains(\"ada\")));\n",
+            "\tlet cell: Shared<Pair> = Shared::new(Pair { left = 1, right = \"one\" });\n",
+            "\tlet weak = cell.downgrade();\n",
+            "\tmatch weak.get() {\n",
+            "\t\tSome(let pair) => print(i\"{pair.left} {pair.right}\"),\n",
+            "\t\tNone => print(\"gone\"),\n",
+            "\t}\n",
+            "}\n",
+        ),
+        "3\n5\n7\n1\ntrue\n1 one\n",
+    );
+}
+
 /// The whole platform-free corpus, under `VILAN_NATIVE_DIFFERENTIAL=1`.
 ///
 /// It prints the census — refused / identical — because that census IS the
@@ -1911,6 +3038,74 @@ const LAZY_PROBE: &str = concat!(
     "\tlet absent: Option<usize> = None;\n",
     "\tprint(absent.unwrap_or(costly().len()));\n",
     "\tprint(evaluations);\n",
+    "}\n",
+);
+
+/// native-ui.md §12: a TYPED element lowers to its builder's method chain
+/// before either backend sees it, so both run the same calls in the same
+/// order — attributes in source order, a bare attribute, text and expression
+/// children, a nested typed element, a `const` one.
+#[test]
+fn a_typed_element_builds_the_same_chain_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_typed_element.vl"),
+        TYPED_ELEMENT_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_typed_element.vl"),
+        Verdict::Identical,
+        "a typed element must lower to the same chain on both backends"
+    );
+}
+
+const TYPED_ELEMENT_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "struct Row {\n",
+    "\tlog: str,\n",
+    "}\n",
+    "\n",
+    "impl Row {\n",
+    "\tfun gap(self, value: i32): Row {\n",
+    "\t\tRow { log = self.log + i\" gap={value}\" }\n",
+    "\t}\n",
+    "\tfun wrap(self): Row {\n",
+    "\t\tRow { log = self.log + \" wrap\" }\n",
+    "\t}\n",
+    "\tfun child(self, value: str): Row {\n",
+    "\t\tRow { log = self.log + \" child=\" + value }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "struct Column {\n",
+    "\tlog: str,\n",
+    "}\n",
+    "\n",
+    "impl Column {\n",
+    "\tfun child(self, value: Row): Column {\n",
+    "\t\tColumn { log = self.log + \" [\" + value.log + \"]\" }\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "[element]\n",
+    "fun row(): Row {\n",
+    "\tRow { log = \"row\" }\n",
+    "}\n",
+    "\n",
+    "[element]\n",
+    "fun column(): Column {\n",
+    "\tColumn { log = \"column\" }\n",
+    "}\n",
+    "\n",
+    "const let folded = <row gap(3)>\"k\"</row>;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet b = \"bee\";\n",
+    "\tprint(<row wrap gap(8) wrap>\"a\"{b}</row>.log);\n",
+    "\tprint(<column><row gap(1) />{<row wrap>\"x\"</row>}</column>.log);\n",
+    "\tprint(folded.log);\n",
     "}\n",
 );
 
@@ -4473,7 +5668,7 @@ fn a_std_http_server_emits_calls_into_the_native_runtime() {
 /// reaches the same server.
 const HTTP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ BodyLimits, Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response, ServerTimeouts };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -4488,6 +5683,7 @@ const HTTP_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -4506,10 +5702,13 @@ const HTTP_PROBE: &str = concat!(
 ///
 /// **What is compared, and what cannot be.** The status line, the header the
 /// PROGRAM set, and the body, byte for byte on both legs. Not the whole
-/// response: node adds a `Date`, which changes every second, and node and this
-/// server order `Connection` and `Content-Length` differently — two facts
-/// written down rather than normalised away, because a reader deserves to know
-/// the comparison is not the whole wire. stdout IS compared whole, and it is
+/// response: node adds a `Date`, which changes every second — a fact written
+/// down rather than normalised away, because a reader deserves to know the
+/// comparison is not the whole wire. (Until Order 58 the two servers also
+/// ordered `Connection` and `Content-Length` differently; F152 made the native
+/// head node's, field for field, and
+/// [`f152_a_kept_connection_answers_the_same_bytes_on_both_backends`] compares
+/// whole heads.) stdout IS compared whole, and it is
 /// the port announcement, which is the same line from both.
 ///
 /// **The ordering is the harness's own, not a sleep.** The SERVER binds port 0
@@ -4569,9 +5768,8 @@ fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
         "the two backends must answer the same body"
     );
     assert_eq!(native.body, "hello\n", "and it is the handler's own body");
-    // The header the PROGRAM set goes out on both. Node's `Date` and the order
-    // it writes `Connection`/`Content-Length` in are its own; see this test's
-    // header comment.
+    // The header the PROGRAM set goes out on both. Node's `Date` is its own;
+    // see this test's header comment.
     for leg in [&native, &javascript] {
         assert!(
             leg.headers
@@ -4611,7 +5809,7 @@ fn a_native_std_http_server_answers_a_get_over_a_real_socket() {
 /// good login, a bad one, and the shell — status line, the header the program
 /// set, `Content-Length` and the body. NOT compared, for Order 39's reasons
 /// written at [`a_native_std_http_server_answers_a_get_over_a_real_socket`]:
-/// node's `Date`, and the order the two write `Connection`/`Content-Length`.
+/// node's `Date`. Every other field is compared, in order.
 ///
 /// **Non-vacuous by its content, not by its exit code.** The bodies are
 /// asserted verbatim, and the two logins differ only in the password — so a
@@ -4715,7 +5913,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "import std::bytes::encode_utf8;\n",
     "import std::crypto::sha256;\n",
     "import std::db::Database;\n",
-    "import std::http::{ BodyLimits, Request, Response, Server };\n",
+    "import std::http::{ BodyLimits, Request, Response, Server, ServerTimeouts };\n",
     "import std::io::print;\n",
     "import std::json::{ FromJson, Json };\n",
     "import std::option::Option::None;\n",
@@ -4768,6 +5966,7 @@ const KOLT_SHAPE_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -5515,8 +6714,9 @@ fn both_servers(staged: &Path, program: &str) -> (Command, Command) {
     (native, node)
 }
 
-/// Builds a client program for node (clients are always the JS leg: the
-/// generated rpc client is a browser-shaped program).
+/// Builds a client program for node (the node client is these pins' fixed
+/// leg; `f1_s1b_a_native_rpc_client_sees_the_same_wire_from_both_servers`
+/// builds the same client natively too).
 fn build_client(staged: &Path, program: &str) {
     let bundled = vilan(staged)
         .args(["build", program])
@@ -5645,6 +6845,190 @@ fn the_keyed_rpc_service_answers_a_node_client_the_same_from_a_native_server() {
             .any(|line| line == format!("hash:{native_contract}")),
         "the client's contract hash is the server's own ({native_contract}):\n{native}"
     );
+}
+
+/// Runs a client COMMAND to completion under a liveness bound (the clients
+/// exit by themselves) and answers its stdout — [`run_client`] for a client
+/// of either backend.
+fn run_client_command(command: &mut Command, environment: &[(&str, String)]) -> String {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let mut child = command.spawn().expect("spawn the client");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if child.try_wait().expect("poll the client").is_some() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the client never finished");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("the client's stdout")
+        .read_to_string(&mut out)
+        .expect("read the client's stdout");
+    out
+}
+
+/// **F1 S1b — the rpc CLIENT natively.** The keyed pin's client half
+/// (`native/keyed_chat_client.vl`, unchanged) built by BOTH backends, and each
+/// build run against BOTH servers: the generated `ChatClient::connect` dials
+/// over `vilan_rt::ws` (the upgrade, the `vilan-rpc` offer, the accept check,
+/// masked frames), verifies the contract, attaches both mirrors, holds a
+/// per-key subscription, calls both rpcs and closes. All four pairings print
+/// the same lines, and the node client against the node server — the pairing
+/// that predates this slice — is the reference.
+#[test]
+fn f1_s1b_a_native_rpc_client_sees_the_same_wire_from_both_servers() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_keyed_server.vl"),
+        include_str!("native/keyed_chat_server.vl"),
+    )
+    .expect("write the server");
+    std::fs::write(
+        staged.join("native_keyed_client.vl"),
+        include_str!("native/keyed_chat_client.vl"),
+    )
+    .expect("write the client");
+    let (mut native_server, mut node_server) = both_servers(&staged, "native_keyed_server.vl");
+    let (mut native_client, mut node_client) = both_servers(&staged, "native_keyed_client.vl");
+    let mut answers = Vec::new();
+    for (server_name, server_command) in
+        [("native", &mut native_server), ("node", &mut node_server)]
+    {
+        for (client_name, client_command) in
+            [("native", &mut native_client), ("node", &mut node_client)]
+        {
+            let server = ServerUnderTest::spawn(server_command);
+            let answered =
+                run_client_command(client_command, &[("CHAT_PORT", server.port().to_string())]);
+            answers.push((
+                format!("{client_name} client, {server_name} server"),
+                answered,
+            ));
+        }
+    }
+    let reference = answers
+        .iter()
+        .find(|(pairing, _)| pairing == "node client, node server")
+        .map(|(_, answered)| answered.clone())
+        .expect("the reference pairing ran");
+    for line in [
+        "post:2",
+        "edit:true",
+        "m2:world again",
+        "held:m2=world again ",
+        "topic-held:general",
+        "fault:false",
+    ] {
+        assert!(
+            reference.lines().any(|answered| answered == line),
+            "the reference client's `{line}`:\n{reference}"
+        );
+    }
+    for (pairing, answered) in &answers {
+        assert_eq!(
+            answered, &reference,
+            "{pairing} must print what a node client prints against a node server"
+        );
+    }
+}
+
+/// F1 S1b: `wss://` is refused by the native client BY NAME — the native
+/// backend has no TLS (`native-objective.md` S1) — where the node build dials
+/// it. The refusal is the constructor's, at run time (the URL is a value), and
+/// it says what to do instead.
+#[test]
+fn f1_s1b_a_native_wss_dial_is_refused_by_name() {
+    let staged = stage();
+    let file = "native_probe_wss_refused.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n",
+            "import std::result::Result::{ self, Err, Ok };\n",
+            "import std::rpc::connect_socket;\n",
+            "\n",
+            "async fun main() {\n",
+            "\tprint(\"dialling\");\n",
+            "\tmatch connect_socket(\"wss://127.0.0.1:9/\") {\n",
+            "\t\tOk(let _duplex) => print(\"open\"),\n",
+            "\t\tErr(let reason) => print(i\"err {reason}\"),\n",
+            "\t}\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    let run = run_on(&staged, Some("rust"), file);
+    assert_eq!(run.code, Some(1), "{}", run.stderr);
+    assert_eq!(run.stdout, "dialling\n");
+    assert!(
+        run.stderr
+            .contains("the native backend has no TLS, so `wss://` is refused")
+            && run.stderr.contains("wss://127.0.0.1:9/"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// F1 S1b: `guarded_async` answers a CANCELLED body as an `Err`, on both
+/// backends — the JS helper's `catch` takes the `AbortError` an aborted
+/// `__sleep` rejects with, and the native one re-raised the cancellation
+/// instead, which carried a cancelled dial's backoff out through its nursery
+/// (`dial_cancel.rs`'s backoff ordering, natively, failed the program).
+#[test]
+fn f1_s1b_guarded_async_catches_a_cancelled_body_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_guarded_abort.vl";
+    std::fs::write(
+        staged.join(file),
+        concat!(
+            "import std::io::print;\n",
+            "import std::result::Result::{ self, Err, Ok };\n",
+            "import std::task::nursery;\n",
+            "import std::time::sleep;\n",
+            "\n",
+            "[extern(\"__guarded_async\")]\n",
+            "async external fun guarded<T>(body: async || T): Result<T, str>;\n",
+            "\n",
+            "fun wait(): bool {\n",
+            "\tsleep(1000);\n",
+            "\ttrue\n",
+            "}\n",
+            "\n",
+            "async fun main() {\n",
+            "\tlet answer = nursery(|n| {\n",
+            "\t\tlet running = async guarded(|| wait());\n",
+            "\t\tn.cancel();\n",
+            "\t\tawait running\n",
+            "\t});\n",
+            "\tmatch answer {\n",
+            "\t\tOk(let value) => print(i\"ok {value}\"),\n",
+            "\t\tErr(let reason) => print(i\"err {reason}\"),\n",
+            "\t}\n",
+            "\tprint(\"after\");\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "err This operation was aborted\nafter\n",
+            "{backend:?}"
+        );
+    }
 }
 
 /// **F18 slice 3's EXIT** — a program with the SHAPE of kolt's server leg,
@@ -5939,13 +7323,12 @@ impl ServedRequest {
         let status = lines.next().unwrap_or_default().to_string();
         ServedRequest {
             status,
-            // node adds a `Date` of its own and the two backends order
-            // `Connection`/`Content-Length` differently; both are dropped here
-            // so the two legs can be compared whole. See the exit's own
-            // comment for why that is written down rather than normalised
-            // away silently.
+            // node adds a `Date` of its own, which is dropped here so the two
+            // legs can be compared whole — every other field, in order (F152
+            // made the native head node's). See the exit's own comment for why
+            // that is written down rather than normalised away silently.
             headers: lines
-                .filter(|line| !line.starts_with("Date:") && !line.starts_with("Connection:"))
+                .filter(|line| !line.starts_with("Date:"))
                 .map(str::to_string)
                 .collect(),
             body: body.to_string(),
@@ -6080,7 +7463,7 @@ fn a_stopped_server_ends_the_program_the_same_on_both_backends() {
 
 const STOP_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ BodyLimits, Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response, ServerTimeouts };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -6095,6 +7478,7 @@ const STOP_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| print(\"stopped\"),\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -6135,6 +7519,11 @@ impl SignalledServer {
         assert!(
             manifest.contains("vilan-rt-signal"),
             "a program that starts a server links the signal crate:\n{manifest}"
+        );
+        // F160: and the readiness wait its loop blocks in.
+        assert!(
+            manifest.contains("vilan-rt-poll"),
+            "a program that starts a server links the readiness wait:\n{manifest}"
         );
         let binary = String::from_utf8_lossy(&built.stdout)
             .lines()
@@ -6310,10 +7699,83 @@ fn a_second_termination_signal_ends_a_server_whose_stream_never_closes() {
     drop(stream);
 }
 
+/// F157: a termination ends the program once its servers have drained,
+/// WHATEVER ELSE is pending — node, with no handler, dies of the signal and
+/// abandons it all. Two shapes, each of which kept the native process alive
+/// after the listener closed (the second signal then blamed "open
+/// connections" that did not exist): a detached forever-loop task sleeping an
+/// hour (kolt's `keep_storage_tidy`), and an `async fun main` that is itself
+/// still suspended on an hour-long sleep, which ends without its value and
+/// without a failure line. Each exits 0 on the FIRST signal with nothing on
+/// stderr; the 60-second bound in `finish` is liveness only.
+#[cfg(unix)]
+#[test]
+fn f157_a_termination_ends_the_program_whatever_else_is_pending() {
+    let staged = stage();
+    for (file, source) in [
+        ("native_probe_detached_forever.vl", DETACHED_FOREVER_PROBE),
+        ("native_probe_suspended_main.vl", SUSPENDED_MAIN_PROBE),
+    ] {
+        std::fs::write(staged.join(file), source).expect("write the probe program");
+        let server = SignalledServer::spawn(&staged, file, &[]);
+        let answered = ServedRequest::exchange(server.port, "GET", "/", "");
+        assert_eq!(answered.body, "ok", "{file}");
+        server.signal("-TERM");
+        let (status, stderr) = server.finish();
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{file}: one SIGTERM ends it (stderr: {stderr})"
+        );
+        assert_eq!(stderr, "", "{file}: a graceful end says nothing");
+    }
+}
+
+#[cfg(unix)]
+const DETACHED_FOREVER_PROBE: &str = concat!(
+    "import std::http::{ Response, Server };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "fun tidy() {\n",
+    "\tasync {\n",
+    "\t\tfor {\n",
+    "\t\t\tsleep(3600000);\n",
+    "\t\t}\n",
+    "\t};\n",
+    "}\n",
+    "\n",
+    "async fun main() {\n",
+    "\ttidy();\n",
+    "\tServer::builder()\n",
+    "\t\t.port(0)\n",
+    "\t\t.on_request(|request| Response::builder().code(200).body(\"ok\").build())\n",
+    "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()}\"))\n",
+    "\t\t.build()\n",
+    "\t\t.start();\n",
+    "}\n",
+);
+
+#[cfg(unix)]
+const SUSPENDED_MAIN_PROBE: &str = concat!(
+    "import std::http::{ Response, Server };\n",
+    "import std::time::sleep;\n",
+    "\n",
+    "async fun main() {\n",
+    "\tServer::builder()\n",
+    "\t\t.port(0)\n",
+    "\t\t.on_request(|request| Response::builder().code(200).body(\"ok\").build())\n",
+    "\t\t.on_start(|server| print(i\"vilan-test-port={server.port()}\"))\n",
+    "\t\t.build()\n",
+    "\t\t.start();\n",
+    "\tsleep(3600000);\n",
+    "\tprint(\"main ended\");\n",
+    "}\n",
+);
+
 #[cfg(unix)]
 const OPEN_STREAM_PROBE: &str = concat!(
     "import std::io::print;\n",
-    "import std::http::{ BodyLimits, Server, Response };\n",
+    "import std::http::{ BodyLimits, Server, Response, ServerTimeouts };\n",
     "import std::option::Option::None;\n",
     "\n",
     "fun main() {\n",
@@ -6327,6 +7789,7 @@ const OPEN_STREAM_PROBE: &str = concat!(
     "\t\ton_stop = |stopped| {},\n",
     "\t\tupgrade_handler = None,\n",
     "\t\tbody_limits = BodyLimits::new(),\n",
+    "\t\ttimeouts = ServerTimeouts::new(),\n",
     "\t\tnode = None,\n",
     "\t};\n",
     "\tserver.start();\n",
@@ -6630,8 +8093,10 @@ fn the_crypto_surface_answers_nodes_bytes_on_both_backends() {
     assert!(
         !manifest.contains("vilan-rt-crypto")
             && !manifest.contains("vilan-rt-sqlite")
-            && !manifest.contains("vilan-rt-image"),
-        "a program that reaches none names none (M185: the image crate included):\n{manifest}"
+            && !manifest.contains("vilan-rt-image")
+            && !manifest.contains("vilan-rt-poll"),
+        "a program that reaches none names none (M185: the image crate included; F160: \
+         the readiness wait too):\n{manifest}"
     );
 }
 
@@ -7090,6 +8555,273 @@ fn a_field_and_a_branch_read_move_at_their_own_last_use_on_both_backends() {
         "the copies the path- and branch-aware last use leaves"
     );
 }
+
+/// **M199**: a pattern over a `Shared` read that only VIEWS what it binds
+/// reads the cell in place natively — the scrutinee is the cell's shared
+/// borrow (`&(*(cell).borrow()).value`) and every capture a reference into it
+/// — where it had copied the payload out whole to look at it (kolt's
+/// dictionary deep-copied a 123,702-entry map per word checked). The analyzer
+/// admits a construct only when no write of the cell, rebind included, can
+/// run while it does (B457's write summaries), nothing in it suspends, and
+/// every capture is immutable, at no value seam and read by no closure.
+///
+/// Seven forms borrow: a `match` over a field spine (lending `&task`), an
+/// `if .. is` over the bare read, a nested tuple pattern under a let-chain,
+/// a comparison, a nested variant payload, an `is` with a `let _` binder,
+/// and a capture STORED into a constructor (the copy moves to the store,
+/// `Some((xs).clone())`, where rule 1 owes it). Seven keep the copy, and
+/// each prints the value the match found: a write in the arm, a write
+/// through a call, a REBIND in the arm (which a live borrow would meet as a
+/// reentrant write), a capture an escaping closure reads, a `mut` capture,
+/// a guard clause (its capture outlives any construct), and an arm that
+/// awaits while another task rebinds the cell.
+#[test]
+fn m199_a_viewed_only_pattern_over_a_shared_read_borrows_the_cell_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_cell_borrows.vl"),
+        CELL_BORROWS_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_cell_borrows.vl"),
+        Verdict::Identical,
+        "the borrowed and the copied forms must print the same bytes on both backends"
+    );
+    let native = vilan(&staged)
+        .args(["run", "--backend", "rust", "native_probe_cell_borrows.vl"])
+        .output()
+        .expect("run the native backend");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        concat!(
+            "7\n3\n6\ntrue\n3\ntrue\n",
+            "writes_in_arm 2 3\nwrites_through_a_call 2\n3\nrebinds_in_arm 2\n",
+            "stores Some([1, 2, 3]) Some([1, 2])\nescapes 2\n",
+            "mutable_capture 3 Some([1, 2])\nguarded 2\nawaits 2\n",
+        )
+    );
+    let output = vilan(&staged)
+        .env("VILAN_NATIVE_REPORT_COPIES", "1")
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_cell_borrows.vl",
+        ])
+        .output()
+        .expect("emit the program");
+    assert!(output.status.success(), "the probe must emit");
+    let source = String::from_utf8_lossy(&output.stdout);
+    let census = source
+        .lines()
+        .find(|line| line.starts_with("vilan-native: consumed-copies="))
+        .expect("a copy census");
+    assert!(
+        census.ends_with("cell-read-copies=7 cell-read-borrows=7"),
+        "seven forms borrow and seven copy: {census}"
+    );
+    let body = |name: &str| -> String {
+        let start = source
+            .find(&format!("fn {name}_"))
+            .unwrap_or_else(|| panic!("no `{name}` in:\n{source}"));
+        let end = source[start..]
+            .find("\n}\n")
+            .map_or(source.len(), |offset| start + offset);
+        source[start..end].to_string()
+    };
+    for name in [
+        "viewed_match",
+        "viewed_is",
+        "viewed_nested",
+        "viewed_compare",
+        "viewed_variant_payload",
+        "has",
+        "stores",
+    ] {
+        let text = body(name);
+        assert!(
+            text.contains(").borrow())") && !text.contains(").get()"),
+            "`{name}` must read the cell in place:\n{text}"
+        );
+    }
+    for name in [
+        "writes_in_arm",
+        "writes_through_a_call",
+        "rebinds_in_arm",
+        "escapes",
+        "mutable_capture",
+        "guarded",
+        "awaits",
+    ] {
+        let text = body(name);
+        assert!(
+            !text.contains(").borrow())"),
+            "`{name}` must keep its copy:\n{text}"
+        );
+    }
+}
+
+const CELL_BORROWS_PROBE: &str = r#"import std::io::print;
+import std::shared::Shared;
+import std::time::sleep;
+
+[derive(PartialEq)]
+struct Task {
+	title: str,
+	tags: List<str>,
+}
+
+struct Holder {
+	value: Option<Task>,
+	pair: (List<i32>, i32),
+}
+
+fun tag_count(task: &Task): usize {
+	task.tags.len()
+}
+
+// Viewed only: each binds by reference natively and shares on JS.
+fun viewed_match(cell: Shared<Holder>): usize {
+	match cell.read().value {
+		Some(let task) => task.tags.len() + task.title.len() + tag_count(&task),
+		None => 0,
+	}
+}
+
+fun viewed_is(cell: Shared<Option<List<i32>>>): usize {
+	if cell.read() is Some(let items) {
+		ret items.len();
+	}
+	0
+}
+
+fun viewed_nested(cell: Shared<Holder>): i32 {
+	if cell.read().pair is (let xs, let n) && n > 0 {
+		ret xs[0] + n;
+	}
+	-1
+}
+
+fun viewed_compare(cell: Shared<Holder>, other: Task): bool {
+	match cell.read().value {
+		Some(let task) => task == other && other == task,
+		None => false,
+	}
+}
+
+fun viewed_variant_payload(cell: Shared<Option<Option<Task>>>): usize {
+	match cell.read() {
+		Some(Some(let task)) => task.title.len(),
+		Some(None) => 100,
+		None => 200,
+	}
+}
+
+fun has(cell: Shared<Holder>): bool {
+	cell.read().value is Some(let _)
+}
+
+// Must still copy: the old value is what each prints.
+fun writes_in_arm(cell: Shared<(List<i32>, i32)>) {
+	if cell.read() is (let xs, let n) {
+		cell.write().0.push(9);
+		cell.write().1 = 99;
+		print(i"writes_in_arm {xs.len()} {n}");
+	}
+}
+
+fun poke(cell: Shared<(List<i32>, i32)>) {
+	cell.write().0.push(9);
+}
+
+fun writes_through_a_call(cell: Shared<(List<i32>, i32)>) {
+	match cell.read() {
+		(let xs, _) => {
+			poke(cell);
+			print(i"writes_through_a_call {xs.len()}");
+		}
+	}
+}
+
+fun rebinds_in_arm(cell: Shared<Option<List<i32>>>) {
+	if cell.read() is Some(let xs) {
+		cell.write() = Some([]);
+		print(i"rebinds_in_arm {xs.len()}");
+	}
+}
+
+fun stores(cell: Shared<Option<List<i32>>>): Option<List<i32>> {
+	if cell.read() is Some(let xs) {
+		ret Some(xs);
+	}
+	None
+}
+
+fun escapes(cell: Shared<Option<List<i32>>>): || usize {
+	if cell.read() is Some(let xs) {
+		ret || xs.len();
+	}
+	ret || 0;
+}
+
+fun mutable_capture(cell: Shared<Option<List<i32>>>): usize {
+	match cell.read() {
+		Some(mut xs) => {
+			xs.push(1);
+			xs.len()
+		}
+		None => 0,
+	}
+}
+
+fun guarded(cell: Shared<Option<List<i32>>>): usize {
+	cell.read() is Some(let xs) else ret 0;
+	xs.len()
+}
+
+fun awaits(cell: Shared<Option<List<i32>>>) {
+	let _writer = async {
+		sleep(10);
+		cell.write() = Some([]);
+	};
+	if cell.read() is Some(let xs) {
+		sleep(300);
+		print(i"awaits {xs.len()}");
+	}
+}
+
+fun main() {
+	let task = Task { title = "abc", tags = ["x", "y"] };
+	let holder = Shared::new(Holder { value = Some(task), pair = ([4, 5], 2) });
+	print(viewed_match(holder));
+	print(viewed_is(Shared::new(Some([1, 2, 3]))));
+	print(viewed_nested(holder));
+	print(viewed_compare(holder, task));
+	print(viewed_variant_payload(Shared::new(Some(Some(task)))));
+	print(has(holder));
+	writes_in_arm(Shared::new(([1, 2], 3)));
+	let pair = Shared::new(([1, 2], 3));
+	writes_through_a_call(pair);
+	print(pair.read().0.len());
+	rebinds_in_arm(Shared::new(Some([1, 2])));
+	let kept = Shared::new(Some([1, 2]));
+	mut taken = stores(kept);
+	if &mut taken is Some(let xs) {
+		xs.push(3);
+	}
+	print(i"stores {taken.debug()} {kept.read().debug()}");
+	let closed = Shared::new(Some([1, 2]));
+	let count = escapes(closed);
+	closed.write() = Some([]);
+	print(i"escapes {count()}");
+	let counted = Shared::new(Some([1, 2]));
+	print(i"mutable_capture {mutable_capture(counted)} {counted.read().debug()}");
+	print(i"guarded {guarded(counted)}");
+	awaits(Shared::new(Some([1, 2])));
+}
+"#;
 
 const MOVES_PROBE: &str = concat!(
     "import std::io::print;\n",
@@ -8372,7 +10104,7 @@ fn the_native_copy_census_matches_its_table() {
 ///
 /// `host_name` is reached nowhere but inside the argument of the refused
 /// `set_priority` call; `range_i32` nowhere but inside the body of the closure
-/// the refused `hmr_register_teardown` takes. Neither was in the census before
+/// the refused `on_exit` takes. Neither was in the census before
 /// the walk continued past a refusal, which is how `createServer`'s handler hid
 /// nine bindings from the census that sized F18.
 ///
@@ -8380,10 +10112,12 @@ fn the_native_copy_census_matches_its_table() {
 /// table will ever answer: the pair had been `random_bytes(random_uuid()..)`,
 /// and F40 lowered both, which turned the pin's shape into a program with
 /// nothing hidden in it. A pair the runtime cannot grow into keeps it measuring
-/// the walk rather than the runtime's coverage.
+/// the walk rather than the runtime's coverage. The closure-taking refusal is
+/// the program's own for the same reason: it had been std's
+/// `hmr_register_teardown`, which F1 S1b lowered (inert: a native build has no
+/// HMR shim).
 const CENSUS_PROBE: &str = concat!(
     "import std::random::range_i32;\n",
-    "import std::rpc::hmr_register_teardown;\n",
     "import std::io::print;\n",
     "\n",
     "[extern(\"node:os\", \"hostname\")]\n",
@@ -8392,9 +10126,12 @@ const CENSUS_PROBE: &str = concat!(
     "[extern(\"node:os\", \"setPriority\")]\n",
     "external fun set_priority(name: str): i32;\n",
     "\n",
+    "[extern(\"node:process\", \"on\", retains)]\n",
+    "external fun on_exit(handler: || void);\n",
+    "\n",
     "fun main() {\n",
     "\tprint(set_priority(host_name()));\n",
-    "\thmr_register_teardown(|| { print(range_i32(1, 4)); });\n",
+    "\ton_exit(|| { print(range_i32(1, 4)); });\n",
     "}\n",
 );
 
@@ -8442,7 +10179,7 @@ fn the_host_census_walks_past_a_refusal_into_its_arguments_and_closure_bodies() 
     // a continuation OF.
     for refused in [
         "the host binding `set_priority`",
-        "the host binding `hmr_register_teardown`",
+        "the host binding `on_exit`",
     ] {
         assert!(
             census.contains(refused),
@@ -9859,17 +11596,18 @@ fn a_field_read_off_a_generic_call_is_identical_on_both_backends() {
 /// replaced it at `vilan check` — "cannot infer the type of this value" at the
 /// user's call — so the library-body probe now proves that the refusal comes
 /// from the CHECK, at the call, before any body is instantiated.) N167: the
-/// in-body note's std probe is `std::fs::copy_dir`, which checks clean and
-/// whose body reaches a host binding the native backend does not emit
-/// (`new_fs_options`): the refusal is drawn at the user's call and names the
-/// body and its file.
+/// in-body note's std probe is `std::fs::with_file`, which checks clean and
+/// whose body reaches a host type the native backend does not emit (`File`,
+/// the handle tier): the refusal is drawn at the user's call and names the
+/// body and its file. (It was `copy_dir` over `new_fs_options` until F156
+/// gave that body a native twin.)
 #[test]
 fn a_refusal_inside_another_files_body_names_where_to_look() {
     let staged = stage();
     let file = "native_probe_n167_std_body_refusal.vl";
     std::fs::write(
         staged.join(file),
-        "import std::fs::copy_dir;\n\nfun main() {\n\tcopy_dir(\"a\", \"b\");\n}\n",
+        "import std::fs::with_file;\n\nfun main() {\n\twith_file(\"a\", |file| 0);\n}\n",
     )
     .expect("write the probe");
     let checked = vilan(&staged)
@@ -9893,7 +11631,7 @@ fn a_refusal_inside_another_files_body_names_where_to_look() {
     assert!(
         stderr.contains(&format!("{file}:4:2"))
             && stderr.contains(
-                "The construct is in `copy_dir`'s body (`fs.vl`), which this call instantiates.",
+                "The construct is in `with_file`'s body (`fs.vl`), which this call instantiates.",
             ),
         "the refusal inside std's body is drawn at the user's call and names the body:\n{stderr}"
     );
@@ -14329,6 +16067,195 @@ fn f153_a_for_over_the_key_stream_builds_on_both_backends() {
     }
 }
 
+/// B718: `!` on the result of a host-bound (`external`) method — `parse_f64()!`,
+/// a generic `List::get(..)!`, a `Result`'s `ok_or(..)!` — builds natively; it was
+/// refused as "an unresolved receiver" because a call to an extern callee had
+/// no type in the emitter. A user method's `!` is the control.
+#[test]
+fn b718_a_bang_on_a_host_bound_result_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b718_bang_on_host_result.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b718_bang_on_host_result.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\nfalse\nfalse\n7\ntrue\n2\ntrue\n42\ntrue\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// B719: a let-else whose scrutinee ends in `}` natively (an awaited call, an
+/// `if` value) is parenthesized, and `for f() is Some(let found) { .. }` — and a
+/// `&&` chain after a capture — is a `while let` that keeps its binder.
+#[test]
+fn b719_a_let_else_over_a_block_and_a_capturing_loop_are_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b719_let_else_and_while_let.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b719_let_else_and_while_let.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "true\n40\ntrue\n2\ncb\n0\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b719_let_else_and_while_let")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("while let Some(found_"),
+        "the emission names `while let Some(found_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(" = ({ let awaited = "),
+        "the let-else's awaited scrutinee is parenthesized:\n{emitted}"
+    );
+}
+
+/// B722: `*` on a binding a tuple pattern declares (a closure's `|(name, _)|`,
+/// a destructuring `let`) reads the value natively: the destructure copies its
+/// subject, and `(*name)` was rustc's E0614 / E0277.
+#[test]
+fn b722_a_deref_of_a_destructured_binding_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b722_tuple_binder_deref.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b722_tuple_binder_deref.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "2\n1\n4\ntrue\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// B723: `a + b` over `str`s two host-bound methods answer is a concatenation
+/// natively; untyped, it was emitted `Rc<str> + Rc<str>` (E0369).
+#[test]
+fn b723_a_concatenation_of_host_str_results_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b723_str_add_of_host_results.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b723_str_add_of_host_results.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "Hello\n\nmixed caseMIXED CASEMixed Case\n10Mixed\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
+/// B725: a function made async that calls itself, and two that call each other,
+/// build natively: the awaited calls around the cycle are boxed (rustc E0733
+/// otherwise — the future would contain itself).
+#[test]
+fn b725_a_recursive_async_function_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b725_async_recursion.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b725_async_recursion.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "4\n0\n6\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b725_async_recursion")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains("Box::pin(depth_"),
+        "the emission names `Box::pin(depth_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("Box::pin(pong_"),
+        "the emission names `Box::pin(pong_`:\n{emitted}"
+    );
+    assert!(
+        emitted.contains("Box::pin(ping_"),
+        "the emission names `Box::pin(ping_`:\n{emitted}"
+    );
+}
+
+/// B726: a `let` initialized with `List<T>::new()` is annotated natively, as one
+/// initialized with `[]` is, so a read before the first push types (rustc E0282
+/// on a bare `Vec::new()`).
+#[test]
+fn b726_a_list_read_before_its_first_push_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b726_list_new_before_push.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b726_list_new_before_push.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "2\n0\ntrue\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+    let emitted = std::fs::read_to_string(
+        staged
+            .join("dist")
+            .join("native")
+            .join("native_probe_b726_list_new_before_push")
+            .join("src")
+            .join("main.rs"),
+    )
+    .expect("read the emitted Rust");
+    assert!(
+        emitted.contains(": Vec<(usize, usize)> = Vec::new()"),
+        "the `let` names its element:\n{emitted}"
+    );
+    assert!(
+        emitted.contains(": Vec<vilan_rt::Str> = Vec::new()"),
+        "an annotated `let` names its element too:\n{emitted}"
+    );
+}
+
+/// B705: a mutating call whose other arguments read its receiver —
+/// `next.insert(next.position(..).unwrap_or(next.len()), x)`, a map keyed off
+/// its own length, a field's list, `grow(&mut xs, xs.len())` — evaluates the
+/// reads before the `&mut` is taken (rustc E0502 otherwise).
+#[test]
+fn b705_an_argument_reading_the_mutated_receiver_is_identical_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_b705_argument_reads_mutated_receiver.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/b705_argument_reads_mutated_receiver.vl"),
+    )
+    .expect("write the probe program");
+    let expected = "5\n2\n9\n1\n4\n4\n4\n1\n";
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string())
+    );
+}
+
 /// F154: a `str`-backed enum's `.value()` read at RUN time builds natively
 /// and answers what JS answers. The synthesized `value()` (and a hand-written
 /// `match self`) matches a LOANED receiver — `&Rc<str>` natively — where
@@ -15299,6 +17226,256 @@ fn m165_a_bind_list_converts_options_and_bools_on_both_backends() {
     }
 }
 
+/// B721: a typed value at an `any`-typed slot converts at the boundary,
+/// element-wise for a list and payload-wise for an option — a `List<str>`
+/// variable at std::db's `List<any>` (read again after the call), a
+/// `List<Option<i32>>`, a nested `List<List<str>>`, an `Option<str>` at
+/// `Option<any>`, a mixed literal, and std's own `Database::migrate`, whose
+/// bind list literal goes straight to a host binding. Natively every one was
+/// rustc's E0308 (`expected Vec<Any>, found Vec<Rc<str>>`), so no program that
+/// migrated built.
+#[test]
+fn b721_a_typed_value_converts_at_an_any_slot_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_typed_values_at_any.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/typed_values_at_any.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "2\n0\n1\n2\n2\n3\n2\n3\ntrue\nfalse\n4\n2\n",
+            "{backend:?}"
+        );
+    }
+}
+
+/// M175 + M195 + F149: a `std::db` bind list is a `List<dyn SqlValue>`, and
+/// every `SqlValue` type round-trips on both backends — each number width,
+/// `str`, `bool`, `Bytes` as a BLOB (a NUL and a high byte inside; natively it
+/// was rustc's E0277, and a BLOB column read back as lossy TEXT), an `Option`
+/// at depth 1 and 2 — filled by a literal (literal leaves and an operator's
+/// result included), `push`, a generic helper (B679's shape: an `Option`
+/// through `T` binds its payload on both) and a program's own `SqlValue`
+/// newtype; and the `optional_*` readers answer `None` for NULL.
+#[test]
+fn m175_every_sql_value_round_trips_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_sql_value.vl";
+    std::fs::write(staged.join(file), include_str!("native/db_sql_value.vl"))
+        .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "i8: integer -8\n",
+                "u8: integer 200\n",
+                "i16: integer -1600\n",
+                "u16: integer 60000\n",
+                "i32: integer 7\n",
+                "u32: integer 4000000000\n",
+                "i53: integer 1720656000000\n",
+                "u53: integer 9007199254740991\n",
+                "usize: integer 3\n",
+                "f32: real 0.5\n",
+                "f64: real 2.25\n",
+                "str: text text\n",
+                "true: integer 1\n",
+                "false: integer 0\n",
+                "bytes: blob 00ff8000\n",
+                "some: integer 11\n",
+                "none: null NULL\n",
+                "deep: text deep\n",
+                "deep none: null NULL\n",
+                "literal: integer -13\n",
+                "branch: integer 11\n",
+                "pushed: real 1.5\n",
+                "generic: integer 11\n",
+                "user: text u-1\n",
+                "4\n",
+                "true\n",
+                "74657874\n",
+                "None\n",
+                "None\n",
+                "None\n",
+                "None\n",
+                "true\n",
+                "true\n",
+                "Some(11)\n",
+                "Some(11)\n",
+                "Some(11.0)\n",
+                "Some(\"text\")\n",
+                "2\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
+/// M195: a `Bytes` binds as a BLOB and reads back through `Row::bytes` as
+/// the bytes bound on both backends — a NUL and a high byte inside, an empty
+/// buffer, `typeof` blob, a BLOB as a `WHERE` parameter — and a TEXT column
+/// read through `bytes` is its UTF-8 (SQLite's `CAST(value AS BLOB)`).
+/// Natively the bind was rustc's E0277 (`vilan_rt::Any` had no BLOB arm) and
+/// a BLOB column read back as lossy TEXT.
+#[test]
+fn m195_a_blob_round_trips_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_blob.vl";
+    std::fs::write(staged.join(file), include_str!("native/db_blob.vl"))
+        .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout, "blob blob 5 00ff800007\nempty blob 0 \ntext text 6 68c3a96c6c6f\nblob\n",
+            "{backend:?}"
+        );
+    }
+}
+
+/// F149 (ruling S5): a typed column reader refuses a NULL on both backends —
+/// a panic naming the column, the reader and its `optional_` door, at the
+/// reader's CALL (the readers are `[track_caller]`). JS answered the host's
+/// `null` behind an `i32`/`str`, and natively `0`/`""`. One program per
+/// reader family: the number readers, the text reader and the BLOB reader
+/// are three different native arms.
+#[test]
+fn f149_a_typed_reader_refuses_a_null_naming_the_column_on_both_backends() {
+    let staged = stage();
+    for reader in ["integer", "real", "text", "bytes"] {
+        let file = format!("native_probe_db_null_{reader}.vl");
+        let source = format!(
+            "import std::db::Database;\n\
+             \n\
+             fun main() {{\n\
+             \tlet db = Database::open(\":memory:\");\n\
+             \tdb.exec(\"CREATE TABLE t (a TEXT, gap)\");\n\
+             \tlet none: Option<i32> = None;\n\
+             \tdb.prepare(\"INSERT INTO t VALUES (?, ?)\").run([\"x\", none]);\n\
+             \tlet row = db.prepare(\"SELECT a, gap FROM t\").first([]).unwrap();\n\
+             \tprint(row.text(\"a\"));\n\
+             \tlet _ = row.{reader}(\"gap\");\n\
+             \tprint(\"unreachable\");\n\
+             }}\n"
+        );
+        std::fs::write(staged.join(&file), &source).expect("write the probe program");
+        let site = site_of(&file, &source, "let _ = row.", &format!("{reader}(\"gap"));
+        let expected = format!(
+            "panicked at {site}: std::db: column 'gap' is NULL (or not in the row) and \
+             `Row::{reader}` reads a value; read a nullable column with \
+             `Row::optional_{reader}`"
+        );
+        for backend in [None, Some("rust")] {
+            let run = run_on(&staged, backend, &file);
+            assert_eq!(run.code, Some(1), "{reader} {backend:?}: {}", run.stderr);
+            assert_eq!(run.stdout, "x\n", "{reader} {backend:?}");
+            assert!(
+                run.stderr.contains(&expected),
+                "{reader} {backend:?}: expected {expected:?} in:\n{}",
+                run.stderr
+            );
+        }
+    }
+}
+
+/// F149: the `optional_*` readers are a nullable column's door on both
+/// backends — `None` for NULL and for a column the row does not have, `Some`
+/// for a value, at every reader (`optional_bytes` included).
+#[test]
+fn f149_the_optional_readers_answer_none_for_null_on_both_backends() {
+    let staged = stage();
+    let file = "native_probe_db_optional_readers.vl";
+    std::fs::write(
+        staged.join(file),
+        include_str!("native/db_optional_readers.vl"),
+    )
+    .expect("write the probe program");
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        assert_eq!(
+            run.stdout,
+            concat!(
+                "nulls\nNone\nNone\nNone\nNone\nnone\ntrue\nNone\n",
+                "values\nSome(4)\nSome(1720656000000)\nSome(2.5)\nSome(\"x\")\n00ff\nfalse\nNone\n",
+            ),
+            "{backend:?}"
+        );
+    }
+}
+
+/// M175: a scalar leaf — a literal, an operator's result — erases into a
+/// trait object where it lands, as a local already did, on both backends:
+/// in a list literal, at an annotated `let`, through `push`. JS stored the
+/// bare value (`Cannot read properties of undefined`), and natively rustc
+/// refused it (E0308, E0599). `[id, 1.5, "label"]` at a `List<dyn SqlValue>`
+/// is the shape every bind list has.
+#[test]
+fn m175_a_scalar_leaf_erases_into_a_trait_object_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_dyn_scalar_leaves.vl"),
+        include_str!("native/dyn_scalar_leaves.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_dyn_scalar_leaves.vl"),
+        Verdict::Identical,
+        "a scalar leaf at a trait-object position must erase on both backends"
+    );
+}
+
+/// B724: a closure that captures a VIEW parameter builds natively and leaves
+/// the caller's place as the JS backend does — a `&mut` parameter written
+/// through a closure handed to `map`, through a closure kept in a local and
+/// called between direct writes, through a `&mut self` method's closure, past
+/// an early return, and handed on to another `&mut` callee; and a `&`
+/// parameter read inside a closure. Natively the first was rustc's E0525 (the
+/// closure `FnMut` where every closure is an `Rc<dyn Fn>`) and every one a
+/// borrow that must outlive `'static`.
+#[test]
+fn b724_a_closure_captures_a_view_parameter_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_view_parameter_captures.vl"),
+        include_str!("native/view_parameter_captures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_view_parameter_captures.vl"),
+        Verdict::Identical,
+        "a closure capturing a view parameter must build and write back on both backends"
+    );
+}
+
+/// B720: a closure whose body builds a variant that fixes only SOME of its
+/// enum's parameters (`|found| Ok(found)`, which says nothing of `E`) is typed
+/// at the call's position natively — `Result` through `map_or` with an `Err`
+/// fallback, a body with both arms, a user enum of two parameters, and a
+/// closure binding with its type written. The analyzer records such a
+/// variant's enum with its arguments ERASED, which the emitter read as closed
+/// and wrote as `Result<>` (rustc E0107).
+#[test]
+fn b720_a_closure_building_a_partial_variant_is_typed_at_its_position_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_partial_variant_closures.vl"),
+        include_str!("native/partial_variant_closures.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_partial_variant_closures.vl"),
+        Verdict::Identical,
+        "a closure building a partial variant must take its position's type on both backends"
+    );
+}
+
 /// M185: `std::image` prints the same pixels on both backends — the point of
 /// running ONE codec core (`vilan-image`) natively through `vilan-rt-image` and
 /// on node as its wasm32 build. Decode and sniff, the pixel limit's sentence,
@@ -15509,14 +17686,142 @@ fn m181_percent_encoding_is_identical_on_both_backends() {
     );
 }
 
+/// Runs one `native/` probe on both backends and answers node's stdout after
+/// asserting the native leg printed the same bytes and both exited 0.
+fn identical_probe(file: &str, source: &str) -> String {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    let mut outputs = Vec::new();
+    for backend in [None, Some("rust")] {
+        let run = run_on(&staged, backend, file);
+        assert_eq!(run.code, Some(0), "{backend:?}: {}", run.stderr);
+        outputs.push(run.stdout);
+    }
+    assert_eq!(outputs[0], outputs[1], "node and native print differently");
+    outputs.swap_remove(0)
+}
+
+/// F156: `str::index_of`/`last_index_of` count UTF-16 code units on both
+/// backends — through `é`, `ö` and a surrogate-pair emoji, absence, an empty
+/// needle at either end, and the index fed back into `substring` — and
+/// `Instant::to_iso` is `toISOString()` byte for byte, from the epoch out to
+/// the expanded years at both ends of the `Date` range (`native/index_and_iso.vl`).
+#[test]
+fn f156_index_of_and_to_iso_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_index_and_iso.vl",
+        include_str!("native/index_and_iso.vl"),
+    );
+    assert_eq!(
+        printed,
+        concat!(
+            "[wörld] first=6 last=15\n",
+            "[😀] first=12 last=12\n",
+            "[h] first=0 last=0\n",
+            "[d] first=10 last=19\n",
+            "[zz] first=none last=none\n",
+            "[] first=0 last=20\n",
+            "😀 wörld\n",
+            "empty: 0 0 none\n",
+            "0 1970-01-01T00:00:00.000Z\n",
+            "1700000000000 2023-11-14T22:13:20.000Z\n",
+            "-1 1969-12-31T23:59:59.999Z\n",
+            "-1000000000000 1938-04-24T22:13:20.000Z\n",
+            "951782400000 2000-02-29T00:00:00.000Z\n",
+            "1709251199999 2024-02-29T23:59:59.999Z\n",
+            "-62167219200000 0000-01-01T00:00:00.000Z\n",
+            "-62167219200001 -000001-12-31T23:59:59.999Z\n",
+            "253402300799999 9999-12-31T23:59:59.999Z\n",
+            "253402300800000 +010000-01-01T00:00:00.000Z\n",
+            "8640000000000000 +275760-09-13T00:00:00.000Z\n",
+            "-8640000000000000 -271821-04-20T00:00:00.000Z\n",
+        )
+    );
+}
+
+/// F156: `std::fs`'s options-object calls — `create_dir_all` (twice),
+/// `scan_dir`, `read_dir_all`, `copy_dir`'s merge into an existing tree and
+/// into a fresh deep path, and `remove_dir_all` over a file, a missing path and
+/// a tree — leave the same tree and print the same lines on both backends
+/// (`native/fs_options.vl`). The failures and the symlink cases are
+/// `vilan_rt::fs`'s unit tests: a vilan program cannot catch the throw.
+#[test]
+fn f156_fs_options_calls_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_fs_options.vl",
+        include_str!("native/fs_options.vl"),
+    );
+    assert_eq!(
+        printed,
+        concat!(
+            "made: true\n",
+            "scan src:\n",
+            "  a.txt dir=false file=true link=false\n",
+            "  sub dir=true file=false link=false\n",
+            "all: a.txt sub sub/b.txt sub/deeper\n",
+            "copied a: A\n",
+            "copied b: B\n",
+            "extra: kept\n",
+            "fresh: one one/two one/two/a.txt one/two/sub one/two/sub/b.txt one/two/sub/deeper\n",
+            "scan src after:\n",
+            "  sub dir=true file=false link=false\n",
+            "gone: true\n",
+        )
+    );
+}
+
+/// F156: `std::binary`'s `f64`s go through a `DataView` over a scratch
+/// buffer, natively `vilan_rt::bytes::DataView` — the same little-endian bytes
+/// and the same values back on both backends (`native/binary_f64.vl`).
+#[test]
+fn f156_binary_doubles_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_binary_f64.vl",
+        include_str!("native/binary_f64.vl"),
+    );
+    assert!(
+        printed.starts_with("070000000000000000000000000000000000f83f"),
+        "{printed}"
+    );
+    assert!(printed.ends_with("same=true\n"), "{printed}");
+}
+
+/// F158: `std::base64::encode`/`decode` (standard, padded, strict) and
+/// `JsonValue::keys` print the same lines on both backends
+/// (`native/base64_and_keys.vl`): every length mod 3 and all 256 byte values
+/// round-trip to node's own encodings, fourteen malformed texts are `None`,
+/// and the keys of an object come in insertion order while an array, a
+/// string, a number, `null` and a missing field have none.
+#[test]
+fn f158_base64_and_json_keys_are_identical_on_both_backends() {
+    let printed = identical_probe(
+        "native_probe_base64_and_keys.vl",
+        include_str!("native/base64_and_keys.vl"),
+    );
+    for line in [
+        "foobar -> Zm9vYmFy -> [666f6f626172]\n",
+        "héllo 😀 -> aMOpbGxvIPCfmIA= -> [68c3a96c6c6f20f09f9880]\n",
+        "every byte back: true\n",
+        "Zh== -> none\n",
+        "Zm9= -> none\n",
+        "keys: b,a,c,é\n",
+        "nested: z,y\n",
+        "array: 0\n",
+        "missing: 0\n",
+    ] {
+        assert!(printed.contains(line), "{line:?} missing from:\n{printed}");
+    }
+    assert_eq!(printed.matches(" -> none\n").count(), 14, "{printed}");
+}
+
 /// A179: `std::rpc::dial_within` answers the same on both backends over
 /// hand-written dials (`native/dial_within.vl`) — a dial that wins with `Ok`
 /// and one that wins with its own `Err`, a deadline that beats a minute-long
 /// dial (the nursery cancels it, and joins it, so a dial left running would
 /// hold the line back by that minute), a deadline already past — and the two
 /// new `RpcError` arms `Debug`-render, compare and encode as the others. The
-/// WebSocket dial itself is JS-only (the native backend refuses `WebSocket`),
-/// which `dial_cancel.rs` pins on node.
+/// WebSocket dial's own cancel orderings are `dial_cancel.rs`'s, on node and
+/// natively (F1 S1b).
 #[test]
 fn a179_dial_within_answers_the_same_on_both_backends() {
     let staged = stage();
@@ -15627,6 +17932,239 @@ fn m168_a_server_bound_to_one_address_answers_there_only_on_both_backends() {
     }
 }
 
+/// F163: `Request::peer_address` answers the connection's remote end as node's
+/// `request.socket.remoteAddress` spells it, on both backends, for each bind
+/// the native server shares with node: `127.0.0.1` (an IPv4 listener sees
+/// `127.0.0.1`), `::1` (an IPv6 one sees `::1`), and `::`, the dual-stack
+/// listener, where an IPv4 client reads back mapped as `::ffff:127.0.0.1`.
+///
+/// F164: and a server with NO `host`, which node binds `::` dual-stack (when
+/// the machine has IPv6) and the native server now binds the same way — so an
+/// IPv4 client reads `::ffff:127.0.0.1` on both and an IPv6 one `::1`, where
+/// before the fix the native server took `0.0.0.0`, read the IPv4 client as
+/// `127.0.0.1` and refused the IPv6 one.
+#[cfg(target_os = "linux")]
+#[test]
+fn f163_a_requests_peer_address_is_spelled_alike_on_both_backends() {
+    let staged = stage();
+    let source = include_str!("native/http_peer_address.vl");
+    for (host, dial, expected) in [
+        (Some("127.0.0.1"), "127.0.0.1", "peer=127.0.0.1"),
+        (Some("::1"), "::1", "peer=::1"),
+        (Some("::"), "127.0.0.1", "peer=::ffff:127.0.0.1"),
+        (Some("::"), "::1", "peer=::1"),
+        (None, "127.0.0.1", "peer=::ffff:127.0.0.1"),
+        (None, "::1", "peer=::1"),
+    ] {
+        let program = "native_probe_http_peer_address.vl";
+        let host_line = "\t\t.host(\"127.0.0.1\")\n";
+        assert!(source.contains(host_line), "the probe's host line moved");
+        let rewritten = match host {
+            Some(host) => source.replace(host_line, &format!("\t\t.host(\"{host}\")\n")),
+            None => source.replace(host_line, ""),
+        };
+        let host = host.unwrap_or("no host");
+        std::fs::write(staged.join(program), rewritten).expect("write the probe program");
+        let (mut native, mut node) = both_servers(&staged, program);
+        for (leg, command) in [("native", &mut native), ("node", &mut node)] {
+            let server = ServerUnderTest::spawn(command);
+            let port = server.port();
+            let mut stream = std::net::TcpStream::connect((dial, port))
+                .unwrap_or_else(|error| panic!("{leg} on {host}: connect: {error}"));
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                .expect("send the request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("read the response");
+            let body = response
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap_or_default();
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "{leg} on {host}: {response:?}"
+            );
+            assert_eq!(body, expected, "{leg} on {host}: the peer address");
+        }
+    }
+}
+
+/// Reads ONE response off a connection that may stay open (F152): the head,
+/// then the body by the head's own framing — a `Content-Length`, chunks to the
+/// zero-size one, or (with neither, on an answer that closes) the rest of the
+/// stream; a head with neither on a kept connection has no body (`HEAD`,
+/// `204`). Node's `Date` line is dropped — the one field the two servers cannot
+/// agree on — and everything else is answered byte for byte. `pending` carries
+/// what one read took past this response.
+fn read_kept_response(stream: &mut std::net::TcpStream, pending: &mut Vec<u8>) -> String {
+    let mut chunk = [0u8; 4096];
+    let mut fill = |pending: &mut Vec<u8>, stream: &mut std::net::TcpStream| -> bool {
+        let count = stream.read(&mut chunk).expect("read the response");
+        pending.extend_from_slice(&chunk[..count]);
+        count > 0
+    };
+    let head_end = loop {
+        if let Some(at) = pending.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at + 4;
+        }
+        if !fill(pending, stream) {
+            return String::from_utf8_lossy(&std::mem::take(pending)).into_owned();
+        }
+    };
+    let head = String::from_utf8_lossy(&pending[..head_end]).into_owned();
+    let lower = head.to_ascii_lowercase();
+    let body_end = if let Some(line) = lower
+        .lines()
+        .find(|line| line.starts_with("content-length:"))
+    {
+        let length: usize = line["content-length:".len()..]
+            .trim()
+            .parse()
+            .expect("a numeric length");
+        while pending.len() < head_end + length {
+            assert!(fill(pending, stream), "the body ended short: {head}");
+        }
+        head_end + length
+    } else if lower.contains("\r\ntransfer-encoding: chunked\r\n") {
+        loop {
+            if let Some(at) = pending[head_end..]
+                .windows(5)
+                .position(|window| window == b"0\r\n\r\n")
+            {
+                break head_end + at + 5;
+            }
+            assert!(
+                fill(pending, stream),
+                "the chunked body ended short: {head}"
+            );
+        }
+    } else if lower.contains("\r\nconnection: close\r\n") {
+        while fill(pending, stream) {}
+        pending.len()
+    } else {
+        head_end
+    };
+    let response: Vec<u8> = pending.drain(..body_end).collect();
+    String::from_utf8_lossy(&response)
+        .split_inclusive("\r\n")
+        .filter(|line| !line.starts_with("Date: "))
+        .collect()
+}
+
+/// F151 + F152 (Order 58's S3/S4): the two servers answer the SAME BYTES, less
+/// node's `Date`, for what a persistent connection carries — node's reason
+/// phrases (`418 I'm a Teapot`, `413 Payload Too Large`, `422 Unprocessable
+/// Entity`, node's `unknown` for a code it does not list), `Connection:
+/// keep-alive` with `Keep-Alive: timeout=5`, a `204`, a `HEAD` with no body and
+/// no length, a stream sent `Transfer-Encoding: chunked`, and a program's own
+/// `Connection: close` — all NINE over one connection, which is itself the
+/// claim that the connection is kept — then HTTP/1.0 (ended by the close, no
+/// length) and a client's `Connection: close` on connections of their own, and
+/// node's `408` bytes for a head that misses the program's 400 ms
+/// `headers_timeout`.
+///
+/// The header comparison is whole and ordered: node writes the program's
+/// fields, then `Connection`/`Keep-Alive`, then the framing, and the native
+/// server writes them in that order. The 408's TIMING is not compared — node
+/// sweeps for expired requests on an interval (`std::http` sets it to half the
+/// deadline) where the native server checks every turn — only that it lands
+/// after the deadline and well before a liveness bound.
+#[test]
+fn f152_a_kept_connection_answers_the_same_bytes_on_both_backends() {
+    let staged = stage();
+    let program = "native_probe_http_keep_alive.vl";
+    std::fs::write(
+        staged.join(program),
+        include_str!("native/http_keep_alive.vl"),
+    )
+    .expect("write the probe program");
+    let (mut native, mut node) = both_servers(&staged, program);
+    let mut transcripts = Vec::new();
+    for (leg, command) in [("native", &mut native), ("node", &mut node)] {
+        let server = ServerUnderTest::spawn(command);
+        let port = server.port();
+        let mut transcript = Vec::new();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|error| panic!("{leg}: connect: {error}"));
+        let mut pending = Vec::new();
+        for request in [
+            "GET /ok HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /teapot HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /too-large HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /unprocessable HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /unlisted HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /empty HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /stream HTTP/1.1\r\nHost: a\r\n\r\n",
+            "HEAD /ok HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET /close HTTP/1.1\r\nHost: a\r\n\r\n",
+        ] {
+            stream.write_all(request.as_bytes()).expect("send");
+            transcript.push(read_kept_response(&mut stream, &mut pending));
+        }
+        for request in [
+            "GET /ok HTTP/1.0\r\n\r\n",
+            "GET /ok HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+        ] {
+            let mut own = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            own.write_all(request.as_bytes()).expect("send");
+            transcript.push(read_kept_response(&mut own, &mut Vec::new()));
+        }
+        let mut slow = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let started = std::time::Instant::now();
+        slow.write_all(b"GET / HTTP/1.1\r\nHost:")
+            .expect("send half a head");
+        slow.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .expect("bound the read");
+        let mut timed_out = String::new();
+        slow.read_to_string(&mut timed_out)
+            .unwrap_or_else(|error| panic!("{leg}: read the 408: {error}"));
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(350),
+            "{leg}: the 408 came before the deadline: {waited:?}"
+        );
+        transcript.push(timed_out);
+        transcripts.push(transcript);
+    }
+    assert_eq!(
+        transcripts[0], transcripts[1],
+        "node and native answer different bytes"
+    );
+    let keep = "Connection: keep-alive\r\nKeep-Alive: timeout=5\r\n";
+    let plain = "Content-Type: text/plain\r\n";
+    assert_eq!(
+        transcripts[0],
+        vec![
+            format!("HTTP/1.1 200 OK\r\n{plain}{keep}Content-Length: 7\r\n\r\nGET /ok"),
+            format!(
+                "HTTP/1.1 418 I'm a Teapot\r\n{plain}{keep}Content-Length: 11\r\n\r\nGET /teapot"
+            ),
+            format!(
+                "HTTP/1.1 413 Payload Too Large\r\n{plain}{keep}Content-Length: 14\r\n\r\nGET /too-large"
+            ),
+            format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\n{plain}{keep}Content-Length: 18\r\n\r\n\
+                 GET /unprocessable"
+            ),
+            format!("HTTP/1.1 299 unknown\r\n{plain}{keep}Content-Length: 13\r\n\r\nGET /unlisted"),
+            format!("HTTP/1.1 204 No Content\r\n{plain}{keep}\r\n"),
+            format!(
+                "HTTP/1.1 200 OK\r\n{plain}{keep}Transfer-Encoding: chunked\r\n\r\n\
+                 4\r\none \r\n4\r\ntwo \r\n5\r\nthree\r\n0\r\n\r\n"
+            ),
+            format!("HTTP/1.1 200 OK\r\n{plain}{keep}\r\n"),
+            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 7\r\n\r\nclosing".to_string(),
+            format!("HTTP/1.1 200 OK\r\n{plain}Connection: close\r\n\r\nGET /ok"),
+            format!(
+                "HTTP/1.1 200 OK\r\n{plain}Connection: close\r\nContent-Length: 7\r\n\r\nGET /ok"
+            ),
+            "HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n".to_string(),
+        ]
+    );
+}
+
 /// A178 S1 + S2: `Length` is data — a number and a `Unit`, or a text — and its
 /// operators (`+ - * /` through std's traits), conversions (`as_rem`, `as_px`,
 /// `as_dp`) and comparisons (`PartialOrd` across px/rem/dp, structural `==`)
@@ -15694,5 +18232,1111 @@ fn m186_a_shared_store_path_subscribes_writes_and_prunes_on_both_backends() {
         compare(&staged, "native_probe_store_path_sharing.vl"),
         Verdict::Identical,
         "a shared store path must subscribe, write and prune alike on both backends"
+    );
+}
+
+/// F1 M2: a program that reaches `std::window` gives the MAIN thread to the
+/// desktop shell — `main` is one call, `vilan_rt_webview::run`, handing it the
+/// program's own body — and that body installs the readiness wait first, so
+/// the window's source never ticks. A program that reaches no window keeps
+/// its `main` as it was. Emitted with `--stdout`: no cargo build, so this runs
+/// wherever the suite does (the build and the window are `desktop_shell.rs`'s).
+#[test]
+fn f1_m2_a_window_program_hands_main_to_the_desktop_shell() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_window.vl"), WINDOW_PROBE)
+        .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_window.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    assert!(
+        emitted.status.success(),
+        "the window probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    assert!(
+        source.contains(
+            "fn main() {\n    vilan_rt_webview::run(vilan_program_main);\n}\n\nfn vilan_program_main() {\n    vilan_rt_poll::install();\n"
+        ),
+        "`main` is not the shell's, with the readiness wait installed first:\n{source}"
+    );
+    assert!(source.contains("vilan_rt_webview::open("), "{source}");
+    assert!(source.contains("vilan_rt_webview::close("), "{source}");
+
+    let plain = vilan(&staged)
+        .args(["build", "--backend", "rust", "--stdout", "bool.vl"])
+        .output()
+        .expect("emit a program with no window");
+    assert!(plain.status.success());
+    let plain = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        !plain.contains("vilan_rt_webview") && !plain.contains("vilan_program_main"),
+        "a program with no window kept the shell's `main`:\n{plain}"
+    );
+}
+
+/// F1 M2: the generated manifest names `vilan-rt-webview` beside the runtime
+/// only for a program that reaches a window — the crate is not in the
+/// compiler's workspace, and a program without a window must not pay for
+/// WebKitGTK's development packages to build.
+#[test]
+fn f1_m2_only_a_window_program_names_the_webview_crate() {
+    let runtime = "/cache/vilan-rt";
+    let windowed = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            window: true,
+            poll: true,
+            ..Default::default()
+        },
+    );
+    // The sibling path is joined with the host's separator (`\\` on Windows),
+    // so the pin names the dependency line, not the spelled path.
+    assert!(
+        windowed.contains("vilan-rt-webview = { path = \"/cache"),
+        "{windowed}"
+    );
+    assert!(windowed.contains("vilan-rt-poll"), "{windowed}");
+    let plain = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            poll: true,
+            ..Default::default()
+        },
+    );
+    assert!(!plain.contains("vilan-rt-webview"), "{plain}");
+}
+
+const WINDOW_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "import std::window::Window;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmatch Window::builder(\"about:blank\").title(\"t\").size(200, 100).open() {\n",
+    "\t\tOk(let window) => window.close(),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// native-ui.md P1 (R8): a program that reaches `std::gfx` hands its loop to
+/// the GPU crate's host — `install` first, then the host's `block_on` in place
+/// of the executor's (opening a window is async, so this `main` is) — and links
+/// the termination signals and the readiness wait, which a GPU window stops on
+/// and waits through. A `main` that stays synchronous (it only shapes text)
+/// gets the host's `run_pending` instead. A program that reaches no GPU window
+/// keeps its `main` as it was. Emitted with `--stdout`: no cargo build, so this
+/// runs wherever the suite does (the build and the window are `gfx_window.rs`'s).
+#[test]
+fn gfx_p1_a_gfx_program_hands_its_loop_to_the_host() {
+    let staged = stage();
+    let emit = |program: &str, source: &str| {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("emit the probe");
+        assert!(
+            emitted.status.success(),
+            "{program} was refused:\n{}",
+            String::from_utf8_lossy(&emitted.stderr)
+        );
+        String::from_utf8_lossy(&emitted.stdout).into_owned()
+    };
+    let source = emit("native_probe_gfx.vl", GFX_PROBE);
+    assert!(
+        source.contains(
+            "fn main() {\n    vilan_rt_gfx::host::install();\n    vilan_rt_poll::install();\n    vilan_rt_signal::install();\n    vilan_rt::main_guard(|| vilan_rt_gfx::host::block_on(vilan_async_main()));\n}"
+        ),
+        "`main` does not hand an async program to the host:\n{source}"
+    );
+    assert!(
+        !source.contains("vilan_rt::executor::block_on("),
+        "{source}"
+    );
+    for call in [
+        "vilan_rt_gfx::host::open(",
+        "vilan_rt_gfx::host::on_frame(",
+        "vilan_rt_gfx::host::rectangle(",
+        "vilan_rt_gfx::host::text_layout(",
+    ] {
+        assert!(source.contains(call), "no {call}:\n{source}");
+    }
+
+    let synchronous = emit("native_probe_gfx_sync.vl", GFX_SYNC_PROBE);
+    assert!(
+        synchronous.contains("fn main() {\n    vilan_rt_gfx::host::install();\n")
+            && synchronous.contains("    vilan_rt_gfx::host::run_pending();\n")
+            && !synchronous.contains("vilan_rt::executor::run_pending();"),
+        "a synchronous `main` does not end in the host's loop:\n{synchronous}"
+    );
+
+    let plain = emit("native_probe_no_gfx.vl", "fun main() {\n\tprint(1);\n}\n");
+    assert!(
+        !plain.contains("vilan_rt_gfx"),
+        "a program with no GPU window reached the host:\n{plain}"
+    );
+}
+
+/// native-ui.md P1 (R11): the generated manifest names `vilan-rt-gfx` beside
+/// the runtime only for a program that reaches `std::gfx` — the crate is not
+/// in the compiler's workspace, and a program without a GPU window must not
+/// compile a GPU stack.
+#[test]
+fn gfx_p1_only_a_gfx_program_names_the_gfx_crate() {
+    let runtime = "/cache/vilan-rt";
+    let drawn = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            gfx: true,
+            poll: true,
+            signal: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        // Separator-neutral: the manifest joins the cache path with the
+        // platform's separator.
+        drawn.contains("vilan-rt-gfx = { path = \"/cache"),
+        "{drawn}"
+    );
+    let plain = vilan_rust::cargo_manifest(
+        "app",
+        runtime,
+        vilan_rust::OptionalCrates {
+            poll: true,
+            window: true,
+            ..Default::default()
+        },
+    );
+    assert!(!plain.contains("vilan-rt-gfx"), "{plain}");
+}
+
+/// native-ui.md P1: a program that reaches BOTH `std::window` and `std::gfx`
+/// is refused by name — each wants the main thread for its own window
+/// system's loop — and so is a `main` answering an exit code, under which no
+/// window loop would ever run.
+#[test]
+fn gfx_p1_two_kinds_of_window_and_an_exiting_main_are_refused_by_name() {
+    let staged = stage();
+    let refusal = |program: &str, source: &str| {
+        std::fs::write(staged.join(program), source).expect("write the probe program");
+        let emitted = vilan(&staged)
+            .args(["build", "--backend", "rust", "--stdout", program])
+            .output()
+            .expect("emit the probe");
+        assert!(!emitted.status.success(), "{program} was not refused");
+        String::from_utf8_lossy(&emitted.stderr).into_owned()
+    };
+    let both = refusal("native_probe_both_windows.vl", BOTH_WINDOWS_PROBE);
+    assert!(
+        both.contains("this program reaches both `std::window` and `std::gfx`"),
+        "{both}"
+    );
+    let exiting = refusal("native_probe_gfx_exit.vl", GFX_EXIT_CODE_PROBE);
+    assert!(
+        exiting.contains("this program reaches `std::gfx`, and its `main` answers an exit code"),
+        "{exiting}"
+    );
+}
+
+/// A `match` on a `str` whose last leg BINDS the subject (`let other =>`)
+/// built the `&str` the subject is matched as into a value that must be a
+/// `str` — rustc refused the emitted Rust (met by `std::gfx`'s key names).
+/// Both backends print the bound text.
+#[test]
+fn a_str_match_that_binds_its_subject_reads_a_str_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_str_binding.vl"),
+        STR_BINDING_PROBE,
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_str_binding.vl"),
+        Verdict::Identical,
+        "a binding leg of a str match must read the same text on both backends"
+    );
+}
+
+const GFX_PROBE: &str = concat!(
+    "import std::gfx::{ Color, Frame, Point, Rect, Rectangle, TextLayout, TextStyle, Window, dp };\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet label = TextLayout::new(\"hi\", TextStyle::new());\n",
+    "\tmatch Window::builder().title(\"t\").size(dp(200), dp(100)).open() {\n",
+    "\t\tOk(let window) => window.on_frame(|frame: Frame| {\n",
+    "\t\t\tframe.rectangle(Rectangle::new(Rect::new(dp(0), dp(0), dp(10), dp(10)), Color::white()));\n",
+    "\t\t\tframe.text(label, Point::new(dp(0), dp(0)), Color::black());\n",
+    "\t\t}),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// native-ui.md P2: a program that only lays a `std::ui` tree out — no
+/// window — reaches the GPU crate's host as a `std::gfx` program does: the
+/// `__ui_*` helpers are calls into `vilan_rt_gfx::host::ui`, an element is the
+/// host's `Node` (taken by reference where a helper only reads it), and the
+/// synchronous `main` ends in the host's loop. Emitted with `--stdout`, so it
+/// runs wherever the suite does (the build, the boxes and the pictures are
+/// `ui_screen.rs`'s).
+#[test]
+fn ui_p2_a_ui_program_lowers_onto_the_gfx_hosts_element_tree() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_ui.vl"), UI_PROBE).expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_ui.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    assert!(
+        emitted.status.success(),
+        "the std::ui probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    assert!(
+        source.contains("fn main() {\n    vilan_rt_gfx::host::install();\n")
+            && source.contains("    vilan_rt_gfx::host::run_pending();\n"),
+        "a std::ui program does not end in the GPU host's loop:\n{source}"
+    );
+    for call in [
+        "vilan_rt_gfx::host::ui::node(",
+        "vilan_rt_gfx::host::ui::set(&",
+        "vilan_rt_gfx::host::ui::append_text(&",
+        "vilan_rt_gfx::host::ui::add_child(&",
+        "vilan_rt_gfx::host::ui::layout(&",
+        "vilan_rt_gfx::host::ui::node_number(&",
+        "vilan_rt_gfx::host::ui::Node",
+    ] {
+        assert!(source.contains(call), "no {call}:\n{source}");
+    }
+}
+
+const UI_PROBE: &str = concat!(
+    "import std::gfx::{ Size, dp };\n",
+    "import std::io::print;\n",
+    "import std::ui::{ column, layout, text };\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet root = column().gap(dp(4)).child(text().child(\"hi\")).child(\"there\");\n",
+    "\tlayout(root, Size::new(dp(100), dp(50)), 1.0);\n",
+    "\tprint(root.element().bounds().width.value());\n",
+    "}\n",
+);
+
+/// native-ui.md P3: an interactive `std::ui` program — a style condition, an
+/// event attribute, a signal-bound text, a scroll, a mounted window — lowers
+/// onto the host's style layers, its handler table (a `|| void` callback per
+/// event, crossing as an `Rc<dyn Fn()>`), its text runs, its scroll and its
+/// mount. Emitted with `--stdout`, as P2's probe is (the run is
+/// `ui_interaction.rs`'s).
+#[test]
+fn ui_p3_an_interactive_ui_program_lowers_onto_the_hosts_layers_handlers_and_mount() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_ui_p3.vl"), UI_P3_PROBE)
+        .expect("write the probe program");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_ui_p3.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    assert!(
+        emitted.status.success(),
+        "the std::ui P3 probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    for call in [
+        "vilan_rt_gfx::host::ui::style_group(&",
+        "vilan_rt_gfx::host::ui::style_layer(&",
+        "vilan_rt_gfx::host::ui::style_color(&",
+        "vilan_rt_gfx::host::ui::style_end(&",
+        "vilan_rt_gfx::host::ui::on(&",
+        "vilan_rt_gfx::host::ui::append_text(&",
+        "vilan_rt_gfx::host::ui::set_run(&",
+        "vilan_rt_gfx::host::ui::set_offset(&",
+        "vilan_rt_gfx::host::ui::on_offset(&",
+        "vilan_rt_gfx::host::ui::set_focusable(&",
+        "vilan_rt_gfx::host::ui::mount(",
+        "vilan_rt_gfx::host::event_current(",
+    ] {
+        assert!(source.contains(call), "no {call}:\n{source}");
+    }
+}
+
+const UI_P3_PROBE: &str = concat!(
+    "import std::gfx::{ Color, Point, Scroll, Window, dp };\n",
+    "import std::io::print;\n",
+    "import std::reactive::{ Signal, SignalCell };\n",
+    "import std::ui::{ Style, column, hovered, mount, row, scroll, style, text };\n",
+    "\n",
+    "fun main() {\n",
+    "\tmatch Window::builder().title(\"probe\").open() {\n",
+    "\t\tOk(let window) => {\n",
+    "\t\t\tlet count: SignalCell<i32> = Signal::new(0);\n",
+    "\t\t\tlet offset: SignalCell<Point> = Signal::new(Point::new(dp(0), dp(0)));\n",
+    "\t\t\tlet look = style().when(hovered(), |look: Style| look.background(Color::white()));\n",
+    "\t\t\tmount(window, <column>\n",
+    "\t\t\t\t<text>{count.derive(|value: i32| i\"{value}\")}</text>\n",
+    "\t\t\t\t<row style(look) focusable on_click(|| count.set(count.get() + 1))>\"Add\"</row>\n",
+    "\t\t\t\t<scroll offset(offset) on_scroll(|wheel: Scroll| print(wheel.y.value()))><column /></scroll>\n",
+    "\t\t\t</column>);\n",
+    "\t\t},\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
+/// gfx-path.md S2: `Path` and `PathBuilder` lower to the GPU crate's host
+/// values, recognized by the externs that read them (as `TextLayout` and
+/// `Texture` are), and parsing, building, reading and drawing a path to one
+/// host call each. Emitted with `--stdout`: no cargo build (the built and
+/// drawn path is `gfx_window.rs`'s).
+#[test]
+fn gfx_path_paths_lower_to_the_hosts_values_and_calls() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_path.vl"), GFX_PATH_PROBE).expect("write the probe");
+    let emitted = vilan(&staged)
+        .args([
+            "build",
+            "--backend",
+            "rust",
+            "--stdout",
+            "native_probe_path.vl",
+        ])
+        .output()
+        .expect("emit the probe");
+    let source = String::from_utf8_lossy(&emitted.stdout);
+    assert!(
+        emitted.status.success(),
+        "the path probe was refused:\n{}",
+        String::from_utf8_lossy(&emitted.stderr)
+    );
+    for expected in [
+        "vilan_rt_gfx::Path",
+        "vilan_rt_gfx::host::PathBuilder",
+        "vilan_rt_gfx::host::path_parse(",
+        "vilan_rt_gfx::host::path_builder(",
+        "vilan_rt_gfx::host::path_segment(",
+        "vilan_rt_gfx::host::path_finish(",
+        "vilan_rt_gfx::host::path_number(",
+        "vilan_rt_gfx::host::path(",
+        "vilan_rt_gfx::host::install();",
+    ] {
+        assert!(source.contains(expected), "no {expected}:\n{source}");
+    }
+}
+
+const GFX_PATH_PROBE: &str = concat!(
+    "import std::gfx::{ Color, FillRule, Frame, Offscreen, Path, PathPaint, Point, Stroke, dp };\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tlet built = Path::builder().move_to(0.0, 0.0).line_to(4.0, 4.0).close().finish();\n",
+    "\tmatch Path::from_svg(\"M20 6 9 17l-5-5\") {\n",
+    "\t\tOk(let check) => {\n",
+    "\t\t\tprint(check.bounds().width.value());\n",
+    "\t\t\tlet drawn = Offscreen::new(dp(32), dp(32)).render(|frame: Frame| {\n",
+    "\t\t\t\tframe.path(check, Point::new(dp(0), dp(0)), 1.0, PathPaint::Stroke(Stroke::new(2.0)), Color::black());\n",
+    "\t\t\t\tframe.path(built, Point::new(dp(0), dp(0)), 2.0, PathPaint::Fill(FillRule::EvenOdd), Color::black());\n",
+    "\t\t\t});\n",
+    "\t\t\tprint(drawn.is_ok());\n",
+    "\t\t},\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
+const GFX_SYNC_PROBE: &str = concat!(
+    "import std::gfx::{ TextLayout, TextStyle };\n",
+    "import std::io::print;\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(TextLayout::new(\"hi\", TextStyle::new()).line_count());\n",
+    "}\n",
+);
+
+const BOTH_WINDOWS_PROBE: &str = concat!(
+    "import std::gfx::{ Window, dp };\n",
+    "import std::io::print;\n",
+    "import std::window;\n",
+    "\n",
+    "fun main() {\n",
+    "\tmatch window::Window::builder(\"about:blank\").open() {\n",
+    "\t\tOk(let page) => page.close(),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "\tmatch Window::builder().size(dp(10), dp(10)).open() {\n",
+    "\t\tOk(let window) => window.close(),\n",
+    "\t\tErr(let reason) => print(reason),\n",
+    "\t}\n",
+    "}\n",
+);
+
+const GFX_EXIT_CODE_PROBE: &str = concat!(
+    "import std::gfx::{ TextLayout, TextStyle };\n",
+    "\n",
+    "fun main(): i32 {\n",
+    "\tTextLayout::new(\"hi\", TextStyle::new()).line_count().as_i32()\n",
+    "}\n",
+);
+
+const STR_BINDING_PROBE: &str = concat!(
+    "import std::io::print;\n",
+    "\n",
+    "enum Named {\n",
+    "\tEnter,\n",
+    "\tOther(str),\n",
+    "}\n",
+    "\n",
+    "fun named(name: str): Named {\n",
+    "\tmatch name {\n",
+    "\t\t\"Enter\" => Named::Enter,\n",
+    "\t\tlet other => Named::Other(other),\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tfor name in [\"Enter\", \"CapsLock\"] {\n",
+    "\t\tmatch named(name) {\n",
+    "\t\t\tNamed::Enter => print(\"enter\"),\n",
+    "\t\t\tNamed::Other(let text) => print(i\"other {text} {text.len()}\"),\n",
+    "\t\t}\n",
+    "\t}\n",
+    "}\n",
+);
+
+// ---------------------------------------------------------------------------
+// B743: a closure that awaits, at every position a closure value reaches.
+// ---------------------------------------------------------------------------
+
+/// B743: one program on both backends, asserting node's lines on each. A
+/// closure whose body awaits is a future-answering one natively wherever the
+/// JS backend AWAITS a call through it (J2's channels: a binding declared or
+/// adopted async, an `async |T| U` parameter or field, an adapted parameter),
+/// and floats — runs to its first suspension, the rest later — wherever a call
+/// through it is not awaited. The lines each body prints before and after its
+/// suspension are the order a wrong choice changes.
+fn assert_async_closure_probe(file: &str, source: &str, expected: &str) {
+    let staged = stage();
+    std::fs::write(staged.join(file), source).expect("write the probe program");
+    assert_eq!(
+        both_stdouts(&staged, file),
+        (expected.to_string(), expected.to_string()),
+        "{file}: a closure that awaits must run in node's order on both backends"
+    );
+}
+
+/// (a) The bug as filed: a local `void` closure whose body awaits, called
+/// through its binding. The analyzer adopts the binding as async (J2), so the
+/// call awaits on both backends and the closure's body finishes before the
+/// next line.
+#[test]
+fn b743_a_local_closure_that_awaits_is_awaited_where_it_is_called() {
+    assert_async_closure_probe(
+        "native_probe_b743_local_void.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"first\");\n",
+            "\tprint(\"after first\");\n",
+            "\tboard(\"second\");\n",
+            "\tprint(\"after second\");\n",
+            "}\n",
+        ),
+        concat!(
+            "first start\n",
+            "first end\n",
+            "after first\n",
+            "second start\n",
+            "second end\n",
+            "after second\n",
+        ),
+    );
+}
+
+/// (a) The same with a VALUE: an `i32` and a `str` read in an interpolation
+/// (the `str` one is `held_text`'s shape in the ui examples, whose future
+/// output has to be written, or a borrowing reader settles it as the unsized
+/// `str`).
+#[test]
+fn b743_a_local_closure_that_awaits_answers_its_value_at_the_call() {
+    assert_async_closure_probe(
+        "native_probe_b743_local_value.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet add = |x: i32| {\n",
+            "\t\tprint(i\"add {x}\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tx + 1\n",
+            "\t};\n",
+            "\tprint(i\"got {add(1)}\");\n",
+            "\tlet quoted = || {\n",
+            "\t\tsleep(1);\n",
+            "\t\t\"held\"\n",
+            "\t};\n",
+            "\tprint(i\"[{quoted()}] {quoted().len()}\");\n",
+            "\tprint(\"after\");\n",
+            "}\n",
+        ),
+        concat!("add 1\n", "got 2\n", "[held] 4\n", "after\n",),
+    );
+}
+
+/// (a) A binding DECLARED `async |str| void` and initialized with a literal.
+#[test]
+fn b743_a_binding_declared_async_holds_a_future_answering_closure() {
+    assert_async_closure_probe(
+        "native_probe_b743_declared_async.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board: async |str| void = |what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"first\");\n",
+            "\tprint(\"after first\");\n",
+            "}\n",
+        ),
+        concat!("first start\n", "first end\n", "after first\n",),
+    );
+}
+
+/// (a) A local closure that calls another awaiting local closure is adopted
+/// too, and so is awaited where it is called.
+#[test]
+fn b743_a_closure_calling_an_awaiting_closure_awaits_it_in_turn() {
+    assert_async_closure_probe(
+        "native_probe_b743_nested_local.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tlet outer = || {\n",
+            "\t\tboard(\"inner\");\n",
+            "\t\tprint(\"outer done\");\n",
+            "\t};\n",
+            "\touter();\n",
+            "\tprint(\"after outer\");\n",
+            "}\n",
+        ),
+        concat!(
+            "inner start\n",
+            "inner end\n",
+            "outer done\n",
+            "after outer\n",
+        ),
+    );
+}
+
+/// (b) An awaiting binding answering a value, called directly and then handed
+/// to a plain `|i32| i32` parameter, which the callee's adapted instance
+/// awaits (F22).
+#[test]
+fn b743_an_awaiting_binding_answering_a_value_reaches_an_adapted_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_adapted_parameter.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun apply(f: |i32| i32): i32 {\n",
+            "\tf(1) + f(2)\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet slow = |x: i32| {\n",
+            "\t\tprint(i\"x {x}\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tx * 10\n",
+            "\t};\n",
+            "\tprint(i\"direct {slow(5)}\");\n",
+            "\tlet total = apply(slow);\n",
+            "\tprint(i\"sum {total}\");\n",
+            "}\n",
+        ),
+        concat!("x 5\n", "direct 50\n", "x 1\n", "x 2\n", "sum 30\n",),
+    );
+}
+
+/// (b) An awaiting binding called directly (awaited) and then handed to a
+/// `|str| void` parameter, whose calls do not await it on either backend:
+/// each call runs the body to its first suspension and the rest floats.
+#[test]
+fn b743_an_awaiting_binding_floats_at_a_synchronous_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_sync_parameter.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun twice(f: |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tprint(\"between\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"direct\");\n",
+            "\tprint(\"after direct\");\n",
+            "\ttwice(board);\n",
+            "\tprint(\"after twice\");\n",
+            "}\n",
+        ),
+        concat!(
+            "direct start\n",
+            "direct end\n",
+            "after direct\n",
+            "a start\n",
+            "between\n",
+            "b start\n",
+            "twice done\n",
+            "after twice\n",
+            "a end\n",
+            "b end\n",
+        ),
+    );
+}
+
+/// (b) An awaiting binding handed to an `async |str| void` parameter: every
+/// call through it awaits.
+#[test]
+fn b743_an_awaiting_binding_is_awaited_through_an_async_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_async_parameter.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun twice(f: async |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tprint(\"between\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\ttwice(board);\n",
+            "\tprint(\"after twice\");\n",
+            "}\n",
+        ),
+        concat!(
+            "a start\n",
+            "a end\n",
+            "between\n",
+            "b start\n",
+            "b end\n",
+            "twice done\n",
+            "after twice\n",
+        ),
+    );
+}
+
+/// (b) The mirror: a SYNCHRONOUS closure binding handed to an `async |str|
+/// void` parameter answers a ready future natively, the body running at the
+/// call.
+#[test]
+fn b743_a_synchronous_binding_is_lifted_at_an_async_parameter() {
+    assert_async_closure_probe(
+        "native_probe_b743_lifted.vl",
+        concat!(
+            "fun twice(f: async |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet plain = |what: str| print(i\"{what} plain\");\n",
+            "\ttwice(plain);\n",
+            "\tprint(\"after twice\");\n",
+            "}\n",
+        ),
+        concat!("a plain\n", "b plain\n", "twice done\n", "after twice\n",),
+    );
+}
+
+/// (c) An awaiting binding called directly and then stored in a `|str| void`
+/// field: a call through the field floats.
+#[test]
+fn b743_an_awaiting_binding_floats_in_a_synchronous_field() {
+    assert_async_closure_probe(
+        "native_probe_b743_sync_field.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "struct Holder {\n",
+            "\trun: |str| void,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"direct\");\n",
+            "\tprint(\"after direct\");\n",
+            "\tlet holder = Holder { run = board };\n",
+            "\t(holder.run)(\"field\");\n",
+            "\tprint(\"after field\");\n",
+            "}\n",
+        ),
+        concat!(
+            "direct start\n",
+            "direct end\n",
+            "after direct\n",
+            "field start\n",
+            "after field\n",
+            "field end\n",
+        ),
+    );
+}
+
+/// (c) The same through an ASSIGNMENT to the field.
+#[test]
+fn b743_an_awaiting_binding_assigned_to_a_synchronous_field_floats() {
+    assert_async_closure_probe(
+        "native_probe_b743_assigned_field.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "struct Holder {\n",
+            "\trun: |str| void,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut holder = Holder { run = |what| print(i\"{what} plain\") };\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tholder.run = board;\n",
+            "\t(holder.run)(\"field\");\n",
+            "\tprint(\"after field\");\n",
+            "}\n",
+        ),
+        concat!("field start\n", "after field\n", "field end\n",),
+    );
+}
+
+/// (c) An awaiting binding stored in an unannotated list, pushed on a
+/// `List<|str| void>` and wrapped in `Some`: no call through any of them
+/// awaits, on either backend.
+#[test]
+fn b743_an_awaiting_binding_floats_in_a_list_and_an_option() {
+    assert_async_closure_probe(
+        "native_probe_b743_containers.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"direct\");\n",
+            "\tlet listed = [board];\n",
+            "\tfor handler in listed {\n",
+            "\t\thandler(\"listed\");\n",
+            "\t}\n",
+            "\tprint(\"after listed\");\n",
+            "\tmut typed: List<|str| void> = [];\n",
+            "\ttyped.push(board);\n",
+            "\ttyped[0](\"typed\");\n",
+            "\tprint(\"after typed\");\n",
+            "\tlet maybe = Some(board);\n",
+            "\tmatch maybe {\n",
+            "\t\tSome(let found) => found(\"maybe\"),\n",
+            "\t\tNone => {},\n",
+            "\t}\n",
+            "\tprint(\"after maybe\");\n",
+            "}\n",
+        ),
+        concat!(
+            "direct start\n",
+            "direct end\n",
+            "listed start\n",
+            "after listed\n",
+            "typed start\n",
+            "after typed\n",
+            "maybe start\n",
+            "after maybe\n",
+            "listed end\n",
+            "typed end\n",
+            "maybe end\n",
+        ),
+    );
+}
+
+/// (e) An awaiting binding called inside a function and then returned as its
+/// `|str| void`: the caller's call floats.
+#[test]
+fn b743_an_awaiting_binding_floats_through_a_synchronous_return() {
+    assert_async_closure_probe(
+        "native_probe_b743_sync_return.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun make(): |str| void {\n",
+            "\tlet board = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tboard(\"inside\");\n",
+            "\tboard\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet made = make();\n",
+            "\tmade(\"made\");\n",
+            "\tprint(\"after made\");\n",
+            "}\n",
+        ),
+        concat!(
+            "inside start\n",
+            "inside end\n",
+            "made start\n",
+            "after made\n",
+            "made end\n",
+        ),
+    );
+}
+
+/// (a) A `mut` binding that starts synchronous and is REASSIGNED an awaiting
+/// closure: adopted, so both of its values answer a future and both calls
+/// await.
+#[test]
+fn b743_a_reassigned_binding_holds_a_future_answering_closure() {
+    assert_async_closure_probe(
+        "native_probe_b743_reassigned.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut step = |what: str| print(i\"{what} plain\");\n",
+            "\tstep(\"one\");\n",
+            "\tstep = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tstep(\"two\");\n",
+            "\tprint(\"after two\");\n",
+            "}\n",
+        ),
+        concat!("one plain\n", "two start\n", "two end\n", "after two\n",),
+    );
+}
+
+/// (a) A MODULE-level binding holding an awaiting closure.
+#[test]
+fn b743_a_module_binding_that_awaits_is_awaited_where_it_is_called() {
+    assert_async_closure_probe(
+        "native_probe_b743_module_binding.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "let board = |what: str| {\n",
+            "\tprint(i\"{what} start\");\n",
+            "\tsleep(1);\n",
+            "\tprint(i\"{what} end\");\n",
+            "};\n",
+            "\n",
+            "fun main() {\n",
+            "\tboard(\"module\");\n",
+            "\tprint(\"after module\");\n",
+            "}\n",
+        ),
+        concat!("module start\n", "module end\n", "after module\n",),
+    );
+}
+
+/// (a) A `mut` MODULE-level binding reassigned an awaiting closure.
+#[test]
+fn b743_a_reassigned_module_binding_holds_a_future_answering_closure() {
+    assert_async_closure_probe(
+        "native_probe_b743_module_reassigned.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "mut step = |what: str| print(i\"{what} plain\");\n",
+            "\n",
+            "fun main() {\n",
+            "\tstep(\"one\");\n",
+            "\tstep = |what: str| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t};\n",
+            "\tstep(\"two\");\n",
+            "\tprint(\"after two\");\n",
+            "}\n",
+        ),
+        concat!("one plain\n", "two start\n", "two end\n", "after two\n",),
+    );
+}
+
+/// The second symptom: a trait default is emitted once per receiver type,
+/// from whichever body reaches it first, and it took that body's instance
+/// record — so a default first reached inside an awaiting body was emitted
+/// `async` and its synchronous call sites did not await it (`[object
+/// Promise]` on node, a refused build natively). It is the ui-todo `when(..,
+/// || text_input(..).width(..).padding(..))` refusal.
+#[test]
+fn b743_a_trait_default_first_reached_from_an_async_body_stays_synchronous() {
+    assert_async_closure_probe(
+        "native_probe_b743_trait_default.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "trait Sized2 {\n",
+            "\tfun base(self): i32;\n",
+            "\n",
+            "\tfun doubled(self): i32 {\n",
+            "\t\tself.base() * 2\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "struct Box2 {\n",
+            "\tvalue: i32,\n",
+            "}\n",
+            "\n",
+            "impl Box2 with Sized2 {\n",
+            "\tfun base(self): i32 {\n",
+            "\t\tself.value\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun apply(f: || i32): i32 {\n",
+            "\tf() + 1\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tlet slow = apply(|| {\n",
+            "\t\tsleep(1);\n",
+            "\t\tBox2 { value = 3 }.doubled()\n",
+            "\t});\n",
+            "\tprint(i\"slow {slow}\");\n",
+            "\tlet four = Box2 { value = 4 };\n",
+            "\tprint(i\"direct {four.doubled()}\");\n",
+            "}\n",
+        ),
+        concat!("slow 7\n", "direct 8\n",),
+    );
+}
+
+/// (b), (c), (e) for LITERALS, which already agreed before B743 and must keep
+/// doing so: a literal at a `|str| void` parameter, in a `|str| void` field
+/// and returned as one.
+#[test]
+fn b743_closures_that_await_at_synchronous_positions_still_float() {
+    assert_async_closure_probe(
+        "native_probe_b743_literals_float.vl",
+        concat!(
+            "import std::time::sleep;\n",
+            "\n",
+            "struct Holder {\n",
+            "\trun: |str| void,\n",
+            "}\n",
+            "\n",
+            "fun twice(f: |str| void) {\n",
+            "\tf(\"a\");\n",
+            "\tf(\"b\");\n",
+            "\tprint(\"twice done\");\n",
+            "}\n",
+            "\n",
+            "fun make(): |str| void {\n",
+            "\t|what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t}\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\ttwice(|what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t});\n",
+            "\tprint(\"after twice\");\n",
+            "\tlet holder = Holder { run = |what| {\n",
+            "\t\tprint(i\"{what} start\");\n",
+            "\t\tsleep(1);\n",
+            "\t\tprint(i\"{what} end\");\n",
+            "\t} };\n",
+            "\t(holder.run)(\"field\");\n",
+            "\tprint(\"after field\");\n",
+            "\tlet made = make();\n",
+            "\tmade(\"made\");\n",
+            "\tprint(\"after made\");\n",
+            "}\n",
+        ),
+        concat!(
+            "a start\n",
+            "b start\n",
+            "twice done\n",
+            "after twice\n",
+            "field start\n",
+            "after field\n",
+            "made start\n",
+            "after made\n",
+            "a end\n",
+            "b end\n",
+            "field end\n",
+            "made end\n",
+        ),
     );
 }

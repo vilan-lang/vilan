@@ -149,6 +149,12 @@ pub struct Func<'src> {
     // through a trait bound, never on a concrete type's own surface
     // (`proposal/transport-rpc.md` §3.2).
     pub trait_only: bool,
+    // Declared `[element]` (native-ui.md §12): an element CONSTRUCTOR. A tag
+    // whose name resolves to this function lowers to a typed method chain on
+    // what it returns (`<row gap(x)>` is `row().gap(x)`) instead of to the
+    // web `view("row")` chain. The parser holds it to a free, bodied function
+    // with no parameters.
+    pub element: bool,
     pub generic_parameters: Option<GenericParameters<'src>>,
     pub parameters: Spanned<Vec<Parameter<'src>>>,
     pub return_type: Option<Box<Spanned<Node<'src>>>>,

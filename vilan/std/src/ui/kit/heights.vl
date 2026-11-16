@@ -1,0 +1,282 @@
+// The row heights behind `kit::virtual_list`'s ESTIMATED form (`lists.vl`): a
+// height per row where it was measured and an estimate elsewhere, and the two
+// questions the list asks of them — where row `i` starts, and which row an offset
+// falls in — each in O(log n).
+//
+// THE ESTIMATE of a row not yet measured is the mean of the rows measured so far,
+// and the app's estimate until one is: a list whose rows are all shorter (or all
+// taller) than the app guessed builds the right number of rows after the first
+// few are measured, instead of approaching it by a fraction per layout pass. So a
+// row's start is
+//
+//     top(i) = (i - measured rows above i) * estimate + (their heights' sum)
+//
+// and the structure keeps the two sums the formula needs as two Fenwick trees over
+// the rows (a count of measured rows and a sum of their heights); a change of the
+// estimate is then one division, not a pass over the rows.
+//
+// THE OPERATIONS: measuring one row (or measuring it again) is O(log n); an insert,
+// a removal or a move rebuilds the trees from the first index it changed to the
+// end, O(n - at + log n) — the list's own copy of the items moves the same way. A
+// reset rebuilds them whole.
+
+/// Every row's height in dp, as far as it is known. See the module comment.
+export(in pkg) struct RowHeights {
+	/// Each row's measured height, or -1 while it has not been measured.
+	heights: List<f64>,
+	/// The two trees, 1-based (slot 0 is unused): for node `j`, the rows
+	/// `j - lowest_bit(j) .. j` — how many of them are measured, and the sum of
+	/// their measured heights.
+	counted: List<f64>,
+	summed: List<f64>,
+	/// The app's estimate, used until a row is measured.
+	given: f64,
+	/// How many rows are measured, and their heights' sum.
+	measured_rows: f64,
+	measured_sum: f64,
+}
+
+/// `count` rows, none measured, each estimated at `given` dp.
+export(in pkg) fun row_heights(count: usize, given: f64): RowHeights {
+	mut heights: List<f64> = [];
+	mut counted: List<f64> = [0.0];
+	mut summed: List<f64> = [0.0];
+	mut index: usize = 0;
+	for index < count {
+		heights.push(-1.0);
+		counted.push(0.0);
+		summed.push(0.0);
+		index += 1;
+	}
+	RowHeights { heights, counted, summed, given, measured_rows = 0.0, measured_sum = 0.0 }
+}
+
+/// The lowest set bit of a Fenwick index: the length of the node's range.
+fun lowest_bit(index: usize): usize {
+	index - (index & (index - 1))
+}
+
+export(in pkg) impl RowHeights {
+	fun len(&self): usize {
+		self.heights.len()
+	}
+
+	/// A row's height when it is not measured: the measured rows' mean, or the
+	/// app's estimate while none is.
+	fun estimate(&self): f64 {
+		if self.measured_rows > 0.0 {
+			self.measured_sum / self.measured_rows
+		} else {
+			self.given
+		}
+	}
+
+	/// Whether row `index` has been measured.
+	fun known(&self, index: usize): bool {
+		self.heights[index] >= 0.0
+	}
+
+	/// Row `index`'s height: measured, or the estimate.
+	fun height(&self, index: usize): f64 {
+		let height = self.heights[index];
+		if height >= 0.0 {
+			height
+		} else {
+			self.estimate()
+		}
+	}
+
+	/// Where row `index` starts: the heights of the rows above it. `index` may be
+	/// the count, which answers the whole list's height.
+	fun top(&self, index: usize): f64 {
+		mut rows = 0.0;
+		mut sum = 0.0;
+		mut node = index;
+		for node > 0 {
+			rows += self.counted[node];
+			sum += self.summed[node];
+			node -= lowest_bit(node);
+		}
+		(index.as_f64() - rows) * self.estimate() + sum
+	}
+
+	/// The whole list's height.
+	fun total(&self): f64 {
+		self.top(self.heights.len())
+	}
+
+	/// The largest `index` in `0 ..= len` whose `top(index)` is below `offset`
+	/// (or at it, when `strict` is false): one descent of both trees at once,
+	/// since `top` grows with the index.
+	fun search(&self, offset: f64, strict: bool): usize {
+		let count = self.heights.len();
+		let estimate = self.estimate();
+		mut step: usize = 1;
+		for step * 2 <= count {
+			step = step * 2;
+		}
+		mut at: usize = 0;
+		mut rows = 0.0;
+		mut sum = 0.0;
+		for step > 0 {
+			let next = at + step;
+			if next <= count {
+				let next_rows = rows + self.counted[next];
+				let next_sum = sum + self.summed[next];
+				let top = (next.as_f64() - next_rows) * estimate + next_sum;
+				if top < offset || (!strict && top == offset) {
+					at = next;
+					rows = next_rows;
+					sum = next_sum;
+				}
+			}
+			step = step / 2;
+		}
+		at
+	}
+
+	/// The row `offset` falls in: the last row that starts at or above it (the
+	/// first row for an offset above the list, the last for one below it; 0 for an
+	/// empty list).
+	fun index_at(&self, offset: f64): usize {
+		let count = self.heights.len();
+		if count == 0 {
+			ret 0;
+		}
+		let found = self.search(offset, false);
+		if found >= count {
+			count - 1
+		} else {
+			found
+		}
+	}
+
+	/// How many rows start above `offset`.
+	fun rows_above(&self, offset: f64): usize {
+		if offset <= 0.0 {
+			ret 0;
+		}
+		let count = self.heights.len();
+		let found = self.search(offset, true) + 1;
+		if found > count {
+			count
+		} else {
+			found
+		}
+	}
+
+	/// Row `index` measured at `height` dp.
+	fun set(&mut self, index: usize, height: f64) {
+		let was = self.heights[index];
+		let rows = if was >= 0.0 { 0.0 } else { 1.0 };
+		let sum = if was >= 0.0 { height - was } else { height };
+		self.heights[index] = height;
+		self.measured_rows += rows;
+		self.measured_sum += sum;
+		let count = self.heights.len();
+		mut node = index + 1;
+		for node <= count {
+			self.counted[node] += rows;
+			self.summed[node] += sum;
+			node += lowest_bit(node);
+		}
+	}
+
+	/// `removed` rows taken out at `at`, and rows of `inserted` heights (-1 for one
+	/// not measured) put there.
+	fun splice(&mut self, at: usize, removed: usize, inserted: List<f64>) {
+		mut taken: usize = 0;
+		for taken < removed {
+			let gone = self.heights.remove(at);
+			if gone >= 0.0 {
+				self.measured_rows -= 1.0;
+				self.measured_sum -= gone;
+			}
+			taken += 1;
+		}
+		mut offset: usize = 0;
+		for height in inserted {
+			self.heights.insert(at + offset, height);
+			if height >= 0.0 {
+				self.measured_rows += 1.0;
+				self.measured_sum += height;
+			}
+			offset += 1;
+		}
+		self.rebuild_from(at);
+	}
+
+	/// `count` rows at `from` taken out and put back at `to` (an index in the list
+	/// without them), as `SeqOp::Move` moves its items.
+	fun move_rows(&mut self, from: usize, count: usize, to: usize) {
+		mut lifted: List<f64> = [];
+		mut taken: usize = 0;
+		for taken < count {
+			lifted.push(self.heights.remove(from));
+			taken += 1;
+		}
+		mut offset: usize = 0;
+		for height in lifted {
+			self.heights.insert(to + offset, height);
+			offset += 1;
+		}
+		self.rebuild_from(if from < to { from } else { to });
+	}
+
+	/// Every row replaced: `heights` (-1 for a row not measured).
+	fun reset(&mut self, heights: List<f64>) {
+		self.measured_rows = 0.0;
+		self.measured_sum = 0.0;
+		for height in heights {
+			if height >= 0.0 {
+				self.measured_rows += 1.0;
+				self.measured_sum += height;
+			}
+		}
+		self.heights = heights;
+		self.rebuild_from(0);
+	}
+
+	/// The trees again after the rows from `at` on changed (and the count may
+	/// have): nodes `1 ..= at` cover only rows above `at` and keep their sums;
+	/// every later node is its own row, plus what its children push into it.
+	/// The children at or before `at` whose parent is later are exactly the
+	/// nodes a prefix sum to `at` visits, so they push first, then every later
+	/// node in order, each complete by its turn.
+	fun rebuild_from(&mut self, at: usize) {
+		let count = self.heights.len();
+		for self.counted.len() > count + 1 {
+			let _dropped = self.counted.pop();
+			let _summed = self.summed.pop();
+		}
+		for self.counted.len() < count + 1 {
+			self.counted.push(0.0);
+			self.summed.push(0.0);
+		}
+		mut node = at + 1;
+		for node <= count {
+			let height = self.heights[node - 1];
+			self.counted[node] = if height >= 0.0 { 1.0 } else { 0.0 };
+			self.summed[node] = if height >= 0.0 { height } else { 0.0 };
+			node += 1;
+		}
+		mut below = at;
+		for below > 0 {
+			let parent = below + lowest_bit(below);
+			if parent <= count {
+				self.counted[parent] += self.counted[below];
+				self.summed[parent] += self.summed[below];
+			}
+			below -= lowest_bit(below);
+		}
+		node = at + 1;
+		for node <= count {
+			let parent = node + lowest_bit(node);
+			if parent <= count {
+				self.counted[parent] += self.counted[node];
+				self.summed[parent] += self.summed[node];
+			}
+			node += 1;
+		}
+	}
+}

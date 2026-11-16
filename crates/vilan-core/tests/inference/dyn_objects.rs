@@ -2196,3 +2196,99 @@ fn b617_a_dyn_slot_running_a_blanket_impl_reads_the_threaded_context() {
         "blanket under s\nblanket under t\nstage\nblanket, no scope\ntag under v\nplain under w\n",
     );
 }
+
+// --- M175: scalar leaves erase; an unimplemented object position names the trait ---
+
+/// M175: a scalar LEAF at an object position erases where it lands, as a local
+/// already did — every literal form and an operator's result, in a list
+/// literal, at an annotated `let`, through `push`. Before, the analyzer
+/// recorded no erasure for a literal or an operator, so JS stored the bare
+/// value and the first call through it threw. The native leg is
+/// `native_differential::m175_a_scalar_leaf_erases_into_a_trait_object_on_both_backends`.
+#[test]
+fn m175_a_scalar_leaf_erases_into_a_trait_object() {
+    assert_compiles_and_runs(
+        include_str!("../../../vilan-cli/tests/native/dyn_scalar_leaves.vl"),
+        concat!(
+            "i32 5\ni32 -3\nf64 1.5\nstr lit\nbool true\ni32 5\ni32 -4\nbool true\n",
+            "i32 9\nstr hi ada\nstr ada!\nbool true\nstr multi\ni32 7\ni32 8\nstr pushed\ni32 3\n",
+        ),
+    );
+}
+
+/// M175: an operator at an object position erases its RESULT once — its
+/// operands are typed as if no context were given, so a struct operand of an
+/// overloaded `+` is not wrapped first (the sum of two pairs).
+#[test]
+fn m175_an_operator_erases_its_result_not_its_operands() {
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::operators::Add;
+        trait Weighed {
+            fun weight(self): i32;
+        }
+        struct Box2 { mass: i32 }
+        impl Box2 with Add {
+            fun add(self, other: Box2): Box2 { Box2 { mass = self.mass + other.mass } }
+        }
+        impl Box2 with Weighed {
+            fun weight(self): i32 { self.mass }
+        }
+        fun main() {
+            let a = Box2 { mass = 2 };
+            let b = Box2 { mass = 3 };
+            let both: dyn Weighed = a + b;
+            let listed: List<dyn Weighed> = [a + b + a];
+            print(both.weight());
+            print(listed[0].weight());
+        }
+        "#,
+        "5\n7\n",
+    );
+}
+
+/// M175: a value whose type does not implement the object's trait is told so
+/// by name, with the trait's implementors — at a literal's element and at a
+/// `push` argument. One implementor reads in the singular; more than sixteen
+/// are cut short with a count.
+#[test]
+fn m175_an_unimplemented_object_position_names_the_trait_and_its_implementors() {
+    let preamble = r#"
+        trait Shape {
+            fun area(self): i32;
+        }
+        struct Square { side: i32 }
+        struct Point { x: i32 }
+        impl Square with Shape {
+            fun area(self): i32 { self.side * self.side }
+        }
+    "#;
+    assert_fails_with(
+        &format!(
+            "{preamble} fun main() {{ let shapes: List<dyn Shape> = [Square {{ side = 1 }}, Point {{ x = 2 }}]; }}"
+        ),
+        "Expected dyn Shape (this literal's element type), but got Point instead. `Point` does \
+         not implement `Shape`, so it cannot become a `dyn Shape`; the type that does is `Square`.",
+    );
+    assert_fails_with(
+        &format!(
+            "{preamble} fun main() {{ mut shapes: List<dyn Shape> = []; shapes.push(Point {{ x = 2 }}); }}"
+        ),
+        "Expected dyn Shape, but got Point instead. `Point` does not implement `Shape`, so it \
+         cannot become a `dyn Shape`; the type that does is `Square`.",
+    );
+    let many: String = (0..18)
+        .map(|index| {
+            format!(
+                "struct S{index} {{ v: i32 }} impl S{index} with Shape {{ fun area(self): i32 {{ self.v }} }}\n"
+            )
+        })
+        .collect();
+    assert_fails_with(
+        &format!(
+            "{preamble}{many} fun main() {{ let shapes: List<dyn Shape> = [Point {{ x = 2 }}]; }}"
+        ),
+        "and 3 more.",
+    );
+}

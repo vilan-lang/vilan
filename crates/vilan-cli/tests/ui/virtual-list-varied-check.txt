@@ -1,0 +1,70 @@
+first layout: offset=0 range=5632734.833333334 count=100000 built=0..13 rows=0..12 (13) elements=30 settled=true consistent=true
+accessibility at the first layout:
+ScrollView "viewport" scroll_y=0/1047977.5 [scroll_down]
+  List
+    ListItem "row 0" item=1/100000 [focus]
+      Label value="Note 0: lorem"
+    ListItem "row 1" item=2/100000 [focus]
+      Label value="Note 1: ipsum dolor sit amet consectetur adipiscing elit sed do"
+    ListItem "row 2" item=3/100000 [focus]
+      Label value="Note 2: dolor sit amet consectetur adipiscing elit sed do eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing"
+    ListItem "row 3" item=4/100000 [focus]
+      Label value="Note 3: sit amet consectetur adipiscing elit sed do eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor lorem ipsum dolor sit"
+    ListItem "row 4" item=5/100000 [focus]
+      Label value="Note 4: amet consectetur adipiscing elit"
+    ListItem "row 5" item=6/100000 [focus]
+      Label value="Note 5: consectetur adipiscing elit sed do eiusmod tempor lorem ipsum dolor sit amet"
+    ListItem "row 6" item=7/100000 [focus]
+      Label value="Note 6: adipiscing elit sed do eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor lorem ipsum"
+    ListItem "row 7" item=8/100000 [focus]
+      Label value="Note 7: elit sed do eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor"
+    ListItem "row 8" item=9/100000 [focus]
+      Label value="Note 8: sed do eiusmod tempor lorem ipsum dolor sit"
+    ListItem "row 9" item=10/100000 [focus]
+      Label value="Note 9: do eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor lorem"
+    ListItem "row 10" item=11/100000 [focus]
+      Label value="Note 10: eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor lorem ipsum dolor sit amet consectetur adipiscing elit sed do"
+    ListItem "row 11" item=12/100000 [focus]
+      Label value="Note 11: tempor lorem ipsum"
+    ListItem "row 12" item=13/100000 [focus]
+      Label value="Note 12: lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod"
+reveal middle: offset=2772808.5 range=5546175.693548387 count=100000 built=49987..50003 rows=49987..50002 (16) elements=36 settled=true consistent=true
+  row 50000's bottom at the viewport's bottom: true
+inserted at the top: offset=2772863.9677419355 range=5546231.161290322 count=100001 built=49988..50004 rows=49987..50002 (16) elements=36 settled=true consistent=true
+  anchor row 49990 kept on the screen (a row inserted far above): true
+removed at the top: offset=2772808.5 range=5546175.693548387 count=100000 built=49987..50003 rows=49987..50002 (16) elements=36 settled=true consistent=true
+  anchor row 49990 kept on the screen (a row removed far above): true
+row 49987 above the viewport lengthened: offset=2913946 range=5828433.758064516 count=100000 built=49987..50003 rows=49987..50002 (16) elements=36 settled=true consistent=true
+  anchor row 49990 kept on the screen (a row above it resized): true
+the anchor row 49990 lengthened: offset=3026786 range=6054240.20967742 count=100000 built=49987..50002 rows=49987..50001 (15) elements=34 settled=true consistent=true
+  anchor row 49990 kept on the screen (its own top edge): true
+  row 49991 below it moved down: true
+row 49992 below the anchor lengthened: offset=3111416 range=6223595.048387097 count=100000 built=49987..50001 rows=49987..50000 (14) elements=32 settled=true consistent=true
+  anchor row 49990 kept on the screen (a row below it resized): true
+the anchor row 49990 removed: offset=2923468.21875 range=5847780.515625 count=99999 built=49985..50000 rows=49985,49986,49987,49988,49989,49991,49992,49993,49994,49995,49996,49997,49998,49999,50000 (15) elements=34 settled=true consistent=true
+  row 49991 after it kept its place on the screen: true
+the bottom row moved to the top: offset=2923526.703125 range=5847780.515625 count=99999 built=49986..50001 rows=49985,49986,49987,49988,49989,49991,49992,49993,49994,49995,49996,49997,49998,49999,50000 (15) elements=34 settled=true consistent=true
+  anchor row 49988 kept on the screen (a row moved from below to above): true
+wheel 50 down: offset=2923576.6875 range=5847780.515625 count=99999 built=49986..50002 rows=49985,49986,49987,49988,49989,49991,49992,49993,49994,49995,49996,49997,49998,49999,50000,50001 (16) elements=36 settled=true consistent=true
+  anchor row 49988 moved up by the wheel's 50 dp: true
+revealed the first row: offset=0 range=5866009.5 count=99999 built=0..13 rows=99999,0,1,2,3,4,5,6,7,8,9,10,11 (13) elements=30 settled=true consistent=true
+inserted at the very top: offset=0 range=5780283.852941177 count=100000 built=0..14 rows=-2,99999,0,1,2,3,4,5,6,7,8,9,10,11 (14) elements=32 settled=true consistent=true
+  offset 0, the new row first on the screen: true
+revealed the last row: offset=5741954.5 range=5741954.691489362 count=100000 built=99987..100000 rows=99986..99998 (13) elements=30 settled=true consistent=true
+  the last row's bottom at the viewport's bottom: true at the end: true
+a row near the end lengthened: offset=5853656.5 range=5853656.819148936 count=100000 built=99988..100000 rows=99987..99998 (12) elements=28 settled=true consistent=true
+  still at the end: true the last row's bottom at the viewport's bottom: true
+revealed row 30 from above: offset=1078.0967741935483 range=5659078.919354838 count=100000 built=17..33 rows=15..30 (16) elements=36 settled=true consistent=true
+  row 30's bottom at the viewport's bottom: true
+reveal_key 60000 from below: offset=3392717 range=5653946.954545455 count=100000 built=59999..60013 rows=59998..60011 (14) elements=32 settled=true consistent=true
+  found: true; its top at the viewport's top: true
+240 random operations: offset=1328760.4885496183 range=6235099.778625955 count=99991 built=21305..21319 rows=21273,200042,60000,21276,21279,21280,21283,21284,200043,21286,21287,21289,200040,21293 (14) elements=32 settled=true consistent=true
+  steps where the rows were not where the heights say: 0; an untouched anchor moved: 0
+ten million rows: offset=0 range=319999700 count=10000000 built=0..12 rows=0..11 (12) elements=27 meet=true placed=true
+ten million rows, row 9999990 revealed: offset=319999412 range=319999700 count=10000000 built=9999979..9999993 rows=9999979..9999992 (14) elements=31 meet=true placed=true
+ten million rows, wheel 7.5 up: offset=319999404.5 range=319999700 count=10000000 built=9999979..9999993 rows=9999979..9999992 (14) elements=31 meet=true placed=true
+ten million rows, wheel 3000.25 further up: offset=319996404.25 range=319999700 count=10000000 built=9999885..9999900 rows=9999885..9999899 (15) elements=33 meet=true placed=true
+  a click at y 97.25: row 9999890, the offset says row 9999890: true
+plain, row 1000 revealed: rows=995..1002 (8) elements=11 its bottom at the viewport's bottom: true
+plain, ten rows put on top: rows=995..1002 (8) elements=11 count=2010 row 1000 kept on the screen: true
+plain, back to the first list: row 1000 starts where it did: true kept on the screen: true

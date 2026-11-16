@@ -354,8 +354,13 @@ fn generated_server(port: u16) -> String {
 
 fn http_get(port: u16, path: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect for GET");
+    // The bound is the suite's liveness clock, not a felt five seconds: a
+    // loaded Windows runner took longer than that to render its first page,
+    // and the read's timeout was swallowed into an EMPTY page that failed the
+    // assertion about its markup (CI run 43546495690, windows 3/4). A server
+    // that never answers is its own failure, named as one.
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(support::run_liveness()))
         .expect("set a read timeout");
     write!(
         stream,
@@ -363,7 +368,12 @@ fn http_get(port: u16, path: &str) -> String {
     )
     .expect("send GET");
     let mut response = Vec::new();
-    let _ = stream.read_to_end(&mut response);
+    if let Err(error) = stream.read_to_end(&mut response) {
+        panic!(
+            "GET {path} on port {port} did not complete ({error}); it had answered {:?}",
+            String::from_utf8_lossy(&response)
+        );
+    }
     let text = String::from_utf8_lossy(&response).into_owned();
     match text.split_once("\r\n\r\n") {
         Some((_, body)) => body.to_string(),

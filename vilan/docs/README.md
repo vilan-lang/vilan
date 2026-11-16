@@ -87,6 +87,7 @@ move an anchor, and a moved anchor is a broken link.
 | [Server-side rendering](guide/ssr.md) | render-and-replace, one component on both legs, the HTML shell |
 | [A full-stack walkthrough](guide/walkthrough.md) | the Notes app end to end: every layer meeting, quoted from a real, tested example |
 | [The dev loop](guide/dev-loop.md) | `run --watch`, hot module replacement, what carries across a swap |
+| [Writing Vilan programs well](guide/wisdom.md) | principles and real cases: symptoms to causes, the questions to ask before building, what a large app learned |
 
 ### std reference
 
@@ -117,6 +118,9 @@ modules — sits at `std::<name>`.
 | [dev / HMR](std/dev.md) | `std::web::dev`: `stash`/`take`, `on_teardown`, `hmr_active` |
 | [process](std/process.md) | db, http, fs, build, `web::document`, process, `rpc::server`, watch |
 | [images](std/image.md) | `std::image`: decode, resize, crop, encode (process) |
+| [windows](std/window.md) | `std::window`: a desktop window on a web page (process, native only) |
+| [GPU graphics](std/gfx.md) | `std::gfx`: a window drawn with the GPU, frames on demand, input as values (process, native only) |
+| [elements and layout](std/ui.md) | `std::ui`: rows, columns, stacks, text and images laid out for a GPU window; style as values (process, native only) |
 | [misc](std/misc.md) | io, task, `js::promise`, context, crypto, jwt, `web::asset` |
 
 ### Specification

@@ -100,7 +100,10 @@ fn doc_examples_from(text: &str, file_label: &str, into: &mut Vec<(String, Strin
             None => {
                 let indent = leading_spaces(line);
                 if let Some(info) = line[indent..].strip_prefix("```") {
-                    let compile = matches!(info.trim(), "vilan" | "vilan,norun" | "vilan,browser");
+                    let compile = matches!(
+                        info.trim(),
+                        "vilan" | "vilan,norun" | "vilan,browser" | "vilan,native"
+                    );
                     fence = Some(DocFence {
                         compile,
                         opened_at: index,
@@ -116,7 +119,7 @@ fn doc_examples_from(text: &str, file_label: &str, into: &mut Vec<(String, Strin
 }
 
 /// Every compilable fenced example under `vilan/docs/**` (plus the repo README),
-/// as `(label, source)` — `vilan` / `vilan,norun` / `vilan,browser` are complete
+/// as `(label, source)` — `vilan` / `vilan,norun` / `vilan,browser` / `vilan,native` are complete
 /// programs (compiled by the docs gate, hence clean to parse); `vilan,fragment`
 /// and non-vilan fences are skipped.
 ///

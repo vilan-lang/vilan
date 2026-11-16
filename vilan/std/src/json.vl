@@ -1678,3 +1678,25 @@ export impl [type T: FromJson; const N] with FromJson {
 		decoded.to_array<N>().ok_or(i"expected an array of {N} elements")
 	}
 }
+
+// --- An object's keys (F158) ---
+// Last in the file for the reason the fixed arrays above are.
+
+/// `Object.keys(value)` — reached only past `keys`'s object check: a host array's
+/// or string's keys are its indices, and `null`'s a throw.
+[extern("Object.keys")]
+external fun json_object_keys(value: JsonValue): List<str>;
+
+export impl JsonValue {
+	/// The keys of a JSON object, in JavaScript's order — integer-like keys
+	/// ascending first, then the rest in insertion order — and the empty list for
+	/// anything that is not an object (an array, a string, `null`, a missing
+	/// field). The reading half of walking an object whose keys are data, which
+	/// `field` alone cannot do.
+	fun keys(self): List<str> {
+		if self.kind() != JsonKind::Object {
+			ret [];
+		}
+		json_object_keys(self)
+	}
+}

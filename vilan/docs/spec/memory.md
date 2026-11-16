@@ -104,7 +104,11 @@ The same holds for a place handed to a parameter declared `own` — a signature'
 way of saying the callee keeps it, which is how `List::push` is written — and
 for a place a body **returns** that it does not own, which is every place
 reached through a **loaned** parameter: bare, `&`, and `&mut` alike (§6.8's R3
-calls all three loans). What decides is the *return*, not the place: a
+calls all three loans), and every place reached through a **module-level**
+binding — a `let`, a `mut` or a `lazy let`, the payload a module-level
+`Shared` cell's `read()` hands back, a field or element of one — which outlives
+every call just as the caller's storage does, so `fun all(): List<i32> {
+registry }` and `fun current(): List<i32> { cell.read() }` copy. What decides is the *return*, not the place: a
 signature that hands back a value hands back a value, so `fun make(&self):
 (i32, i32) { self.pair }` copies, while a signature that hands back a **view**
 (`fun slot(&mut self): &mut (i32, i32) borrows self`) is rule 3's sanctioned
@@ -146,6 +150,22 @@ fun main() {
 	mut rows = [xs];        // a copy: the element is not xs's storage
 	rows[0].push(9);
 	print(xs.len());        // 2
+}
+```
+
+```vilan
+import std::shared::Shared;
+
+let cell: Shared<List<i32>> = Shared::new([1, 2]);
+
+fun current(): List<i32> {
+	cell.read()             // a copy: the module-level cell outlives the call
+}
+
+fun main() {
+	mut mine = current();
+	mine.push(9);
+	print(cell.read().len());   // 2
 }
 ```
 
@@ -455,6 +475,18 @@ such an argument (and one whose callee writes the cell); the native backend
 copies every read out of the cell's borrow where it stands. This is not
 §6.9's view of a captured binding, which is taken after the call's other
 arguments.
+
+A **pattern** over a read is a capture like any other (§6.1): `if cell.read()
+is Some(let xs)` binds what the cell held when the pattern matched, and a write
+to the cell inside the arm (in place, through a call, or by a rebind) never
+reaches `xs`. Rule 2 lets an implementation skip the copy when nothing could
+tell: when no write of the cell can run while the `match` or `if` that binds
+the captures runs, nothing in it suspends, and every capture is only viewed
+(immutable, handed out of no value seam, captured by no closure), both backends
+read the payload in place (the native one under the cell's shared borrow)
+instead of copying it out whole. A guard clause's capture (`cell.read() is
+Some(let xs) else ret;`) outlives its statement, so it is copied unless no
+write mutates the cell in place anywhere.
 
 ## 6.8 Resources and destruction
 

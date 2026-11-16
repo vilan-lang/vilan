@@ -1,0 +1,75 @@
+// F158: `std::base64::encode`/`decode` (standard alphabet, padded, strict) and
+// `JsonValue::keys` print the same lines on both backends. Each length mod 3 is
+// encoded and round-tripped, every byte value too; `decode` refuses a bad
+// length, a character outside the alphabet (the URL-safe pair, whitespace,
+// non-ASCII), padding anywhere but the end, and non-zero padding bits. The keys
+// come in insertion order for an object and empty for everything else.
+import std::base64::{ decode, encode };
+import std::bytes::{ Bytes, encode_utf8 };
+import std::display::Display;
+import std::json::JsonValue;
+import std::range::Range;
+
+fun shown(decoded: Option<Bytes>): str {
+	match decoded {
+		Some(let bytes) => i"[{bytes.to_hex()}]",
+		None => "none",
+	}
+}
+
+fun main() {
+	for text in ["", "f", "fo", "foo", "foob", "fooba", "foobar", "héllo 😀"] {
+		let encoded = encode(encode_utf8(text));
+		print(i"{text} -> {encoded} -> {shown(decode(encoded))}");
+	}
+	mut every = Bytes::alloc(256);
+	for value in Range::new(0, 256) {
+		every.set(value.as_usize(), value);
+	}
+	let all = encode(every);
+	print(all);
+	match decode(all) {
+		Some(let back) => print(i"every byte back: {back.to_hex() == every.to_hex()}"),
+		None => print("every byte refused"),
+	}
+	let refused = [
+		"Zg",
+		"Zg=",
+		"Zm9v\n",
+		"Zm 9v",
+		"Zm9-",
+		"Zm9_",
+		"Zé==",
+		"Zg==Zg==",
+		"=Zg=",
+		"Z===",
+		"====",
+		"Zh==",
+		"Zm9=",
+		"Zm8",
+	];
+	for text in refused {
+		print(i"{text.replace("\n", "\\n")} -> {shown(decode(text))}");
+	}
+	let document = "{\"b\":1,\"a\":{\"z\":true,\"y\":null},\"c\":[1,2],\"é\":\"x\"}";
+	let value = document.try_parse_json();
+	match value {
+		Some(let parsed) => {
+			print(i"keys: {parsed.keys().join(",")}");
+			print(i"nested: {parsed.field("a").keys().join(",")}");
+			print(i"array: {parsed.field("c").keys().len()}");
+			print(i"string: {parsed.field("é").keys().len()}");
+			print(i"number: {parsed.field("b").keys().len()}");
+			print(i"missing: {parsed.field("nope").keys().len()}");
+		},
+		None => print("not json"),
+	}
+	match "{}".try_parse_json() {
+		Some(let empty) => print(i"empty: {empty.keys().len()}"),
+		None => print("not json"),
+	}
+	match "null".try_parse_json() {
+		Some(let nothing) => print(i"null: {nothing.keys().len()}"),
+		None => print("not json"),
+	}
+}

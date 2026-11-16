@@ -1,0 +1,87 @@
+import std::shared::Shared;
+
+// B735: rule 1's return clause read a place rooted at a MODULE-LEVEL binding
+// as a local's dead owner, so a function handing back a module-level cell's
+// read (or the binding itself, or a piece of it) gave the caller the binding's
+// live storage: the caller's push grew the module binding, and a later write
+// of it showed through the caller's result. A module-level binding outlives
+// every call, as a loaned parameter's storage does, and copies like one.
+// Every line below printed a grown length before the fix.
+
+// witness: return __clone(plain.v);
+// witness: return __clone(__force(loaded).v);
+// witness: return __clone(holder[0].v);
+// witness: return __clone(xs);
+
+struct Holder {
+	cell: Shared<List<i32>>,
+	count: i32,
+}
+
+let plain: Shared<List<i32>> = Shared::new([1, 2]);
+lazy let loaded: Shared<List<i32>> = Shared::new([1, 2]);
+let holder: Holder = Holder { cell = Shared::new([1, 2]), count = 0 };
+let cells: List<Shared<List<i32>>> = [Shared::new([1, 2])];
+let xs: List<i32> = [1, 2];
+mut ys: List<i32> = [1, 2];
+
+fun from_plain(): List<i32> {
+	plain.read()
+}
+
+fun from_plain_early(flag: bool): List<i32> {
+	if flag {
+		ret plain.read();
+	}
+	[]
+}
+
+fun from_lazy(): List<i32> {
+	loaded.read()
+}
+
+fun from_field(): List<i32> {
+	holder.cell.read()
+}
+
+fun from_element(): List<i32> {
+	cells[0].read()
+}
+
+fun get_xs(): List<i32> {
+	xs
+}
+
+fun get_ys(): List<i32> {
+	ys
+}
+
+fun main() {
+	// The caller's push stays the caller's.
+	mut a = from_plain();
+	a.push(3);
+	mut b = from_plain_early(true);
+	b.push(3);
+	mut c = from_lazy();
+	c.push(3);
+	mut d = from_field();
+	d.push(3);
+	mut e = from_element();
+	e.push(3);
+	mut f = get_xs();
+	f.push(3);
+	mut g = get_ys();
+	g.push(3);
+	print(i"{plain.read().len()} {loaded.read().len()} {holder.cell.read().len()} {cells[0].read().len()} {xs.len()} {ys.len()}");
+
+	// A later write of the binding stays out of the caller's result.
+	let held_plain = from_plain();
+	let held_lazy = from_lazy();
+	let held_field = from_field();
+	let held_ys = get_ys();
+	plain.write().push(9);
+	loaded.write().push(9);
+	holder.cell.write().push(9);
+	ys.push(9);
+	print(i"{held_plain.len()} {held_lazy.len()} {held_field.len()} {held_ys.len()}");
+}

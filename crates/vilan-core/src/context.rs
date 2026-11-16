@@ -436,6 +436,7 @@ impl ContextLog {
                 ThreadForm::Param { owner } => (owner.id(), 0),
                 ThreadForm::WrapSome { owner } => (owner.id(), 1),
                 ThreadForm::NoneLiteral => (Id(0), 2),
+                ThreadForm::Unwrap { owner } => (owner.id(), 3),
             }
         };
         let mut rows: Vec<(u8, Id, Id, Id, u8)> = Vec::new();
@@ -449,9 +450,9 @@ impl ContextLog {
                 rows.push((1, closure, context, provider, 0));
             }
         }
-        for &(call_id, context, owner, wrap_some) in &plan.gets {
+        for &(call_id, context, owner, form) in &plan.gets {
             if cold(call_id) {
-                rows.push((2, call_id, context, owner.id(), u8::from(wrap_some)));
+                rows.push((2, call_id, context, owner.id(), form as u8));
             }
         }
         for &(call_id, context, ref form) in &plan.thread_calls {
@@ -532,13 +533,28 @@ struct ClearSite {
 
 /// How a threaded call site obtains one context's argument: the caller's
 /// own parameter (bare or already-`Option`), that parameter `Some`-wrapped
-/// (the covered→safe boundary), or a literal `None` (an entry point with no
-/// value — a top-level call, or the inlined entry `main`).
+/// (a bare holder supplying an `Option` one), that parameter UNWRAPPED (an
+/// `Option` holder supplying a bare one — B740: only a covered holder, whose
+/// `Option` is `Some` wherever the call runs), or a literal `None` (an entry
+/// point with no value — a top-level call, or the inlined entry `main`).
 #[derive(Clone, Copy)]
 enum ThreadForm {
     Param { owner: Node },
     WrapSome { owner: Node },
     NoneLiteral,
+    Unwrap { owner: Node },
+}
+
+/// How a rewritten `get()`/`get_safe()` reads its holder's parameter: as it
+/// is (a strict read of a bare holder, a safe read of an `Option` one),
+/// `Some`-wrapped (a safe read of a bare holder), or unwrapped (a strict read
+/// of an `Option` holder — B740: the holder is covered, so it holds `Some`).
+/// The discriminants are the mutation log's form codes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadForm {
+    AsIs = 0,
+    WrapSome = 1,
+    Unwrap = 2,
 }
 
 /// The rewrite to apply once analysis succeeds. Node ids are sorted/owned so the
@@ -561,9 +577,8 @@ struct Plan {
     /// parameter rather than taking its own.
     captures: Vec<(Id, Id, Id)>,
     /// `get()`/`get_safe()` calls to replace with a read of the in-scope
-    /// parameter; `wrap_some` marks a safe read inside a STRICT holder, whose
-    /// bare value must be `Some`-wrapped.
-    gets: Vec<(Id, Id, Node, bool)>,
+    /// parameter, and how the read takes it ([`ReadForm`]).
+    gets: Vec<(Id, Id, Node, ReadForm)>,
     /// Calls to needs-context functions, to thread one context's argument
     /// into, as `(call, context, form)`. ONE channel for every append, built
     /// context-by-context, so a call site's arguments accumulate in
@@ -670,6 +685,17 @@ fn call_target(program: &Program, call_id: Id) -> Option<Id> {
         Expr::Local(target) => Some(*target),
         _ => None,
     }
+}
+
+/// The per-entry dispatch edges that share one hand-off path
+/// (`dispatch_refine::RefinedEdge::via`): `(caller, callee)` each, the caller
+/// `None` for top-level code. Kept apart from the site-level edges because
+/// who a callee's value comes from along the path is a per-context answer.
+/// Before the per-context loop `via` is narrowed to the nodes on the path
+/// that establish some context (M203); the order is the path's.
+struct EntryCoverageEdges {
+    via: std::rc::Rc<[Id]>,
+    edges: Vec<(Option<Id>, Id)>,
 }
 
 /// The binding an entity resolves to, if it is a direct `Expr::Local`.
@@ -1792,9 +1818,12 @@ fn analyze(
             // found no need — so a top-level call threaded nothing into it
             // (`blanket-impl.vl`'s `badge("static")`: JS passed `undefined`,
             // rustc refused the arity).
+            // B744: a call through a `dyn` object reaches only its trait's
+            // members — every one of them, whatever file imported them.
             let candidates =
                 crate::dispatch_refine::known_receiver_candidates(program, call.call_id)
                     .or_else(|| crate::dispatch_refine::bound_candidates(program, call.call_id))
+                    .or_else(|| crate::dispatch_refine::object_candidates(program, call.call_id))
                     .unwrap_or_else(|| dispatch_candidates(call.call_id, name));
             for &candidate in &candidates {
                 dispatch_callers
@@ -1819,38 +1848,28 @@ fn analyze(
     // graph, which must stay checked. Outside entries: calls made by
     // top-level statements (the graph has no top-level node), and functions
     // taken as values (called indirectly; the value-use error also fires).
-    let owned_call_ids: HashSet<Id> = graph
-        .nodes()
-        .iter()
-        .flat_map(|node| graph.calls_of(node.id()))
-        .map(|call| call.call_id)
-        .collect();
-    let top_level_targets: HashSet<Id> = program
-        .function_calls
-        .iter()
-        .filter(|(call_id, _)| !owned_call_ids.contains(call_id))
-        .filter_map(|(_, call)| local_target(program, call.subject_id))
-        .collect();
-    // Every entity that names a callee IN CALL POSITION. `function_calls`
-    // holds the calls the solver WIRED; an arity-invalid call is refused
-    // before wiring, and its subject would otherwise read as the callee taken
-    // as a value (B241) — the same "a written call the site scan cannot see"
-    // hole B229 found under `run`, with a different lid. A call written with
-    // the wrong number of arguments is still a CALL of the name it wrote.
-    let call_subject_entities: HashSet<Id> = program
+    // The first are `top_level_incoming`'s keys (the index below).
+    //
+    // Every entity that names a callee IN CALL POSITION: the subjects of the
+    // calls the solver WIRED (`function_calls`), and those of the calls it
+    // did not. An arity-invalid call is refused before wiring, and its
+    // subject would otherwise read as the callee taken as a value (B241) —
+    // the same "a written call the site scan cannot see" hole B229 found
+    // under `run`, with a different lid. A call written with the wrong number
+    // of arguments is still a CALL of the name it wrote.
+    let wired_subjects: HashSet<Id> = program
         .function_calls
         .values()
         .map(|call| call.subject_id)
-        .chain(
-            program
-                .arity_invalid_calls
-                .iter()
-                .map(|(_, subject_id)| *subject_id),
-        )
+        .collect();
+    let unwired_subjects: HashSet<Id> = program
+        .arity_invalid_calls
+        .iter()
+        .map(|(_, subject_id)| *subject_id)
         // E189: and the subject of every call that never wired at all — the
         // third face of the same hole. `f(bad)` where `bad` does not type
         // leaves `f` named in call position and recorded nowhere, so the scan
-        // above read it as `f` taken AS A VALUE: a "reads context, so it can't
+        // below read it as `f` taken AS A VALUE: a "reads context, so it can't
         // be used as a value" refusal at a call, and a callee the value-use
         // entry then holds permanently uncovered for its whole transitive read
         // set. A call written with an argument that did not type is still a
@@ -1867,23 +1886,40 @@ fn analyze(
     // refusal reads the sites — one scan of the entity map for both, where the
     // refusal used to rescan it per context (6 ms of kolt's client leg per
     // context; Order 50). Scan order is the map's, as the refusal's was.
-    let function_value_sites: Vec<(Id, Id)> = program
-        .entity_map
-        .iter()
-        .filter_map(|(entity_id, expr)| match expr {
-            Expr::Local(target)
-                if program.functions.contains_key(target)
-                    && !call_subject_entities.contains(entity_id) =>
-            {
-                Some((*entity_id, *target))
+    //
+    // The same scan answers the dispatch refinement's value-taken set
+    // (`dispatch_refine::RefineIndex::value_taken`), which the refinement
+    // used to rescan for itself (M203). It counts only a WIRED call's subject
+    // as call position, so it holds every function above plus any named only
+    // as an unwired call's subject — none in a program that types; the
+    // refinement's verdicts were drawn with that set, and keep it.
+    let mut function_value_sites: Vec<(Id, Id)> = Vec::new();
+    let mut refine_value_taken: HashSet<Id> = HashSet::default();
+    for (entity_id, expr) in &program.entity_map {
+        if let Expr::Local(target) = expr
+            && program.functions.contains_key(target)
+            && !wired_subjects.contains(entity_id)
+        {
+            refine_value_taken.insert(*target);
+            if !unwired_subjects.contains(entity_id) {
+                function_value_sites.push((*entity_id, *target));
             }
-            _ => None,
-        })
-        .collect();
+        }
+    }
     let value_taken: HashSet<Id> = function_value_sites
         .iter()
         .map(|(_, target)| *target)
         .collect();
+
+    // The calls the graph's nodes make, and every function's incoming calls
+    // from nodes and from top-level code: the A2 walk-back below reads them,
+    // and so does the dispatch refinement, which takes this index rather than
+    // building its own (M203).
+    let refine_index =
+        crate::dispatch_refine::RefineIndex::with_value_taken(program, graph, refine_value_taken);
+    let owned_call_ids = &refine_index.node_owned_calls;
+    let incoming_calls = &refine_index.incoming_calls;
+    let top_level_incoming = &refine_index.top_level_incoming;
 
     // --- Coverage-only dispatch refinement (element-syntax H8 →
     // proposal/requirement-polymorphism.md): the union edges above stay for
@@ -1895,29 +1931,6 @@ fn analyze(
     // shape widening back to the whole candidate list. The resolution rules
     // live in [`crate::dispatch_refine`] (extracted for the const-only
     // capability check, backlog B143 — see that module's documentation).
-    // Incoming direct calls per function, and top-level incoming calls (the
-    // A2 walk-back below reads these; the refinement recomputes its own
-    // internally, so its edges are a function of program + graph alone).
-    let mut incoming_calls: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
-    for node in graph.nodes() {
-        for call in graph.calls_of(node.id()) {
-            if let CallTarget::Function(target) = call.target {
-                incoming_calls
-                    .entry(target)
-                    .or_default()
-                    .push((node.id(), call.call_id));
-            }
-        }
-    }
-    let mut top_level_incoming: HashMap<Id, Vec<Id>> = HashMap::default();
-    for (call_id, call) in &program.function_calls {
-        if owned_call_ids.contains(call_id) {
-            continue;
-        }
-        if let Some(target) = local_target(program, call.subject_id) {
-            top_level_incoming.entry(target).or_default().push(*call_id);
-        }
-    }
     // A `Node` edge draws a coverage edge from that caller; a `TopLevel`
     // edge marks the callee outside-entered — always uncovered.
     let refinement_sites: Vec<crate::dispatch_refine::DispatchSite> = dispatch_sites
@@ -1930,19 +1943,48 @@ fn analyze(
             },
         )
         .collect();
+    // An edge charged at the SITE is the same for every context. A per-ENTRY
+    // edge is not: it charges the caller whose instantiation selects the
+    // callee, on the reading that the value is handed caller → generic body →
+    // callee — and a node on that path (`RefinedEdge::via`) may get its value
+    // from somewhere else in one context and not in another. Those wait for
+    // the per-context loop (`entry_coverage_edges`), grouped by path.
     let mut coverage_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
     let mut coverage_outside: HashSet<Id> = HashSet::default();
-    for edge in crate::dispatch_refine::refined_edges(program, graph, &refinement_sites) {
-        match edge.caller {
-            crate::dispatch_refine::RefinedCaller::Node(caller) => {
-                coverage_dispatch_callers
-                    .entry(edge.callee)
-                    .or_default()
-                    .push(caller);
+    let mut entry_coverage_edges: Vec<EntryCoverageEdges> = Vec::new();
+    let refined_edges = crate::dispatch_refine::refined_edges_over(
+        program,
+        graph,
+        &refinement_sites,
+        &refine_index,
+    );
+    for edge in &refined_edges {
+        if edge.via.is_empty() {
+            match edge.caller {
+                crate::dispatch_refine::RefinedCaller::Node(caller) => {
+                    coverage_dispatch_callers
+                        .entry(edge.callee)
+                        .or_default()
+                        .push(caller);
+                }
+                crate::dispatch_refine::RefinedCaller::TopLevel => {
+                    coverage_outside.insert(edge.callee);
+                }
             }
-            crate::dispatch_refine::RefinedCaller::TopLevel => {
-                coverage_outside.insert(edge.callee);
+            continue;
+        }
+        let caller = match edge.caller {
+            crate::dispatch_refine::RefinedCaller::Node(caller) => Some(caller),
+            crate::dispatch_refine::RefinedCaller::TopLevel => None,
+        };
+        match entry_coverage_edges.last_mut() {
+            Some(group) if std::rc::Rc::ptr_eq(&group.via, &edge.via) => {
+                group.edges.push((caller, edge.callee));
             }
+            _ => entry_coverage_edges.push(EntryCoverageEdges {
+                via: edge.via.clone(),
+                edges: vec![(caller, edge.callee)],
+            }),
         }
     }
 
@@ -1952,17 +1994,43 @@ fn analyze(
     // dependency package (E84) — was caused by user code calling into that
     // library, so the diagnostic must lead with the user's call, not the
     // library's body. The reporting loops below walk from the site's owner
-    // back along the same edges the strictness climbed, and these are those
-    // edges at call-site grain.
-    let mut dispatch_incoming: HashMap<Id, Vec<(Id, Id)>> = HashMap::default();
-    for (owner, call_id, candidates) in &dispatch_sites {
-        for &candidate in candidates {
-            dispatch_incoming
-                .entry(candidate)
-                .or_default()
-                .push((*owner, *call_id));
-        }
-    }
+    // back along the edges coverage read, at call-site grain.
+    //
+    // B741: the dispatch half of those edges is the REFINED set — the one
+    // coverage reads — indexed by callee. The name-keyed candidate lists the
+    // strictness climbed are wider: they charge every call into a generic
+    // body with what any instantiation of it selects, so one real refusal was
+    // also reported at every call that instantiates the body with a type that
+    // selects nothing needy (`shown("static")` beside `shown(cell)`). A
+    // per-entry edge carries the calls it crosses (`RefinedEdge::through`)
+    // and is followed along exactly those, not along every call into the
+    // generic body it crosses. Built on the first refusal: a program that
+    // checks clean never reads it.
+    let refined_incoming: std::cell::OnceCell<HashMap<Id, Vec<usize>>> = std::cell::OnceCell::new();
+    let refined_incoming_of = |node: Id| -> &[usize] {
+        refined_incoming
+            .get_or_init(|| {
+                let mut incoming: HashMap<Id, Vec<usize>> = HashMap::default();
+                for (index, edge) in refined_edges.iter().enumerate() {
+                    incoming.entry(edge.callee).or_default().push(index);
+                }
+                incoming
+            })
+            .get(&node)
+            .map_or(&[], Vec::as_slice)
+    };
+    // The calls a trace labels as a dispatch ("may select a reader").
+    let dispatch_site_calls: std::cell::OnceCell<HashSet<Id>> = std::cell::OnceCell::new();
+    let is_dispatch_site = |call: Id| -> bool {
+        dispatch_site_calls
+            .get_or_init(|| {
+                dispatch_sites
+                    .iter()
+                    .map(|(_, call_id, _)| *call_id)
+                    .collect()
+            })
+            .contains(&call)
+    };
     // C3a's demotion domain (E84): code the user did not write — a std module
     // or a dependency package's, both disk-loaded (an overlaid buffer is live
     // user territory and anchors at itself). The anchoring walk (A2/E74) and
@@ -1976,31 +2044,6 @@ fn analyze(
         program.source_of(id).is_some_and(|source| {
             program.frozen_sources.contains(&source) || program.dependency_sources.contains(&source)
         })
-    };
-    // Whether a dispatch site can actually select `candidate` — the
-    // concrete-receiver narrowing the coverage refinement uses, applied at
-    // one site: a recorded receiver's HEAD selects among candidates, so a
-    // site whose receiver picks a different member never takes the blame for
-    // this one. `OnConstraint` sites resolve per ENTRY, not per site, so they
-    // stay admitted (the union), exactly as conservative as the union edges.
-    let dispatch_admits = |call_id: Id, candidate: Id| -> bool {
-        match crate::async_infer::dispatch_at(program, call_id) {
-            Some(crate::analyzer::GenericDispatch::OnType(Some(receiver), member)) => {
-                match program.type_id_to_type_map.get(&receiver) {
-                    Some(resolved) if crate::impl_select::is_resolvable(resolved) => {
-                        let selected = crate::dispatch_refine::impl_members_for(
-                            program,
-                            program.admitting_file(call_id),
-                            receiver,
-                            member,
-                        );
-                        selected.is_empty() || selected.contains(&candidate)
-                    }
-                    _ => true,
-                }
-            }
-            _ => true,
-        }
     };
 
     // --- E189: the closures an UNRESOLVED call was handed. ---
@@ -2654,7 +2697,8 @@ fn analyze(
             .collect();
         injected_appearances.sort_by_key(|entity| entity.0);
         for entity in injected_appearances {
-            if call_subject_entities.contains(&entity)
+            if wired_subjects.contains(&entity)
+                || unwired_subjects.contains(&entity)
                 || allowed_forwards.contains(&entity)
                 || run_body_entities.contains(&entity)
                 || refused_landings.contains(&entity)
@@ -2742,6 +2786,54 @@ fn analyze(
     // unused-clause warning are both about the whole clause against the whole
     // body, so both are answered after the loop.
     let mut inferred_of_function: HashMap<Id, HashSet<Id>> = HashMap::default();
+
+    // M203: an entry edge is settled per context only because a node on its
+    // path may establish (or clear) THIS context — a `run` body, a deferred
+    // literal, a declaring function, a `clear` body. A path that crosses no
+    // node establishing ANY context settles to its own caller in every
+    // context, so its edges join the site-level ones once, here; the rest
+    // keep only the nodes that can establish something, in path order. The
+    // per-context test implies this one, so the first node it accepts in the
+    // kept list is the first it accepts on the whole path — the same answer,
+    // asked of a few nodes per group instead of every node of every group in
+    // every context.
+    let may_establish_some_context = |node: Id| {
+        run_closures.contains_key(&node)
+            || clear_closures.contains_key(&node)
+            || deferred.values().any(|closures| closures.contains(&node))
+            || declared_of_context
+                .values()
+                .any(|functions| functions.contains(&node))
+    };
+    let entry_coverage_edges: Vec<EntryCoverageEdges> = entry_coverage_edges
+        .into_iter()
+        .filter_map(|group| {
+            let establishers: std::rc::Rc<[Id]> = group
+                .via
+                .iter()
+                .copied()
+                .filter(|node| may_establish_some_context(*node))
+                .collect();
+            if !establishers.is_empty() {
+                return Some(EntryCoverageEdges {
+                    via: establishers,
+                    edges: group.edges,
+                });
+            }
+            for (caller, callee) in group.edges {
+                match caller {
+                    Some(caller) => coverage_dispatch_callers
+                        .entry(callee)
+                        .or_default()
+                        .push(caller),
+                    None => {
+                        coverage_outside.insert(callee);
+                    }
+                }
+            }
+            None
+        })
+        .collect();
 
     // --- Per-context effect inference + coverage. ---
     for &context in &plan.contexts {
@@ -3018,6 +3110,38 @@ fn analyze(
         if let Some(main) = entry_main {
             bound.remove(&main);
         }
+        // The per-entry dispatch edges, settled for THIS context. An entry
+        // edge charges the caller that instantiates a generic body with the
+        // callee, because that caller's value is what the body hands on — up
+        // to the first node on the hand-off path that takes its value from
+        // elsewhere: a `run` body (handed it by `run`), a function declaring
+        // the context (handed it by its own callers, and checked at its
+        // boundary — B242), a `clear` body (handed nothing). From there
+        // inward the callee has whatever THAT node has, so it is the edge's
+        // caller here. Charging the entry regardless refused
+        // `owner_scope.run(owner, || gap.bind(..))` inside a generic for
+        // every caller without an owner of its own, when the body had just
+        // established one.
+        let mut entry_dispatch_callers: HashMap<Id, Vec<Id>> = HashMap::default();
+        let mut entry_outside: HashSet<Id> = HashSet::default();
+        for group in &entry_coverage_edges {
+            let establishing = group.via.iter().copied().find(|node| {
+                run_closure_ids.contains(node)
+                    || declared_here.contains(node)
+                    || cleared_here(*node).is_some()
+            });
+            for &(caller, callee) in &group.edges {
+                match establishing.or(caller) {
+                    Some(caller) => entry_dispatch_callers
+                        .entry(callee)
+                        .or_default()
+                        .push(caller),
+                    None => {
+                        entry_outside.insert(callee);
+                    }
+                }
+            }
+        }
         loop {
             let mut removed = false;
             for &id in &strict {
@@ -3040,11 +3164,18 @@ fn analyze(
                     // run); one selected from a top-level call is entered
                     // from outside the graph — uncovered.
                     let callers = graph.callers_of(id);
-                    let through_dispatch = coverage_dispatch_callers.get(&id);
-                    let no_edges =
-                        callers.is_empty() && through_dispatch.is_none_or(|list| list.is_empty());
+                    let through_dispatch = || {
+                        coverage_dispatch_callers
+                            .get(&id)
+                            .into_iter()
+                            .chain(entry_dispatch_callers.get(&id))
+                            .flatten()
+                    };
+                    let no_edges = callers.is_empty() && through_dispatch().next().is_none();
                     if coverage_outside.contains(&id)
-                        || top_level_targets.contains(&id)
+                        || entry_outside.contains(&id)
+                        // top-level code calls it by name
+                        || top_level_incoming.contains_key(&id)
                         || value_taken.contains(&id)
                     {
                         // Entered from outside the graph — uncovered
@@ -3058,10 +3189,7 @@ fn analyze(
                         true
                     } else {
                         callers.iter().all(|caller| bound.contains(&caller.id()))
-                            && through_dispatch
-                                .into_iter()
-                                .flatten()
-                                .all(|caller| bound.contains(caller))
+                            && through_dispatch().all(|caller| bound.contains(caller))
                     }
                 } else if cleared_here(id).is_some() {
                     // B458: a `clear` body runs with the value absent — an
@@ -3107,9 +3235,10 @@ fn analyze(
         // What makes it sound is ONE property of `refined_edges`, stated in its
         // own documentation and load-bearing here: **every fallback widens to
         // the whole candidate list**. A site the refinement cannot resolve —
-        // an opaque binding, a value-taken or dispatch-reachable level whose
-        // entries cannot be enumerated, a receiver-less `OnType` — draws an
-        // edge to EVERY candidate, so no candidate of an unresolved site is
+        // an opaque binding, a level whose entries cannot be enumerated (a
+        // function taken as a value, or one a dispatch outside the listed
+        // sites can select), a receiver-less `OnType` whose receiver is not
+        // on record (a `dyn` entry) — draws an edge to EVERY candidate, so no candidate of an unresolved site is
         // ever mistaken for dead. A node with no refined edge was therefore
         // excluded by a RESOLUTION at every site that lists it, which is a real
         // answer about what can run.
@@ -3125,6 +3254,47 @@ fn analyze(
         // site the refinement CANNOT resolve is still refused for coverage, and
         // it goes red the moment a fallback stops widening.
 
+        // How the walk crosses one REFINED dispatch edge into the node it
+        // reaches (B741): the calls it crosses, innermost first, and the node
+        // it goes on from (`None`: a top-level entry, with nothing above it).
+        // `None` for an edge whose effective caller is covered — the same
+        // caller coverage settled it to: the first node on the hand-off path
+        // that establishes the context (handing on only the site, the one
+        // call known to be inside it), else the entry's own caller.
+        let refined_hop =
+            |edge: &crate::dispatch_refine::RefinedEdge| -> Option<(Vec<Id>, Option<Id>)> {
+                use crate::dispatch_refine::RefinedCaller;
+                if edge.via.is_empty() {
+                    return match edge.caller {
+                        RefinedCaller::Node(caller) => {
+                            (!bound.contains(&caller)).then(|| (vec![edge.anchor], Some(caller)))
+                        }
+                        RefinedCaller::TopLevel => Some((vec![edge.anchor], None)),
+                    };
+                }
+                let establishing = edge.via.iter().copied().find(|node| {
+                    run_closure_ids.contains(node)
+                        || declared_here.contains(node)
+                        || cleared_here(*node).is_some()
+                });
+                if let Some(node) = establishing {
+                    return (!bound.contains(&node))
+                        .then(|| (edge.through.iter().copied().take(1).collect(), Some(node)));
+                }
+                let chain: Vec<Id> = edge
+                    .through
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(edge.anchor))
+                    .collect();
+                match edge.caller {
+                    RefinedCaller::Node(caller) => {
+                        (!bound.contains(&caller)).then_some((chain, Some(caller)))
+                    }
+                    RefinedCaller::TopLevel => Some((chain, None)),
+                }
+            };
+
         // The A2 walk-back (E74, widened to any dependency package by
         // C3a/E84): a refused site whose own span sits in library code
         // anchors at the user-written calls that enter the library on an
@@ -3136,17 +3306,26 @@ fn analyze(
         // not merely reveal the next), returned in id order so the least-id
         // one still leads, exactly where E74 anchored. A site in user code
         // anchors at itself and returns no entries here. The walk descends
-        // the same edges the strictness climbed — direct calls, admitted
-        // dispatch calls, the capture hop — and only through UNBOUND
-        // callers: a covered caller is not on the uncovered path and must
-        // not take the blame. No user entry found (an uncovered read
-        // reachable only from a library's own load would be the library's
-        // bug, not the user's) falls back to the library anchor.
-        let user_entries_of = |site: Id, start: Id| -> Vec<Id> {
+        // the same edges COVERAGE read — direct calls, the refined dispatch
+        // edges (B741), the capture hop — and only through UNBOUND callers:
+        // a covered caller is not on the uncovered path and must not take
+        // the blame. No user entry found (an uncovered read reachable only
+        // from a library's own load would be the library's bug, not the
+        // user's) falls back to the library anchor.
+        //
+        // Each entry keeps where its trace goes on from: the calls a
+        // per-entry dispatch edge crosses beyond it (`rest`), then the node
+        // above them (`from`) — for any other entry, the frame holding it.
+        struct WalkEntry {
+            call: Id,
+            rest: Vec<Id>,
+            from: Option<Id>,
+        }
+        let user_entries_of = |site: Id, start: Id| -> Vec<WalkEntry> {
             if !library_spanned(site) {
                 return Vec::new();
             }
-            let mut entries: Vec<Id> = Vec::new();
+            let mut entries: Vec<WalkEntry> = Vec::new();
             let mut visited: HashSet<Id> = HashSet::default();
             let mut walk: Vec<Id> = vec![start];
             while let Some(node) = walk.pop() {
@@ -3160,31 +3339,46 @@ fn analyze(
                     if library_spanned(call_id) {
                         walk.push(caller);
                     } else {
-                        entries.push(call_id);
+                        entries.push(WalkEntry {
+                            call: call_id,
+                            rest: Vec::new(),
+                            from: Some(caller),
+                        });
                     }
                 }
-                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
-                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                for &index in refined_incoming_of(node) {
+                    let Some((chain, from)) = refined_hop(&refined_edges[index]) else {
                         continue;
-                    }
-                    if library_spanned(call_id) {
-                        walk.push(caller);
-                    } else {
-                        entries.push(call_id);
+                    };
+                    match chain.iter().position(|call| !library_spanned(*call)) {
+                        Some(at) => entries.push(WalkEntry {
+                            call: chain[at],
+                            rest: chain[at + 1..].to_vec(),
+                            from,
+                        }),
+                        None => walk.extend(from),
                     }
                 }
                 // A top-level call is an uncovered entry by construction; it
                 // has no node to walk onward to.
                 for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
                     if !library_spanned(call_id) {
-                        entries.push(call_id);
+                        entries.push(WalkEntry {
+                            call: call_id,
+                            rest: Vec::new(),
+                            from: None,
+                        });
                     }
                 }
                 // B458: a `clear` body's uncovered-ness came from the `clear`
                 // itself, never from its defining scope.
                 if let Some(clear_call) = cleared_here(node) {
                     if !library_spanned(clear_call) {
-                        entries.push(clear_call);
+                        entries.push(WalkEntry {
+                            call: clear_call,
+                            rest: Vec::new(),
+                            from: owner_of.get(&clear_call).map(|frame| frame.id()),
+                        });
                     }
                     continue;
                 }
@@ -3198,8 +3392,8 @@ fn analyze(
             }
             // One dispatch site reaches the walk once per visited candidate;
             // a diagnostic per site, not per candidate.
-            entries.sort_by_key(|entry| entry.0);
-            entries.dedup();
+            entries.sort_by_key(|entry| entry.call.0);
+            entries.dedup_by_key(|entry| entry.call);
             entries
         };
 
@@ -3216,19 +3410,33 @@ fn analyze(
         // depth: the closure blames its defining scope's callers directly.
         struct Hop {
             call: Id,
-            /// A dispatch edge is union-admitted (row 222's residual): the
-            /// site MAY select the needy candidate, so its label must not
-            /// overclaim.
+            /// A dispatch site on the path (row 222's residual): a site the
+            /// refinement could not resolve MAY select the needy candidate,
+            /// so its label must not overclaim, and one label serves both.
             dispatch: bool,
             /// B458: the `clear` whose body the path runs in — where the
             /// value stops, labelled as such.
             clear: bool,
             depth: usize,
         }
-        let uncovered_hops_from = |start: Id| -> Vec<Hop> {
-            let mut hops: Vec<Hop> = Vec::new();
+        // `rest` are calls already known to be on the path, innermost first
+        // (a per-entry edge's calls past its user entry); `start` is the
+        // frame above them, if any.
+        let uncovered_hops_from = |rest: &[Id], start: Option<Id>| -> Vec<Hop> {
+            let mut hops: Vec<Hop> = rest
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| !library_spanned(**call))
+                .map(|(depth, call)| Hop {
+                    call: *call,
+                    dispatch: is_dispatch_site(*call),
+                    clear: false,
+                    depth,
+                })
+                .collect();
             let mut visited: HashSet<Id> = HashSet::default();
-            let mut frontier: VecDeque<(Id, usize)> = VecDeque::from([(start, 0)]);
+            let mut frontier: VecDeque<(Id, usize)> =
+                start.map(|start| (start, rest.len())).into_iter().collect();
             while let Some((node, depth)) = frontier.pop_front() {
                 if !visited.insert(node) {
                     continue;
@@ -3247,19 +3455,25 @@ fn analyze(
                     }
                     frontier.push_back((caller, depth + 1));
                 }
-                for &(caller, call_id) in dispatch_incoming.get(&node).into_iter().flatten() {
-                    if bound.contains(&caller) || !dispatch_admits(call_id, node) {
+                // A dispatch edge, refined (B741): each call it crosses is a
+                // hop, one level further out than the last.
+                for &index in refined_incoming_of(node) {
+                    let Some((chain, from)) = refined_hop(&refined_edges[index]) else {
                         continue;
+                    };
+                    for (offset, call) in chain.iter().enumerate() {
+                        if !library_spanned(*call) {
+                            hops.push(Hop {
+                                call: *call,
+                                dispatch: is_dispatch_site(*call),
+                                clear: false,
+                                depth: depth + offset,
+                            });
+                        }
                     }
-                    if !library_spanned(call_id) {
-                        hops.push(Hop {
-                            call: call_id,
-                            dispatch: true,
-                            clear: false,
-                            depth,
-                        });
+                    if let Some(from) = from {
+                        frontier.push_back((from, depth + chain.len()));
                     }
-                    frontier.push_back((caller, depth + 1));
                 }
                 for &call_id in top_level_incoming.get(&node).into_iter().flatten() {
                     if !library_spanned(call_id) {
@@ -3300,8 +3514,8 @@ fn analyze(
         // Past TRACE_CAP the entry side is kept and the rest elides behind
         // the honest tail. Each label follows the `Note::source` contract:
         // the file is named only when it differs from the anchor's.
-        let trace_of = |start: Id, anchor: Id| -> Vec<TraceHop> {
-            let mut hops = uncovered_hops_from(start);
+        let trace_of = |rest: &[Id], start: Option<Id>, anchor: Id| -> Vec<TraceHop> {
+            let mut hops = uncovered_hops_from(rest, start);
             hops.sort_by(|a, b| b.depth.cmp(&a.depth).then(a.call.0.cmp(&b.call.0)));
             let mut seen: HashSet<Id> = HashSet::default();
             hops.retain(|hop| seen.insert(hop.call));
@@ -3370,20 +3584,18 @@ fn analyze(
                 let trace = if library_spanned(get.call_id) {
                     Vec::new()
                 } else {
-                    trace_of(get.owner.id(), get.call_id)
+                    trace_of(&[], Some(get.owner.id()), get.call_id)
                 };
                 errors.push(anchored_tracing(program, get.call_id, message, trace, None));
             } else {
                 for entry in entries {
-                    // The chain climbs from the frame holding the entry call;
-                    // a top-level entry has no frame and nothing above it.
-                    let trace = owner_of
-                        .get(&entry)
-                        .map(|frame| trace_of(frame.id(), entry))
-                        .unwrap_or_default();
+                    // The chain climbs from the entry call: through the calls
+                    // known to follow it, then from the frame above them; a
+                    // top-level entry has no frame and nothing above it.
+                    let trace = trace_of(&entry.rest, entry.from, entry.call);
                     errors.push(anchored_tracing(
                         program,
-                        entry,
+                        entry.call,
                         message.clone(),
                         trace,
                         Some(library_frame_note(
@@ -3392,7 +3604,7 @@ fn analyze(
                             get.call_id,
                             get.owner.id(),
                             "read",
-                            entry,
+                            entry.call,
                         )),
                     ));
                 }
@@ -3413,18 +3625,15 @@ fn analyze(
                 let trace = if library_spanned(*call_id) {
                     Vec::new()
                 } else {
-                    trace_of(owner.id(), *call_id)
+                    trace_of(&[], Some(owner.id()), *call_id)
                 };
                 errors.push(anchored_tracing(program, *call_id, message, trace, None));
             } else {
                 for entry in entries {
-                    let trace = owner_of
-                        .get(&entry)
-                        .map(|frame| trace_of(frame.id(), entry))
-                        .unwrap_or_default();
+                    let trace = trace_of(&entry.rest, entry.from, entry.call);
                     errors.push(anchored_tracing(
                         program,
-                        entry,
+                        entry.call,
                         message.clone(),
                         trace,
                         Some(library_frame_note(
@@ -3433,7 +3642,7 @@ fn analyze(
                             *call_id,
                             owner.id(),
                             "injected call",
-                            entry,
+                            entry.call,
                         )),
                     ));
                 }
@@ -3572,7 +3781,7 @@ fn analyze(
             sites.dedup_by_key(|(call_id, _)| *call_id);
             for (call_id, caller) in sites {
                 let trace = caller
-                    .map(|caller| trace_of(caller, call_id))
+                    .map(|caller| trace_of(&[], Some(caller), call_id))
                     .unwrap_or_default();
                 errors.push(anchored_tracing(
                     program,
@@ -3617,17 +3826,16 @@ fn analyze(
         // A body-less declaration has no callers and no body, so joining
         // `needs` here — after the propagation, the coverage fixpoint and every
         // refusal above — changes nothing but its own parameter list: it
-        // takes the hidden parameter, BARE when a member of its union reads
-        // the context strictly, so the slot can hand each implementation the
-        // value the call through the object threaded. ---
+        // takes the hidden parameter, BARE when a member of its union holds
+        // the value bare (settled below), so the slot can hand each
+        // implementation the value the call through the object threaded. ---
+        let mut slot_declarations: Vec<(Id, &Vec<Id>)> = Vec::new();
         for (declaration, union) in &object_slot_unions {
             if needs.contains(declaration) || !union.iter().any(|member| needs.contains(member)) {
                 continue;
             }
             needs.insert(*declaration);
-            if union.iter().any(|member| strict.contains(member)) {
-                strict.insert(*declaration);
-            }
+            slot_declarations.push((*declaration, union));
         }
 
         // --- Record the rewrite for this context. ---
@@ -3693,18 +3901,98 @@ fn analyze(
         for &id in &param_nodes {
             provider_of.entry(id).or_insert(id);
         }
-        // A parameter holds the BARE value when its provider is strict or a
-        // `run` closure (which `run` hands the bare value); otherwise it
-        // holds `Option<T>`.
-        // B482: a literal that can reach a cleared position holds the
-        // `Option`, whatever its provider would otherwise say.
-        let holds_bare = |node: Id| -> bool {
+
+        // --- B740: the parameter's FLAVOUR — whether it holds the bare value
+        // or `Option<T>` — is decided per FUNCTION, and every caller of one
+        // function hands it one form. `strict` is the wrong answer to that
+        // question: it is the DEMAND (some read below needs the value) and it
+        // climbs to every caller, including one that has no value to hand —
+        // a generic whose strict candidate is reached only from code with an
+        // owner, instantiated again from code without one (the coverage
+        // refinement, B737, rightly accepts that), or a safe candidate
+        // promoted strict by a mixed dispatch site and called from `main`.
+        // Such a node received NOTHING where a bare value was declared: JS
+        // read `undefined` and its safe reads answered `Some(undefined)`, and
+        // the native emitter refused the call the checker had accepted.
+        //
+        // The rule: a node holds the bare value only when EVERY entry into it
+        // has one to hand — it is strict and COVERED (`bound`, the fixpoint
+        // above, over the refined edges). Every other needy node holds the
+        // `Option`, and its callers hand it `None` where they have no value.
+        // A strict read in an `Option` holder unwraps, and that is sound
+        // because an `Option` holder that READS strictly is covered: a strict
+        // read, an injected call or a direct call to a bare callee in an
+        // uncovered node was refused above (the callee of a direct call from
+        // an uncovered caller is itself uncovered, or declares the context
+        // and refuses the call at its boundary), so the unwrap only ever
+        // runs where every entry handed `Some`.
+        let mut bare: HashSet<Id> = strict
+            .iter()
+            .copied()
+            .filter(|id| bound.contains(id))
+            .collect();
+        // A node with no value source at all: the inlined entry `main`, a
+        // `clear` body, or a closure rooted at one.
+        let has_source = |node: Id| !none_rooted.contains(&node);
+        let node_bare = |bare: &HashSet<Id>, node: Id| -> bool {
             provider_of
                 .get(&node)
                 .filter(|provider| !cleared_literals.contains_key(provider))
-                .map(|provider| strict.contains(provider) || run_closure_ids.contains(provider))
-                .unwrap_or(false)
+                .is_some_and(|provider| {
+                    bare.contains(provider) || run_closure_ids.contains(provider)
+                })
         };
+        // One dispatch call passes ONE argument whichever candidate it lands
+        // on (JS dispatches through a single call), so its needy candidates
+        // must agree on the flavour, and a caller that holds the `Option`
+        // can hand a bare candidate nothing it is sure of. Either way the
+        // bare candidates are DEMOTED to the `Option` (their strict reads
+        // unwrap, which is sound: each is covered, so every entry into it
+        // carries a value). Demotion changes the flavour of the sites inside
+        // the demoted node, so this runs to a fixpoint; it only ever removes,
+        // so it ends. A caller with no value source at all is left alone: a
+        // bare candidate of its site is covered, so the site never selects
+        // it, and the site hands `None` to the `Option` holders it can reach.
+        loop {
+            let mut demoted = false;
+            for (caller, _call_id, candidates) in &dispatch_sites {
+                if !needs.contains(caller) || !has_source(*caller) {
+                    continue;
+                }
+                let needy = || {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(|candidate| needs.contains(candidate))
+                };
+                let any_bare = needy().any(|candidate| bare.contains(&candidate));
+                if !any_bare {
+                    continue;
+                }
+                let all_bare = needy().all(|candidate| bare.contains(&candidate));
+                if all_bare && node_bare(&bare, *caller) {
+                    continue;
+                }
+                for candidate in needy() {
+                    demoted |= bare.remove(&candidate);
+                }
+            }
+            if !demoted {
+                break;
+            }
+        }
+        // B617: the slot's declaration is bare when a member of its union is.
+        for (declaration, union) in &slot_declarations {
+            if union.iter().any(|member| bare.contains(member)) {
+                bare.insert(*declaration);
+            }
+        }
+        // A parameter holds the BARE value when its provider does (above) or
+        // is a `run` closure (which `run` hands the bare value); otherwise it
+        // holds `Option<T>`.
+        // B482: a literal that can reach a cleared position holds the
+        // `Option`, whatever its provider would otherwise say.
+        let holds_bare = |node: Id| -> bool { node_bare(&bare, node) };
         // F23: the flavour rides along with the node, so `apply` can record it
         // against the parameter it is about to mint. The iteration order is
         // the set's own, unchanged — it is what decides the order the hidden
@@ -3721,11 +4009,16 @@ fn analyze(
                 plan.none_gets.push(get.call_id);
                 continue;
             }
-            // A safe read of a BARE holder wraps; everything else reads the
-            // parameter as-is (bare for strict gets, `Option` for safe reads
-            // in safe holders).
-            let wrap_some = get.safe && holds_bare(get.owner.id());
-            plan.gets.push((get.call_id, context, get.owner, wrap_some));
+            // A safe read of a BARE holder wraps, and a strict read of an
+            // `Option` holder unwraps (B740: the holder is covered, so its
+            // `Option` is `Some` wherever the read runs); the other two read
+            // the parameter as-is.
+            let form = match (get.safe, holds_bare(get.owner.id())) {
+                (true, true) => ReadForm::WrapSome,
+                (false, false) => ReadForm::Unwrap,
+                (true, false) | (false, true) => ReadForm::AsIs,
+            };
+            plan.gets.push((get.call_id, context, get.owner, form));
         }
 
         // Spawn registration: a spawn whose owner has a value source reads it
@@ -3746,10 +4039,23 @@ fn analyze(
         // needs-context function — direct calls, and dispatch sites whose
         // candidate callees include a needy one (B14; a candidate that does
         // not need the value ignores the extra trailing argument). The
-        // argument form follows the flavors: bare→bare and Option→Option
-        // pass the parameter through; a BARE holder supplying a SAFE callee
-        // `Some`-wraps (the covered→safe boundary). Safe→strict cannot occur
-        // (strictness propagated to the caller).
+        // argument form follows the flavours (`bare`, above): bare→bare and
+        // Option→Option pass the parameter through; a BARE holder supplying
+        // an `Option` callee `Some`-wraps; an `Option` holder supplying a
+        // bare callee unwraps (B740 — only a covered holder does, so its
+        // `Option` is `Some`). A node with no value source hands an `Option`
+        // callee `None`, and a bare one nothing: a bare callee is covered, so
+        // no call from such a node reaches it.
+        let form_between = |caller: Id, owner: Node, callee_bare: bool| -> Option<ThreadForm> {
+            if !has_source(caller) {
+                return (!callee_bare).then_some(ThreadForm::NoneLiteral);
+            }
+            Some(match (holds_bare(caller), callee_bare) {
+                (true, true) | (false, false) => ThreadForm::Param { owner },
+                (true, false) => ThreadForm::WrapSome { owner },
+                (false, true) => ThreadForm::Unwrap { owner },
+            })
+        };
         for &node_id in &needs {
             let Some(&owner) = node_of.get(&node_id) else {
                 continue;
@@ -3757,25 +4063,8 @@ fn analyze(
             for call in graph.calls_of(node_id) {
                 if let CallTarget::Function(callee) = call.target
                     && needs.contains(&callee)
+                    && let Some(form) = form_between(node_id, owner, bare.contains(&callee))
                 {
-                    if none_rooted.contains(&node_id) {
-                        // No value here: safe callees get `None` (a
-                        // strict callee under a None root already
-                        // fenced).
-                        if !strict.contains(&callee) {
-                            plan.thread_calls.push((
-                                call.call_id,
-                                context,
-                                ThreadForm::NoneLiteral,
-                            ));
-                        }
-                        continue;
-                    }
-                    let form = if !strict.contains(&callee) && holds_bare(node_id) {
-                        ThreadForm::WrapSome { owner }
-                    } else {
-                        ThreadForm::Param { owner }
-                    };
                     plan.thread_calls.push((call.call_id, context, form));
                 }
             }
@@ -3784,36 +4073,28 @@ fn analyze(
             if !needs.contains(caller) {
                 continue;
             }
-            let needy: Vec<Id> = candidates
+            let mut needy = candidates
                 .iter()
                 .copied()
                 .filter(|candidate| needs.contains(candidate))
-                .collect();
-            if needy.is_empty() {
+                .peekable();
+            if needy.peek().is_none() {
                 continue;
             }
             let Some(&owner) = node_of.get(caller) else {
                 continue;
             };
-            // Mixed flavors were promoted away: needy candidates are now all
-            // strict or all safe.
-            let callee_safe = needy.iter().all(|id| !strict.contains(id));
-            if none_rooted.contains(caller) {
-                if callee_safe {
-                    plan.thread_calls
-                        .push((*call_id, context, ThreadForm::NoneLiteral));
-                }
-                continue;
+            // A caller with a value source sees needy candidates of ONE
+            // flavour (the demotion above). One with none may see both, and
+            // reaches only the `Option` holders among them.
+            let callee_bare = needy.all(|id| bare.contains(&id));
+            if let Some(form) = form_between(*caller, owner, callee_bare) {
+                plan.thread_calls.push((*call_id, context, form));
             }
-            let form = if callee_safe && holds_bare(*caller) {
-                ThreadForm::WrapSome { owner }
-            } else {
-                ThreadForm::Param { owner }
-            };
-            plan.thread_calls.push((*call_id, context, form));
         }
         // Calls through injected closures: the caller's value rides as the
-        // deferred trailing argument (the bare channel).
+        // deferred trailing argument (the bare channel) — unwrapped from an
+        // `Option` holder (B740: a demoted one, covered).
         //
         // B482: a call through a CLEARED position hands an `Option` — `None`
         // under the `clear`, the caller's bare value `Some`-wrapped elsewhere
@@ -3824,10 +4105,12 @@ fn analyze(
                 .is_some_and(|carrier| carrier_cleared(*carrier));
             let form = if cleared_calls.contains(call_id) {
                 ThreadForm::NoneLiteral
-            } else if through_cleared && holds_bare(owner.id()) {
-                ThreadForm::WrapSome { owner: *owner }
             } else {
-                ThreadForm::Param { owner: *owner }
+                match (through_cleared, holds_bare(owner.id())) {
+                    (true, true) => ThreadForm::WrapSome { owner: *owner },
+                    (false, false) => ThreadForm::Unwrap { owner: *owner },
+                    (true, false) | (false, true) => ThreadForm::Param { owner: *owner },
+                }
             };
             plan.thread_calls.push((*call_id, context, form));
         }
@@ -3849,9 +4132,9 @@ fn analyze(
             plan.cleared_types
                 .extend(cleared_types.into_iter().map(|type_id| (type_id, context)));
         }
-        // Top-level calls to safe functions: the entry point with no value —
-        // a literal `None` rides along. (Top-level calls to STRICT functions
-        // already failed the fence.)
+        // Top-level calls to `Option` holders: the entry point with no value
+        // — a literal `None` rides along. (A bare callee is covered, so no
+        // top-level call reaches it.)
         for (&call_id, function_call) in &program.function_calls {
             if owned_call_ids.contains(&call_id) {
                 continue;
@@ -3859,7 +4142,7 @@ fn analyze(
             let Some(target) = local_target(program, function_call.subject_id) else {
                 continue;
             };
-            if needs.contains(&target) && !strict.contains(&target) {
+            if needs.contains(&target) && !bare.contains(&target) {
                 plan.thread_calls
                     .push((call_id, context, ThreadForm::NoneLiteral));
             }
@@ -4185,7 +4468,7 @@ struct MintCounts {
 #[derive(Default)]
 struct Deferred {
     spawns: Vec<(Id, Id, Node, bool)>,
-    gets: Vec<(Id, Id, Node, bool)>,
+    gets: Vec<(Id, Id, Node, ReadForm)>,
     thread_calls: Vec<(Id, Id, ThreadForm)>,
 }
 
@@ -4280,24 +4563,26 @@ fn wrap_in_some(program: &mut Program, minting: &mut Minting, plan: &Plan, param
 
 /// `get()` becomes a read of the in-scope parameter; a safe read of a BARE
 /// holder becomes `Some(parameter)` (the get's own call entity is rewritten
-/// into the wrap, its method records purged like `run`'s). A row whose owner
+/// into the wrap, its method records purged like `run`'s), and a strict read
+/// of an `Option` holder a read the backends unwrap
+/// (`Program::context_unwrapped_reads`, B740). A row whose owner
 /// has no parameter yet goes to `defer` when one is given.
 fn rewrite_gets(
     program: &mut Program,
     minting: &mut Minting,
     plan: &Plan,
-    rows: &[(Id, Id, Node, bool)],
-    mut defer: Option<&mut Vec<(Id, Id, Node, bool)>>,
+    rows: &[(Id, Id, Node, ReadForm)],
+    mut defer: Option<&mut Vec<(Id, Id, Node, ReadForm)>>,
 ) {
     for &row in rows {
-        let (call_id, context, owner, wrap_some) = row;
+        let (call_id, context, owner, form) = row;
         let Some(&parameter) = minting.source.get(&(context, owner.id())) else {
             if let Some(defer) = defer.as_deref_mut() {
                 defer.push(row);
             }
             continue;
         };
-        if wrap_some {
+        if form == ReadForm::WrapSome {
             let some_variant = plan
                 .some_variant
                 .expect("safe sites resolved the Option variants");
@@ -4325,6 +4610,9 @@ fn rewrite_gets(
             program.generic_dispatch.remove(&call_id);
         } else {
             program.entity_map.insert(call_id, Expr::Local(parameter));
+            if form == ReadForm::Unwrap {
+                program.context_unwrapped_reads.insert(call_id);
+            }
         }
     }
 }
@@ -4398,6 +4686,21 @@ fn thread_arguments(
                     continue;
                 };
                 wrap_in_some(program, minting, plan, parameter)
+            }
+            ThreadForm::Unwrap { owner } => {
+                let Some(parameter) = owner_parameter(minting, owner) else {
+                    if let Some(defer) = defer.as_deref_mut() {
+                        defer.push(row);
+                        deferred_calls.insert(call_id);
+                    }
+                    continue;
+                };
+                // Its own entity, never the shared pass-through (M137): the
+                // unwrap is recorded against the read entity.
+                let reference = minting.fresh();
+                program.entity_map.insert(reference, Expr::Local(parameter));
+                program.context_unwrapped_reads.insert(reference);
+                reference
             }
             ThreadForm::NoneLiteral => {
                 if deferred_calls.contains(&call_id) {

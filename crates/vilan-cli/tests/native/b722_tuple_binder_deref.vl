@@ -1,0 +1,21 @@
+// B722: `*` on a binding a tuple pattern declares — a closure's tuple
+// parameter `|(name, _)| *name == key` and a destructuring `let`. The
+// emitted `let` copies its subject, so the bindings are values natively
+// and `(*name)` was rustc's E0614 on an `i32` and E0277 on a `str`.
+import std::io::print;
+
+fun meta_of(meta: List<(str, str)>, key: str): str {
+	meta.filter(|(name, _)| *name == key).first().map_or(|(_, value)| value, "")
+}
+
+fun ids_without(open: List<(i32, str)>, connection: i32): List<(i32, str)> {
+	open.filter(|(each, _)| *each != connection)
+}
+
+fun main() {
+	print(meta_of([("a", "1"), ("b", "2")], "b"));
+	print(ids_without([(1, "x"), (2, "y")], 1).len());
+	let (left, right) = (3, "three");
+	print(*left + 1);
+	print(*right == "three");
+}

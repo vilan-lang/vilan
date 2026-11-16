@@ -1,0 +1,70 @@
+// M175: a scalar LEAF erases into a trait object where it lands, as a local
+// already did - a number, a negative number, a float, a `str`, a `bool`, a
+// multiline string and an i-string literal, and an operator's result (`n + 1`,
+// `-n`, `!flag`, `n * 2 + 1`, `name + "!"`, `n == 4`) - in a list literal, at an
+// annotated `let` and through `push`. JS stored the bare value and failed at the
+// first call through it (`Cannot read properties of undefined`); natively rustc
+// refused the bare value (E0308) and the `let` (E0599).
+trait Shown {
+	fun shown(self): str;
+}
+
+impl i32 with Shown {
+	fun shown(self): str {
+		i"i32 {self}"
+	}
+}
+
+impl f64 with Shown {
+	fun shown(self): str {
+		i"f64 {self}"
+	}
+}
+
+impl str with Shown {
+	fun shown(self): str {
+		i"str {self}"
+	}
+}
+
+impl bool with Shown {
+	fun shown(self): str {
+		i"bool {self}"
+	}
+}
+
+fun every(values: List<dyn Shown>) {
+	for value in values {
+		print(value.shown());
+	}
+}
+
+fun main() {
+	let n: i32 = 4;
+	let flag = false;
+	let name = "ada";
+	every([
+		5,
+		-3,
+		1.5,
+		"lit",
+		true,
+		n + 1,
+		-n,
+		!flag,
+		n * 2 + 1,
+		i"hi {name}",
+		name + "!",
+		n == 4,
+		"""
+		multi
+		""",
+	]);
+	let one: dyn Shown = 7;
+	print(one.shown());
+	mut pushed: List<dyn Shown> = [];
+	pushed.push(8);
+	pushed.push("pushed");
+	pushed.push(n - 1);
+	every(pushed);
+}

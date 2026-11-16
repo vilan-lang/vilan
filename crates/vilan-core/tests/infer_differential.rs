@@ -150,7 +150,7 @@ fn compare(program: &str) -> Compared {
 }
 
 /// The corpus programs the inference sweep CHANGES — 29 of them when this gate
-/// was written (const-eval.md §9.1), 43 today.
+/// was written (const-eval.md §9.1), 44 today.
 ///
 /// `crypto.vl` joined at A108, and it is the additive direction the headnote
 /// asks to be noticed: the Wire visitor's state moved out of `Shared` cells
@@ -167,6 +167,7 @@ fn compare(program: &str) -> Compared {
 /// number that got smaller.
 const FOLDS: &[&str] = &[
     "arena.vl",
+    "b735.vl",
     "backed-enum-keys.vl",
     "bool.vl",
     "capture-clones.vl",

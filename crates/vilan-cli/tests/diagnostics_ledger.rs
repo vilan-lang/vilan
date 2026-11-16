@@ -398,7 +398,7 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// `&'static str` rather than a literal (the lexer's rule constants come through
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
-const RULE_STATEMENT_SITES: usize = 68;
+const RULE_STATEMENT_SITES: usize = 72;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what
@@ -434,6 +434,26 @@ const RESOURCE_DERIVE_REFUSAL_FRAGMENT: &str =
 /// unmistakable is the bar, and a tail edit that leaves the head standing
 /// still lands on a row that names the constant.
 const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "ELEMENT_ON_A_METHOD",
+        "`[element]` marks the function a tag calls by name: it may label only a free `fun`, and a method",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "ELEMENT_ON_AN_EXTERNAL",
+        "`[element]` marks the function a tag calls by name: it may label only a `fun` with a body",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "ELEMENT_WITH_PARAMETERS",
+        "an `[element]` function is called by its tag with no arguments",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "ELEMENT_NOT_ON_A_FUNCTION",
+        "`[element]` marks the function a tag calls by name: it may label only a free `fun`",
+    ),
     (
         "crates/vilan-core/src/parsing.rs",
         "CSS_IS_A_KEYWORD",

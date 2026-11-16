@@ -1,8 +1,8 @@
-// Base64url (RFC 4648 §5, unpadded) over `Bytes` — pure vilan, so it is also
-// available at compile time. The alphabet's `-`/`_` and the absent padding are what
-// JWTs and URL-safe tokens expect.
+// Base64 over `Bytes`, in pure vilan: base64url (RFC 4648 §5, `-`/`_`, unpadded;
+// JWTs and URL-safe tokens, also at compile time) and, at the end of the file,
+// standard base64 (§4, `+`/`/`, padded).
 
-import pkg::bytes::Bytes;
+import pkg::bytes::{ Bytes, decode_utf8, encode_utf8 };
 import pkg::option::Option::{ self, None, Some };
 import pkg::range::Range;
 
@@ -110,6 +110,113 @@ export fun decode_url(text: str): Option<Bytes> {
 		let chunk = (a << 12) | (b << 6) | c;
 		out.set(write, (chunk >> 10) & 255);
 		out.set(write + 1, (chunk >> 2) & 255);
+	}
+	Some(out)
+}
+
+// --- Standard base64 (RFC 4648 §4, padded; F158) ---------------------------------
+// What a file upload, a data URL or an email part carries. It works through `Bytes`
+// both ways — the text's UTF-8 bytes in, the output's bytes out — so it is linear
+// on both backends, where a `code_at` per character walks a native `str` from its
+// start every time.
+
+/// The standard alphabet: the URL-safe one's `-`/`_` are `+`/`/` here.
+let standard_alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// The ASCII code of `=`, the padding character.
+let pad = 61;
+
+/// `bytes` as standard, padded base64 — `Buffer.from(bytes).toString("base64")`:
+/// four characters per three bytes, the last group padded with `=` to four.
+export fun encode(bytes: Bytes): str {
+	let total = bytes.len();
+	let table = encode_utf8(standard_alphabet);
+	let groups = (total + 2) / 3;
+	mut out = Bytes::alloc(groups * 4);
+	for group in Range::new(0, groups.as_i32()) {
+		let base = group.as_usize() * 3;
+		let left = total - base;
+		let second = if left > 1 { bytes.get(base + 1) } else { 0 };
+		let third = if left > 2 { bytes.get(base + 2) } else { 0 };
+		let chunk = (bytes.get(base) << 16) | (second << 8) | third;
+		let write = group.as_usize() * 4;
+		out.set(write, table.get(((chunk >> 18) & 63).as_usize()));
+		out.set(write + 1, table.get(((chunk >> 12) & 63).as_usize()));
+		out.set(write + 2, if left > 1 { table.get(((chunk >> 6) & 63).as_usize()) } else { pad });
+		out.set(write + 3, if left > 2 { table.get((chunk & 63).as_usize()) } else { pad });
+	}
+	decode_utf8(out)
+}
+
+/// The 6-bit value of a standard-alphabet character code, or -1 for anything else
+/// (`=` included: padding is read by position, never as a digit).
+fun standard_digit(code: i32): i32 {
+	if code >= 65 && code <= 90 {
+		ret code - 65;
+	}
+	if code >= 97 && code <= 122 {
+		ret code - 71;
+	}
+	if code >= 48 && code <= 57 {
+		ret code + 4;
+	}
+	if code == 43 {
+		ret 62;
+	}
+	if code == 47 {
+		ret 63;
+	}
+	0 - 1
+}
+
+/// Standard, padded base64 back to its bytes, or `None` for text that is not
+/// exactly what `encode` writes. STRICT, where node's `Buffer.from(text, "base64")`
+/// decodes whatever it can and drops the rest: the length is a multiple of four,
+/// every character is in the standard alphabet (no URL-safe `-`/`_`, no whitespace
+/// or line breaks), `=` appears only as one or two characters of padding at the
+/// very end, and the bits the padding leaves over are zero. So every accepted text
+/// is the ONE encoding of its bytes, and a truncated or mangled upload is `None`
+/// rather than shorter data. The empty string is the empty `Bytes`.
+export fun decode(text: str): Option<Bytes> {
+	let input = encode_utf8(text);
+	let length = input.len();
+	if length % 4 != 0 {
+		ret None;
+	}
+	if length == 0 {
+		ret Some(Bytes::alloc(0));
+	}
+	let padding = if input.get(length - 1) != pad {
+		0
+	} else if input.get(length - 2) != pad {
+		1
+	} else {
+		2
+	};
+	let groups = length / 4;
+	mut out = Bytes::alloc(groups * 3 - padding.as_usize());
+	for group in Range::new(0, groups.as_i32()) {
+		let base = group.as_usize() * 4;
+		let last = group.as_usize() + 1 == groups;
+		let a = standard_digit(input.get(base));
+		let b = standard_digit(input.get(base + 1));
+		let c = if last && padding == 2 { 0 } else { standard_digit(input.get(base + 2)) };
+		let d = if last && padding > 0 { 0 } else { standard_digit(input.get(base + 3)) };
+		if a < 0 || b < 0 || c < 0 || d < 0 {
+			ret None;
+		}
+		if last && (padding == 2 && (b & 15) != 0 || padding == 1 && (c & 3) != 0) {
+			ret None;
+		}
+		let chunk = (a << 18) | (b << 12) | (c << 6) | d;
+		let write = group.as_usize() * 3;
+		out.set(write, (chunk >> 16) & 255);
+		if !(last && padding == 2) {
+			out.set(write + 1, (chunk >> 8) & 255);
+		}
+		if !(last && padding > 0) {
+			out.set(write + 2, chunk & 255);
+		}
 	}
 	Some(out)
 }

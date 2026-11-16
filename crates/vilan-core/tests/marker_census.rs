@@ -333,6 +333,12 @@ const ATTRIBUTE_CLASSES: &[(&str, &str, Class, &str)] = &[
         "the owned-resource class: moved, never copied, torn down at scope end",
     ),
     (
+        "element",
+        "[element]",
+        Class::Typing,
+        "makes a tag naming the function a typed element: lowered to a method chain on what it returns",
+    ),
+    (
         "hint",
         "[hint(Show)]",
         Class::Tooling,

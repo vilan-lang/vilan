@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 
 use vilan_embedded::{
     CONTENT_HASH, FILES, IMAGE_CORE_MANIFEST, RT_CONTENT_HASH, RT_CRYPTO_MANIFEST, RT_FILES,
-    RT_IMAGE_MANIFEST, RT_MANIFEST, RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, RT_TERM_MANIFEST,
-    materialize_into,
+    RT_GFX_LOCK, RT_GFX_MANIFEST, RT_IMAGE_MANIFEST, RT_MANIFEST, RT_NET_MANIFEST,
+    RT_POLL_MANIFEST, RT_SIGNAL_MANIFEST, RT_SQLITE_MANIFEST, RT_TERM_MANIFEST, RT_WEBVIEW_LOCK,
+    RT_WEBVIEW_MANIFEST, materialize_into,
 };
 
 mod scratch;
@@ -182,8 +183,18 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
         ("vilan-rt-sqlite", RT_SQLITE_MANIFEST, "rusqlite"),
         ("vilan-rt-crypto", RT_CRYPTO_MANIFEST, "getrandom"),
         ("vilan-rt-signal", RT_SIGNAL_MANIFEST, "ctrlc"),
+        // F164: the signal crate keeps its sibling path dependency on the
+        // dual-stack listener, and the listener its platform blocks.
+        (
+            "vilan-rt-signal",
+            RT_SIGNAL_MANIFEST,
+            "vilan-rt-net = { path = \"../vilan-rt-net\" }",
+        ),
+        ("vilan-rt-net", RT_NET_MANIFEST, "windows-sys"),
         // A173 S2: a PLATFORM dependency block is kept like the plain one.
         ("vilan-rt-term", RT_TERM_MANIFEST, "libc"),
+        // F160: the same two platform blocks, for the readiness wait.
+        ("vilan-rt-poll", RT_POLL_MANIFEST, "libc"),
         // M185: the glue keeps its sibling path dependency on the core, and
         // the core its crates.io one.
         (
@@ -192,7 +203,47 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
             "vilan-image = { path = \"../vilan-image\" }",
         ),
         ("vilan-image", IMAGE_CORE_MANIFEST, "image = { version"),
+        // F1 M2: the webview, outside the compiler's workspace (D2a) but
+        // embedded the same way, its two exact pins kept.
+        (
+            "vilan-rt-webview",
+            RT_WEBVIEW_MANIFEST,
+            "wry = { version = \"=0.57.2\"",
+        ),
+        (
+            "vilan-rt-webview",
+            RT_WEBVIEW_MANIFEST,
+            "tao = { version = \"=0.37.2\"",
+        ),
+        // native-ui.md P1: the GPU crate, outside the workspace (R11), its
+        // exact pins and its two sibling path dependencies kept.
+        (
+            "vilan-rt-gfx",
+            RT_GFX_MANIFEST,
+            "wgpu = { version = \"=30.0.1\"",
+        ),
+        (
+            "vilan-rt-gfx",
+            RT_GFX_MANIFEST,
+            "winit = { version = \"=0.30.13\"",
+        ),
+        (
+            "vilan-rt-gfx",
+            RT_GFX_MANIFEST,
+            "vilan-rt-poll = { path = \"../vilan-rt-poll\" }",
+        ),
     ];
+    // native-ui.md P1: the GPU crate's shader is source the collector carries
+    // (its renderer `include_str!`s it).
+    assert!(
+        keys.contains(&"vilan-rt-gfx/src/shader.wgsl"),
+        "the shader was not embedded"
+    );
+    // F1 M2: nothing under a crate's own `target/` is ever embedded — the
+    // webview crate, outside the compiler's workspace, builds into one beside
+    // its sources, and its build scripts write `.rs` files there.
+    let built: Vec<&&str> = keys.iter().filter(|key| key.contains("/target/")).collect();
+    assert!(built.is_empty(), "build output was embedded: {built:?}");
     for (directory, manifest, dependency) in optional {
         let mut on_disk = Vec::new();
         walk_rust(&root.join(directory), Path::new(directory), &mut on_disk);
@@ -221,6 +272,8 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
         "[target.'cfg(windows)'.dependencies]\nwindows-sys",
     ] {
         assert!(RT_TERM_MANIFEST.contains(block), "{RT_TERM_MANIFEST}");
+        assert!(RT_NET_MANIFEST.contains(block), "{RT_NET_MANIFEST}");
+        assert!(RT_POLL_MANIFEST.contains(block), "{RT_POLL_MANIFEST}");
     }
 
     let cache_root = scratch::root().join(format!(
@@ -244,7 +297,50 @@ fn the_optional_crates_embed_and_materialize_beside_the_runtime() {
     let _ = fs::remove_dir_all(&cache_root);
 }
 
-/// Every `.rs` file under `directory`, as the table's keys spell them.
+/// F1 M2 (D2a): the lockfile a desktop program's project is seeded with IS the
+/// webview crate's own — the one its audit and licence gates read — and it
+/// holds the same `wry` and `tao` the manifest pins exactly.
+#[test]
+fn the_webview_lockfile_embedded_is_the_crates_own() {
+    let on_disk = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vilan-rt-webview/Cargo.lock"),
+    )
+    .expect("the webview crate's lockfile");
+    assert_eq!(RT_WEBVIEW_LOCK, on_disk);
+    for package in [
+        "name = \"wry\"\nversion = \"0.57.2\"",
+        "name = \"tao\"\nversion = \"0.37.2\"",
+    ] {
+        assert!(
+            RT_WEBVIEW_LOCK.contains(package),
+            "the lockfile holds {package}"
+        );
+    }
+}
+
+/// native-ui.md P1 (R11): the lockfile a `std::gfx` program's project is
+/// seeded with IS the GPU crate's own, and it holds the `wgpu` and `winit` the
+/// manifest pins exactly.
+#[test]
+fn the_gfx_lockfile_embedded_is_the_crates_own() {
+    let on_disk = fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../vilan-rt-gfx/Cargo.lock"),
+    )
+    .expect("the GPU crate's lockfile");
+    assert_eq!(RT_GFX_LOCK, on_disk);
+    for package in [
+        "name = \"wgpu\"\nversion = \"30.0.1\"",
+        "name = \"winit\"\nversion = \"0.30.13\"",
+    ] {
+        assert!(
+            RT_GFX_LOCK.contains(package),
+            "the lockfile holds {package}"
+        );
+    }
+}
+
+/// Every `.rs` (and `.wgsl`) file under `directory`, as the table's keys
+/// spell them.
 fn walk_rust(directory: &Path, prefix: &Path, out: &mut Vec<String>) {
     for entry in fs::read_dir(directory)
         .expect("read the runtime crate")
@@ -253,8 +349,16 @@ fn walk_rust(directory: &Path, prefix: &Path, out: &mut Vec<String>) {
         let path = entry.path();
         let relative = prefix.join(entry.file_name());
         if path.is_dir() {
+            // A crate root's own `target/` is build output (the collector's
+            // rule; the webview crate is its own workspace and has one).
+            if entry.file_name() == "target" && prefix.components().count() == 1 {
+                continue;
+            }
             walk_rust(&path, &relative, out);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "rs" || extension == "wgsl")
+        {
             out.push(
                 relative
                     .components()

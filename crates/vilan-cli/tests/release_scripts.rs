@@ -1314,7 +1314,10 @@ fn both_scripts_are_committed_executable() {
 /// The pin RUNS the script's own `release_files` (extracted, so nothing else
 /// in the script executes) from the repository root and holds its manifests
 /// to the root `Cargo.toml`'s `members`, both directions — a crate that joins
-/// the workspace joins the release commit, and nothing outside it does.
+/// the workspace joins the release commit, and nothing outside it does — plus
+/// its `exclude` list (F1 M2): `crates/vilan-rt-webview` is outside the
+/// workspace (D2a) but under `crates/`, so `bump-version.sh` rewrites its
+/// version with the rest and the commit must carry it.
 #[test]
 fn the_release_commit_stages_every_workspace_members_manifest() {
     let root = repository_root();
@@ -1353,9 +1356,23 @@ fn the_release_commit_stages_every_workspace_members_manifest() {
         .collect();
 
     assert!(!members.is_empty(), "the workspace names its members");
+    let excluded: std::collections::BTreeSet<String> = workspace
+        .find("\nexclude = [")
+        .map(|start| {
+            let end = start + workspace[start..].find(']').expect("its end");
+            workspace[start..end]
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .map(|path| format!("{path}/Cargo.toml"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let bumped: std::collections::BTreeSet<String> = members.union(&excluded).cloned().collect();
     assert_eq!(
-        staged, members,
-        "the release commit must stage exactly the workspace members' manifests"
+        staged, bumped,
+        "the release commit must stage exactly the manifests the bump rewrites: the workspace \
+         members' and its excluded crates'"
     );
     assert!(
         script.contains("RELEASE_FILES=\"$(release_files)\""),

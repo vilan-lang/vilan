@@ -14823,6 +14823,87 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // E362: a file holding an EMPTY import set (`import pkg::lib::ui::widget::{  };`
+    // — it parses, and imports nothing) from a module the program loads. The
+    // add-import edit asserted a set has a member, and every analysis computes
+    // that edit for each auto-import candidate (M29): the panic took the
+    // file's whole analysis with it, one "internal error" diagnostic where the
+    // file's own were, on open. The empty set is stepped over and the name
+    // gets its own line, for the candidate table and the quick fix alike.
+    #[test]
+    fn an_empty_import_set_from_a_loaded_module_does_not_take_the_analysis_down() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                concat!(
+                    "import pkg::helper::run;\n",
+                    "import pkg::lib::ui::widget::{  };\n\n",
+                    "fun main() {\n\trun();\n\t\n}\n",
+                ),
+            ),
+            (
+                "helper.vl",
+                "import pkg::lib::ui::widget::greet;\n\nexport fun run() {\n\tgreet();\n}\n",
+            ),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let messages: Vec<&str> = document
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.msg.as_str())
+            .collect();
+        assert!(messages.is_empty(), "the file analyzes clean: {messages:?}");
+        let marker = "run();\n\t";
+        let offset = document.line_index.text().find(marker).unwrap() + marker.len();
+        let mut offered: Vec<String> = document
+            .completion(offset)
+            .into_iter()
+            .filter(|candidate| candidate.needs_import.is_some())
+            .map(|candidate| candidate.label)
+            .filter(|label| label == "farewell" || label == "greet")
+            .collect();
+        offered.sort();
+        assert_eq!(
+            offered,
+            ["farewell", "greet"],
+            "the loaded module's names are auto-import candidates"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_import_set_from_the_target_module_still_offers_the_add_import() {
+        let (dir, document) = analyze_workspace(&[
+            (
+                "main.vl",
+                "import pkg::lib::ui::widget::{  };\n\nfun main() {\n\tfarewell();\n}\n",
+            ),
+            (
+                "lib/ui/widget.vl",
+                "export fun greet() {}\n\nexport fun farewell() {}\n",
+            ),
+        ]);
+        let program = document.program.as_ref().expect("a program");
+        let fixes: Vec<(String, String)> = document
+            .diagnostics
+            .iter()
+            .flat_map(|diagnostic| document.quickfixes(program, diagnostic.span))
+            .filter(|fix| fix.title.starts_with("Import `farewell`"))
+            .map(|fix| (fix.title, fix.replacement))
+            .collect();
+        assert_eq!(
+            fixes,
+            vec![(
+                "Import `farewell` from pkg::lib::ui::widget".to_string(),
+                "import pkg::lib::ui::widget::farewell;\n".to_string(),
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // …and the exemption that carries the estate: a module carrying no marker
     // anywhere offers everything it declares, exactly as it did before the bit
     // existed (visibility.md §14).
@@ -20502,6 +20583,60 @@ pub(crate) mod tests {
                 "`{wrong}` may not appear in a head: {labels:?}"
             );
         }
+    }
+
+    // --- native-ui.md §12: a TYPED element's tag -----------------------------
+
+    /// A typed element's builder and constructor, shared by the pins below.
+    const TYPED_ELEMENT_PRELUDE: &str = "struct Row {\n\tlog: str,\n}\n\nimpl Row {\n\tfun gap(self, value: i32): Row {\n\t\tself\n\t}\n\tfun wrap(self): Row {\n\t\tself\n\t}\n}\n\n[element]\nfun row(): Row {\n\tRow { log = \"row\" }\n}\n\n";
+
+    // A typed element's head items are its builder's methods, so they are the
+    // whole vocabulary — undotted, and no HTML attribute, no `on:`.
+    #[test]
+    fn a_typed_element_head_offers_the_builders_methods() {
+        let labels = completions_at_marker(
+            &format!("{TYPED_ELEMENT_PRELUDE}fun main() {{\n\tlet built = <row ~ />;\n}}\n"),
+            '~',
+        );
+        for method in ["gap", "wrap"] {
+            assert!(
+                labels.contains(&method.to_string()),
+                "`{method}` is a Row method: {labels:?}"
+            );
+        }
+        for wrong in ["on:", "class", ".gap", "log", "built"] {
+            assert!(
+                !labels.contains(&wrong.to_string()),
+                "`{wrong}` is no attribute of a typed element: {labels:?}"
+            );
+        }
+        // The control: the same position on a web tag offers the web forms.
+        let web = completions_at_marker(
+            &format!(
+                "{TYPED_ELEMENT_PRELUDE}{ELEMENT_HEAD_PRELUDE}fun main() {{\n\tlet built = <div ~ />;\n}}\n"
+            ),
+            '~',
+        );
+        assert!(web.contains(&"on:".to_string()), "{web:?}");
+    }
+
+    // The tag IS the constructor's reference: go-to-definition lands on the
+    // `[element]` function and hover shows its signature.
+    #[test]
+    fn definition_and_hover_on_a_typed_tag_reach_its_element_function() {
+        let source =
+            format!("{TYPED_ELEMENT_PRELUDE}fun main() {{\n\tlet built = <row gap(1) />;\n}}\n");
+        let document = Document::analyze(&source, &std_root(), Path::new("test.vl"));
+        let offset = source.find("<row").unwrap() + 2;
+        let (_, span) = document
+            .definition(offset)
+            .expect("go-to-definition on the tag should answer");
+        let declared = source.find("fun row").unwrap() + "fun ".len();
+        assert_eq!(span.into_range(), declared..declared + "row".len());
+        let hover = document
+            .hover(offset)
+            .expect("hovering the tag should answer");
+        assert!(hover.contains("fun row(): Row"), "{hover}");
     }
 
     // E67: a NESTED tag under construction. The unfinished chain link used to

@@ -95,6 +95,43 @@ fn main() {
         ));
     }
 
+    // F1 M2 (D2a): the webview crate keeps a lockfile of its own, outside the
+    // compiler's, and a desktop program's generated project is SEEDED with it
+    // so every transitive crate starts at the version that lockfile was audited
+    // with (`vilan-cli`'s `native.rs` writes it).
+    let webview_lock = manifest_dir.join("../vilan-rt-webview/Cargo.lock");
+    println!("cargo:rerun-if-changed={}", webview_lock.display());
+    assert!(
+        webview_lock.is_file(),
+        "embedded-std build: {} is missing — is this a complete checkout?",
+        webview_lock.display()
+    );
+    generated.push_str(&format!(
+        "/// `vilan-rt-webview`'s own `Cargo.lock` (F1 M2, D2a): the versions its\n\
+         /// audit and licence gates read, which a desktop program's generated\n\
+         /// project starts from.\n\
+         pub static RT_WEBVIEW_LOCK: &str = include_str!({:?});\n",
+        webview_lock.canonicalize().unwrap()
+    ));
+
+    // native-ui.md P1 (R11): the GPU crate keeps a lockfile of its own too,
+    // outside the compiler's, and seeds a `std::gfx` program's generated
+    // project the same way (`vilan-cli`'s `native.rs` writes it).
+    let gfx_lock = manifest_dir.join("../vilan-rt-gfx/Cargo.lock");
+    println!("cargo:rerun-if-changed={}", gfx_lock.display());
+    assert!(
+        gfx_lock.is_file(),
+        "embedded-std build: {} is missing — is this a complete checkout?",
+        gfx_lock.display()
+    );
+    generated.push_str(&format!(
+        "/// `vilan-rt-gfx`'s own `Cargo.lock` (native-ui.md R11): the versions\n\
+         /// its audit and licence gates read, which a `std::gfx` program's\n\
+         /// generated project starts from.\n\
+         pub static RT_GFX_LOCK: &str = include_str!({:?});\n",
+        gfx_lock.canonicalize().unwrap()
+    ));
+
     let mut out = fs::File::create(&out_path).unwrap();
     out.write_all(generated.as_bytes()).unwrap();
 }
@@ -159,10 +196,23 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         manifest_static: "RT_SIGNAL_MANIFEST",
         item: "F45",
     },
+    // F164: the dual-stack listener `vilan-rt-signal` reaches by a path
+    // dependency (`../vilan-rt-net`) — like the image core, named by no
+    // generated manifest, materialized because a sibling's manifest names it.
+    OptionalCrate {
+        directory: "vilan-rt-net",
+        manifest_static: "RT_NET_MANIFEST",
+        item: "F164",
+    },
     OptionalCrate {
         directory: "vilan-rt-term",
         manifest_static: "RT_TERM_MANIFEST",
         item: "A173 S2",
+    },
+    OptionalCrate {
+        directory: "vilan-rt-poll",
+        manifest_static: "RT_POLL_MANIFEST",
+        item: "F160",
     },
     // M185: `std::image`'s glue, and the codec core it reaches by a path
     // dependency (`../vilan-image`) — the one optional crate with a sibling
@@ -177,6 +227,20 @@ const OPTIONAL_CRATES: &[OptionalCrate] = &[
         directory: "vilan-image",
         manifest_static: "IMAGE_CORE_MANIFEST",
         item: "M185",
+    },
+    // F1 M2: `std::window`'s webview (`wry` + `tao`). Outside the compiler's
+    // workspace (D2a), embedded like every other optional crate all the same.
+    OptionalCrate {
+        directory: "vilan-rt-webview",
+        manifest_static: "RT_WEBVIEW_MANIFEST",
+        item: "F1 M2",
+    },
+    // native-ui.md P1: `std::gfx`'s GPU window (`wgpu` + `winit`). Outside
+    // the compiler's workspace (R11), embedded like the webview.
+    OptionalCrate {
+        directory: "vilan-rt-gfx",
+        manifest_static: "RT_GFX_MANIFEST",
+        item: "native-ui.md P1",
     },
 ];
 
@@ -286,7 +350,8 @@ fn collect(directory: &Path, prefix: &Path, files: &mut Vec<(String, PathBuf)>) 
 /// key relative to the materialization root, absolute path) — [`collect`]'s
 /// twin for the runtime crate, whose sources are Rust rather than vilan. Its
 /// `Cargo.toml` is deliberately NOT collected: [`runtime_manifest`] generates
-/// the one the cache carries.
+/// the one the cache carries. A `.wgsl` file is source too (native-ui.md P1:
+/// `vilan-rt-gfx`'s shader, which its renderer `include_str!`s).
 fn collect_rust(directory: &Path, prefix: &Path, files: &mut Vec<(String, PathBuf)>) {
     println!("cargo:rerun-if-changed={}", directory.display());
     for entry in fs::read_dir(directory).unwrap() {
@@ -294,11 +359,27 @@ fn collect_rust(directory: &Path, prefix: &Path, files: &mut Vec<(String, PathBu
         let path = entry.path();
         let relative = prefix.join(entry.file_name());
         if path.is_dir() {
+            // F1 M2: a crate root's own `target/` is build output, never
+            // source — and the webview crate, its own workspace outside the
+            // compiler's, HAS one (its build scripts write `.rs` files there).
+            if is_crate_target(prefix, &entry.file_name()) {
+                continue;
+            }
             collect_rust(&path, &relative, files);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "rs" || extension == "wgsl")
+        {
             files.push((key_of(&relative), path));
         }
     }
+}
+
+/// Whether `name`, under `prefix`, is a crate root's `target/` directory: the
+/// prefix is the crate's own directory name alone (`vilan-rt-webview`), one
+/// component deep.
+fn is_crate_target(prefix: &Path, name: &std::ffi::OsStr) -> bool {
+    name == "target" && prefix.components().count() == 1
 }
 
 /// A collected file's table key: its path relative to the materialization root,

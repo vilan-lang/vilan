@@ -532,19 +532,19 @@ main();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// M165: a value SQLite cannot hold — a struct, a list, a tuple or a
-/// non-`Option` enum, which reached a `List<any>` because `any` takes it — is
-/// refused at the bind by its INDEX in the list, with what may be bound,
-/// rather than by `node:sqlite`'s own sentence (an array was read as named
-/// parameters: "Unknown named parameter '0'"). JS only: natively such a value
-/// cannot be built into a bind list at all (`vilan_rt::Any` has no arm for
-/// it). The run stops — a refused bind is a throw, as a failing statement is.
+/// M175: a value SQLite cannot hold — a struct, a list or a tuple — is refused
+/// by the CHECKER, at the element, naming its vilan type and what may be bound
+/// (`SqlValue`'s implementors). Under `List<any>` it reached a run-time refusal
+/// that could name only the index and a guessed JS shape (M165), and natively
+/// rustc's E0277. A `push` onto a `List<dyn SqlValue>` is refused the same way,
+/// and a built `List<str>` is told to rebuild itself element-wise. Nothing runs:
+/// the build stops before the program starts.
 #[test]
-fn m165_an_unbindable_parameter_is_refused_naming_its_index() {
+fn m175_an_unbindable_parameter_is_refused_by_the_checker() {
     let dir = migration_project(
         "unbindable",
         r#"import std::io::print;
-import std::db::Database;
+import std::db::{ Database, SqlValue };
 
 struct Point {
 	x: i32,
@@ -557,7 +557,12 @@ fun main() {
 	insert.run([1, true, Some(2)]);
 	print("bound");
 	insert.run([1, 2, Point { x = 3 }]);
-	print("unreachable");
+	insert.run([1, 2, [3, 4]]);
+	insert.run([1, 2, (3, "four")]);
+	mut pushed: List<dyn SqlValue> = [1, 2];
+	pushed.push(Point { x = 5 });
+	let built: List<str> = ["a", "b", "c"];
+	insert.run(built);
 }
 main();
 "#,
@@ -565,16 +570,31 @@ main();
     let output = run(&dir, &[]);
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "bound\n",
-        "a bool and an Option bind; the struct stops the run"
+        "",
+        "a refused bind list stops the build, so nothing runs"
     );
-    let stderr = stderr_of_failure(&output, "binding a struct");
+    let stderr = stderr_of_failure(&output, "binding a struct, a list and a tuple");
+    let implementors = "the types that do are `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i53`, \
+                        `u53`, `usize`, `f32`, `f64`, `str`, `bool`, `Bytes` and `Option<T>`.";
+    for refused in ["Point", "List<i32>", "(i32, str)"] {
+        let sentence = format!(
+            "`{refused}` does not implement `SqlValue`, so it cannot become a `dyn SqlValue`; \
+             {implementors}"
+        );
+        assert!(
+            stderr.contains(&sentence),
+            "the refusal names `{refused}` and what may be bound:\n{stderr}"
+        );
+    }
     assert!(
         stderr.contains(
-            "std::db: cannot bind the parameter at index 2 of 3: a struct, tuple, list or enum \
-             value is not a SQLite value (bind a number, a str, a bool, or an Option of one)"
+            "Expected dyn SqlValue, but got Point instead. `Point` does not implement `SqlValue`"
         ),
-        "the refusal names the parameter's index:\n{stderr}"
+        "a push is refused at its argument:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("a `List<str>` does not become a `List<dyn SqlValue>` as a whole"),
+        "a built list is told to rebuild element-wise:\n{stderr}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

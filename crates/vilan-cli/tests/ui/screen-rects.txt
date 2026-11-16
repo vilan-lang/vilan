@@ -1,0 +1,104 @@
+screen 960 x 640 dp at 1
+column screen 0 0 960 640
+  row header 0 0 960 56
+    text brand 24 14 60 28
+    row spacer 104 28 592 0
+    text guide 716 18 45 21
+    text library 781 18 63 21
+    text examples 864 18 72 21
+  row body 0 56 960 584
+    column sidebar 0 56 200 584
+      text  16 72 168 33
+      text  16 109 168 33
+      text  16 146 168 33
+      text  16 183 168 33
+      text  16 220 168 33
+    column content 200 56 760 584
+      text title 228 84 704 36
+      text  228 136 704 84
+      row feature 228 236 704 136
+        stack card 228 236 256 136
+          image picture 236 244 240 120
+          text badge 440 244 36 22
+        column caption 504 236 428 113
+          text  504 236 428 21
+          text  504 265 428 84
+      text  228 388 704 63
+screen 960 x 640 dp at 1.5
+column screen 0 0 1440 960
+  row header 0 0 1440 84
+    text brand 36 21 90 42
+    row spacer 156 42 888 0
+    text guide 1074 26 67 32
+    text library 1171 26 95 32
+    text examples 1296 26 108 32
+  row body 0 84 1440 876
+    column sidebar 0 84 300 876
+      text  24 108 252 50
+      text  24 164 252 49
+      text  24 219 252 50
+      text  24 275 252 49
+      text  24 330 252 50
+    column content 300 84 1140 876
+      text title 342 126 1056 55
+      text  342 205 1056 126
+      row feature 342 355 1056 204
+        stack card 342 355 384 204
+          image picture 354 367 360 180
+          text badge 660 367 54 32
+        column caption 756 355 642 169
+          text  756 355 642 31
+          text  756 398 642 126
+      text  342 583 1056 94
+screen 720 x 900 dp at 1
+column screen 0 0 720 900
+  row header 0 0 720 56
+    text brand 24 14 60 28
+    row spacer 104 28 352 0
+    text guide 476 18 45 21
+    text library 541 18 63 21
+    text examples 624 18 72 21
+  row body 0 56 720 844
+    column sidebar 0 56 200 844
+      text  16 72 168 33
+      text  16 109 168 33
+      text  16 146 168 33
+      text  16 183 168 33
+      text  16 220 168 33
+    column content 200 56 520 844
+      text title 228 84 464 36
+      text  228 136 464 105
+      row feature 228 257 464 260
+        stack card 228 257 256 136
+          image picture 236 265 240 120
+          text badge 440 265 36 22
+        column caption 504 257 188 260
+          text  504 257 188 42
+          text  504 307 188 210
+      text  228 533 464 84
+screen 720 x 900 dp at 1.5
+column screen 0 0 1080 1350
+  row header 0 0 1080 84
+    text brand 36 21 90 42
+    row spacer 156 42 528 0
+    text guide 714 26 67 32
+    text library 811 26 95 32
+    text examples 936 26 108 32
+  row body 0 84 1080 1266
+    column sidebar 0 84 300 1266
+      text  24 108 252 50
+      text  24 164 252 49
+      text  24 219 252 50
+      text  24 275 252 49
+      text  24 330 252 50
+    column content 300 84 780 1266
+      text title 342 126 696 55
+      text  342 205 696 157
+      row feature 342 386 696 390
+        stack card 342 386 384 204
+          image picture 354 398 360 180
+          text badge 660 398 54 32
+        column caption 756 386 282 390
+          text  756 386 282 63
+          text  756 461 282 315
+      text  342 800 696 126

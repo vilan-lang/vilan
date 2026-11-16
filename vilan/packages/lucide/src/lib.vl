@@ -1,0 +1,5 @@
+// Lucide's icons (https://lucide.dev, ISC; LICENSE beside this package), one
+// function per icon answering a `std::ui::Icon`: `<icon of(lucide::check()) />`.
+// The functions are generated into `icons` (`src/icons/lib.vl`) and published
+// here under the package's own name.
+export import pkg::icons::*;

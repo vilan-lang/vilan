@@ -4352,6 +4352,138 @@ fn e84_a_workspace_sibling_read_still_anchors_at_itself() {
     );
 }
 
+// --- B741: one refusal, reported once, at the call that causes it ---
+// A strict read inside a generic package body is reached only by the
+// instantiations that select its reader. The walk that anchors the refusal
+// at the user's calls followed the name-keyed dispatch edges, so EVERY user
+// call into the generic was an entry — each its own diagnostic — although
+// coverage, reading the refined edges, had refused only one of them.
+
+/// A package whose generics bind a `MaybeSignal<str>`: the static arm reads
+/// no owner, the reactive arm reads `owner_scope`. `shown` binds directly,
+/// `relayed` forwards to it, and `Badge::labelled` is a trait default that
+/// binds.
+const B741_BADGES: &str = "import std::io::print;
+import std::reactive::MaybeSignal;
+
+fun shown<V: MaybeSignal<str>>(own value: V) {
+\tvalue.bind(|text: str| print(text));
+}
+
+fun relayed<V: MaybeSignal<str>>(own value: V) {
+\tshown(value);
+}
+
+trait Badge {
+\tfun name(self): str;
+
+\tfun labelled<V: MaybeSignal<str>>(self, own value: V) {
+\t\tvalue.bind(|text: str| print(text));
+\t}
+}
+";
+
+/// `main` calling into the package with `calls`: two static values and one
+/// signal, `cell`, in between.
+fn b741_diagnostics(calls: &str) -> Vec<WorkspaceDiagnostic> {
+    let main = format!(
+        "import std::reactive::{{Signal, SignalCell}};
+import badges::{{Badge, relayed, shown}};
+
+struct Tag {{}}
+
+impl Tag with Badge {{
+\tfun name(self): str {{
+\t\t\"tag\"
+\t}}
+}}
+
+fun main() {{
+\tlet cell: SignalCell<str> = Signal::new(\"signal\");
+{calls}
+}}
+main();
+"
+    );
+    analyze_workspace_with_dependencies(
+        &[("main.vl", Box::leak(main.into_boxed_str()))],
+        &[DependencyFixture {
+            import_name: "badges",
+            files: &[("lib.vl", B741_BADGES)],
+            member: false,
+        }],
+    )
+}
+
+/// The one diagnostic `calls` draws: its file, its anchor's text, and its
+/// trace's labelled texts.
+#[track_caller]
+fn assert_one_owner_refusal_at(calls: &str, anchor: &str) {
+    let diagnostics = b741_diagnostics(calls);
+    let anchors: Vec<(&str, &str, &str)> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.message.as_str(),
+                diagnostic.file.as_str(),
+                diagnostic.anchor.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        anchors,
+        vec![(
+            "context `owner_scope` is read here, but this code can be reached without an enclosing `run`",
+            "main.vl",
+            anchor,
+        )],
+        "one refusal, at the call that hands the package a signal"
+    );
+    assert_eq!(
+        diagnostics[0]
+            .trace
+            .iter()
+            .map(|(_, file, text, _)| (file.as_str(), text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("main.vl", "main()")],
+        "the trace names the user's path to that call, and no static call"
+    );
+}
+
+#[test]
+fn b741_a_generic_package_function_is_refused_at_its_reactive_call_only() {
+    assert_one_owner_refusal_at(
+        "\tshown(\"static\");\n\tshown(cell);\n\tshown(\"static again\");",
+        "shown(cell)",
+    );
+}
+
+#[test]
+fn b741_a_forwarding_package_generic_is_refused_at_its_reactive_call_only() {
+    assert_one_owner_refusal_at(
+        "\trelayed(\"static\");\n\trelayed(cell);\n\trelayed(\"static again\");",
+        "relayed(cell)",
+    );
+}
+
+#[test]
+fn b741_a_package_trait_default_is_refused_at_its_reactive_call_only() {
+    assert_one_owner_refusal_at(
+        "\tTag {}.labelled(\"static\");\n\tTag {}.labelled(cell);\n\tTag {}.labelled(\"static again\");",
+        "Tag {}.labelled(cell)",
+    );
+}
+
+#[test]
+fn b741_static_calls_alone_are_not_refused() {
+    assert!(
+        b741_diagnostics(
+            "\tshown(\"static\");\n\trelayed(\"static\");\n\tTag {}.labelled(\"static\");\n\tshown(cell.get());"
+        )
+        .is_empty()
+    );
+}
+
 // --- E90: workspace MEMBERS are carved out of the E84 demotion ---
 // (diagnostics-standard.md C3a ruling note, RULED 2026-08-24): a `[project]`
 // member reached through a path edge classifies `Origin::Dep` like any
