@@ -19340,3 +19340,39 @@ fn b743_closures_that_await_at_synchronous_positions_still_float() {
         ),
     );
 }
+
+/// B746: a backed enum written through `&mut` (a local, a field, an element, a
+/// `&mut self` write direct and generic, the aggregates holding one) and matched
+/// through a view, the same on both backends. Native was always right; JS lost
+/// an int-backed write and threw on a str-backed one.
+#[test]
+fn b746_a_backed_enum_written_through_mut_is_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_backed_enum_through_mut.vl"),
+        include_str!("native/backed_enum_through_mut.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_backed_enum_through_mut.vl"),
+        Verdict::Identical,
+        "a backed enum written through `&mut` must be written on both backends"
+    );
+}
+
+/// B746: a whole-record set over a mirrored record holding backed-enum fields
+/// lands, and the frames after it keep landing, the same on both backends.
+#[test]
+fn b746_a_mirrored_record_with_backed_enum_fields_lands_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_mirror_backed_enum.vl"),
+        include_str!("native/store_mirror_backed_enum.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_mirror_backed_enum.vl"),
+        Verdict::Identical,
+        "a whole-record set over backed-enum fields must land on both backends"
+    );
+}

@@ -3118,3 +3118,136 @@ fn m186_a_shared_paths_identity_is_the_identity_of_its_steps() {
         "true\ntrue\ntrue\nfalse\nfalse\ntrue\nfalse\ntrue\n",
     );
 }
+
+// --- B746: a backed-enum field under a mirrored store's whole-value apply ---
+
+#[test]
+fn b746_a_whole_record_set_over_a_held_struct_with_a_backed_enum_field_lands() {
+    // B746's std case, with no reconnect: the server sets a WHOLE record that the
+    // client's mirror already holds, and the record has a str-backed and an
+    // int-backed enum field. The client applies it over the held struct through
+    // the derived `store_apply_at`, which passes each field by `&mut` and writes
+    // the leaf `self = T::store_wire_rebuild(..)` — the `&mut` of a backed enum
+    // that threw ("Cannot assign to read only property '0' of object '[object
+    // String]'") and stopped the mirror; and the derived diff `match`es each
+    // field's `&self`. Every frame after the set must still land: a root field,
+    // a field inside the record, and a second whole set.
+    assert_compiles_and_runs(
+        r#"
+import std::hash_map::HashMap;
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStoreSome, Storable, Store };
+import std::reactive::{ Owner, Source, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+    Dispatcher,
+    DuplexTransport,
+    ReactiveClient,
+    RpcRequest,
+    call_reading,
+    duplex_pair,
+    local_rpc,
+    register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Wire };
+
+[derive(Storable, Wire, PartialEq)]
+enum Kind {
+    Mention = "mention",
+    Direct = "direct",
+}
+
+[derive(Storable, Wire, PartialEq)]
+enum Level {
+    Low = 1,
+    High = 2,
+}
+
+[derive(Storable, Wire)]
+struct Notice {
+    kind: Kind,
+    level: Level,
+    text: str,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+    notices: HashMap<u53, Notice>,
+    motd: str,
+}
+
+fun main() {
+    let codec = json_codec();
+    mut notices: HashMap<u53, Notice> = HashMap::new();
+    notices.insert(1, Notice { kind = Kind::Mention, level = Level::Low, text = "hi" });
+    let global = Store::new(Global { notices, motd = "welcome" });
+    let (client_end, server_end) = duplex_pair();
+    register_session(7, server_end, codec);
+    let client = ReactiveClient::new(client_end, codec);
+    let dispatcher = Dispatcher::new()
+        .on("global", |request: RpcRequest| reply_store(request, global));
+    let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+    let g: RemoteStoreSome<Global> = mint_store(
+        client,
+        || call_reading(
+            local,
+            codec,
+            "global",
+            [],
+            |reply: Deserializer| read_store_reply<Global>(reply, false),
+        ),
+    );
+    let page = Owner::new();
+    run_with_owner(page, || {
+        let notice = g.notices().at(1).some();
+        notice.kind().effect(|kind| print(i"kind {kind.map(|kind| kind.value()).unwrap_or("-")}"));
+        notice.level().effect(|level| print(i"level {level.map(|level| level.value()).unwrap_or(0)}"));
+        notice.text().effect(|text| print(i"text {text.unwrap_or("-")}"));
+        g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+    });
+    sleep_for(Duration::millis(0));
+    sleep_for(Duration::millis(0));
+    print("-- a whole record set over the held one");
+    global.notices().at(1).set(Some(Notice { kind = Kind::Direct, level = Level::High, text = "dm" }));
+    sleep_for(Duration::millis(0));
+    print("-- frames after it still land");
+    global.motd().set("after");
+    let _text = global.notices().at(1).some().text().patch("dm 2");
+    sleep_for(Duration::millis(0));
+    print("-- and a second whole set");
+    global.notices().at(1).set(Some(Notice { kind = Kind::Mention, level = Level::Low, text = "back" }));
+    sleep_for(Duration::millis(0));
+    page.dispose();
+    print("done");
+}
+
+main();
+"#,
+        "kind -\n\
+         level 0\n\
+         text -\n\
+         motd -\n\
+         kind -\n\
+         level 0\n\
+         text -\n\
+         motd welcome\n\
+         kind mention\n\
+         level 1\n\
+         text hi\n\
+         -- a whole record set over the held one\n\
+         kind direct\n\
+         level 2\n\
+         text dm\n\
+         -- frames after it still land\n\
+         motd after\n\
+         text dm 2\n\
+         -- and a second whole set\n\
+         kind mention\n\
+         level 1\n\
+         text back\n\
+         done\n",
+    );
+}

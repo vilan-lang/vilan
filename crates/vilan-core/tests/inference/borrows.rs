@@ -16023,3 +16023,67 @@ fn b735_a_module_level_return_copies_and_a_local_return_does_not() {
         "{js}"
     );
 }
+
+// --- A scalar view tested by a pattern reads its value (found under B746) -----
+
+#[test]
+fn a_match_or_is_over_a_scalar_view_tests_the_value_not_the_pair() {
+    // A view of a scalar is the `(base, key)` pair, and a `match` or an `is`
+    // over one compared the PAIR against each pattern: `match x { true => ..,
+    // false => .. }` over `x: &bool` took `false`, a `str` literal leg never
+    // matched, and an `i32` one fell to `_` — no error, the wrong leg. The
+    // subject is read through as `*x` reads it, for a view parameter, a `&mut`
+    // one, and a `&place` subject written in the `match` itself.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        fun flag(x: &bool): str {
+            match x {
+                true => "t",
+                false => "f",
+            }
+        }
+        fun text(x: &str): str {
+            match x {
+                "a" => "a",
+                _ => "other",
+            }
+        }
+        fun count(x: &mut i32): str {
+            match x {
+                1 => "one",
+                _ => "other",
+            }
+        }
+        fun bound(x: &i32): i32 {
+            match x {
+                1 => 10,
+                let v => v,
+            }
+        }
+        fun is_true(x: &bool): bool {
+            x is true
+        }
+        struct Holder {
+            flag: bool,
+            text: str,
+            count: i32,
+        }
+        fun main() {
+            mut holder = Holder { flag = true, text = "a", count = 1 };
+            print(flag(&holder.flag));
+            print(text(&holder.text));
+            print(count(&mut holder.count));
+            print(bound(&holder.count));
+            holder.count = 3;
+            print(bound(&holder.count));
+            print(is_true(&holder.flag));
+            let local = false;
+            print(flag(&local));
+            print(match &local { true => "t", false => "f" });
+            print(match &holder.text { "a" => "a", _ => "other" });
+        }
+        "#,
+        "t\na\none\n10\n3\ntrue\nf\nf\na\n",
+    );
+}
