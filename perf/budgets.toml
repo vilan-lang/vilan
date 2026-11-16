@@ -362,3 +362,10 @@ class = "ci"
 ratio = 1.01
 reason = "Order 58 (B740, a miscompile fix: a hidden context parameter is bare only where every entry has the value, 67372fb4): callgrind on one machine 7,492,274,724 at next 9cf4669e to 7,613,935,515 with the fix (x1.0162). The context analysis itself moved by 3.6M; the rest is downstream of 815 strict but uncovered functions in genapp-46 that now hold an Option and take a `Some(..)` wrap or a `None` argument per call, where the base passed `undefined`. That is the cost of passing the right value; M204 asks whether the wraps can be cheaper"
 item = "M204"
+
+[[bump]]
+subject = "genapp:46"
+class = "reference"
+ratio = 1.01
+reason = "Order 58's seal (next ceb5b6ff against the ceiling of v0.54.0's seal): x1.0176 in instructions:u. The order's costs on this subject, each measured when it landed: typed elements x1.0008 (M202), B740's Option contexts x1.0162 to x1.0170 (a miscompile fix; 815 strict but uncovered functions in genapp-46 now take a wrap or a None per call), B742 and B741 x1.0007. Every other reference row is inside its limit (x1.0045 to x1.0094)"
+item = "M204"
