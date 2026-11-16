@@ -88,7 +88,10 @@ fun main() {
 	mut named = Named::A;
 	set_named(&mut named);
 	print(i"named written: {named == Named::B}");
-	mut outer = Outer { inner = Inner { named = Named::A, numbered = Numbered::One }, numbered = Numbered::One };
+	mut outer = Outer {
+		inner = Inner { named = Named::A, numbered = Numbered::One },
+		numbered = Numbered::One,
+	};
 	set_numbered(&mut outer.numbered);
 	set_named(&mut outer.inner.named);
 	print(i"fields: {outer.numbered == Numbered::Two} {outer.inner.named == Named::B} {outer.inner.numbered == Numbered::One}");
