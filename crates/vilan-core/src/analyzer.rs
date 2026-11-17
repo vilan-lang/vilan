@@ -35144,11 +35144,27 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// A scalar view read where a VALUE is read — `value` itself (a view
+    /// binding, a `&place`) or a scalar view leaf of a value `if`/`match`/block
+    /// standing there (B514) — pushed to `leaks`.
+    fn collect_scalar_value_read(
+        &self,
+        value: Id,
+        view_bindings: &HashSet<Id>,
+        leaks: &mut Vec<Id>,
+    ) {
+        if self.is_scalar_view_read(value, view_bindings) {
+            leaks.push(value);
+        }
+        self.collect_view_leaves(value, view_bindings, true, leaks);
+    }
+
     /// Transparent references: a view's value is explicit (`*v` is the only way
     /// to cross from view to value — `transparent-references.md`). A **scalar**
-    /// view used where a value is expected — a value/`any` call argument or a
-    /// binary operand — would otherwise silently pass its `(base, key)` pair
-    /// (C5.1); require the `*`, mirroring the `let`-binding rule (R1). Only direct
+    /// view used where a value is expected — a value/`any` call argument, a
+    /// binary or unary operand, or a condition (B749) — would otherwise
+    /// silently pass its `(base, key)` pair (C5.1); require the `*`,
+    /// mirroring the `let`-binding rule (R1). Only direct
     /// calls (`subject -> Local(callee)`) resolve their parameters, like
     /// `check_mutable_arguments`; dispatched callees are conservatively skipped.
     fn check_view_value_reads(&mut self) {
@@ -35163,10 +35179,34 @@ impl<'src> Analyzer<'src> {
                 // Both operands of a binary operator are values.
                 Expr::Binary(_, lhs, rhs) => {
                     for operand in [*lhs, *rhs] {
-                        if self.is_scalar_view_read(operand, &view_bindings) {
-                            leaks.push(operand);
+                        self.collect_scalar_value_read(operand, &view_bindings, &mut leaks);
+                    }
+                }
+                // B749: a unary operand is an operator's operand like a binary
+                // one, and a CONDITION — an `if`/`else if` (a `then`/`else`
+                // is one), a `for` loop's, a `match` leg's guard — is where a
+                // `bool` value is read. `if x` over `x: &bool` tested the
+                // `(base, key)` pair on JS (an array: always true) and `!x`
+                // negated it (always false). Spec §6.3: the same `*`.
+                Expr::Unary(_, operand) => {
+                    self.collect_scalar_value_read(*operand, &view_bindings, &mut leaks);
+                }
+                Expr::If(branch) => {
+                    let mut branch = branch;
+                    while let ExprIfBranch::If(condition, _, otherwise) = branch {
+                        self.collect_scalar_value_read(*condition, &view_bindings, &mut leaks);
+                        match otherwise {
+                            Some(otherwise) => branch = otherwise,
+                            None => break,
                         }
-                        self.collect_view_leaves(operand, &view_bindings, true, &mut leaks);
+                    }
+                }
+                Expr::For(Some(condition), _) => {
+                    self.collect_scalar_value_read(*condition, &view_bindings, &mut leaks);
+                }
+                Expr::Match(_, legs) => {
+                    for guard in legs.iter().filter_map(|leg| leg.guard) {
+                        self.collect_scalar_value_read(guard, &view_bindings, &mut leaks);
                     }
                 }
                 // B512: a `let` initialized by a value `if`/`match`/block whose

@@ -1,0 +1,74 @@
+// B749/B750: a scalar view read at a CONDITION (`if`, `else if`, `then`, a
+// `for` loop's, a `match` guard) or as a unary or `&&`/`||` operand. A view
+// binding or `&place` there is the checker's "write `*`"; a `borrows` call
+// answering `&bool` or `&i32` is read through. JS tested the call's
+// `(base, key)` pair (always true; `!` always false), and natively
+// `if flag(&holder)` was rustc E0308.
+struct Holder {
+	flag: bool,
+	count: i32,
+}
+
+fun flag(holder: &Holder): &bool {
+	&holder.flag
+}
+
+fun count(holder: &Holder): &i32 {
+	&holder.count
+}
+
+fun starred(flag: &bool, count: &i32): str {
+	let branch = if *flag { "if" } else { "else" };
+	let chained = if *count > 5 { "big" } else if *flag { "flag" } else { "neither" };
+	let sugar = *flag then "then" else "else";
+	let negated = !*flag;
+	let minus = -*count;
+	mut turns = 0;
+	for *flag && turns < 3 {
+		turns += 1;
+	}
+	let guard = match *count {
+		3 if *flag => "guarded",
+		_ => "fell",
+	};
+	i"{branch} {chained} {sugar} {negated} {minus} {turns} {guard}"
+}
+
+fun called(holder: &Holder): str {
+	let branch = if flag(holder) { "if" } else { "else" };
+	let chained = if *count(holder) > 5 {
+		"big"
+	} else if flag(holder) {
+		"flag"
+	} else {
+		"neither"
+	};
+	let sugar = flag(holder) then "then" else "else";
+	let negated = !flag(holder);
+	let minus = -count(holder);
+	mut turns = 0;
+	for flag(holder) && turns < 3 {
+		turns += 1;
+	}
+	let guard = match *count(holder) {
+		3 if flag(holder) => "guarded",
+		_ => "fell",
+	};
+	let both = flag(holder) && true;
+	let either = false || flag(holder);
+	i"{branch} {chained} {sugar} {negated} {minus} {turns} {guard} {both} {either}"
+}
+
+fun main() {
+	let off = Holder { flag = false, count = 3 };
+	let on = Holder { flag = true, count = 3 };
+	print(starred(&off.flag, &off.count));
+	print(starred(&on.flag, &on.count));
+	let local_flag = false;
+	let local_count = 7;
+	let flag_view = &local_flag;
+	let count_view = &local_count;
+	print(starred(flag_view, count_view));
+	print(called(&off));
+	print(called(&on));
+}

@@ -1,0 +1,63 @@
+// B750: a `str`-backed enum or a `str` tested by `is` or by an inline
+// `match &place` builds natively. `x is Named::B` over `x: &Named` (and over a
+// `Named` or a `str` by value) matched an `Rc<str>` against a `&str` literal,
+// and `match &holder.kind { Named::A => .. }` matched `&Rc<str>`: rustc E0308
+// at each. Both backends test the value.
+enum Named {
+	A = "a",
+	B = "b",
+}
+
+struct Holder {
+	kind: Named,
+	name: str,
+}
+
+fun viewed_is(x: &Named): bool {
+	x is Named::B
+}
+
+fun valued_is(x: Named): bool {
+	x is Named::B
+}
+
+fun text_is(text: str): bool {
+	text is "x"
+}
+
+fun viewed_text_is(text: &str): bool {
+	text is "x"
+}
+
+fun label(holder: &Holder): str {
+	match &holder.kind {
+		Named::A => "a",
+		Named::B => "b",
+	}
+}
+
+fun named(holder: &Holder): str {
+	match &holder.name {
+		"x" => "is x",
+		_ => "not x",
+	}
+}
+
+fun main() {
+	let b = Holder { kind = Named::B, name = "x" };
+	let a = Holder { kind = Named::A, name = "y" };
+	print(viewed_is(&b.kind));
+	print(viewed_is(&a.kind));
+	print(valued_is(Named::B));
+	print(valued_is(Named::A));
+	print(text_is("x"));
+	print(text_is("y"));
+	print(viewed_text_is(&b.name));
+	print(viewed_text_is(&a.name));
+	print(&b.kind is Named::B);
+	print(&a.name is "x");
+	print(label(&b));
+	print(label(&a));
+	print(named(&b));
+	print(named(&a));
+}

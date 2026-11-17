@@ -276,7 +276,10 @@ deliberately second-class; a view may not outlive the thing it views:
 
 Mutating through a view writes the viewed place; reading its value
 requires an explicit `*`. A view in **value position** (passed where a
-value is expected, used as an operator's operand, or bound or ASSIGNED to a
+value is expected, used as an operator's operand — a unary one, `!v` and
+`-v`, as much as a binary one and an i-string hole — read as a CONDITION:
+`if v`, `else if v`, `v then a else b`, a `for v` loop's, a `match` leg's
+`if v` guard, or bound or ASSIGNED to a
 value type — `out = v` as much as `let out: T = v`, and a view EXPRESSION
 alike: `out = &a`, `out = inner(&holder)` of a `borrows` function, or a
 branch of a value `if` handing either back — at a binding as at an
@@ -287,7 +290,16 @@ a silent coercion to the pointee (so the `(base, key)` representation of a
 scalar view can't leak); write `*v` to copy the value out. A *scalar* here
 is any type whose runtime value is an immutable host value — the numbers,
 `str`, `bool` and a backed enum (types §5.3) — and a `match` or an `is` over
-a scalar view tests the value it reads, as over `*v`. A method call's
+a scalar view tests the value it reads, as over `*v`. The refusal is for a
+view the expression NAMES: a view binding or parameter, a `&place`, or a
+value `if`/`match`/block handing either back. A view it does not name is
+read through at the same positions, as `*` would read it, on every backend:
+the answer of a `borrows` call (`if flag(&holder)` over `fun flag(holder:
+&Holder): &bool`, `count(&holder) + 1`), and the argument a generic's `T`
+takes beside an option holding a view, whose payload is read out where the
+option is consumed — `shelf.count(i).unwrap_or(&0) + 1` over an
+`Option<&i32>` adds to the payload or to the `0`. A by-value RETURN reads
+its view leaf through as well: that is the copy §6.5 describes. A method call's
 RECEIVER is not a value position: `v.method(..)` reads through the view to
 the referent place, a scalar's as an aggregate's (`n.abs()` with `n: &i32`,
 `s.len()` with `s: &str`). A closure's view

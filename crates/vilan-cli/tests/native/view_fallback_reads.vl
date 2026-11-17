@@ -1,0 +1,34 @@
+// B685: a view FALLBACK beside an `Option<&i32>` whose payload is read out
+// where the option is consumed (B577). `shelf.count(5).unwrap_or(&0) + 1`
+// printed `0,01` on JS (the fallback's `(base, key)` pair, concatenated) where
+// native printed `1`. One line per consumer, over `Some` and over `None`.
+struct Shelf {
+	counts: List<i32>,
+}
+
+impl Shelf {
+	fun count(&self, index: usize): Option<&i32> {
+		if index < self.counts.len() {
+			Some(&self.counts[index])
+		} else {
+			None
+		}
+	}
+}
+
+fun main() {
+	let shelf = Shelf { counts = [3, 4] };
+	let zero = 0;
+	print(shelf.count(0).unwrap_or(&0) + 1);
+	print(shelf.count(5).unwrap_or(&0) + 1);
+	print(shelf.count(5).unwrap_or(&zero) + 1);
+	print(shelf.count(1).unwrap_or_else(|| 0) + 1);
+	print(shelf.count(5).unwrap_or_else(|| 0) + 1);
+	print(shelf.count(1).map(|value| value * 10).unwrap_or(0));
+	print(shelf.count(5).map(|value| value * 10).unwrap_or(0));
+	print(i"{shelf.count(1).unwrap_or(&0)}");
+	print(i"{shelf.count(5).unwrap_or(&0)}");
+	print(shelf.count(5).unwrap_or(&0));
+	let found = shelf.count(5).unwrap_or(&zero);
+	print(found + 1);
+}
