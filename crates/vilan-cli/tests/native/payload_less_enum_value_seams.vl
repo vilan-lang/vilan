@@ -1,0 +1,114 @@
+// B748: a payload-less plain enum is a VALUE at every seam - a binding, an
+// assignment, a struct literal's field, a field read out, a list element, a
+// return, a closure capture, a `mut` parameter, a `mut` capture, a destructure -
+// written through `&mut` (a parameter, a `&mut self` method direct and generic,
+// a generic `&mut T`), so the write never shows in a copy. JS shared the
+// `[index]` array and `__replace` wrote into it.
+
+import std::io::print;
+
+[derive(PartialEq)]
+enum Plain {
+	X,
+	Y,
+}
+
+struct Holder {
+	plain: Plain,
+}
+
+impl Plain {
+	fun flip(&mut self) {
+		self = Plain::Y;
+	}
+}
+
+trait Reset {
+	fun reset(&mut self);
+}
+
+impl Plain with Reset {
+	fun reset(&mut self) {
+		self = Plain::Y;
+	}
+}
+
+fun reset_any<T: Reset>(slot: &mut T) {
+	slot.reset();
+}
+
+fun put<T>(slot: &mut T, value: T) {
+	slot = value;
+}
+
+fun set(slot: &mut Plain) {
+	slot = Plain::Y;
+}
+
+fun keep(value: Plain): Plain {
+	value
+}
+
+fun through(mut value: Plain): bool {
+	set(&mut value);
+	value == Plain::Y
+}
+
+fun main() {
+	mut a = Plain::X;
+	let copy = a;
+	set(&mut a);
+	print(i"let copy: {copy == Plain::X} {a == Plain::Y}");
+	mut b = Plain::X;
+	mut assigned = Plain::Y;
+	assigned = b;
+	set(&mut b);
+	print(i"assignment: {assigned == Plain::X}");
+	let c = Plain::X;
+	mut holder = Holder { plain = c };
+	set(&mut holder.plain);
+	print(i"field init: {c == Plain::X} {holder.plain == Plain::Y}");
+	mut other = Holder { plain = Plain::X };
+	let taken = other.plain;
+	set(&mut other.plain);
+	print(i"field read: {taken == Plain::X}");
+	let d = Plain::X;
+	mut list = [d];
+	set(&mut list[0]);
+	let kept = [Plain::X];
+	mut element = kept[0];
+	set(&mut element);
+	print(i"element: {d == Plain::X} {list[0] == Plain::Y} {kept[0] == Plain::X}");
+	mut e = Plain::X;
+	let returned = keep(e);
+	set(&mut e);
+	print(i"return: {returned == Plain::X}");
+	mut f = Plain::X;
+	let seen = f;
+	let read = || seen == Plain::X;
+	set(&mut f);
+	print(i"capture: {read()}");
+	let g = Plain::X;
+	print(i"mut parameter: {through(g)} {g == Plain::X}");
+	let held: Option<Plain> = Some(Plain::X);
+	match held {
+		Some(mut p) => set(&mut p),
+		None => {},
+	}
+	let pair = (Plain::X, 1);
+	mut (q, _n) = pair;
+	set(&mut q);
+	print(i"mut capture: {held == Some(Plain::X)} destructure: {pair.0 == Plain::X}");
+	mut h = Plain::X;
+	let h_copy = h;
+	h.flip();
+	mut i = Plain::X;
+	let i_copy = i;
+	reset_any(&mut i);
+	mut j = Plain::X;
+	let j_copy = j;
+	put(&mut j, Plain::Y);
+	print(i"mut self: {h_copy == Plain::X} {i_copy == Plain::X} {j_copy == Plain::X}");
+}
+
+main();

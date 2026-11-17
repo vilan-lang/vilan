@@ -15004,6 +15004,208 @@ fn b649_a_view_at_a_generic_parameter_over_a_view_holder_still_compiles() {
     );
 }
 
+// --- B684: a READONLY view at a `&mut` parameter -----------------------------
+//
+// A `&mut` parameter was asked only whether its argument IS a view, never
+// whether it is a WRITABLE one, so `bump(&x)` over `fun bump(a: &mut i32)`
+// checked clean: JS wrote `x` through the `&` (a `&` and a `&mut` view are one
+// runtime form) and the native emission was refused by rustc (E0308). One pin
+// per readonly form; each is refused exactly once, by one message.
+
+const B684_PRELUDE: &str = "struct Counter { n: i32 }
+fun bump(a: &mut i32) { a += 1; }
+fun put<T>(slot: &mut T, value: T) { slot = value; }
+fun peek(counter: &Counter): &i32 borrows counter { &counter.n }
+fun slot(counter: &mut Counter): &mut i32 borrows counter { &mut counter.n }
+";
+
+/// The program `B684_PRELUDE` + `main_body` fails with exactly one diagnostic,
+/// and it contains `message_part`.
+#[track_caller]
+fn b684_refused_once(main_body: &str, message_part: &str) {
+    let source = format!("{B684_PRELUDE}fun main() {{\n{main_body}\n}}\n");
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "expected one diagnostic, got {errors:#?}");
+    assert!(
+        errors[0].0.contains(message_part),
+        "the diagnostic does not contain {message_part:?}: {errors:#?}"
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_at_a_mut_parameter_is_refused() {
+    b684_refused_once(
+        "\tmut x = 1;\n\tbump(&x);\n\tprint(x);",
+        "`bump` takes `a` as `&mut`: write `&mut x`; a `&` view cannot be written through",
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_of_an_immutable_binding_names_the_mut_spelling() {
+    // The binding is immutable too: the first fix is the `&mut`, and taking it
+    // then meets the existing "declare it `mut`" (`check_mutable_references`).
+    b684_refused_once("\tlet x = 1;\n\tbump(&x);\n\tprint(x);", "write `&mut x`");
+}
+
+#[test]
+fn b684_a_shared_view_binding_at_a_mut_parameter_is_refused() {
+    // A view BINDING was already refused, by the root walk; it stays one
+    // diagnostic, not two.
+    b684_refused_once(
+        "\tmut x = 1;\n\tlet view = &x;\n\tbump(view);\n\tprint(x);",
+        "cannot mutate immutable 'view'; declare it `&mut view`",
+    );
+}
+
+#[test]
+fn b684_a_shared_parameter_passed_on_to_a_mut_parameter_is_refused() {
+    let source = format!(
+        "{B684_PRELUDE}fun pass(value: &i32) {{ bump(value); }}\nfun main() {{\n\tmut x = 1;\n\tpass(&x);\n}}\n"
+    );
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0]
+            .0
+            .contains("cannot mutate immutable 'value'; declare it `&mut value`"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b684_a_borrows_call_answering_a_shared_view_is_refused() {
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tbump(peek(&counter));\n\tprint(counter.n);",
+        "`bump` takes `a` as `&mut`, and this view is readonly (`&`): pass a writable one, `&mut <place>`",
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_of_a_field_is_refused() {
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tbump(&counter.n);\n\tprint(counter.n);",
+        "write `&mut counter.n`; a `&` view cannot be written through",
+    );
+}
+
+#[test]
+fn b684_a_field_of_a_shared_view_is_refused_either_way() {
+    // `&view.n` is a readonly view of the field; `&mut view.n` is refused by
+    // the existing root walk, since `view` is a `&` view.
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tlet view = &counter;\n\tbump(&view.n);",
+        "write `&mut view.n`",
+    );
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tlet view = &counter;\n\tbump(&mut view.n);",
+        "cannot take a writable view of immutable 'view'",
+    );
+}
+
+#[test]
+fn b684_a_mut_self_receiver_on_a_shared_view_or_an_immutable_binding_is_refused() {
+    // The receiver is borrowed implicitly; the root walk already refuses it,
+    // and B684 adds nothing beside it.
+    let methods = "impl Counter { fun inc(&mut self) { self.n += 1; } }\n";
+    for (body, message) in [
+        (
+            "\tmut counter = Counter { n = 1 };\n\tlet view = &counter;\n\tview.inc();",
+            "cannot mutate immutable 'view'; declare it `&mut view`",
+        ),
+        (
+            "\tlet counter = Counter { n = 1 };\n\tcounter.inc();",
+            "cannot mutate immutable 'counter'; declare it `mut`",
+        ),
+    ] {
+        let source = format!("{B684_PRELUDE}{methods}fun main() {{\n{body}\n}}\n");
+        let errors = failure_diagnostics(&source);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].0.contains(message), "{errors:#?}");
+    }
+}
+
+#[test]
+fn b684_a_shared_borrow_at_a_methods_mut_parameter_is_refused() {
+    let source = format!(
+        "{B684_PRELUDE}impl Counter {{ fun add_to(&self, total: &mut i32) {{ total += self.n; }} }}
+fun main() {{\n\tlet counter = Counter {{ n = 1 }};\n\tmut total = 0;\n\tcounter.add_to(&total);\n}}\n"
+    );
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0]
+            .0
+            .contains("`add_to` takes `total` as `&mut`: write `&mut total`"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_at_a_generic_mut_parameter_is_refused() {
+    b684_refused_once(
+        "\tmut x = 1;\n\tput(&x, 2);\n\tprint(x);",
+        "`put` takes `slot` as `&mut`: write `&mut x`",
+    );
+}
+
+#[test]
+fn b684_a_shared_view_at_a_closures_mut_parameter_is_refused() {
+    // A closure literal bound to a local, a `&` view binding at it, and a
+    // closure-typed PARAMETER: the closure path has no root walk, so every
+    // readonly form is B684's.
+    b684_refused_once(
+        "\tmut x = 1;\n\tlet add = |a: &mut i32| { a += 1; };\n\tadd(&x);\n\tprint(x);",
+        "this parameter takes `&mut`: write `&mut x`",
+    );
+    b684_refused_once(
+        "\tmut x = 1;\n\tlet add = |a: &mut i32| { a += 1; };\n\tlet view = &x;\n\tadd(view);\n\tprint(x);",
+        "this parameter takes `&mut`, and this view is readonly (`&`)",
+    );
+    let source = format!(
+        "{B684_PRELUDE}fun apply(f: |&mut i32|, value: &i32) {{ f(value); }}\nfun main() {{\n\tmut x = 1;\n\tapply(|a| {{ a += 1; }}, &x);\n}}\n"
+    );
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0]
+            .0
+            .contains("this parameter takes `&mut`, and this view is readonly (`&`)"),
+        "{errors:#?}"
+    );
+}
+
+/// B684: the writable forms still compile and write — `&mut place`, a `&mut`
+/// view binding and parameter passed on, a `borrows` call answering `&mut T`,
+/// a field of a `&mut` view, a generic and a closure `&mut`, a method's.
+#[test]
+fn b684_a_writable_view_at_a_mut_parameter_still_runs() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B684_PRELUDE}impl Counter {{ fun add_to(&self, total: &mut i32) {{ total += self.n; }} }}
+fun again(a: &mut i32) {{ bump(a); }}
+fun main() {{
+\tmut x = 1;
+\tbump(&mut x);
+\tlet view = &mut x;
+\tbump(view);
+\tagain(&mut x);
+\tput(&mut x, x + 10);
+\tlet add = |a: &mut i32| {{ a += 100; }};
+\tadd(&mut x);
+\tmut counter = Counter {{ n = 1 }};
+\tbump(slot(&mut counter));
+\tlet held = &mut counter;
+\tbump(&mut held.n);
+\tcounter.add_to(&mut x);
+\tprint(x);
+\tprint(counter.n);
+}}
+"
+        ),
+        "117\n3\n",
+    );
+}
+
 // --- B647: a module-level `mut` binding lent to a callee that writes it -----
 
 /// B647 (R-k, spec §6.4 rule 4): lending a module-level `mut` binding — a
@@ -15380,6 +15582,209 @@ fun main() {
         copies < 100,
         "a derived `==` over an enum and a fresh `None` copied {copies} values"
     );
+}
+
+// --- B748: a payload-less enum is a value at every seam too ------------------
+//
+// A plain (unbacked) enum with no payload is the same `[index]` array, and B691
+// left it SHARED on the reasoning that a write through a view replaces the
+// whole value. That replacement is `__replace(target, value)`, an in-place
+// assignment into the array every copy shares, so `let copy = a; set(&mut a)`
+// moved `copy`. One pin per sharing seam, each written through a `&mut`; the
+// native half is `native_differential`'s
+// `b748_a_payload_less_enum_is_a_value_at_every_seam_on_both_backends`.
+
+const B748_PRELUDE: &str = "[derive(PartialEq)]
+enum Plain { X, Y }
+struct Holder { plain: Plain }
+fun set(slot: &mut Plain) { slot = Plain::Y; }
+fun shown(value: Plain): str { if value == Plain::X { \"X\" } else { \"Y\" } }
+";
+
+fn b748_runs(main_body: &str, expected: &str) {
+    assert_compiles_and_runs(
+        &format!("{B748_PRELUDE}fun main() {{\n{main_body}\n}}\n"),
+        expected,
+    );
+}
+
+#[test]
+fn b748_a_let_copy_of_a_payload_less_enum_keeps_its_value() {
+    // The item's repro.
+    b748_runs(
+        "\tmut a = Plain::X;\n\tlet copy = a;\n\tset(&mut a);\n\tprint(i\"{shown(a)} {shown(copy)}\");",
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_an_assignment_copies_a_payload_less_enum() {
+    b748_runs(
+        "\tmut a = Plain::X;\n\tmut b = Plain::Y;\n\tb = a;\n\tset(&mut a);\n\tprint(i\"{shown(a)} {shown(b)}\");",
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_struct_literal_field_copies_a_payload_less_enum() {
+    b748_runs(
+        "\tlet a = Plain::X;\n\tmut holder = Holder { plain = a };\n\tset(&mut holder.plain);\n\tprint(i\"{shown(a)} {shown(holder.plain)}\");",
+        "X Y\n",
+    );
+}
+
+#[test]
+fn b748_a_field_read_out_of_a_holder_keeps_its_value() {
+    b748_runs(
+        "\tmut holder = Holder { plain = Plain::X };\n\tlet taken = holder.plain;\n\tset(&mut holder.plain);\n\tprint(i\"{shown(taken)} {shown(holder.plain)}\");",
+        "X Y\n",
+    );
+}
+
+#[test]
+fn b748_a_list_element_copies_a_payload_less_enum() {
+    b748_runs(
+        "\tlet a = Plain::X;\n\tmut many = [a];\n\tset(&mut many[0]);\n\tmut read = many[0];\n\tset(&mut read);\n\tlet kept = [Plain::X];\n\tmut out = kept[0];\n\tset(&mut out);\n\tprint(i\"{shown(a)} {shown(many[0])} {shown(kept[0])}\");",
+        "X Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_return_copies_a_payload_less_enum() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B748_PRELUDE}fun keep(value: Plain): Plain {{ value }}
+fun main() {{
+\tmut a = Plain::X;
+\tlet returned = keep(a);
+\tset(&mut a);
+\tprint(i\"{{shown(a)}} {{shown(returned)}}\");
+}}
+"
+        ),
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_closure_capture_keeps_a_payload_less_enums_value() {
+    b748_runs(
+        "\tmut a = Plain::X;\n\tlet seen = a;\n\tlet read = || shown(seen);\n\tset(&mut a);\n\tprint(i\"{shown(a)} {read()}\");",
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_mut_parameter_copies_a_payload_less_enum_argument() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B748_PRELUDE}fun through(mut value: Plain): str {{
+\tset(&mut value);
+\tshown(value)
+}}
+fun main() {{
+\tlet c = Plain::X;
+\tprint(i\"{{through(c)}} {{shown(c)}}\");
+}}
+"
+        ),
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_mut_capture_and_a_destructure_copy_a_payload_less_enum() {
+    b748_runs(
+        "\tlet held: Option<Plain> = Some(Plain::X);\n\tmatch held {\n\t\tSome(mut p) => set(&mut p),\n\t\tNone => {},\n\t}\n\tlet pair = (Plain::X, 1);\n\tmut (q, _n) = pair;\n\tset(&mut q);\n\tprint(i\"{held == Some(Plain::X)} {shown(pair.0)} {shown(q)}\");",
+        "true X Y\n",
+    );
+}
+
+#[test]
+fn b748_a_mut_self_write_on_a_payload_less_enum_keeps_its_copies() {
+    // Direct, through a trait's generic `&mut self` (std's derived
+    // `store_apply_at` writes a field's enum this way), and a generic `&mut T`.
+    assert_compiles_and_runs(
+        &format!(
+            "{B748_PRELUDE}impl Plain {{ fun flip(&mut self) {{ self = Plain::Y; }} }}
+trait Reset {{ fun reset(&mut self); }}
+impl Plain with Reset {{ fun reset(&mut self) {{ self = Plain::Y; }} }}
+fun reset_any<T: Reset>(slot: &mut T) {{ slot.reset(); }}
+fun put<T>(slot: &mut T, value: T) {{ slot = value; }}
+fun main() {{
+\tmut f = Plain::X;
+\tlet f_copy = f;
+\tf.flip();
+\tmut g = Plain::X;
+\tlet g_copy = g;
+\treset_any(&mut g);
+\tmut h = Plain::X;
+\tlet h_copy = h;
+\tput(&mut h, Plain::Y);
+\tprint(i\"{{shown(f)}}{{shown(f_copy)}} {{shown(g)}}{{shown(g_copy)}} {{shown(h)}}{{shown(h_copy)}}\");
+}}
+"
+        ),
+        "YX YX YX\n",
+    );
+}
+
+#[test]
+fn b748_an_enum_with_a_payload_written_whole_keeps_its_copies() {
+    // B691 already copied these; the whole-value write is `__replace` the same.
+    assert_compiles_and_runs(
+        "[derive(PartialEq)]
+enum Kind { A, B(i32) }
+fun set_kind(slot: &mut Kind) { slot = Kind::B(2); }
+fun main() {
+\tmut k = Kind::A;
+\tlet copy = k;
+\tset_kind(&mut k);
+\tprint(i\"{copy == Kind::A} {k == Kind::B(2)}\");
+}
+",
+        "true true\n",
+    );
+}
+
+/// B748's cost, bounded: a payload-less enum is copied where it is SHARED, not
+/// where it is made. A bare variant (`mut out = Plain::X`), a derived `==` and
+/// a `match` over one copy nothing.
+#[test]
+fn b748_a_fresh_payload_less_variant_and_a_comparison_copy_nothing() {
+    let js = compile(&format!(
+        "{B748_PRELUDE}fun main() {{
+\tmut same = 0;
+\tmut round = 0;
+\tfor round < 100 {{
+\t\tmut out = Plain::X;
+\t\tif round > 50 {{
+\t\t\tout = Plain::Y;
+\t\t}}
+\t\tif out == Plain::Y {{
+\t\t\tsame += 1;
+\t\t}}
+\t\tmatch out {{
+\t\t\tPlain::X => same += 0,
+\t\t\tPlain::Y => same += 1,
+\t\t}}
+\t\tround += 1;
+\t}}
+\tprint(same);
+}}
+"
+    ))
+    .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let counted = js.replace(
+        "function __clone(value) {",
+        "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+    );
+    let counted = format!(
+        "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+    );
+    let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(stdout.starts_with("98\n"), "{stdout}");
+    assert!(stdout.contains("copies=0\n"), "{stdout}");
 }
 
 // --- M199: a pattern over a `Shared` read copies only when it must ----------

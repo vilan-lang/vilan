@@ -803,3 +803,5 @@ NEW	-	this program reaches `std::gfx`, and its `main` answers an exit code: the 
 NEW	-	`{name}` is a hyphenated attribute, which only a web element takes: on `<{tag}>`, an attribute is a method of what `{tag}()` returns, and no method is named `{name}`
 NEW	-	`on:` is the web element's event form: on `<{tag}>`, an event is a method of what `{tag}()` returns, written as an attribute (`on_press(|| …)`)
 NEW	-	a `.method(…)` link is the web element's head form: on `<{tag}>`, every head item is an attribute, a method of what `{tag}()` returns, written without the dot
+NEW	-	{taker}: write `&mut {place}`; a `&` view cannot be written through
+NEW	-	{taker}, and this view is readonly (`&`): pass a writable one, `&mut <place>`

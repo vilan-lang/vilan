@@ -130,7 +130,10 @@ derived `PartialEq` over an enum takes — is not a construction: nothing outliv
 the match, so its patterns bind pieces of the places it names, and each capture
 copies (or shares, when nothing can write the place) exactly as a capture of
 that place alone would. A payload-less variant named bare (`None`) names no
-place at all: every use is a fresh value.
+place at all: every use is a fresh value. A copy of an enum is a copy whatever
+its variants carry: after `let copy = level; set(&mut level)` over `enum Level
+{ Low, Mid, High }`, `copy` keeps its variant, through a field, an element, a
+capture, a return and a `&mut self` write alike (B748).
 
 The return reads **through** a view to reach the place, because a returned
 expression can name storage without being a place: `fun grab(&self): Inner {
@@ -321,6 +324,15 @@ The parameter conventions:
 | own | `own x: T` | by value, explicitly (documentation of intent) | a **move** (R3) |
 | ref | `&x` / `x: &T` | readonly view | readonly view (a loan) |
 | ref mut | `&mut x` / `x: &mut T` | writable view | writable view (a loan) |
+
+A view parameter takes a view, never a bare value (there is no implicit
+borrow), and a `&mut` parameter takes a **writable** one: `&mut place`, a
+`&mut` view binding or parameter passed on, or a `borrows` call answering
+`&mut T`. A readonly view there is refused, whichever form it takes:
+`bump(&x)` over `fun bump(a: &mut i32)` is answered "write `&mut x`", and a
+`&` view binding, a `&` parameter, `&holder.field` or a `borrows` call
+answering `&T` are refused alike, at a `fun`'s, a method's and a closure's
+`&mut` parameter (B684).
 
 The two columns are one rule read at two types, not two rules. **A bare
 parameter is a loan; for data a loan is indistinguishable from a copy** —

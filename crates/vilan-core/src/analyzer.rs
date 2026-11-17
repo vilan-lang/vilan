@@ -28110,8 +28110,9 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Whether a type lowers to a mutable JS aggregate (a struct, `List`,
-    /// `Context`, or a tuple) — the types that alias under assignment and so
-    /// need a semantic copy (rule 1). Scalars and `bool` do not.
+    /// `Context`, a tuple, an unbacked enum) — the types that alias under
+    /// assignment and so need a semantic copy (rule 1). Scalars, `bool` and a
+    /// backed enum do not.
     fn is_cloneable_aggregate(&self, type_: &Type) -> bool {
         match type_ {
             // `Shared<T>` is a `{ v }` CELL, and `__clone` shares a plain object
@@ -28138,16 +28139,22 @@ impl<'src> Analyzer<'src> {
             // write, whatever the payload's type: `mut b = a` of an
             // `Option<List<i32>>` showed `b`'s push in `a`, and of an
             // `Option<i32>` showed `b`'s `+= 5` in `a`. Natively every binding
-            // is its own value. A payload-less enum has nothing to write in
-            // place (a write through a view replaces the whole value), and a
-            // backed one is a bare number or string: both stay scalar copies.
-            Type::Enum(id, _) => self.enums.get(id).is_some_and(|enum_| {
-                enum_.backing.is_none()
-                    && enum_
-                        .variants
-                        .iter()
-                        .any(|variant| !variant.data_type_ids.is_empty())
-            }),
+            // is its own value.
+            //
+            // B748: a PAYLOAD-LESS plain enum is the same `[index]` array, and
+            // it is written in place too. B691 left it shared on the reasoning
+            // that a write through a view replaces the whole value — but that
+            // replacement IS the in-place write: an aggregate view's whole
+            // write is `__replace(target, value)`, which assigns into the
+            // shared array, so `let copy = a; set(&mut a)` moved `copy`, and
+            // so did a field, an element, a capture, a return and a `mut`
+            // parameter's body-entry copy, under a `&mut` parameter and a
+            // `&mut self` method, direct or generic (std's derived
+            // `store_apply_at` writes a field's enum that way). So every enum
+            // whose JS value is a mutable array is copied; only those lowering
+            // to an immutable primitive (`bool`, a backed enum:
+            // `enum_lowers_to_js_primitive`) are not.
+            Type::Enum(id, _) => !enum_lowers_to_js_primitive(*id, self.bool_enum_id, &self.enums),
             _ => false,
         }
     }
@@ -29040,6 +29047,20 @@ impl<'src> Analyzer<'src> {
             Some(Expr::Local(binding_id)) => self.binding_or_param_is_view(*binding_id),
             Some(Expr::Call(call_id)) => self.call_returns_view(*call_id),
             _ => false,
+        }
+    }
+
+    /// Whether the view an expression denotes is WRITABLE — `&mut` →
+    /// `Some(true)`, `&` → `Some(false)` — over the forms
+    /// [`Self::assignment_target_is_view`] admits: a `&[mut] place`, a view
+    /// binding or `&`/`&mut` parameter, a `borrows` call. `None` for anything
+    /// else, a value included (B684).
+    fn view_expr_mutability(&self, expr_id: Id) -> Option<bool> {
+        match self.expr_id_to_expr_map.get(&expr_id)? {
+            Expr::Reference(_, mutable) => Some(*mutable),
+            Expr::Local(binding_id) => self.view_mutability(*binding_id),
+            Expr::Call(call_id) => self.call_view_mutability(*call_id),
+            _ => None,
         }
     }
 
@@ -35423,6 +35444,15 @@ impl<'src> Analyzer<'src> {
                                 "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
                             ),
                         }, *argument_id);
+                    } else if *mutable {
+                        // B684: no binding of the caller's names the view a
+                        // `check_mutable_arguments` root walk would refuse
+                        // here (a closure callee is not a `fun`), so every
+                        // readonly form is this check's.
+                        self.refuse_readonly_view_at_mut(
+                            *argument_id,
+                            "this parameter takes `&mut`",
+                        );
                     }
                 }
                 continue;
@@ -35523,9 +35553,53 @@ impl<'src> Analyzer<'src> {
                             "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
                         ),
                     }, *argument_id);
+                } else if kind == "&mut" && self.readonly_root(*argument_id).is_none() {
+                    // B684: a `&mut` parameter takes a WRITABLE view. A
+                    // readonly view BINDING or `&` parameter is already
+                    // `check_mutable_arguments`' ("cannot mutate immutable"),
+                    // through `readonly_root`; a `&place` and a `borrows` call
+                    // answering `&T` name no binding, and passed clean.
+                    let parameter_name = self
+                        .parameters
+                        .get(parameter_id)
+                        .map_or("the parameter", |parameter| parameter.name);
+                    self.refuse_readonly_view_at_mut(
+                        *argument_id,
+                        &format!("`{callee_name}` takes `{parameter_name}` as `&mut`"),
+                    );
                 }
             }
         }
+    }
+
+    /// B684: refuse a READONLY view (`&place`, a `&` binding or parameter, a
+    /// `borrows` call answering `&T`) passed at a `&mut` parameter. It
+    /// checked clean: on JS the callee wrote through it — a `&` view and a
+    /// `&mut` one are the same runtime form — and the native emission was
+    /// refused by rustc. `taker` names the parameter (`` `bump` takes `a` as
+    /// `&mut` ``).
+    fn refuse_readonly_view_at_mut(&mut self, argument_id: Id, taker: &str) {
+        if self.view_expr_mutability(argument_id) != Some(false) {
+            return;
+        }
+        let msg = match self.expr_id_to_expr_map.get(&argument_id) {
+            Some(Expr::Reference(operand_id, false)) => {
+                let place = self.written_text_of(*operand_id).unwrap_or("<place>");
+                format!("{taker}: write `&mut {place}`; a `&` view cannot be written through")
+            }
+            _ => format!(
+                "{taker}, and this view is readonly (`&`): pass a writable one, `&mut <place>`"
+            ),
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
+                msg,
+            },
+            argument_id,
+        );
     }
 
     /// B649: whether a receiver is a value holding VIEWS — a call returning a
