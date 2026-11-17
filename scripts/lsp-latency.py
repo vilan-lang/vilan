@@ -71,6 +71,28 @@ under the compiler it will drive (`--vilan`, default the `vilan` beside
 when that exits non-zero. Order 49's seal read x2..x7 for want of the gitignored
 `src/lucide` in the base's archive; this is the check that would have said so.
 
+TWO LAYOUTS (N208). Kolt was reorganised on 2026-11-09: the FLAT layout (every
+module in `src/`, `src/shared.vl`, `src/model.vl`, one entry `src/client.vl`)
+became the PACKAGES layout (`src/client/...`, `src/server/...`, `src/shared/lib.vl`
+imported as `pkg::shared`, library packages under `lib/`, two entries in
+`vilan.toml`). `detect_layout` reads which one the copy holds, and each layout has
+its own scenario table, session and generated inputs: `SCENARIOS` is the flat
+table every seal before N208 measured (unchanged, so a run on that exhibit
+measures what it always did), `PACKAGE_SCENARIOS` gives each row the file that
+plays the same role in the new tree, under the SAME row names (a row name is a
+series in `perf/budgets.toml`; which tree a seal measures is seal.sh's choice).
+The JSON records the layout.
+
+`--probes` runs, instead of the latency scenarios, what the owner may feel
+beyond the time to diagnostics (M208): the cold open of the client entry; a
+BURST of ten keystrokes 80 ms apart (does each cancel the last analysis, and how
+long from the LAST keystroke to its diagnostics); the four keystroke-path
+requests asked WHILE an analysis is in flight (answered from the landed analysis,
+or queued behind it), hover far from the edit among them; and SWITCHING to a
+second file of the same world and editing it. After each probe the harness asks
+the server for its session summary (`vilan.logSessionSummary`), whose analysis
+counts (started / landed / cancelled) and base-cache figures are recorded.
+
 `--callgrind DIR` runs the server under valgrind's callgrind with instrumentation
 OFF, switches it on for ONE scenario's measured edit only (`callgrind_control
 -i on`), and prints `callgrind_annotate`'s top offenders. Use a binary built
@@ -258,6 +280,206 @@ SESSION = [
 ]
 SESSION_COMPANIONS = ["src/client.vl"]
 
+# N208: the same script on the PACKAGES layout (kolt from 2026-11-09 on; first
+# taken on kolt@755da23). Every row keeps its name and its role; the files moved
+# and one anchor changed:
+#   leaf          src/views.vl   -> src/client/app/views.vl (imported only by the
+#                                   entry, as before; the anchors are unchanged)
+#   world mode    src/client.vl  -> src/client/main.vl (the client entry)
+#   shared        src/shared.vl  -> src/shared/lib.vl (`pkg::shared`, imported by
+#                                   79 modules of 116, the flat tree's 49 of 126)
+#   model         src/model.vl   -> src/client/app/model.vl (imported by 36
+#                                   client modules; the anchors are unchanged)
+#   importers     + src/client/channels/channel.vl, the entry and views.vl, all
+#                   three importers of the model, as before
+#   css           src/styles.vl  -> src/client/ui/styles.vl: the same `icon_style`
+#                                   `css { }` block, whose lengths are `dp(16)` now
+#                                   where they were `size(4)`; the edit keeps its
+#                                   place (the block's `width` line) and the hover
+#                                   its offset inside the length's call
+#   parse break   src/channel.vl -> src/client/channels/channel.vl (unchanged
+#                                   anchors)
+# A NEW series on this layout: its numbers are not comparable with the flat
+# tree's, whose rows `perf/budgets.toml` carries until the owner re-anchors them.
+PACKAGE_SCENARIOS = [
+    {
+        "name": "leaf keystroke",
+        "file": "src/client/app/views.vl",
+        "edit": ("\tlet theme_modal = create_theme_modal();", 1),
+        "text": " ",
+        "hover": ("create_theme_modal();", 3),
+        "completion": ("get_prefs().theme.derive", len("get_prefs().")),
+    },
+    {
+        "name": "leaf keystroke + pause",
+        "file": "src/client/app/views.vl",
+        "edit": ("\tlet theme_modal = create_theme_modal();", 1),
+        "text": " ",
+        "pause": 3.0,
+        "hover": ("create_theme_modal();", 3),
+        "completion": ("get_prefs().theme.derive", len("get_prefs().")),
+    },
+    {
+        "name": "leaf keystroke, world mode",
+        "file": "src/client/app/views.vl",
+        "also_open": ["src/client/main.vl"],
+        "edit": ("\tlet theme_modal = create_theme_modal();", 1),
+        "text": " ",
+        "hover": ("create_theme_modal();", 3),
+        "completion": ("get_prefs().theme.derive", len("get_prefs().")),
+    },
+    {
+        "name": "shared.vl keystroke",
+        "file": "src/shared/lib.vl",
+        "edit": ("\t\tself.uuid.hash()", 2),
+        "text": " ",
+        "hover": ("self.uuid.hash()", 10),
+        "completion": ("self.uuid.hash()", len("self.")),
+    },
+    {
+        "name": "model.vl keystroke",
+        "file": "src/client/app/model.vl",
+        "edit": ("\t\tget_client().get_safe()!.create_channel(org, name)", 2),
+        "text": " ",
+        "hover": ("create_channel(org, name)", 3),
+        "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
+        # `Channel::ids`, used in eight client modules, none open.
+        "references": ("fun ids(talk", 5),
+    },
+    {
+        "name": "model.vl keystroke, importers open",
+        "file": "src/client/app/model.vl",
+        "also_open": ["src/client/main.vl", "src/client/channels/channel.vl", "src/client/app/views.vl"],
+        "edit": ("\t\tget_client().get_safe()!.create_channel(org, name)", 2),
+        "text": " ",
+        "hover": ("create_channel(org, name)", 3),
+        "completion": ("get_client().get_safe()!.create_channel", len("get_client().")),
+    },
+    {
+        "name": "css keystroke",
+        "file": "src/client/ui/styles.vl",
+        "edit": ("\twidth(dp(16));", 1),
+        "text": " ",
+        "hover": ("min-width(dp(16));", 11),
+        "completion": ('style::element("placeholder")', len("style::")),
+    },
+    {
+        "name": "parse break",
+        "file": "src/client/channels/channel.vl",
+        "edit": ("\t\t\tlet name = Channel { id }.current_name(g.talk());", 3),
+        "text": "(",
+        "repair": "parse repair",
+        "hover": ("Channel { id }.current_name(g.talk());", len("Channel { id }.") + 2),
+        "completion": ("Channel { id }.current_name(g.talk());", len("Channel { id }.")),
+    },
+]
+
+PACKAGE_SESSION = [
+    {
+        "file": "src/client/app/views.vl",
+        "anchor": ("\tlet theme_modal = create_theme_modal();", len("\tlet theme_modal = create_theme_modal();")),
+        "keystrokes": list(" let x=1; "),
+    },
+    {
+        "file": "src/client/ui/theme.vl",
+        "anchor": (
+            "\tmut initial_theme = get_prefs().theme.get();",
+            len("\tmut initial_theme = get_prefs().theme.get();"),
+        ),
+        "keystrokes": list(" let y=2; "),
+    },
+    {
+        "file": "src/client/app/model.vl",
+        "anchor": (
+            "\tfun create(org: str, name: str): Result<Result<u53, str>, RpcError> {",
+            len("\tfun create(org: str, name: str): Result<Result<u53, str>, RpcError> {"),
+        ),
+        "keystrokes": list(" let z=3; "),
+    },
+    {
+        "file": "src/client/ui/styles.vl",
+        "anchor": ("\twidth(dp(16));", len("\twidth(dp(16));")),
+        "keystrokes": [" ", "h", "e", "i", "g", "h", "t", "(", "dp(16)", ");"],
+    },
+]
+
+
+def probes(leaf, entry, second):
+    """M208's probes (`--probes`) over one layout's files: `leaf` (the leaf row's
+    file), `entry` (the client entry), `second` (another module of the same
+    world, the parse-break row's file). The anchors are the leaf and parse-break
+    rows' own, which both layouts hold; the far hover is a call ~120 lines below
+    the edit."""
+    edit = ("\tlet theme_modal = create_theme_modal();", len("\tlet theme_modal = create_theme_modal();"))
+    near = {"completion": ("get_prefs().theme.derive", len("get_prefs()."))}
+    return [
+        # The client world opened cold (the first probe, so the server holds no
+        # world yet; the std prefix may come from the world cache on disk).
+        {"name": "open the client entry", "kind": "open", "file": entry},
+        # (a) ten keystrokes 80 ms apart, typed at the end of the leaf row's line
+        # (each intermediate text is as broken as typing makes it).
+        {"name": "burst of ten keystrokes", "kind": "burst", "file": leaf, "edit": edit,
+         "keystrokes": list(" let x=1; "), "interval": 0.08},
+        # (b) + (d): the keystroke-path requests asked once the analysis is
+        # RUNNING (the server's CPU has risen past the debounce), hover on a call
+        # far from the edit.
+        {"name": "requests while analysing", "kind": "inflight", "file": leaf,
+         "edit": ("\tlet theme_modal = create_theme_modal();", 1), "text": " ",
+         "hover": ("provide_app_actions(search_modal", 3), **near},
+        # (c) the leaf file edited, then a second module of the same world opened
+        # beside it and edited: run 1 is the switch, the rest steady state.
+        {"name": "switch to a second file", "kind": "switch",
+         "prime": {"file": leaf, "edit": ("\tlet theme_modal = create_theme_modal();", 1), "text": " "},
+         "file": second,
+         "edit": ("\t\t\tlet name = Channel { id }.current_name(g.talk());", 3), "text": " ",
+         "hover": ("Channel { id }.current_name(g.talk());", len("Channel { id }.") + 2),
+         "completion": ("Channel { id }.current_name(g.talk());", len("Channel { id }."))},
+    ]
+
+
+# N208: what each layout carries. `inputs` are the gitignored GENERATED inputs a
+# `git archive` lacks and the copy needs to check clean (N165); `perf_gate.py
+# prepare_kolt` carries the same list.
+LAYOUTS = {
+    "flat": {
+        "scenarios": SCENARIOS,
+        "session": SESSION,
+        "companions": SESSION_COMPANIONS,
+        "probes": probes("src/views.vl", "src/client.vl", "src/channel.vl"),
+    },
+    "packages": {
+        "scenarios": PACKAGE_SCENARIOS,
+        "session": PACKAGE_SESSION,
+        "companions": ["src/client/main.vl"],
+        "probes": probes("src/client/app/views.vl", "src/client/main.vl", "src/client/channels/channel.vl"),
+    },
+}
+
+# Every layout's generated inputs, relative to the package root: the flat
+# layout's `search-dict`/`src/search-dict` (the const pass reads it) and
+# `src/lucide` (the icon module every view imports), and the packages layout's
+# `lib/lucide/src/icons` and `lib/search-dict/data` (the same two, as library
+# packages). A path a tree does not have is skipped.
+UNTRACKED_INPUTS = (
+    "search-dict",
+    "src/search-dict",
+    "lucide",
+    "src/lucide",
+    "lib/lucide/src/icons",
+    "lib/search-dict/data",
+)
+
+
+def detect_layout(root):
+    """N208: `packages` for kolt's 2026-11-09 layout (`src/shared/lib.vl` beside
+    the client entry `src/client/main.vl`), else `flat` - the layout every
+    earlier scenario was written for, and the one a tree that is neither is
+    measured as (its anchors then decide what lands)."""
+    root = Path(root)
+    if (root / "src/shared/lib.vl").is_file() and (root / "src/client/main.vl").is_file():
+        return "packages"
+    return "flat"
+
 
 # --- /proc readings -----------------------------------------------------------
 
@@ -376,6 +598,7 @@ class Server:
         self.response_ready = threading.Condition()
         self.publishes = []  # (time, uri, diagnostics)
         self.publish_ready = threading.Condition()
+        self.log_messages = []
         self.write_lock = threading.Lock()
         self.reader = threading.Thread(target=self._read, daemon=True)
         self.reader.start()
@@ -420,8 +643,10 @@ class Server:
                     self.publishes.append((now, params["uri"], params["diagnostics"], cpu))
                     self.publish_ready.notify_all()
             elif message.get("method") == "window/logMessage":
-                self.log.write(f"{now:.3f} {message['params'].get('message', '')}\n")
+                text = message["params"].get("message", "")
+                self.log.write(f"{now:.3f} {text}\n")
                 self.log.flush()
+                self.log_messages.append(text)
 
     def stderr_mark(self):
         """Where the server's stderr ends now — `stderr_since` reads what
@@ -868,11 +1093,11 @@ def counter_fields(line, prefix):
     return dict(word.split("=", 1) for word in line[len(prefix):].split() if "=" in word)
 
 
-def run_session(server, root, session):
+def run_session(server, root, session, companion_files):
     """M110 S0: the scripted session — per keystroke, what the analysis re-walked
     and what moved (the server's `hot-set` phase line and `incremental` counters
     line), its instructions and analyses, and Q10's broken-signature count."""
-    companions = [Document(server, root / relative) for relative in SESSION_COMPANIONS]
+    companions = [Document(server, root / relative) for relative in companion_files]
     for companion in companions:
         opened = time.perf_counter()
         companion.open()
@@ -1027,11 +1252,17 @@ def copy_untracked_inputs(kolt, target):
     the archive when the checkout has them; without them the copy reports errors the
     owner's tree does not (56 `cannot find 'lucide'` at v0.46.0), and a server that
     analyzes a BROKEN program stops early, so every base row reads half its true cost
-    and the seal's ratios inflate (Order 49's seal 1). `perf_gate.py prepare_kolt`
-    carries the same two."""
-    for relative in ("search-dict", "src/search-dict", "lucide", "src/lucide"):
+    and the seal's ratios inflate (Order 49's seal 1). N208: the packages layout keeps
+    the same two under `lib/` (`UNTRACKED_INPUTS`). `perf_gate.py prepare_kolt`
+    carries the same list.
+
+    A path the archive already holds is left alone, a SYMLINK included: kolt@755da23 tracks
+    `src/search-dict -> ../lib/search-dict/data`, which dangles in the archive until the data is
+    copied, and copying through it failed (`exists()` follows the link)."""
+    for relative in UNTRACKED_INPUTS:
         source = kolt / relative
-        if source.is_dir() and not (target / relative).exists():
+        held = target / relative
+        if source.is_dir() and not (held.exists() or held.is_symlink()):
             shutil.copytree(source, target / relative)
 
 
@@ -1172,6 +1403,13 @@ def main():
         "css block, world mode) instead of the latency scenarios, and print what each keystroke re-walked and "
         "moved; the server runs with VILAN_COUNTERS=1 and VILAN_INCREMENTAL=measure unless already set",
     )
+    parser.add_argument(
+        "--probes",
+        action="store_true",
+        help="M208: run the probes instead of the latency scenarios - the client entry's cold open, a burst of "
+        "ten keystrokes 80 ms apart, the keystroke-path requests asked while an analysis runs, and a switch to a "
+        "second file of the same world - each followed by the server's session summary",
+    )
     arguments = parser.parse_args()
 
     scratch = Path(arguments.scratch or os.path.join(os.environ.get("TMPDIR", "/tmp"), "vilan-lsp-latency"))
@@ -1213,22 +1451,30 @@ def main():
             f"the copy of {described} does not check clean under {vilan}:\n  "
             + "\n  ".join(broken)
             + "\nA measurement of a broken program is not a measurement (the server stops early on one): "
-            "carry the package's generated inputs (src/lucide, src/search-dict) into the source, or pass the "
-            "commit/tree that checks under this compiler. Nothing was run."
+            "carry the package's generated inputs (src/lucide and src/search-dict, or lib/lucide/src/icons and "
+            "lib/search-dict/data) into the source, or pass the commit/tree that checks under this compiler. "
+            "Nothing was run."
         )
+    layout = detect_layout(root)
+    table = LAYOUTS[layout]
+    print(f"layout: {layout}", file=sys.stderr)
+    described = f"{described}, {layout} layout"
     if arguments.session:
-        return run_session_main(arguments, root, described, lsp, version, env, scratch, std_note)
-    scenarios = [s for s in SCENARIOS if not arguments.scenario or s["name"] in arguments.scenario]
+        return run_session_main(arguments, root, described, lsp, version, env, scratch, std_note, table)
+    if arguments.probes:
+        return run_probes_main(arguments, root, described, lsp, version, env, scratch, std_note, table, layout)
+    every = table["scenarios"]
+    scenarios = [s for s in every if not arguments.scenario or s["name"] in arguments.scenario]
     if not scenarios:
-        raise SystemExit(f"no scenario named {arguments.scenario}; the names: {[s['name'] for s in SCENARIOS]}")
+        raise SystemExit(f"no scenario named {arguments.scenario}; the names: {[s['name'] for s in every]}")
     # N174: a scenario whose anchors are missing is SKIPPED by name, with the reason in the log and
     # `skipped` in the JSON; the others run. (It used to refuse the whole run, which left Order 51's seal
     # with no LSP rows at all until two scenarios were left out by hand.) The seal reads the list: a
     # skipped MANDATE row is red there, an informational one a note.
     skipped = {}
     for name in arguments.scenario or []:
-        if name not in {s["name"] for s in SCENARIOS}:
-            skipped[name] = [f"{name}: no scenario of that name (the names: {[s['name'] for s in SCENARIOS]})"]
+        if name not in {s["name"] for s in every}:
+            skipped[name] = [f"{name}: no scenario of that name (the names: {[s['name'] for s in every]})"]
     scenarios, anchors_missing = split_by_anchors(root, scenarios)
     skipped.update(anchors_missing)
     for name, reasons in skipped.items():
@@ -1306,6 +1552,7 @@ def main():
                 {
                     "header": header,
                     "source": source,
+                    "layout": layout,
                     "open": cold_rows,
                     "edits": rows,
                     "skipped": list(skipped),
@@ -1343,9 +1590,10 @@ def start_server(command, root, env, scratch):
     return server
 
 
-def run_session_main(arguments, root, described, lsp, version, env, scratch, std_note):
+def run_session_main(arguments, root, described, lsp, version, env, scratch, std_note, table):
+    session = table["session"]
     problems = []
-    for place in SESSION:
+    for place in session:
         text = (root / place["file"]).read_text()
         count = text.count(place["anchor"][0])
         if count != 1:
@@ -1358,7 +1606,7 @@ def run_session_main(arguments, root, described, lsp, version, env, scratch, std
     load_before = load_average()
     server = start_server([lsp], root, env, scratch)
     try:
-        rows = run_session(server, root, SESSION)
+        rows = run_session(server, root, session, table["companions"])
     finally:
         server.stop()
     header = (
@@ -1368,6 +1616,320 @@ def run_session_main(arguments, root, described, lsp, version, env, scratch, std
     print_session(rows, header)
     if arguments.json:
         Path(arguments.json).write_text(json.dumps({"header": header, "session": rows}, indent=1))
+
+
+# --- M208's probes (`--probes`) -------------------------------------------------------
+
+
+def session_summary(server):
+    """The server's session summary (`vilan.logSessionSummary`, E174), which it writes to the client's
+    log before it answers the command: the whole text and its `name=value` fields (`started`, `landed`,
+    `cancelled`, `base_cache_worlds`, `base_cache_weight`, `total` (lsp-index ms), ...). Empty for a
+    server that does not declare the command."""
+    seen = len(server.log_messages)
+    try:
+        server.request("workspace/executeCommand", {"command": "vilan.logSessionSummary", "arguments": []}, timeout=60)
+    except (RuntimeError, TimeoutError):
+        return {"text": "", "fields": {}}
+    # The summary is a `window/logMessage` the server sends before it answers, but the two travel
+    # separately and the answer can arrive first: wait (bounded) for the message itself.
+    deadline = time.perf_counter() + 5
+    text = ""
+    while not text and time.perf_counter() < deadline:
+        text = next((message for message in server.log_messages[seen:] if message.startswith("session trace")), "")
+        if not text:
+            time.sleep(0.01)
+    fields = {}
+    for word in text.split():
+        if "=" in word:
+            name, value = word.split("=", 1)
+            fields.setdefault(name, value)
+    return {"text": text, "fields": fields}
+
+
+def analysis_counts(summary):
+    """(started, landed, cancelled) from a session summary, None where it carries none."""
+    fields = summary["fields"]
+    try:
+        return tuple(int(fields[name]) for name in ("started", "landed", "cancelled"))
+    except (KeyError, ValueError):
+        return None
+
+
+def counts_since(before, after):
+    if before is None or after is None:
+        return None
+    return {name: late - early for name, early, late in zip(("started", "landed", "cancelled"), before, after)}
+
+
+def open_and_settle(server, document):
+    opened = time.perf_counter()
+    document.open()
+    server.wait_publish(document.uri, opened)
+    server.settle()
+
+
+def instructions_between(before, after):
+    return after - before if before is not None and after is not None else None
+
+
+def probe_open(server, root, probe, runs):
+    """The probe's file opened with nothing else open: CPU to its last publish and to idle,
+    instructions, and the analyses it ran."""
+    document = Document(server, root / probe["file"])
+    cpu_before = cpu_ms(server.pid)
+    instructions_before = server.instructions.read()
+    mark = server.stderr_mark()
+    opened = time.perf_counter()
+    document.open()
+    server.wait_publish(document.uri, opened)
+    settled_at = server.settle()
+    last = server.last_publish(document.uri, opened)
+    record = phase_record(server.stderr_since(mark))
+    sample = {
+        "diagnostics_ms": (last[0] - opened) * 1000,
+        "diagnostics_cpu_ms": last[3] - cpu_before,
+        "cpu_ms": cpu_ms(server.pid) - cpu_before,
+        "settle_ms": (settled_at - opened) * 1000,
+        "instructions": instructions_between(instructions_before, server.instructions.read()),
+        "analyses": record["analyses"],
+        "phase": record["phase"],
+        "errors": sum(1 for diagnostic in last[2] if diagnostic.get("severity", 1) == 1),
+        "memory": memory_kb(server.pid),
+        "status": analysis_status(server, document),
+    }
+    document.close()
+    server.settle()
+    return [sample]
+
+
+def analysis_status(server, document):
+    """The status line's answer for a document (`vilan/analysisPlatform`, E247): the world it is analysed in
+    and the analysis's size (`work`: files, entities, impls), or None from a server without it."""
+    try:
+        status, _ = server.request("vilan/analysisPlatform", {"uri": document.uri}, timeout=60)
+    except (RuntimeError, TimeoutError):
+        return None
+    return status
+
+
+def probe_burst(server, root, probe, runs):
+    """(a) The probe's keystrokes typed `interval` seconds apart into its file: from the LAST keystroke to the
+    last publish for the file, the CPU and instructions from the first keystroke to idle, the analyses the
+    server started, landed and cancelled (its session summary, before and after), and the publishes the
+    file got while the burst was typed."""
+    document = Document(server, root / probe["file"])
+    open_and_settle(server, document)
+    offset = anchor_offset(document.text, probe["edit"], probe, "edit")
+    samples = []
+    for _ in range(runs):
+        counts_before = analysis_counts(session_summary(server))
+        server.settle()
+        cpu_before = cpu_ms(server.pid)
+        instructions_before = server.instructions.read()
+        mark = server.stderr_mark()
+        started = time.perf_counter()
+        typed = 0
+        for index, keystroke in enumerate(probe["keystrokes"]):
+            delay = started + index * probe["interval"] - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            document.insert(offset + typed, keystroke)
+            typed += len(keystroke)
+        last_keystroke = time.perf_counter()
+        server.wait_publish(document.uri, last_keystroke)
+        settled_at = server.settle()
+        last = server.last_publish(document.uri, last_keystroke)
+        with server.publish_ready:
+            during = sum(1 for entry in server.publishes if started < entry[0] <= last_keystroke and entry[1] == document.uri)
+        record = phase_record(server.stderr_since(mark))
+        samples.append({
+            "burst_ms": (last_keystroke - started) * 1000,
+            "last_keystroke_to_diagnostics_ms": (last[0] - last_keystroke) * 1000,
+            "last_keystroke_to_diagnostics_cpu_ms": last[3] - cpu_before,
+            "cpu_ms": cpu_ms(server.pid) - cpu_before,
+            "settle_after_last_ms": (settled_at - last_keystroke) * 1000,
+            "instructions": instructions_between(instructions_before, server.instructions.read()),
+            "analyses_landed_phase_lines": record["analyses"],
+            "publishes_during_burst": during,
+            "analyses": counts_since(counts_before, analysis_counts(session_summary(server))),
+            "errors": sum(1 for diagnostic in last[2] if diagnostic.get("severity", 1) == 1),
+            "phase": record["phase"],
+        })
+        undone = time.perf_counter()
+        document.delete(offset, typed)
+        server.wait_publish(document.uri, undone)
+        server.settle()
+    document.close()
+    server.settle()
+    return samples
+
+
+def probe_inflight(server, root, probe, runs, threshold_ms=250.0):
+    """(b) + (d): one keystroke, then, once the server's CPU since the edit passes `threshold_ms` (past the
+    debounce: the keystroke's own handling costs far less, so an analysis is RUNNING; 50 ms was crossed
+    before the analysis began on kolt), the four keystroke-path requests in turn - hover at the probe's
+    (far) anchor, completion, inlay hints, semantic tokens - each one's wall, and whether it was answered
+    before the analysis's publish landed. `in_flight` is false when the analysis landed before the CPU
+    passed the threshold (the requests then measure a settled server)."""
+    document = Document(server, root / probe["file"])
+    open_and_settle(server, document)
+    samples = []
+    for _ in range(runs):
+        at = anchor_offset(document.text, probe["edit"], probe, "edit")
+        cpu_before = cpu_ms(server.pid)
+        started = time.perf_counter()
+        document.insert(at, probe["text"])
+        deadline = started + 10
+        while cpu_ms(server.pid) - cpu_before < threshold_ms and time.perf_counter() < deadline:
+            time.sleep(0.005)
+        asked_at = time.perf_counter()
+        answers = {}
+        for kind in KEYSTROKE_REQUESTS:
+            wall = document.ask(kind, probe)
+            answers[kind] = {"wall_ms": wall * 1000, "answered_at": time.perf_counter()}
+        server.settle()
+        last = server.last_publish(document.uri, started)
+        landed = last[0] if last else None
+        samples.append({
+            "waited_for_analysis_ms": (asked_at - started) * 1000,
+            "in_flight": landed is None or landed > asked_at,
+            "diagnostics_ms": (landed - started) * 1000 if landed else None,
+            "requests": {
+                kind: {
+                    "wall_ms": answer["wall_ms"],
+                    "before_landing": landed is None or answer["answered_at"] < landed,
+                }
+                for kind, answer in answers.items()
+            },
+        })
+        undone = time.perf_counter()
+        document.delete(at, len(probe["text"]))
+        server.wait_publish(document.uri, undone)
+        server.settle()
+    document.close()
+    server.settle()
+    return samples
+
+
+def probe_switch(server, root, probe, runs):
+    """(c) The `prime` file opened and edited (a keystroke and its undo), then - with it still open - the
+    probe's file opened and edited `runs` times: the open's cold row and every edit's sample, run 1 being
+    the first keystroke after the switch."""
+    prime = probe["prime"]
+    first = Document(server, root / prime["file"])
+    open_and_settle(server, first)
+    at = anchor_offset(first.text, prime["edit"], {"name": probe["name"], "file": prime["file"]}, "edit")
+    for change in (lambda: first.insert(at, prime["text"]), lambda: first.delete(at, len(prime["text"]))):
+        changed = time.perf_counter()
+        change()
+        server.wait_publish(first.uri, changed)
+        server.settle()
+    cold, rows = run_scenario(server, root, probe, runs)
+    first.close()
+    server.settle()
+    return {"open": cold, "edits": rows[probe["name"]]}
+
+
+PROBE_KINDS = {"open": probe_open, "burst": probe_burst, "inflight": probe_inflight, "switch": probe_switch}
+
+
+def print_probes(results, header):
+    print(header)
+    print()
+    for probe, samples in results:
+        kind = probe["kind"]
+        print(f"### {probe['name']} ({kind}, {probe['file']})")
+        print()
+        if kind == "open":
+            for sample in samples:
+                instructions = sample["instructions"]
+                print(
+                    f"CPU to diagnostics {sample['diagnostics_cpu_ms']:.0f} ms, to idle {sample['cpu_ms']:.0f} ms, "
+                    f"wall {sample['diagnostics_ms']:.0f} ms, "
+                    f"{'-' if instructions is None else f'{instructions / 1e9:.2f} G'} instructions:u, "
+                    f"{sample['analyses']} analyses, {sample['errors']} errors, "
+                    f"VmHWM {sample['memory']['VmHWM'] / 1024:.0f} MB"
+                )
+                work = (sample.get("status") or {}).get("work")
+                if work:
+                    print(f"analysis size: {work['files']} files, {work['entities']} entities, {work['impls']} impls")
+        elif kind == "burst":
+            print("| run | burst ms | last key to diagnostics ms (wall) | CPU to idle ms | instructions:u (G) "
+                  "| started / landed / cancelled | publishes during burst |")
+            print("|---:|---:|---:|---:|---:|---|---:|")
+            for number, sample in enumerate(samples, start=1):
+                analyses = sample["analyses"]
+                shown = "-" if analyses is None else f"{analyses['started']} / {analyses['landed']} / {analyses['cancelled']}"
+                instructions = sample["instructions"]
+                print(
+                    f"| {number} | {sample['burst_ms']:.0f} | {sample['last_keystroke_to_diagnostics_ms']:.0f} "
+                    f"| {sample['cpu_ms']:.0f} | {'-' if instructions is None else f'{instructions / 1e9:.2f}'} "
+                    f"| {shown} | {sample['publishes_during_burst']} |"
+                )
+        elif kind == "inflight":
+            print("| run | in flight | asked after ms | hover ms | completion ms | inlay ms | tokens ms "
+                  "| diagnostics landed ms |")
+            print("|---:|---|---:|---:|---:|---:|---:|---:|")
+            for number, sample in enumerate(samples, start=1):
+                cells = " | ".join(
+                    f"{sample['requests'][kind]['wall_ms']:.1f}"
+                    + ("" if sample["requests"][kind]["before_landing"] else " (after landing)")
+                    for kind in KEYSTROKE_REQUESTS
+                )
+                landed = sample["diagnostics_ms"]
+                print(
+                    f"| {number} | {'yes' if sample['in_flight'] else 'no'} | {sample['waited_for_analysis_ms']:.0f} "
+                    f"| {cells} | {'-' if landed is None else f'{landed:.0f}'} |"
+                )
+        else:
+            print_table({f"open {probe['file']} beside {probe['prime']['file']}": samples["open"]},
+                        {probe["name"]: samples["edits"]}, "Run 1 is the first keystroke after the switch.")
+            for number, sample in enumerate(samples["edits"], start=1):
+                instructions = sample.get("instructions")
+                print(f"- run {number}: CPU to diagnostics {sample['diagnostics_cpu_ms']:.0f} ms, "
+                      f"{'-' if instructions is None else f'{instructions / 1e9:.2f} G'} instructions:u, "
+                      f"{sample.get('analyses')} analyses")
+        print()
+
+
+def run_probes_main(arguments, root, described, lsp, version, env, scratch, std_note, table, layout):
+    every = table["probes"]
+    chosen = [probe for probe in every if not arguments.scenario or probe["name"] in arguments.scenario]
+    if not chosen:
+        raise SystemExit(f"no probe named {arguments.scenario}; the names: {[probe['name'] for probe in every]}")
+    problems = []
+    for probe in chosen:
+        places = [probe] + ([dict(probe["prime"], name=probe["name"])] if "prime" in probe else [])
+        for place in places:
+            if "edit" in place:
+                problems.extend(scenario_problems(root, dict(place, text=place.get("text", ""))))
+            elif not (root / place["file"]).is_file():
+                problems.append(f"{probe['name']}: cannot read {place['file']}")
+    if problems:
+        raise SystemExit("the probes do not land in " + described + ":\n  " + "\n  ".join(problems))
+    env.setdefault("VILAN_PHASE_TIMING", "1")
+    load_before = load_average()
+    server = start_server([lsp], root, env, scratch)
+    results = []
+    try:
+        for probe in chosen:
+            print(f"  {probe['name']} ...", file=sys.stderr)
+            samples = PROBE_KINDS[probe["kind"]](server, root, probe, arguments.runs)
+            results.append((probe, samples))
+            probe["summary_after"] = session_summary(server)["text"]
+    finally:
+        server.stop()
+    header = (
+        f"vilan-lsp probes (M208) — {version} on {described} ({std_note}); {arguments.runs} run(s) per probe; "
+        f"loadavg {load_before} before, {load_average()} after; {os.cpu_count()} cores"
+    )
+    print_probes(results, header)
+    if arguments.json:
+        Path(arguments.json).write_text(json.dumps(
+            {"header": header, "layout": layout,
+             "probes": [{"probe": probe, "samples": samples} for probe, samples in results]},
+            indent=1, default=str))
 
 
 if __name__ == "__main__":

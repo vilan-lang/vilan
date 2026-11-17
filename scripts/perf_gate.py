@@ -35,7 +35,8 @@ under the tip, and a migrated one does not check under the release. `seal --tip-
 own source — a prepared, already-migrated tree used as-is (copied to the scratch location, no git needed in
 it) — while the base keeps `--kolt`/`--commit`. Before anything is measured, each side must check its own
 source with no errors, or the seal is refused; the verdict and its report say the two sides checked
-different sources, and why.
+different sources, and why. On one source the tip still checks in a copy of its own (N208): a shared copy
+shares the compiler's per-package check-cache table between two toolchains, and every measured run missed.
 
 A clock appears only in T3, which runs on the owner's quiet machine and refuses a CPU verdict under load;
 every other figure is a count, the same on any machine of a class. Linux only (perf_event_open, wait4)."""
@@ -63,6 +64,18 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_RSS_THRESHOLD = 1.05  # N166: peak RSS is deterministic, so it carries a tighter gate than the CPU rows
 BUDGETS = os.path.join(REPO, "perf", "budgets.toml")
 DEFAULT_VERDICTS = os.path.join(os.path.expanduser("~"), ".vilan", "perf-verdicts")
+# kolt's gitignored GENERATED inputs, which a `git archive` of its commit lacks (N165), relative to the package
+# root: the flat layout's search dictionary and lucide icons, and (N208) the 2026-11-09 layout's two library
+# packages' generated halves. A path a tree does not have is skipped. `scripts/lsp-latency.py` carries the
+# same list.
+UNTRACKED_INPUTS = (
+    "search-dict",
+    "src/search-dict",
+    "lucide",
+    "src/lucide",
+    "lib/lucide/src/icons",
+    "lib/search-dict/data",
+)
 
 
 # ---------------------------------------------------------------------------- budgets.toml
@@ -452,10 +465,14 @@ def prepare_kolt(kolt, commit, scratch):
     archive = subprocess.run(["git", "-C", kolt, "archive", commit], stdout=subprocess.PIPE, check=True)
     subprocess.run(["tar", "-x", "-C", copy], input=archive.stdout, check=True)
     # Untracked inputs: the search dictionary the const pass reads, and the generated lucide icons
-    # (ignored since kolt's "ignore generated icons"; without them no commit after it checks).
-    for extra in ("search-dict", "src/search-dict", "src/lucide"):
+    # (ignored since kolt's "ignore generated icons"; without them no commit after it checks). N208: since
+    # kolt's 2026-11-09 layout both live in library packages, `lib/search-dict/data` and
+    # `lib/lucide/src/icons`. `scripts/lsp-latency.py`'s `UNTRACKED_INPUTS` is the same list.
+    # A path the archive holds is left alone, a symlink included (`lexists`): kolt@755da23 tracks
+    # `src/search-dict -> ../lib/search-dict/data`, which dangles until the data is copied.
+    for extra in UNTRACKED_INPUTS:
         source = os.path.join(kolt, extra)
-        if os.path.isdir(source) and not os.path.exists(os.path.join(copy, extra)):
+        if os.path.isdir(source) and not os.path.lexists(os.path.join(copy, extra)):
             shutil.copytree(source, os.path.join(copy, extra))
     sha = subprocess.run(["git", "-C", kolt, "rev-parse", "--short=8", commit],
                          capture_output=True, text=True).stdout.strip()
@@ -482,15 +499,27 @@ def side_envs(options):
 
 
 def prepare_sources(options, scratch):
-    """The two sides' kolt copies: one copy of `--kolt` at `--commit` for both, or — across a breaking
-    release — that copy for the base and the prepared `--tip-kolt` tree for the tip."""
+    """The two sides' kolt copies: `--kolt` at `--commit` for the base and an identical second copy of it
+    for the tip, or — across a breaking release — that copy for the base and the prepared `--tip-kolt` tree
+    for the tip.
+
+    N208: each side ALWAYS checks in a copy of its own. `vilan check` keeps a per-package table (macro
+    expansions and const sites) under `~/.vilan/check-cache/<hash of the package's path>`, stamped with the
+    toolchain's version and build, so two compilers alternating in ONE copy overwrite each other's table
+    and every measured run is a miss: the same kolt read 46.1 G instructions at the seals on one shared copy
+    and 33.7 G at the seals with a `--tip-kolt` tree (two copies, two tables, warm after the warm-up),
+    the const-site table ~9.4 G of the difference and the macro table ~2.9 G. Two copies measure the warm
+    check on both kinds of seal."""
     base_copy, kolt_sha = prepare_kolt(options.kolt, options.commit, scratch)
-    sources = {"base": {"copy": base_copy, "label": f"kolt@{kolt_sha}"},
-               "tip": {"copy": base_copy, "label": f"kolt@{kolt_sha}"}, "kolt": kolt_sha, "different": False}
     if options.tip_kolt:
-        sources["tip"] = {"copy": prepare_tree(options.tip_kolt, scratch),
-                          "label": prepared_tree_label(options.tip_kolt)}
-        sources["different"] = True
+        tip = {"copy": prepare_tree(options.tip_kolt, scratch), "label": prepared_tree_label(options.tip_kolt)}
+    else:
+        tip_copy = os.path.join(scratch, "kolt-tip")
+        # `symlinks=True`: the same tree, a tracked link (kolt's `src/search-dict`) kept a link.
+        shutil.copytree(base_copy, tip_copy, symlinks=True)
+        tip = {"copy": tip_copy, "label": f"kolt@{kolt_sha}"}
+    sources = {"base": {"copy": base_copy, "label": f"kolt@{kolt_sha}"}, "tip": tip, "kolt": kolt_sha,
+               "different": bool(options.tip_kolt)}
     if not options.base_std:
         for side in ("base", "tip"):
             if inside_a_checkout(sources[side]["copy"]):
