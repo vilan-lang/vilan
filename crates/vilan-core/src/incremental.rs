@@ -486,6 +486,14 @@ pub enum Plant {
     /// view-capturing closure to a callee whose storing body is restored then
     /// reads the callee as keeping nothing, and the refusal goes.
     RetainRowsUnrestored,
+    /// M208 (Order 59): an item's signature computed WITHOUT its written
+    /// type references — the rows the per-source index hands it dropped. An
+    /// import edited so a written type name binds to another declaration
+    /// then leaves every item that only WRITES the name (a parameter's
+    /// annotation, nothing that references the declaration as an entity)
+    /// with the signature it had, and its record is served: the previous
+    /// declaration's labels and checks.
+    ItemSignatureWithoutTypeReferences,
 }
 
 impl Plant {
@@ -508,6 +516,7 @@ impl Plant {
             Plant::R11RecordUnguarded => 16,
             Plant::AsyncRecordUnguarded => 17,
             Plant::RetainRowsUnrestored => 18,
+            Plant::ItemSignatureWithoutTypeReferences => 19,
         }
     }
 }

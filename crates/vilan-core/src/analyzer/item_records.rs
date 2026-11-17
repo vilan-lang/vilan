@@ -672,7 +672,11 @@ impl<'src> Analyzer<'src> {
     /// with; for every written type reference in its region the entity it
     /// bound to and its slot's place. Answers the fingerprint and the
     /// windows and prefix tail slots it reached — the read edges.
-    fn item_signature(&self, window: usize) -> (u64, Reached) {
+    fn item_signature(
+        &self,
+        window: usize,
+        type_reference_rows: &HashMap<SourceId, Vec<usize>>,
+    ) -> (u64, Reached) {
         let item = &self.id_windows.windows[window];
         let mut hash = hasher();
         let mut reached = Reached::default();
@@ -704,11 +708,38 @@ impl<'src> Analyzer<'src> {
             && let Some((region_start, region_end, _)) =
                 rows.iter().find(|(_, _, index)| *index == window)
         {
-            for (source, span, target, type_id) in &self.type_references {
-                if *source != item.source || span.start < *region_start || span.start >= *region_end
-                {
+            // M208: the item's source's rows alone, in the table's own order
+            // (`type_reference_rows_by_source`) — the scan this replaces read
+            // every row of the program once per laid-out item, 1,837 items
+            // against 90,758 rows on a kolt keystroke in a widely imported
+            // module. The same rows in the same order, so the same hash.
+            let rows_of_source: &[usize] = match crate::incremental::planted(
+                crate::incremental::Plant::ItemSignatureWithoutTypeReferences,
+            ) {
+                true => &[],
+                false => type_reference_rows
+                    .get(&item.source)
+                    .map_or(&[], Vec::as_slice),
+            };
+            debug_assert!(
+                crate::incremental::planted(
+                    crate::incremental::Plant::ItemSignatureWithoutTypeReferences
+                ) || rows_of_source.iter().copied().eq(self
+                    .type_references
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (source, ..))| *source == item.source)
+                    .map(|(index, _)| index)),
+                "the per-source index holds the source's rows in the table's order"
+            );
+            for (_, span, target, type_id) in rows_of_source
+                .iter()
+                .map(|index| &self.type_references[*index])
+            {
+                if span.start < *region_start || span.start >= *region_end {
                     continue;
                 }
+
                 // Relative to the region (M110 S7b): the absolute offset moves
                 // with every edit EARLIER in the file, which left every later
                 // item that writes a type stale on every keystroke; the
@@ -726,6 +757,24 @@ impl<'src> Analyzer<'src> {
             .retain(|reached_window| *reached_window != window);
         reached.settle();
         (hash.finish(), reached)
+    }
+
+    /// The written type references of every source that holds a laid-out
+    /// item, as row indices into `type_references` in the table's own order
+    /// — what [`Self::item_signature`] reads per item (M208).
+    fn type_reference_rows_by_source(&self) -> HashMap<SourceId, Vec<usize>> {
+        let mut rows: HashMap<SourceId, Vec<usize>> = self
+            .items
+            .spans
+            .keys()
+            .map(|source| (*source, Vec::new()))
+            .collect();
+        for (index, (source, ..)) in self.type_references.iter().enumerate() {
+            if let Some(of_source) = rows.get_mut(source) {
+                of_source.push(index);
+            }
+        }
+        rows
     }
 
     /// The text region of a laid-out window: its start and the item's span
@@ -781,12 +830,13 @@ impl<'src> Analyzer<'src> {
         let mut reads: HashMap<usize, Reached> = HashMap::default();
         let mut candidate: HashMap<usize, Arc<ItemRecord>> = HashMap::default();
         let mut stale: u64 = 0;
+        let type_reference_rows = self.type_reference_rows_by_source();
         for &window in &laid {
             let Some((region_start, text_hash)) = self.item_text(window) else {
                 self.items.unrecordable.insert(window);
                 continue;
             };
-            let (signature, reached) = self.item_signature(window);
+            let (signature, reached) = self.item_signature(window, &type_reference_rows);
             let item = &self.id_windows.windows[window];
             let record = records.get(&item.key).cloned();
             let mut deps: Vec<ItemKey> = reached

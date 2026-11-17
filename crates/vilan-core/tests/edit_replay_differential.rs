@@ -223,6 +223,11 @@ fn replay_the_classes() -> Replayed {
     {
         replay_from_the_base_text(fixture, "views.vl", &mut divergences, &mut censuses);
     }
+    // M208: the hot importers' item records — an untouched item of a
+    // re-walked file, served from the record the first analysis filed.
+    for fixture in ITEM_GRAIN_FIXTURES {
+        replay_from_the_base_text(fixture, "edited.vl", &mut divergences, &mut censuses);
+    }
     // M110 S3: the effect classes start from a served analysis of the BASE
     // text — the world's record is filed with every effect present, and each
     // edit then removes one (a seed that cannot shrink is the planted bug).
@@ -1330,6 +1335,7 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
         .chain(POST_PASS_FIXTURES)
         .chain(BOUND_FIXTURES)
         .chain(WINDOW_FIXTURES)
+        .chain(ITEM_GRAIN_FIXTURES)
     {
         let mut package = fixture.write();
         let mut opened: Vec<&str> = Vec::new();
@@ -1957,6 +1963,24 @@ fn the_differential_sees_an_item_record_served_over_a_dirty_dependency() {
         ),
         "the unguarded-record plant must turn a push into another module's binding red; \
          it found: {divergences:#?}"
+    );
+}
+
+/// M208's plant for the item signature's per-source index: the signature
+/// computed without its written type references. A name an import re-binds
+/// then leaves the item that only writes it served — the gate must see it.
+#[test]
+fn the_differential_sees_an_item_signature_without_its_type_references() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::ItemSignatureWithoutTypeReferences);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("a written type name re-bound by an import")),
+        "the reference-less signature plant must turn the re-bound name red; it found: \
+         {divergences:#?}"
     );
 }
 

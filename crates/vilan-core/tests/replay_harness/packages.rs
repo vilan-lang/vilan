@@ -1726,6 +1726,47 @@ pub const WINDOW_MAIN: &str = "import pkg::shapes::{ Pair, refused, same, total 
 
 pub const WINDOW_SHAPES: &str = "import std::compare::PartialEq;\n\n[derive(PartialEq)]\nexport struct Pair {\n\ta: i32,\n\tb: i32,\n}\n\nexport fun total(items: List<i32>): i32 {\n\tmut sum = 0;\n\tfor item in items {\n\t\tsum = sum + item;\n\t}\n\tsum\n}\n\nexport fun same(pair: Pair): bool {\n\tpair == Pair { a = pair.b, b = pair.a }\n}\n\nexport fun label(pair: Pair): str {\n\ti\"{pair.a}/{pair.b}\"\n}\n\nfun wants_eq<T: PartialEq>(value: T): bool {\n\tvalue == value\n}\n\nexport fun refused(): bool {\n\twants_eq(total)\n}\n";
 
+// --- M208: the hot importers' item records (the signature's type references) --------------
+//
+// A package whose EDITED module is `edited.vl` and whose point is an
+// UNTOUCHED item of that re-walked file: `show(x: Foo)` only WRITES the name
+// `Foo` — no expression of it references the declaration — and the edit
+// re-binds the name through the file's imports. The item's text, walk and
+// every entity reference are what they were; only its written type reference
+// moved, which is the half of the signature the per-source index feeds. The
+// plant `ItemSignatureWithoutTypeReferences` serves the record: the previous
+// declaration's label.
+
+pub const ITEM_REFERENCE_MAIN: &str =
+    "import pkg::edited::pad;\n\nfun main() {\n\tprint(pad());\n}\n";
+
+pub const ITEM_REFERENCE_ONE: &str = "export struct Foo {\n\tn: i32,\n}\n";
+
+pub const ITEM_REFERENCE_TWO: &str = "export struct Bar {\n\tn: i32,\n}\n";
+
+pub const ITEM_REFERENCE_EDITED: &str = "import pkg::one::Foo;\nimport pkg::two::Bar;\n\nexport fun pad(): i32 {\n\t1\n}\n\nexport fun show(x: Foo): i32 {\n\t1\n}\n";
+
+pub const ITEM_GRAIN_FIXTURES: &[Fixture] = &[Fixture {
+    name: "item_type_reference",
+    platform: NODE,
+    files: &[
+        ("main.vl", ITEM_REFERENCE_MAIN),
+        ("one.vl", ITEM_REFERENCE_ONE),
+        ("two.vl", ITEM_REFERENCE_TWO),
+        ("edited.vl", ITEM_REFERENCE_EDITED),
+    ],
+    edits: &[Edit {
+        label: "a written type name re-bound by an import: the untouched item that only writes it is re-derived (M208)",
+        file: "edited.vl",
+        seed: None,
+        replacements: &[(
+            "import pkg::one::Foo;\nimport pkg::two::Bar;\n",
+            "import pkg::one::Foo as Baz;\nimport pkg::two::Bar as Foo;\n",
+        )],
+    }],
+    dependencies: &[],
+}];
+
 pub const WINDOW_FIXTURES: &[Fixture] = &[Fixture {
     name: "id_windows",
     platform: NODE,

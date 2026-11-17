@@ -253,6 +253,7 @@ fn every_other_fixture_answers_the_same_over_a_loaded_prefix() {
     fixtures.extend(EFFECT_FIXTURES.iter());
     fixtures.extend(WINDOW_FIXTURES.iter());
     fixtures.extend(RETAIN_FIXTURES.iter());
+    fixtures.extend(ITEM_GRAIN_FIXTURES.iter());
     compare_fixtures("fixtures", &fixtures);
 }
 
