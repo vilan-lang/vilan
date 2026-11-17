@@ -1832,3 +1832,244 @@ sys.exit(perf_gate.main())
         "{text}"
     );
 }
+
+// --- N208: kolt's two layouts, and one check-cache table per side ---
+
+/// N208 (1): the harness reads which layout a copy holds - kolt's FLAT tree
+/// (every module in `src/`, `src/shared.vl`) before 2026-11-09, its PACKAGES
+/// tree (`src/shared/lib.vl` beside the client entry `src/client/main.vl`,
+/// library packages under `lib/`) after - and picks that layout's scenario
+/// table. The flat table stays the committed `SCENARIOS` (a run on the seal's
+/// exhibit measures what it always did), the packages table keeps every row's
+/// NAME (a row name is a series in `perf/budgets.toml`) and gives each role a
+/// file of the new tree, and a tree that is neither is measured as flat.
+#[cfg(target_os = "linux")]
+#[test]
+fn n208_the_lsp_harness_reads_kolts_layout_and_takes_that_layouts_scenarios() {
+    let scratch = Scratch::new("lsp-layouts");
+    let flat = scratch.path("flat");
+    fs::create_dir_all(flat.join("src")).expect("create the flat tree");
+    fs::write(flat.join("src/shared.vl"), "").expect("write");
+    fs::write(flat.join("src/client.vl"), "").expect("write");
+    let packages = scratch.path("packages");
+    fs::create_dir_all(packages.join("src/shared")).expect("create the packages tree");
+    fs::create_dir_all(packages.join("src/client")).expect("create the packages tree");
+    fs::write(packages.join("src/shared/lib.vl"), "").expect("write");
+    fs::write(packages.join("src/client/main.vl"), "").expect("write");
+    // A shared folder without the client entry is not the packages layout.
+    let neither = scratch.path("neither");
+    fs::create_dir_all(neither.join("src/shared")).expect("create the third tree");
+    fs::write(neither.join("src/shared/lib.vl"), "").expect("write");
+    let probe = r#"
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("latency", sys.argv[1])
+latency = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(latency)
+print("layouts:", [latency.detect_layout(pathlib.Path(path)) for path in sys.argv[2:5]])
+flat, packages = latency.LAYOUTS["flat"], latency.LAYOUTS["packages"]
+print("flat is the committed table:", flat["scenarios"] is latency.SCENARIOS and flat["session"] is latency.SESSION)
+print("same names:", [s["name"] for s in flat["scenarios"]] == [s["name"] for s in packages["scenarios"]])
+for scenario in packages["scenarios"]:
+    print("package row:", scenario["name"], "->", scenario["file"], scenario.get("also_open", []))
+print("package session:", [place["file"] for place in packages["session"]], packages["companions"])
+print("probes:", [(probe["name"], probe["kind"], probe["file"]) for probe in packages["probes"]])
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c"])
+        .arg(probe)
+        .arg(repository_root().join("scripts/lsp-latency.py"))
+        .args([&flat, &packages, &neither])
+        .output()
+        .expect("run the layout probe");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(
+        text.contains("layouts: ['flat', 'packages', 'flat']"),
+        "{text}"
+    );
+    assert!(text.contains("flat is the committed table: True"), "{text}");
+    assert!(text.contains("same names: True"), "{text}");
+    for row in [
+        "package row: leaf keystroke -> src/client/app/views.vl []",
+        "package row: leaf keystroke, world mode -> src/client/app/views.vl ['src/client/main.vl']",
+        "package row: shared.vl keystroke -> src/shared/lib.vl []",
+        "package row: model.vl keystroke -> src/client/app/model.vl []",
+        "package row: model.vl keystroke, importers open -> src/client/app/model.vl \
+         ['src/client/main.vl', 'src/client/channels/channel.vl', 'src/client/app/views.vl']",
+        "package row: css keystroke -> src/client/ui/styles.vl []",
+        "package row: parse break -> src/client/channels/channel.vl []",
+    ] {
+        assert!(text.contains(row), "missing `{row}`:\n{text}");
+    }
+    assert!(
+        text.contains(
+            "package session: ['src/client/app/views.vl', 'src/client/ui/theme.vl', \
+             'src/client/app/model.vl', 'src/client/ui/styles.vl'] ['src/client/main.vl']"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("('burst of ten keystrokes', 'burst', 'src/client/app/views.vl')")
+            && text.contains(
+                "('switch to a second file', 'switch', 'src/client/channels/channel.vl')"
+            ),
+        "{text}"
+    );
+}
+
+/// N208 (1): the packages layout's generated inputs (`lib/lucide/src/icons`,
+/// `lib/search-dict/data`) are carried into the archive's copy beside the flat
+/// layout's, by BOTH scripts from one list - and a path the archive already
+/// holds is left alone, a dangling symlink included. kolt@755da23 tracks
+/// `src/search-dict -> ../lib/search-dict/data`; `exists()` follows the link,
+/// so both scripts tried to copy through it and the harness stopped with
+/// `FileExistsError` before its first edit.
+#[cfg(target_os = "linux")]
+#[test]
+fn n208_both_scripts_carry_the_packages_layouts_generated_inputs_past_a_tracked_symlink() {
+    let scratch = Scratch::new("generated-inputs");
+    let repository = scratch.path("kolt");
+    fs::create_dir_all(repository.join("src")).expect("create the repository");
+    fs::create_dir_all(repository.join("lib/lucide/src")).expect("create lib/lucide");
+    git(&repository, &["init", "--quiet", "."]);
+    fs::write(
+        repository.join("vilan.toml"),
+        "[package]\nname = \"kolt\"\n",
+    )
+    .expect("write");
+    fs::write(repository.join("lib/lucide/src/lib.vl"), "").expect("write");
+    fs::write(
+        repository.join(".gitignore"),
+        "lib/lucide/src/icons/\nlib/search-dict/data/\n",
+    )
+    .expect("write");
+    std::os::unix::fs::symlink(
+        "../lib/search-dict/data",
+        repository.join("src/search-dict"),
+    )
+    .expect("the tracked symlink");
+    git(&repository, &["add", "-A"]);
+    git(&repository, &["commit", "--quiet", "-m", "fixture"]);
+    // The generated halves, untracked, as the owner's checkout holds them.
+    fs::create_dir_all(repository.join("lib/lucide/src/icons")).expect("create the icons");
+    fs::write(repository.join("lib/lucide/src/icons/lib.vl"), "// icons\n").expect("write");
+    fs::create_dir_all(repository.join("lib/search-dict/data")).expect("create the data");
+    fs::write(repository.join("lib/search-dict/data/words.txt"), "kolt\n").expect("write");
+    let probe = r#"
+import argparse, importlib.util, os, pathlib, sys
+spec = importlib.util.spec_from_file_location("latency", os.path.join(sys.argv[1], "lsp-latency.py"))
+latency = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(latency)
+sys.path.insert(0, sys.argv[1])
+import perf_gate
+repository, work = sys.argv[2], pathlib.Path(sys.argv[3])
+print("one list:", perf_gate.UNTRACKED_INPUTS == latency.UNTRACKED_INPUTS)
+root, sha = latency.prepare_copy(repository, "HEAD", work / "latency")
+def carried(copy):
+    copy = pathlib.Path(copy)
+    return ((copy / "lib/lucide/src/icons/lib.vl").read_text().strip(),
+            (copy / "src/search-dict").is_symlink(),
+            (copy / "src/search-dict/words.txt").read_text().strip())
+print("latency carried:", carried(root))
+os.makedirs(work / "seal")
+options = argparse.Namespace(kolt=repository, commit="HEAD", tip_kolt=None, base_std=str(work))
+sources = perf_gate.prepare_sources(options, str(work / "seal"))
+print("seal base carried:", carried(sources["base"]["copy"]))
+print("seal tip carried:", carried(sources["tip"]["copy"]))
+print("own copies:", sources["base"]["copy"] != sources["tip"]["copy"], sources["different"])
+"#;
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c"])
+        .arg(probe)
+        .arg(repository_root().join("scripts"))
+        .arg(&repository)
+        .arg(scratch.path("work"))
+        .output()
+        .expect("run the generated-inputs probe");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("one list: True"), "{text}");
+    let carried = "('// icons', True, 'kolt')";
+    assert!(
+        text.contains(&format!("latency carried: {carried}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("seal base carried: {carried}")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("seal tip carried: {carried}")),
+        "{text}"
+    );
+    assert!(text.contains("own copies: True False"), "{text}");
+}
+
+/// N208 (2): with no `--tip-kolt` the two sides check ONE source but each in
+/// its OWN copy. `vilan check` keeps a per-package table (macro expansions,
+/// const sites) keyed by the package's PATH and stamped with the toolchain's
+/// build; two compilers alternating in one copy overwrote each other's table,
+/// so every measured run missed - the same kolt read 46.1 G instructions at a
+/// seal on one shared copy and 33.7 G at a seal with a tip tree (two copies,
+/// two warm tables). The seal's T3 runs are stubbed to record where each side
+/// ran.
+#[cfg(target_os = "linux")]
+#[test]
+fn n208_a_seal_on_one_source_measures_each_side_in_a_copy_of_its_own() {
+    let scratch = Scratch::new("one-source-two-copies");
+    let budgets = scratch.path("budgets.toml");
+    fs::write(&budgets, HEADER).expect("write the fixture budgets");
+    let vilan = fake_vilan(&scratch);
+    let base = base_kolt(&scratch, "base", false);
+    let verdicts = scratch.path("verdicts");
+    let driver = format!(
+        r#"
+import os, sys
+sys.path.insert(0, {scripts:?})
+import perf_count, perf_gate
+seen = {{}}
+def measure(argv, cwd=None, env=None, counter="auto", log=None):
+    seen.setdefault(argv[0], set()).add(os.path.realpath(cwd))
+    return {{"counter": "instructions:u", "instructions": 1, "peak_rss_kb": 100, "cpu_s": 1.0, "exit": 0}}
+perf_count.measure = measure
+perf_count.hardware_counter_available = lambda: True
+perf_gate.loadavg = lambda: 0.5
+perf_gate.phase_split = lambda vilan, directory: {{"analyze": 1.0}}
+perf_gate.subject_dir = lambda subject, work: work
+sys.argv = ["perf_gate.py", "--budgets", {budgets:?}, "--work", {work:?}, "--scratch", {work:?}, "seal",
+            "--tip", {vilan:?}, "--base", {tip_name:?}, "--kolt", {base:?}, "--base-std", {work:?},
+            "--runs", "2", "--threshold", "5", "--verdict-dir", {verdicts:?}, "--sha", "0123456789abcdef"]
+try:
+    perf_gate.main()
+except SystemExit:
+    pass
+copies = {{os.path.basename(binary): sorted(os.path.basename(path) for path in paths) for binary, paths in seen.items()}}
+print("COPIES", sorted(copies.items()))
+"#,
+        scripts = repository_root().join("scripts").display().to_string(),
+        budgets = budgets.display().to_string(),
+        work = scratch.0.display().to_string(),
+        vilan = vilan.display().to_string(),
+        // The base under another name, so the stub can tell the sides apart.
+        tip_name = {
+            let alias = scratch.path("base-vilan");
+            std::os::unix::fs::symlink(&vilan, &alias).expect("alias the compiler");
+            alias.display().to_string()
+        },
+        base = base.display().to_string(),
+        verdicts = verdicts.display().to_string(),
+    );
+    let output = Command::new("python3")
+        .args(["-c", &driver])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run the seal driver");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(
+        text.contains("COPIES [('base-vilan', ['kolt']), ('fake-vilan', ['kolt-tip'])]"),
+        "each side ran in its own copy, and only there:\n{text}"
+    );
+}
