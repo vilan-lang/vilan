@@ -958,6 +958,7 @@ pub fn layout(root: &Node, width: f64, height: f64, scale_factor: f64) {
         }
     }
     let took = started.elapsed().as_secs_f64() * 1.0e6;
+    super::report::layout(took);
     LAST_FRAME.with(|last| {
         let mut record = last.get();
         record.layout_us = took;
@@ -987,6 +988,7 @@ pub fn paint(frame: u32, root: &Node) {
         with_tree(|tree| with_text(|text| or_fail(tree.paint(id, builder, text))))
     });
     let took = started.elapsed().as_secs_f64() * 1.0e6;
+    super::report::paint(took);
     let rebuilt = with_tree(|tree| tree.last_pass().rebuilt);
     LAST_FRAME.with(|last| {
         let mut record = last.get();

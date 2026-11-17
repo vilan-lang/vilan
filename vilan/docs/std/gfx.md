@@ -471,6 +471,26 @@ fun main() {
 main();
 ```
 
+## Diagnostics
+
+Three environment variables, read by the native host and never by the program,
+change nothing a program can observe. `VILAN_GFX_REPORT=1` prints a report to
+stderr: when a window opens, the GPU adapter it runs on (name, vendor, device
+type, backend, driver), the surface's format and present mode, and the window's
+size, scale factor and monitor; a line for each scale-factor change, each
+surface the window system declared outdated or lost, and each resize (at most
+four a second); and when the program ends, the frames presented and the count,
+median, 95th percentile and maximum of each part of a frame in microseconds
+(layout, paint, the frame callback, encode, submit, waiting for the surface,
+present, and the interval between frames that were asked for back to back).
+`WGPU_BACKEND` picks the graphics API (`vulkan`, `dx12`, `metal` or `gl`) instead
+of the system's default, and `WGPU_DEBUG=1` names every GPU object for a frame
+debugger.
+
+```sh
+VILAN_GFX_REPORT=1 vilan run --backend rust .
+```
+
 ## Not here yet
 
 Icons as `std::ui` elements (gfx-path.md), more than one window, rotation, text

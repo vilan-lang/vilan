@@ -41,6 +41,13 @@
 //! program's lines — each injection waits for the line its predecessor caused
 //! — never from a sleep.
 //!
+//! 10. `VILAN_GFX_REPORT=1` (F187): the host prints its start report (the
+//!     adapter, the surface, the window) and, when the window closes, its exit
+//!     report (frames and their times) to stderr; with `VILAN_GFX_REPORT=0`
+//!     it prints neither. The report's statistics and wording are pinned by
+//!     the GPU crate's unit tests (`src/host/report.rs`); this proves the
+//!     host prints them, from a real adapter.
+//!
 //! # When it runs
 //!
 //! On Linux with `xvfb-run` and `cargo`, and a software Vulkan adapter (Mesa's
@@ -462,4 +469,77 @@ fn the_clipboard_round_trips_with_another_x_client_and_is_absent_without_a_displ
         "the clipboard mode ended with {code:?}:\n{}\n--- stderr\n{stderr}",
         seen.join("\n")
     );
+}
+
+/// F187 (item 10 above): the report switch, on and off, around one hover and
+/// a close. Each step waits for the line its predecessor caused.
+#[test]
+fn the_report_switch_prints_the_adapter_at_start_and_the_frames_at_exit() {
+    if !may_run(tools_missing()) {
+        return;
+    }
+    let binary = build_example_as("report");
+    let injector = build_injector();
+    let run = |value: &str| {
+        let started = Instant::now();
+        let mut running = Running::start_in(
+            &binary,
+            &["--smoke"],
+            TITLE,
+            &[("VILAN_GFX_REPORT".to_string(), value.to_string())],
+        );
+        running.wait_for("frame 1 ", started);
+        // The button is 144 x 48 dp at (108, 140); at 100% a dp is a pixel.
+        running.inject(&injector, &["move", "180", "164"]);
+        running.wait_for("hover=true", started);
+        running.inject(&injector, &["close"]);
+        let (code, seen, stderr) = running.exit(started);
+        // Older `xvfb-run` scripts merge the program's stderr into stdout.
+        let said = format!("{}\n--- stderr\n{stderr}", seen.join("\n"));
+        assert_eq!(code, Some(0), "the run ended with {code:?}:\n{said}");
+        said
+    };
+
+    let off = run("0");
+    assert!(
+        !off.contains("vilan gfx report"),
+        "VILAN_GFX_REPORT=0 printed a report:\n{off}"
+    );
+
+    let on = run("1");
+    let lines: Vec<&str> = on.lines().collect();
+    let has = |wanted: &str| lines.iter().any(|line| line.starts_with(wanted));
+    for wanted in [
+        "--- vilan gfx report: start ---",
+        "adapter: ",
+        "adapter type: ",
+        "backend: ",
+        "surface format: ",
+        "present mode: ",
+        "scale factor: 1",
+        "--- vilan gfx report: exit ---",
+        "encode: count ",
+        "interval: ",
+        "glyph atlas: ",
+    ] {
+        assert!(has(wanted), "the report has no line `{wanted}..`:\n{on}");
+    }
+    // The window opened at its asked size, 360 x 240 dp at 100%.
+    assert!(
+        has("window inner size: 360x240 px"),
+        "the start report's window size:\n{on}"
+    );
+    // The first frame and the hover's: at least two presented.
+    let presented: u64 = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("frames presented: "))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("no frame count:\n{on}"));
+    assert!(presented >= 2, "{presented} frames presented:\n{on}");
+    // Both sections once, the start before the exit.
+    let start = on.find("--- vilan gfx report: start ---").expect("start");
+    let exit = on.find("--- vilan gfx report: exit ---").expect("exit");
+    assert!(start < exit, "the exit report came first:\n{on}");
+    assert_eq!(on.matches("--- vilan gfx report: start ---").count(), 1);
+    assert_eq!(on.matches("--- vilan gfx report: exit ---").count(), 1);
 }
