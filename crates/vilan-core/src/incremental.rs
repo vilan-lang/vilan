@@ -494,6 +494,12 @@ pub enum Plant {
     /// with the signature it had, and its record is served: the previous
     /// declaration's labels and checks.
     ItemSignatureWithoutTypeReferences,
+    /// M208 (Order 59): a served item's bound-audit sites skipped under ANY
+    /// late-declaration epoch — the epoch a constant. An `impl` removed from
+    /// one re-walked module then leaves a call in ANOTHER module's untouched
+    /// item, whose bound that impl satisfied, unasked: the refusal a clean
+    /// analysis speaks is never spoken.
+    BoundEpochUnguarded,
 }
 
 impl Plant {
@@ -517,6 +523,7 @@ impl Plant {
             Plant::AsyncRecordUnguarded => 17,
             Plant::RetainRowsUnrestored => 18,
             Plant::ItemSignatureWithoutTypeReferences => 19,
+            Plant::BoundEpochUnguarded => 20,
         }
     }
 }

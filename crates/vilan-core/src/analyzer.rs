@@ -9700,10 +9700,11 @@ impl<'src> Analyzer<'src> {
         // diagnostic to find. The slots the skipped questions would have
         // minted are not minted: no reader depends on a post-settle
         // `TypeId`'s VALUE (the census in the S2a entry of the CHANGELOG).
-        // M110 S7: MODULE grain, deliberately — a re-walked file's items keep
-        // their sites live (`item_records`: the question names the callee's
-        // constraint slot, and the hot set's own impls are the late impls the
-        // record's guard would ask of). M143 (S7b): the live modules' sites
+        // M110 S7 kept a re-walked file's sites at MODULE grain (the question
+        // names the callee's constraint slot, and the hot set's own impls are
+        // the late impls a record's guard would ask of); M208 serves them at
+        // item grain below, under an epoch over those late declarations
+        // rather than a per-question guard. M143 (S7b): the live modules' sites
         // are WALKED (`live_module_entries`) rather than every recorded site
         // of the program asked; the reused modules whose audit must re-run
         // (`bound_recompute_ranges`: a late impl answers one of their
@@ -9720,6 +9721,12 @@ impl<'src> Analyzer<'src> {
                     recorded.push((id, substitution.clone()));
                 }
             }
+        }
+        // M208: ITEM grain for a re-walked file — the sites of a served item
+        // whose record was clean under this analysis's late-declaration
+        // epoch are not asked (`item_records.rs`: `ItemRecord::bound_clean`).
+        if self.serves_bound_sites() {
+            recorded.retain(|(call_id, _)| !self.bound_site_served(*call_id));
         }
         let checked = recorded.len() as u64;
         let served = (self.method_call_substitution.len() as u64).saturating_sub(checked);
@@ -9783,6 +9790,7 @@ impl<'src> Analyzer<'src> {
             // the whole struct's span, about a call the author never wrote —
             // is E104's covered set doing nothing for anyone.
             if self.call_covered_by_expose_refusal(call_id) {
+                self.note_bound_site_unclean(call_id);
                 continue;
             }
             for (&constraint_id, &value_type_id) in &substitution {
@@ -9815,6 +9823,7 @@ impl<'src> Analyzer<'src> {
                         .expose_refused_elements
                         .contains(&self.pretty_print_type(&value_type, &HashMap::default()))
                 {
+                    self.note_bound_site_unclean(call_id);
                     continue;
                 }
                 if let Some(requirement) = tuple_requirement {
@@ -9926,6 +9935,7 @@ impl<'src> Analyzer<'src> {
                         && self.source_of_id(call_id) == Some(DERIVED_SOURCE)
                         && self.expose_refused_key_bounds.contains(&trait_label)
                     {
+                        self.note_bound_site_unclean(call_id);
                         continue;
                     }
                     let type_label = self.pretty_print_type(&value_type, &HashMap::default());
@@ -9946,6 +9956,7 @@ impl<'src> Analyzer<'src> {
                             .rpc_refused_wire_types
                             .contains(&without_spaces(&type_label))
                     {
+                        self.note_bound_site_unclean(call_id);
                         continue;
                     }
                     // B319's half of the same stand-down: a keyed handle's KEY
@@ -9962,6 +9973,7 @@ impl<'src> Analyzer<'src> {
                             .rpc_refused_key_types
                             .contains(&without_spaces(&type_label))
                     {
+                        self.note_bound_site_unclean(call_id);
                         continue;
                     }
                     // E271: an element-syntax HOLE refused at `child`'s
@@ -10007,6 +10019,11 @@ impl<'src> Analyzer<'src> {
         // --- trait's abstract (empty) member — a silent misrender the  ---
         // --- loop above never sees, since it iterates what WAS         ---
         // --- recorded. Make that state a diagnostic.                   ---
+        // M208: a refused site's item is not clean (by the SITE, which is
+        // what the skip is keyed by — never by where the refusal's span lands).
+        for (call_id, ..) in &errors {
+            self.note_bound_site_unclean(*call_id);
+        }
         self.push_bound_refusals(errors, &hole_refusals);
     }
 
