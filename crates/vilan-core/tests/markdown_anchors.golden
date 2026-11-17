@@ -475,6 +475,7 @@ std/gfx.md h2 events
 std/gfx.md h2 the-clipboard
 std/gfx.md h2 how-a-gpu-program-ends
 std/gfx.md h2 offscreen
+std/gfx.md h2 diagnostics
 std/gfx.md h2 not-here-yet
 std/image.md h1 images
 std/image.md h2 avatars-one-upload-three-sizes
