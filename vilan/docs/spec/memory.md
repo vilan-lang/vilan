@@ -322,6 +322,15 @@ The parameter conventions:
 | ref | `&x` / `x: &T` | readonly view | readonly view (a loan) |
 | ref mut | `&mut x` / `x: &mut T` | writable view | writable view (a loan) |
 
+A view parameter takes a view, never a bare value (there is no implicit
+borrow), and a `&mut` parameter takes a **writable** one: `&mut place`, a
+`&mut` view binding or parameter passed on, or a `borrows` call answering
+`&mut T`. A readonly view there is refused, whichever form it takes:
+`bump(&x)` over `fun bump(a: &mut i32)` is answered "write `&mut x`", and a
+`&` view binding, a `&` parameter, `&holder.field` or a `borrows` call
+answering `&T` are refused alike, at a `fun`'s, a method's and a closure's
+`&mut` parameter (B684).
+
 The two columns are one rule read at two types, not two rules. **A bare
 parameter is a loan; for data a loan is indistinguishable from a copy** —
 nothing observes the difference, because the callee's copy is private and a

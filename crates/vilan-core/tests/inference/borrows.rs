@@ -15004,6 +15004,208 @@ fn b649_a_view_at_a_generic_parameter_over_a_view_holder_still_compiles() {
     );
 }
 
+// --- B684: a READONLY view at a `&mut` parameter -----------------------------
+//
+// A `&mut` parameter was asked only whether its argument IS a view, never
+// whether it is a WRITABLE one, so `bump(&x)` over `fun bump(a: &mut i32)`
+// checked clean: JS wrote `x` through the `&` (a `&` and a `&mut` view are one
+// runtime form) and the native emission was refused by rustc (E0308). One pin
+// per readonly form; each is refused exactly once, by one message.
+
+const B684_PRELUDE: &str = "struct Counter { n: i32 }
+fun bump(a: &mut i32) { a += 1; }
+fun put<T>(slot: &mut T, value: T) { slot = value; }
+fun peek(counter: &Counter): &i32 borrows counter { &counter.n }
+fun slot(counter: &mut Counter): &mut i32 borrows counter { &mut counter.n }
+";
+
+/// The program `B684_PRELUDE` + `main_body` fails with exactly one diagnostic,
+/// and it contains `message_part`.
+#[track_caller]
+fn b684_refused_once(main_body: &str, message_part: &str) {
+    let source = format!("{B684_PRELUDE}fun main() {{\n{main_body}\n}}\n");
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "expected one diagnostic, got {errors:#?}");
+    assert!(
+        errors[0].0.contains(message_part),
+        "the diagnostic does not contain {message_part:?}: {errors:#?}"
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_at_a_mut_parameter_is_refused() {
+    b684_refused_once(
+        "\tmut x = 1;\n\tbump(&x);\n\tprint(x);",
+        "`bump` takes `a` as `&mut`: write `&mut x`; a `&` view cannot be written through",
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_of_an_immutable_binding_names_the_mut_spelling() {
+    // The binding is immutable too: the first fix is the `&mut`, and taking it
+    // then meets the existing "declare it `mut`" (`check_mutable_references`).
+    b684_refused_once("\tlet x = 1;\n\tbump(&x);\n\tprint(x);", "write `&mut x`");
+}
+
+#[test]
+fn b684_a_shared_view_binding_at_a_mut_parameter_is_refused() {
+    // A view BINDING was already refused, by the root walk; it stays one
+    // diagnostic, not two.
+    b684_refused_once(
+        "\tmut x = 1;\n\tlet view = &x;\n\tbump(view);\n\tprint(x);",
+        "cannot mutate immutable 'view'; declare it `&mut view`",
+    );
+}
+
+#[test]
+fn b684_a_shared_parameter_passed_on_to_a_mut_parameter_is_refused() {
+    let source = format!(
+        "{B684_PRELUDE}fun pass(value: &i32) {{ bump(value); }}\nfun main() {{\n\tmut x = 1;\n\tpass(&x);\n}}\n"
+    );
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0]
+            .0
+            .contains("cannot mutate immutable 'value'; declare it `&mut value`"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b684_a_borrows_call_answering_a_shared_view_is_refused() {
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tbump(peek(&counter));\n\tprint(counter.n);",
+        "`bump` takes `a` as `&mut`, and this view is readonly (`&`): pass a writable one, `&mut <place>`",
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_of_a_field_is_refused() {
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tbump(&counter.n);\n\tprint(counter.n);",
+        "write `&mut counter.n`; a `&` view cannot be written through",
+    );
+}
+
+#[test]
+fn b684_a_field_of_a_shared_view_is_refused_either_way() {
+    // `&view.n` is a readonly view of the field; `&mut view.n` is refused by
+    // the existing root walk, since `view` is a `&` view.
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tlet view = &counter;\n\tbump(&view.n);",
+        "write `&mut view.n`",
+    );
+    b684_refused_once(
+        "\tmut counter = Counter { n = 1 };\n\tlet view = &counter;\n\tbump(&mut view.n);",
+        "cannot take a writable view of immutable 'view'",
+    );
+}
+
+#[test]
+fn b684_a_mut_self_receiver_on_a_shared_view_or_an_immutable_binding_is_refused() {
+    // The receiver is borrowed implicitly; the root walk already refuses it,
+    // and B684 adds nothing beside it.
+    let methods = "impl Counter { fun inc(&mut self) { self.n += 1; } }\n";
+    for (body, message) in [
+        (
+            "\tmut counter = Counter { n = 1 };\n\tlet view = &counter;\n\tview.inc();",
+            "cannot mutate immutable 'view'; declare it `&mut view`",
+        ),
+        (
+            "\tlet counter = Counter { n = 1 };\n\tcounter.inc();",
+            "cannot mutate immutable 'counter'; declare it `mut`",
+        ),
+    ] {
+        let source = format!("{B684_PRELUDE}{methods}fun main() {{\n{body}\n}}\n");
+        let errors = failure_diagnostics(&source);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].0.contains(message), "{errors:#?}");
+    }
+}
+
+#[test]
+fn b684_a_shared_borrow_at_a_methods_mut_parameter_is_refused() {
+    let source = format!(
+        "{B684_PRELUDE}impl Counter {{ fun add_to(&self, total: &mut i32) {{ total += self.n; }} }}
+fun main() {{\n\tlet counter = Counter {{ n = 1 }};\n\tmut total = 0;\n\tcounter.add_to(&total);\n}}\n"
+    );
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0]
+            .0
+            .contains("`add_to` takes `total` as `&mut`: write `&mut total`"),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn b684_a_shared_borrow_at_a_generic_mut_parameter_is_refused() {
+    b684_refused_once(
+        "\tmut x = 1;\n\tput(&x, 2);\n\tprint(x);",
+        "`put` takes `slot` as `&mut`: write `&mut x`",
+    );
+}
+
+#[test]
+fn b684_a_shared_view_at_a_closures_mut_parameter_is_refused() {
+    // A closure literal bound to a local, a `&` view binding at it, and a
+    // closure-typed PARAMETER: the closure path has no root walk, so every
+    // readonly form is B684's.
+    b684_refused_once(
+        "\tmut x = 1;\n\tlet add = |a: &mut i32| { a += 1; };\n\tadd(&x);\n\tprint(x);",
+        "this parameter takes `&mut`: write `&mut x`",
+    );
+    b684_refused_once(
+        "\tmut x = 1;\n\tlet add = |a: &mut i32| { a += 1; };\n\tlet view = &x;\n\tadd(view);\n\tprint(x);",
+        "this parameter takes `&mut`, and this view is readonly (`&`)",
+    );
+    let source = format!(
+        "{B684_PRELUDE}fun apply(f: |&mut i32|, value: &i32) {{ f(value); }}\nfun main() {{\n\tmut x = 1;\n\tapply(|a| {{ a += 1; }}, &x);\n}}\n"
+    );
+    let errors = failure_diagnostics(&source);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert!(
+        errors[0]
+            .0
+            .contains("this parameter takes `&mut`, and this view is readonly (`&`)"),
+        "{errors:#?}"
+    );
+}
+
+/// B684: the writable forms still compile and write — `&mut place`, a `&mut`
+/// view binding and parameter passed on, a `borrows` call answering `&mut T`,
+/// a field of a `&mut` view, a generic and a closure `&mut`, a method's.
+#[test]
+fn b684_a_writable_view_at_a_mut_parameter_still_runs() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B684_PRELUDE}impl Counter {{ fun add_to(&self, total: &mut i32) {{ total += self.n; }} }}
+fun again(a: &mut i32) {{ bump(a); }}
+fun main() {{
+\tmut x = 1;
+\tbump(&mut x);
+\tlet view = &mut x;
+\tbump(view);
+\tagain(&mut x);
+\tput(&mut x, x + 10);
+\tlet add = |a: &mut i32| {{ a += 100; }};
+\tadd(&mut x);
+\tmut counter = Counter {{ n = 1 }};
+\tbump(slot(&mut counter));
+\tlet held = &mut counter;
+\tbump(&mut held.n);
+\tcounter.add_to(&mut x);
+\tprint(x);
+\tprint(counter.n);
+}}
+"
+        ),
+        "117\n3\n",
+    );
+}
+
 // --- B647: a module-level `mut` binding lent to a callee that writes it -----
 
 /// B647 (R-k, spec §6.4 rule 4): lending a module-level `mut` binding — a

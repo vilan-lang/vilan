@@ -29043,6 +29043,20 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// Whether the view an expression denotes is WRITABLE — `&mut` →
+    /// `Some(true)`, `&` → `Some(false)` — over the forms
+    /// [`Self::assignment_target_is_view`] admits: a `&[mut] place`, a view
+    /// binding or `&`/`&mut` parameter, a `borrows` call. `None` for anything
+    /// else, a value included (B684).
+    fn view_expr_mutability(&self, expr_id: Id) -> Option<bool> {
+        match self.expr_id_to_expr_map.get(&expr_id)? {
+            Expr::Reference(_, mutable) => Some(*mutable),
+            Expr::Local(binding_id) => self.view_mutability(*binding_id),
+            Expr::Call(call_id) => self.call_view_mutability(*call_id),
+            _ => None,
+        }
+    }
+
     /// Transparent-references rule R5: a bare assignment to a view writes
     /// *through* it. Wrap a view-typed assignment target (and, for a compound
     /// assignment, the synthesized re-read of that target) in a synthetic
@@ -35423,6 +35437,15 @@ impl<'src> Analyzer<'src> {
                                 "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
                             ),
                         }, *argument_id);
+                    } else if *mutable {
+                        // B684: no binding of the caller's names the view a
+                        // `check_mutable_arguments` root walk would refuse
+                        // here (a closure callee is not a `fun`), so every
+                        // readonly form is this check's.
+                        self.refuse_readonly_view_at_mut(
+                            *argument_id,
+                            "this parameter takes `&mut`",
+                        );
                     }
                 }
                 continue;
@@ -35523,9 +35546,53 @@ impl<'src> Analyzer<'src> {
                             "a `{kind}` parameter takes a view; pass `{kind} <place>` (there is no implicit borrow)."
                         ),
                     }, *argument_id);
+                } else if kind == "&mut" && self.readonly_root(*argument_id).is_none() {
+                    // B684: a `&mut` parameter takes a WRITABLE view. A
+                    // readonly view BINDING or `&` parameter is already
+                    // `check_mutable_arguments`' ("cannot mutate immutable"),
+                    // through `readonly_root`; a `&place` and a `borrows` call
+                    // answering `&T` name no binding, and passed clean.
+                    let parameter_name = self
+                        .parameters
+                        .get(parameter_id)
+                        .map_or("the parameter", |parameter| parameter.name);
+                    self.refuse_readonly_view_at_mut(
+                        *argument_id,
+                        &format!("`{callee_name}` takes `{parameter_name}` as `&mut`"),
+                    );
                 }
             }
         }
+    }
+
+    /// B684: refuse a READONLY view (`&place`, a `&` binding or parameter, a
+    /// `borrows` call answering `&T`) passed at a `&mut` parameter. It
+    /// checked clean: on JS the callee wrote through it — a `&` view and a
+    /// `&mut` one are the same runtime form — and the native emission was
+    /// refused by rustc. `taker` names the parameter (`` `bump` takes `a` as
+    /// `&mut` ``).
+    fn refuse_readonly_view_at_mut(&mut self, argument_id: Id, taker: &str) {
+        if self.view_expr_mutability(argument_id) != Some(false) {
+            return;
+        }
+        let msg = match self.expr_id_to_expr_map.get(&argument_id) {
+            Some(Expr::Reference(operand_id, false)) => {
+                let place = self.written_text_of(*operand_id).unwrap_or("<place>");
+                format!("{taker}: write `&mut {place}`; a `&` view cannot be written through")
+            }
+            _ => format!(
+                "{taker}, and this view is readonly (`&`): pass a writable one, `&mut <place>`"
+            ),
+        };
+        self.push_anchored(
+            Error {
+                trace: Vec::new(),
+                note: None,
+                span: **self.span_map.get(&argument_id).unwrap_or(&&EMPTY_SPAN),
+                msg,
+            },
+            argument_id,
+        );
     }
 
     /// B649: whether a receiver is a value holding VIEWS — a call returning a
