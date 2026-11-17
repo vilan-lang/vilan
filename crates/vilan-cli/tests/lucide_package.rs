@@ -19,6 +19,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod support;
+
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -95,12 +97,8 @@ fn generate_one(test: &str, svg: &str) -> std::process::Output {
             .unwrap_or_else(|| panic!("the generator's UPSTREAM.{key}"));
         after.split('"').next().expect("a quoted value").to_string()
     };
-    let scratch = std::env::temp_dir().join(format!(
-        "vilan-lucide-{test}-{}-{:?}",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    let _ = std::fs::remove_dir_all(&scratch);
+    // The harness's own scratch, under `target/` (N82): never the shared tmpfs.
+    let scratch = support::scratch_dir(&format!("lucide-{test}"));
     let upstream = scratch.join("package");
     std::fs::create_dir_all(upstream.join("icons")).expect("scratch");
     std::fs::write(
