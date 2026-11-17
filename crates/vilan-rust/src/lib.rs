@@ -6187,8 +6187,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             }
             Expr::Binary(op, left, right) => self.binary(id, op, left, right, depth, span)?,
             Expr::Unary(op, operand) => match op {
-                '!' => format!("!({})", self.expression(operand, depth)?),
-                '-' => format!("-({})", self.expression(operand, depth)?),
+                '!' => format!("!({})", self.condition_value(operand, depth)?),
+                '-' => format!("-({})", self.condition_value(operand, depth)?),
                 other => {
                     return Err(unsupported(&format!("the unary operator `{other}`"), span));
                 }
@@ -6205,7 +6205,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     Some(condition) => match self.capturing_condition(condition, depth)? {
                         Some((parts, captured)) => (format!("while {parts}"), captured),
                         None => (
-                            format!("while {}", self.expression(condition, depth)?),
+                            format!("while {}", self.condition_value(condition, depth)?),
                             Vec::new(),
                         ),
                     },
@@ -6949,12 +6949,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // &Holder): List<i32> { &holder.items }` emitted `&holder.items` against
         // a signature promising a value.
         if !self.current_returns_view && !self.declaring_a_view && self.reads_through_a_view(id) {
-            if let Some(&Expr::Reference(operand, _)) = self.program.entity_map.get(&id) {
-                let operand_text = self.expression(operand, depth)?;
-                return Ok(format!("({operand_text}).clone()"));
-            }
-            let text = self.expression(id, depth)?;
-            return Ok(format!("({text}).clone()"));
+            return self.view_leaf_read(id, depth);
         }
         let text = self.expression(id, depth)?;
         // F62: a field read through a `Shared` view is already a copy out of
@@ -7069,6 +7064,31 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 .is_some_and(|type_id| self.is_resource_type(type_id))
     }
 
+    /// B109: the VALUE of a [`Self::reads_through_a_view`] leaf — the place a
+    /// `&place` names, or a `borrows` call's answer, copied out (rule 1).
+    fn view_leaf_read(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        if let Some(&Expr::Reference(operand, _)) = self.program.entity_map.get(&id) {
+            let operand_text = self.expression(operand, depth)?;
+            return Ok(format!("({operand_text}).clone()"));
+        }
+        let text = self.expression(id, depth)?;
+        Ok(format!("({text}).clone()"))
+    }
+
+    /// B749/B750: a condition (`if`, `else if`, a `for` loop's, a `match`
+    /// guard) or a unary operand — a position that reads a VALUE, as an
+    /// operator's operand does ([`Self::binary`] reads both through
+    /// `value_of`). A `borrows` call answering `&bool` is a reference here,
+    /// and `if flag(&holder)` was rustc E0308; it is read through, as on the
+    /// JS backend. A view binding or `&place` there is the checker's refusal
+    /// (spec §6.3), so every other condition renders unchanged.
+    fn condition_value(&mut self, id: Id, depth: usize) -> Result<String, Error> {
+        if self.reads_through_a_view(id) {
+            return self.view_leaf_read(id, depth);
+        }
+        self.expression(id, depth)
+    }
+
     /// Whether `id` is a leaf that names STORAGE without being a place — a
     /// written `&place`, or a call to a `borrows` function. Both answer a
     /// reference natively and a value is what the position wants.
@@ -7090,6 +7110,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             return false;
         }
         match self.program.entity_map.get(&subject) {
+            // B750: a written `&place` subject (`match &holder.kind { .. }`)
+            // is a reference natively, as a loan is.
+            Some(Expr::Reference(..)) => true,
             Some(Expr::Parameter(_)) => self.reads_a_loaned_parameter(subject),
             Some(Expr::Local(binding)) => {
                 self.reads_a_loaned_parameter(subject)
@@ -9824,7 +9847,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                         }
                         format!("if let {pattern_text} = {subject_text}")
                     }
-                    None => format!("if {}", self.expression(*condition, depth)?),
+                    None => format!("if {}", self.condition_value(*condition, depth)?),
                 };
                 let mut body = String::new();
                 let walked = self.emit_block(statements, *tail, &mut body, depth + 1);
@@ -10212,33 +10235,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         } else if destructures && !self.moves_an_owned_resource(subject) {
             subject_text = self.copy_a_pattern_subject(subject, subject_text);
         }
-        // A `str` subject is matched as a `&str`, which is the only form a
-        // string LITERAL pattern has natively — see [`Emitter::pattern`]. The
-        // question is asked of the PATTERNS rather than of the subject's type
-        // because a subject that is a call (`s.trim()`) carries no type on its
-        // own id, and a string literal in a leg is the whole evidence.
-        let matches_a_string = legs.iter().any(|leg| match &leg.pattern {
-            ExprPattern::Literal(id) => Self::string_pattern_text(self.program, *id).is_some(),
-            // A `str`-BACKED enum's variant is a string literal too.
-            ExprPattern::Variant(enum_id, _, _) => self
-                .program
-                .enums
-                .get(enum_id)
-                .is_some_and(|declaration| declaration.backing == Some(Backing::Str)),
-            _ => false,
-        });
+        let matches_a_string = legs
+            .iter()
+            .any(|leg| self.pattern_matches_a_string(&leg.pattern));
         if matches_a_string {
-            subject_text = if self.matches_a_string_through_a_loan(subject, &subject_text) {
-                // F154: a binding held as a LOAN (`self` of a `str`-backed
-                // enum's method is a `&Rc<str>`: its synthesized `value()`,
-                // and any `match self` over its variants) — `&*` stops at
-                // `&Rc<str>`, which no `&str` literal matches (rustc E0308).
-                // `AsRef` reaches the `str` through either form, so a binding
-                // read as a loan that is a value after all still builds.
-                format!("AsRef::<str>::as_ref(&({subject_text}))")
-            } else {
-                format!("&*({subject_text})")
-            };
+            subject_text = self.string_subject(subject, subject_text);
         }
         let pad = Self::indent(depth);
         let leg_pad = Self::indent(depth + 1);
@@ -10257,7 +10258,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // the next leg.
             if let Some(guard) = leg.guard {
                 let condition =
-                    self.expecting_nothing(|emitter| emitter.expression(guard, depth + 1))?;
+                    self.expecting_nothing(|emitter| emitter.condition_value(guard, depth + 1))?;
                 guards.push(format!("({condition})"));
             }
             let pattern = if guards.is_empty() {
@@ -10587,6 +10588,43 @@ impl<'a, 'src> Emitter<'a, 'src> {
         resolved
     }
 
+    /// A `str` subject is matched as a `&str`, which is the only form a
+    /// string LITERAL pattern has natively — see [`Emitter::pattern`]. The
+    /// question is asked of the PATTERNS rather than of the subject's type
+    /// because a subject that is a call (`s.trim()`) carries no type on its
+    /// own id, and a string literal in a leg is the whole evidence. A `match`
+    /// and an `is` ask it alike: an `is` asked nothing, so `x is Named::B`
+    /// over a `str`-backed enum, and `s is "x"` over a `str`, matched the
+    /// `Rc<str>` against a `&str` (rustc E0308, B750).
+    fn pattern_matches_a_string(&self, pattern: &ExprPattern) -> bool {
+        match pattern {
+            ExprPattern::Literal(id) => Self::string_pattern_text(self.program, *id).is_some(),
+            // A `str`-BACKED enum's variant is a string literal too.
+            ExprPattern::Variant(enum_id, _, _) => self
+                .program
+                .enums
+                .get(enum_id)
+                .is_some_and(|declaration| declaration.backing == Some(Backing::Str)),
+            _ => false,
+        }
+    }
+
+    /// A subject [`Self::pattern_matches_a_string`] said is matched as a
+    /// `&str`, rendered as one.
+    fn string_subject(&self, subject: Id, subject_text: String) -> String {
+        if self.matches_a_string_through_a_loan(subject, &subject_text) {
+            // F154: a binding held as a LOAN (`self` of a `str`-backed
+            // enum's method is a `&Rc<str>`: its synthesized `value()`,
+            // and any `match self` over its variants) — `&*` stops at
+            // `&Rc<str>`, which no `&str` literal matches (rustc E0308).
+            // `AsRef` reaches the `str` through either form, so a binding
+            // read as a loan that is a value after all still builds.
+            format!("AsRef::<str>::as_ref(&({subject_text}))")
+        } else {
+            format!("&*({subject_text})")
+        }
+    }
+
     fn is_test(
         &mut self,
         subject: Id,
@@ -10608,6 +10646,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let subject_text = match borrowed {
             Some(text) => text,
             None => self.expression(subject, depth)?,
+        };
+        let subject_text = if self.pattern_matches_a_string(pattern) {
+            self.string_subject(subject, subject_text)
+        } else {
+            subject_text
         };
         let subject_type = self.settled_value_type(subject);
         let pattern_text = self.pattern(pattern, subject_type, span)?;

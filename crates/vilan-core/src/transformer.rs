@@ -6487,15 +6487,43 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// `id` walked where its VALUE is read, read through when it is a scalar
+    /// view, exactly as `*id` would read it: a `&place` reads the place itself,
+    /// anything else whose emission is a `(base, key)` pair reads
+    /// `pair[0][pair[1]]`, and every other expression is its own emission.
+    ///
+    /// The positions (spec §6.3): a condition (`if`, `else if`, a `for`
+    /// loop's, a `match` guard), a unary or a `&&`/`||` operand (B749), a
+    /// `match`/`is` subject (B746, `walk_tested_subject`), and an argument at a
+    /// by-value parameter (B444, B685). The checker refuses a view binding or a
+    /// `&place` at the first three with "write `*`"; what reaches them is a
+    /// view it does not see — a `borrows` call answering `&bool` — and a pair
+    /// tested as a condition is an array, always true. At a by-value argument
+    /// the one `&place` the checker admits is B649's: a generic `T` over an
+    /// option holding a view (`shelf.count(5).unwrap_or(&0)`), whose payload
+    /// B577 reads out, so the fallback is read out beside it.
+    fn walk_value_read(
+        &mut self,
+        id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> Option<js::Node<'src>> {
+        if let Some(&Expr::Reference(place, _)) = self.program.entity_map.get(&id)
+            && self.emits_scalar_view_ref(id, place)
+        {
+            return self.walk_entity(place, block);
+        }
+        let node = self.walk_entity(id, block)?;
+        Some(self.read_through_a_scalar_view(id, node, block))
+    }
+
     /// The subject of a `match` or an `is` test, as its patterns read it: the
     /// VALUE. An aggregate view is the value's own JS reference, so it is the
     /// subject unchanged (and a payload capture writes through it); a scalar
     /// view is a `(base, key)` pair, which no pattern can test — `x is
     /// Named::B` compared the pair against `"b"`, and a `match` over one fell
     /// to its trap arm (or, over `bool`/`i32`/`str`, silently to the wrong leg).
-    /// So a scalar view subject is read through, exactly as `*subject` would
-    /// read it: a `&place` reads the place itself, anything else holding a pair
-    /// reads `pair[0][pair[1]]`. A scalar has no payload, so no leg can want
+    /// So a scalar view subject is read through (`walk_value_read`), exactly
+    /// as `*subject` would read it. A scalar has no payload, so no leg can want
     /// the pair (B577's wrapped views are an `Option` subject, kept by the
     /// caller). B746 made every backed enum a scalar view, and std's derived
     /// `store_diff` matches `self` and `other`, both `&Self`.
@@ -6504,15 +6532,8 @@ impl<'src> Transformer<'src> {
         subject_id: Id,
         block: &mut Vec<js::Node<'src>>,
     ) -> js::Node<'src> {
-        if let Some(&Expr::Reference(place, _)) = self.program.entity_map.get(&subject_id)
-            && self.emits_scalar_view_ref(subject_id, place)
-        {
-            return self.walk_entity(place, block).unwrap_or(js::Node::Void);
-        }
-        let node = self
-            .walk_entity(subject_id, block)
-            .unwrap_or(js::Node::Void);
-        self.read_through_a_scalar_view(subject_id, node, block)
+        self.walk_value_read(subject_id, block)
+            .unwrap_or(js::Node::Void)
     }
 
     /// Read the value out of a scalar `(base, key)` view: `view[0][view[1]]`.
@@ -7958,13 +7979,20 @@ impl<'src> Transformer<'src> {
                         &late,
                         block,
                         |this, arg, block| {
+                            // B444/B685: whether the parameter here takes a VALUE.
+                            let by_value = function_call
+                                .argument_ids
+                                .iter()
+                                .position(|argument| *argument == arg)
+                                .and_then(|position| value_positions.get(position))
+                                .is_some_and(|by_value| *by_value);
                             // lazy.md §1: an argument standing in a `lazy` position
                             // is not evaluated here at all — it is packaged, or it
                             // forwards a cell it already holds. Both answers are
                             // built whole, so neither passes through `maybe_clone`:
                             // a memo cell is an identity, and copying one would give
                             // the callee a second memo of the same thunk.
-                            if let Some(cell) = this.lazy_argument(arg) {
+                            if let Some(cell) = this.lazy_argument(arg, by_value) {
                                 return Some(cell);
                             }
                             // B505: a receiver a `&self`/`&mut self` borrows
@@ -7989,18 +8017,15 @@ impl<'src> Transformer<'src> {
                             }
                             // An argument to an `own` parameter is copied (marked in
                             // `clone_sites`), like a binding copy.
-                            let node = this.walk_entity(arg, block)?;
+                            //
                             // B444: a scalar view handed to a BY-VALUE parameter
-                            // is read through — the callee wants the value.
-                            let position = function_call
-                                .argument_ids
-                                .iter()
-                                .position(|argument| *argument == arg);
-                            let node =
-                                match position.and_then(|position| value_positions.get(position)) {
-                                    Some(true) => this.read_through_a_scalar_view(arg, node, block),
-                                    _ => node,
-                                };
+                            // is read through — the callee wants the value. B685:
+                            // a written `&place` there too (`walk_value_read`).
+                            let node = if by_value {
+                                this.walk_value_read(arg, block)?
+                            } else {
+                                this.walk_entity(arg, block)?
+                            };
                             Some(this.maybe_clone(arg, node))
                         },
                     )
@@ -8782,11 +8807,14 @@ impl<'src> Transformer<'src> {
                 // and `concat_render_dispatch` never hold one), and they are
                 // neither bitwise nor division.
                 if matches!(op, BinaryOp::And | BinaryOp::Or) {
-                    let lhs = self.walk_entity(*lhs_id, block).unwrap_or(js::Node::Void);
+                    // B444/B749: each operand is a VALUE read, as below.
+                    let lhs = self
+                        .walk_value_read(*lhs_id, block)
+                        .unwrap_or(js::Node::Void);
                     let mark = self.pending_temporaries.len();
                     let mut scratch = Vec::new();
                     let t_rhs = self
-                        .walk_entity(*rhs_id, &mut scratch)
+                        .walk_value_read(*rhs_id, &mut scratch)
                         .unwrap_or(js::Node::Void);
                     // The overwhelmingly common case — a right operand that
                     // needed no statement — emits exactly as it always did,
@@ -8987,7 +9015,9 @@ impl<'src> Transformer<'src> {
                 binary(*op, lhs, rhs)
             }
             Expr::Unary(operator, operand) => {
-                let operand = self.walk_entity(*operand, block).unwrap_or(js::Node::Void);
+                let operand = self
+                    .walk_value_read(*operand, block)
+                    .unwrap_or(js::Node::Void);
                 js::Node::Unary(*operator, Box::new(operand))
             }
             // A view of a scalar place lowers to a `[base, key]` pair — a boxed
@@ -9301,7 +9331,7 @@ impl<'src> Transformer<'src> {
                 // loop read the wrong branch — or never ended.
                 let mut prelude = Vec::new();
                 let t_condition = condition
-                    .and_then(|condition| self.walk_entity(condition, &mut prelude))
+                    .and_then(|condition| self.walk_value_read(condition, &mut prelude))
                     .unwrap_or(js::Node::Bool(true));
                 // A loop body owning resource locals drops them each iteration
                 // (destruction.md §7); `jump break`/`continue` leave through the
@@ -9529,7 +9559,7 @@ impl<'src> Transformer<'src> {
                             let mut prelude = Vec::new();
                             let slot = if is_root { &mut *block } else { &mut prelude };
                             let t_condition = t
-                                .walk_entity(*condition, slot)
+                                .walk_value_read(*condition, slot)
                                 .unwrap_or(js::Node::Bool(false));
                             let t_body = t.walk_branch_body(&body.0, body.1, expr_variable_name);
                             let inner = js::IfBranch::If(
@@ -9706,7 +9736,7 @@ impl<'src> Transformer<'src> {
                             self.materialize_captures(&leg.pattern, &mut copies);
                             let mut guard_prelude = Vec::new();
                             let outer_reads = self.is_binding_reads.replace(HashSet::default());
-                            guard_condition = self.walk_entity(guard_id, &mut guard_prelude);
+                            guard_condition = self.walk_value_read(guard_id, &mut guard_prelude);
                             let guard_reads =
                                 std::mem::replace(&mut self.is_binding_reads, outer_reads)
                                     .unwrap_or_default();
@@ -10342,8 +10372,11 @@ impl<'src> Transformer<'src> {
     ///   walked into the closure's OWN block, so every statement its lowering
     ///   needs (temporaries, short-circuit slots, scope-end teardown) lands
     ///   INSIDE the thunk. Walking it into the enclosing block would evaluate at
-    ///   the call site the very thing the whole feature defers.
-    fn lazy_argument(&mut self, argument_id: Id) -> Option<js::Node<'src>> {
+    ///   the call site the very thing the whole feature defers. A thunk for a
+    ///   BY-VALUE parameter (`by_value`) returns the value, read through a
+    ///   scalar view as the eager argument is (B685: `unwrap_or`'s `lazy
+    ///   fallback`, handed `&0` over an option whose payload B577 reads out).
+    fn lazy_argument(&mut self, argument_id: Id, by_value: bool) -> Option<js::Node<'src>> {
         if self.program.lazy_argument_forwards.contains(&argument_id) {
             let Some(Expr::Local(binding)) = self.program.entity_map.get(&argument_id) else {
                 return None;
@@ -10355,7 +10388,11 @@ impl<'src> Transformer<'src> {
         let name = *self.program.lazy_argument_thunks.get(&argument_id)?;
         let mark = self.pending_temporaries.len();
         let mut body: Vec<js::Node<'src>> = Vec::new();
-        let value = self.walk_entity(argument_id, &mut body);
+        let value = if by_value {
+            self.walk_value_read(argument_id, &mut body)
+        } else {
+            self.walk_entity(argument_id, &mut body)
+        };
         if let Some(value) = value {
             // The same tail seam a closure body takes (B152): a divergent tail
             // is the statement, never a value to `return`.

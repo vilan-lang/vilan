@@ -16087,3 +16087,271 @@ fn a_match_or_is_over_a_scalar_view_tests_the_value_not_the_pair() {
         "t\na\none\n10\n3\ntrue\nf\nf\na\n",
     );
 }
+
+// --- B749: a scalar view at a condition or a unary operand ------------------
+
+/// The refusal B749 adds, in full (spec §6.3).
+const B749_WRITE_STAR: &str =
+    "a view can't be read as a value here; write `*` to copy the value out";
+
+/// B749: each condition position and unary operand over a scalar view, the
+/// view spelled three ways — a `&bool` (or `&i32`) PARAMETER, a local view
+/// binding, and a view of a struct FIELD. `{v}` is the view; every position
+/// reads it as a value, so each is refused at the view with the sentence an
+/// operator's operand gets, and `*v` is the spelling (the next pin). On JS
+/// `if x` tested the `(base, key)` pair, an array, so it was always true, and
+/// `!x` always false; natively `if x` was rustc E0308 (B750).
+fn b749_view_sources(read: &str) -> [String; 3] {
+    let body = |prelude: &str, view: &str| {
+        format!(
+            "struct Holder {{\n\tflag: bool,\n\tcount: i32,\n}}\n\nfun read(flag: &bool, count: &i32): str {{\n{}\n}}\n\nfun main() {{\n{prelude}\tprint(read({view}));\n}}\n",
+            read
+        )
+    };
+    [
+        // A parameter.
+        body("\tlet off = false;\n\tlet three = 3;\n", "&off, &three"),
+        // A local view binding: `read`'s parameters re-bound.
+        format!(
+            "fun read(flag_value: bool, count_value: i32): str {{\n\tlet flag = &flag_value;\n\tlet count = &count_value;\n{read}\n}}\n\nfun main() {{\n\tprint(read(false, 3));\n}}\n"
+        ),
+        // A view of a field.
+        format!(
+            "struct Holder {{\n\tflag: bool,\n\tcount: i32,\n}}\n\nfun read(holder: Holder): str {{\n\tlet flag = &holder.flag;\n\tlet count = &holder.count;\n{read}\n}}\n\nfun main() {{\n\tprint(read(Holder {{ flag = false, count = 3 }}));\n}}\n"
+        ),
+    ]
+}
+
+/// Each of `b749_view_sources(read)` refused with B749's sentence spanning
+/// exactly the view: the name that `locator` (a snippet of `read`) starts with.
+fn b749_assert_refused_at(read: &str, locator: &str) {
+    let view = locator
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .next()
+        .expect("the locator starts with the view's name");
+    for source in b749_view_sources(read) {
+        let start = source.find(read).expect("the read is in the source")
+            + read.find(locator).expect("the locator is in the read");
+        let diagnostics = failure_diagnostics(&source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|(message, range)| message.contains(B749_WRITE_STAR)
+                    && *range == (start..start + view.len())),
+            "no {B749_WRITE_STAR:?} at {view:?} ({locator:?}) in\n{source}\ngot: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
+fn b749_a_bool_view_as_an_if_condition_is_refused() {
+    b749_assert_refused_at("\tif flag { \"yes\" } else { \"no\" }", "flag {");
+}
+
+#[test]
+fn b749_a_bool_view_as_an_else_if_condition_is_refused() {
+    b749_assert_refused_at(
+        "\tif *count > 5 { \"big\" } else if flag { \"yes\" } else { \"no\" }",
+        "flag {",
+    );
+}
+
+#[test]
+fn b749_a_bool_view_before_then_is_refused() {
+    b749_assert_refused_at("\tflag then \"yes\" else \"no\"", "flag then");
+}
+
+#[test]
+fn b749_a_bool_view_under_not_is_refused() {
+    b749_assert_refused_at("\tlet negated = !flag;\n\ti\"{negated}\"", "flag;");
+}
+
+#[test]
+fn b749_a_number_view_under_negation_is_refused() {
+    b749_assert_refused_at("\tlet negated = -count;\n\ti\"{negated}\"", "count;");
+}
+
+#[test]
+fn b749_a_bool_view_as_a_loop_condition_is_refused() {
+    b749_assert_refused_at(
+        "\tmut turns = 0;\n\tfor flag {\n\t\tturns += 1;\n\t}\n\ti\"{turns}\"",
+        "flag {",
+    );
+}
+
+#[test]
+fn b749_a_bool_view_as_a_match_guard_is_refused() {
+    b749_assert_refused_at(
+        "\tmatch *count {\n\t\t3 if flag => \"guarded\",\n\t\t_ => \"other\",\n\t}",
+        "flag =>",
+    );
+}
+
+#[test]
+fn b749_a_bool_view_as_an_and_operand_is_refused() {
+    b749_assert_refused_at(
+        "\tif flag && *count > 1 { \"yes\" } else { \"no\" }",
+        "flag &&",
+    );
+}
+
+#[test]
+fn b749_a_bool_view_as_an_or_operand_is_refused() {
+    b749_assert_refused_at(
+        "\tif *count > 5 || flag { \"yes\" } else { \"no\" }",
+        "flag {",
+    );
+}
+
+/// B749: `*` is the spelling at every position the refusals above name, and
+/// it reads the VALUE on JS: a `false` flag takes every `else`, its negation
+/// holds, a loop over it never runs, and a guard over it falls through.
+#[test]
+fn b749_the_star_reads_the_value_at_every_condition() {
+    for source in b749_view_sources(concat!(
+        "\tlet branch = if *flag { \"if\" } else { \"else\" };\n",
+        "\tlet chained = if *count > 5 { \"big\" } else if *flag { \"flag\" } else { \"neither\" };\n",
+        "\tlet sugar = *flag then \"then\" else \"else\";\n",
+        "\tlet negated = !*flag;\n",
+        "\tlet minus = -*count;\n",
+        "\tmut turns = 0;\n",
+        "\tfor *flag && turns < 3 {\n\t\tturns += 1;\n\t}\n",
+        "\tlet guard = match *count {\n\t\t3 if *flag => \"guarded\",\n\t\t_ => \"fell\",\n\t};\n",
+        "\tlet both = *flag && *count > 1;\n",
+        "\tlet either = *count > 5 || *flag;\n",
+        "\ti\"{branch} {chained} {sugar} {negated} {minus} {turns} {guard} {both} {either}\"",
+    )) {
+        assert_eq!(
+            compile_and_run(&source).unwrap_or_else(|errors| panic!("{errors:?}\n{source}")),
+            "else neither else true -3 0 fell false false\n",
+            "{source}"
+        );
+    }
+}
+
+/// B749: a `borrows` call answering a scalar view is a view the checker does
+/// not see (B444's class), so at a condition and a unary operand it is READ
+/// THROUGH, as at a binary operand: `if flag(&holder)` over a `false` field
+/// tested the pair (always true) and `!flag(&holder)` printed `false`.
+#[test]
+fn b749_a_borrows_call_answering_a_scalar_view_reads_the_value_at_a_condition() {
+    assert_compiles_and_runs(
+        r#"
+        struct Holder {
+            flag: bool,
+            count: i32,
+        }
+
+        fun flag(holder: &Holder): &bool {
+            &holder.flag
+        }
+
+        fun count(holder: &Holder): &i32 {
+            &holder.count
+        }
+
+        fun main() {
+            let holder = Holder { flag = false, count = 3 };
+            if flag(&holder) {
+                print("if: wrong");
+            } else {
+                print("if: right");
+            }
+            if *count(&holder) > 5 {
+                print("else if: wrong");
+            } else if flag(&holder) {
+                print("else if: wrong");
+            } else {
+                print("else if: right");
+            }
+            print(flag(&holder) then "then: wrong" else "then: right");
+            print(!flag(&holder));
+            print(-count(&holder));
+            // Bounded, so a regression is a wrong count rather than a hang.
+            mut turns = 0;
+            for flag(&holder) && turns < 3 {
+                turns += 1;
+            }
+            print(turns);
+            print(match *count(&holder) {
+                3 if flag(&holder) => "guard: wrong",
+                _ => "guard: right",
+            });
+            print(flag(&holder) && true);
+            print(false || flag(&holder));
+        }
+        "#,
+        "if: right\nelse if: right\nthen: right\ntrue\n-3\n0\nguard: right\nfalse\nfalse\n",
+    );
+}
+
+/// B749 beside B746: a backed enum's view is a scalar view, so read as a
+/// value — an interpolation hole, an operand — it is refused with the same
+/// sentence, while a `match` or an `is` over it tests the value (B746).
+#[test]
+fn b749_a_backed_enum_view_read_as_a_value_is_refused() {
+    let source = r#"
+        enum Named {
+            A = "a",
+            B = "b",
+        }
+
+        fun shown(x: &Named): str {
+            i"{x}"
+        }
+
+        fun main() {
+            let named = Named::B;
+            print(shown(&named));
+        }
+        "#;
+    assert_fails_spanning_nth(source, "x", 1, B749_WRITE_STAR);
+}
+
+// --- B685: a view fallback beside an option whose payload is read out -------
+
+/// B685: `shelf.count(5).unwrap_or(&0) + 1` over an `Option<&i32>` that is
+/// `None` handed the FALLBACK — a view, which B649 admits at a generic `T`
+/// over a view holder — on as its `(base, key)` pair: `0,01` on JS where
+/// native printed `1`. B577 reads a `Some` payload out where the option is
+/// consumed; the fallback is read out beside it, at a by-value parameter as
+/// B444 reads any scalar view there, `lazy` included. One line per consumer,
+/// over `Some` and over `None`.
+#[test]
+fn b685_a_view_fallback_is_read_out_where_the_option_is_consumed() {
+    assert_compiles_and_runs(
+        r#"
+        struct Shelf {
+            counts: List<i32>,
+        }
+
+        impl Shelf {
+            fun count(&self, index: usize): Option<&i32> {
+                if index < self.counts.len() {
+                    Some(&self.counts[index])
+                } else {
+                    None
+                }
+            }
+        }
+
+        fun main() {
+            let shelf = Shelf { counts = [3, 4] };
+            let zero = 0;
+            print(shelf.count(0).unwrap_or(&0) + 1);
+            print(shelf.count(5).unwrap_or(&0) + 1);
+            print(shelf.count(5).unwrap_or(&zero) + 1);
+            print(shelf.count(1).unwrap_or_else(|| 0) + 1);
+            print(shelf.count(5).unwrap_or_else(|| 0) + 1);
+            print(shelf.count(1).map(|value| value * 10).unwrap_or(0));
+            print(shelf.count(5).map(|value| value * 10).unwrap_or(0));
+            print(i"{shelf.count(1).unwrap_or(&0)}");
+            print(i"{shelf.count(5).unwrap_or(&0)}");
+            print(shelf.count(5).unwrap_or(&0));
+            let found = shelf.count(5).unwrap_or(&zero);
+            print(found + 1);
+        }
+        "#,
+        "4\n1\n1\n5\n1\n40\n0\n4\n0\n0\n1\n",
+    );
+}

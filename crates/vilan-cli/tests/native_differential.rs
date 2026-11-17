@@ -19376,3 +19376,60 @@ fn b746_a_mirrored_record_with_backed_enum_fields_lands_the_same_on_both_backend
         "a whole-record set over backed-enum fields must land on both backends"
     );
 }
+
+/// B749/B750: a scalar view read at a condition (`if`, `else if`, `then`, a
+/// `for` loop's, a `match` guard) or as a unary or `&&`/`||` operand — `*`
+/// over a parameter, a local view and a field view, and a `borrows` call
+/// answering `&bool`/`&i32` read through — the same on both backends. JS
+/// tested the call's pair (always true); natively `if flag(&holder)` was
+/// rustc E0308.
+#[test]
+fn b749_a_scalar_view_at_a_condition_reads_the_value_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_scalar_view_conditions.vl"),
+        include_str!("native/scalar_view_conditions.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_scalar_view_conditions.vl"),
+        Verdict::Identical,
+        "a scalar view at a condition or a unary operand must read the value on both backends"
+    );
+}
+
+/// B685: a view fallback beside an `Option<&i32>` whose payload is read out
+/// (`unwrap_or(&0)`, `unwrap_or_else`, `map`, interpolation, a binding), over
+/// `Some` and `None`, the same on both backends. JS printed `0,01`.
+#[test]
+fn b685_a_view_fallback_is_read_out_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_view_fallback_reads.vl"),
+        include_str!("native/view_fallback_reads.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_view_fallback_reads.vl"),
+        Verdict::Identical,
+        "a view fallback must be read out on both backends"
+    );
+}
+
+/// B750: `is` over a `str`-backed enum or a `str` (a view or a value), and an
+/// inline `match &place` over one, build natively and answer what JS answers.
+/// Each was rustc E0308 (`Rc<str>` or `&Rc<str>` against a `&str` literal).
+#[test]
+fn b750_a_str_tested_through_a_view_or_by_is_builds_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_str_view_tests.vl"),
+        include_str!("native/str_view_tests.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_str_view_tests.vl"),
+        Verdict::Identical,
+        "a str tested by `is` or an inline `match &place` must build and agree on both backends"
+    );
+}
