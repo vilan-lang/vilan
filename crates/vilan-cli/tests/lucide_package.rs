@@ -77,3 +77,104 @@ fn the_package_checks_clean_on_both_backends() {
         );
     }
 }
+
+// --- The generator's SVG reader: comments ---------------------------------------
+
+/// A scratch `lucide-static` package holding ONE icon, `probe`, whose SVG is
+/// `svg`, at the version the generator pins (read out of the generator, so a
+/// version bump does not strand this pin). Answers the generator's run over it.
+fn generate_one(test: &str, svg: &str) -> std::process::Output {
+    let script = repository_root().join("scripts").join("lucide-native.mjs");
+    let source = std::fs::read_to_string(&script).expect("the generator");
+    let pinned = |key: &str| {
+        let needle = format!("{key}: \"");
+        let after = source
+            .split("const UPSTREAM = {")
+            .nth(1)
+            .and_then(|rest| rest.split(&needle).nth(1))
+            .unwrap_or_else(|| panic!("the generator's UPSTREAM.{key}"));
+        after.split('"').next().expect("a quoted value").to_string()
+    };
+    let scratch = std::env::temp_dir().join(format!(
+        "vilan-lucide-{test}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let upstream = scratch.join("package");
+    std::fs::create_dir_all(upstream.join("icons")).expect("scratch");
+    std::fs::write(
+        upstream.join("package.json"),
+        format!(
+            "{{\"name\": \"{}\", \"version\": \"{}\"}}",
+            pinned("name"),
+            pinned("version")
+        ),
+    )
+    .expect("package.json");
+    std::fs::write(upstream.join("icon-nodes.json"), "{\"probe\": []}").expect("icon-nodes.json");
+    std::fs::write(upstream.join("icons").join("probe.svg"), svg).expect("probe.svg");
+    let output = Command::new("node")
+        .arg(&script)
+        .arg("generate")
+        .arg(&upstream)
+        .arg(scratch.join("out"))
+        .output()
+        .expect("run node");
+    let _ = std::fs::remove_dir_all(&scratch);
+    output
+}
+
+/// Lucide's root, as every upstream icon writes it.
+const ROOT: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\" \
+     viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" \
+     stroke-linecap=\"round\" stroke-linejoin=\"round\">";
+
+/// A comment anywhere outside a tag is dropped, as upstream's licence line is.
+#[test]
+fn the_generator_drops_a_comment_and_reads_the_icon() {
+    let svg = format!(
+        "<!-- @license lucide-static - ISC -->\n{ROOT}\n  <!-- a dot -->\n  \
+         <path d=\"M12 5v14\" />\n</svg>\n"
+    );
+    let output = generate_one("comment", &svg);
+    assert!(
+        output.status.success(),
+        "a commented icon generates:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Removing comments in ONE pass can leave a new opener behind: the inner
+/// comment of `<!<!-- a -->--` goes and a bare `<!--` remains (code scanning
+/// alert 19, js/incomplete-multi-character-sanitization). The reader removes
+/// to a fixed point and refuses an opener that survives, by name, where it
+/// used to fall through to a later "content other than self-closing
+/// elements".
+#[test]
+fn the_generator_refuses_a_comment_opener_that_survives_removal() {
+    for (case, inside) in [
+        (
+            "an opener rebuilt by the removal",
+            "<!<!-- a -->-- left open",
+        ),
+        ("a comment never closed", "<!-- never closed"),
+    ] {
+        let svg = format!("{ROOT}\n  {inside}\n  <path d=\"M12 5v14\" />\n</svg>\n");
+        let output = generate_one("opener", &svg);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains("probe: an unterminated comment"),
+            "{case}: refused by name, nothing written:\n{stderr}"
+        );
+    }
+    // The nested form that DOES close is one comment after two passes, and the
+    // icon reads: the fixed point is what makes it so.
+    let svg = format!("{ROOT}\n  <!<!-- a -->-- b -->\n  <path d=\"M12 5v14\" />\n</svg>\n");
+    let output = generate_one("nested", &svg);
+    assert!(
+        output.status.success(),
+        "a comment rebuilt and then closed is removed whole:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

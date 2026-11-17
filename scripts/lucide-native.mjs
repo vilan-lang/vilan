@@ -203,7 +203,19 @@ function readSvg(text, name) {
     const refuse = (why) => {
         throw new Error(`${name}: ${why}`);
     };
-    const body = text.replace(/<!--[\s\S]*?-->/g, "").trim();
+    // Comments are removed to a FIXED POINT. One pass is not enough: removing
+    // the inner comment of `<!<!-- a -->-- b -->` leaves a new `<!--` behind
+    // (code scanning's js/incomplete-multi-character-sanitization). Nothing
+    // below would accept one, since a leftover is "content other than
+    // self-closing elements", and nothing here writes HTML; but an opener
+    // that survives is an unterminated comment, and it is refused by name.
+    let body = text;
+    for (let previous = null; previous !== body; ) {
+        previous = body;
+        body = body.replace(/<!--[\s\S]*?-->/g, "");
+    }
+    if (body.includes("<!--")) refuse("an unterminated comment");
+    body = body.trim();
     const attributePattern = /([A-Za-z_:][\w:.-]*)\s*=\s*"([^"]*)"/g;
     const readAttributes = (source) => {
         const attributes = new Map();
