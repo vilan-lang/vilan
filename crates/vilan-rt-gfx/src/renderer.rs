@@ -37,6 +37,19 @@ pub struct FrameStats {
     /// CPU time to encode the scene, upload, record and submit. Not the GPU's
     /// time: submission returns before the GPU finishes.
     pub cpu_time: Duration,
+    /// The part of `cpu_time` spent turning the scene into instances (scaling,
+    /// snapping, culling, paint order, and rasterising glyphs and path masks
+    /// not yet in the atlas); the rest is uploading, recording and submitting.
+    pub encode_time: Duration,
+    /// The GPU memory of the instance buffers after the frame, in bytes: they
+    /// grow (doubling) and never shrink, so the last frame's is the peak.
+    pub instance_buffer_bytes: u64,
+    /// A window's frame only (zero offscreen): waiting for the surface's next
+    /// texture, which is where a frame waits for the display under vsync.
+    pub acquire_time: Duration,
+    /// A window's frame only (zero offscreen): handing the frame to the
+    /// window system.
+    pub present_time: Duration,
 }
 
 #[repr(C)]
@@ -642,6 +655,7 @@ impl Renderer {
         };
         self.encoder
             .encode(scene, units, (width, height), &mut glyphs, &mut self.frame);
+        let encode_time = started.elapsed();
         self.path_masks.end_frame(&mut self.pages);
         self.sync_images(context)?;
         self.upload_instances(context);
@@ -721,6 +735,11 @@ impl Renderer {
             atlas: self.atlas.stats(),
             path_mask_textures: self.path_masks.own_textures() as u32,
             cpu_time: started.elapsed(),
+            encode_time,
+            instance_buffer_bytes: self.quad_capacity * std::mem::size_of::<QuadInstance>() as u64
+                + self.sprite_capacity * std::mem::size_of::<SpriteInstance>() as u64,
+            acquire_time: Duration::ZERO,
+            present_time: Duration::ZERO,
         })
     }
 }

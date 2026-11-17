@@ -97,6 +97,21 @@
 //! program compiled to Rust calls this crate directly: no interpreter, no
 //! foreign-function boundary on the hot path.
 //!
+//! # Environment
+//!
+//! Read at run time, never by the program, and changing nothing it can
+//! observe:
+//!
+//! - `WGPU_BACKEND` (wgpu's own: `vulkan`, `dx12`, `metal`, `gl`, or a comma
+//!   list): the graphics APIs the instance is made with, in place of every
+//!   backend this crate is built with ([`GpuContext`], `window.rs`).
+//! - `WGPU_DEBUG=1`: the instance's `DEBUG` flag, off otherwise; see
+//!   `gpu.rs` for why (a crash in the Vulkan loader).
+//! - `VILAN_GFX_REPORT=1` (F187): the host's report on stderr — the adapter,
+//!   surface and window when a window opens, changes of scale and surface
+//!   while it runs, and frame counts and per-part frame times when the
+//!   program ends. See `host/report.rs`.
+//!
 //! # Known limits of the first version
 //!
 //! - A layer's opacity is applied per primitive (as GPUI does): overlapping

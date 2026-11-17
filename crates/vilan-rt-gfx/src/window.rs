@@ -12,6 +12,7 @@
 //! crate's yet. `examples/window.rs` drives a window standalone.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
@@ -33,6 +34,24 @@ pub struct WindowRenderer {
     configuration: wgpu::SurfaceConfiguration,
     context: GpuContext,
     renderer: Renderer,
+    surface_counts: SurfaceCounts,
+}
+
+/// How often acquiring a window's next frame did not simply succeed, since
+/// the renderer was made: what the surface told [`WindowRenderer::render`],
+/// for a diagnostic report (`host/report.rs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SurfaceCounts {
+    /// Drawn, and the surface configured again for the next frame.
+    pub(crate) suboptimal: u64,
+    /// Skipped, and the surface configured again.
+    pub(crate) outdated: u64,
+    /// Skipped, and the surface made again.
+    pub(crate) lost: u64,
+    /// Skipped: no texture came in time.
+    pub(crate) timeout: u64,
+    /// Skipped: the window is minimised or covered.
+    pub(crate) occluded: u64,
 }
 
 /// What [`WindowRenderer::render`] did.
@@ -102,7 +121,22 @@ impl WindowRenderer {
             configuration,
             context,
             renderer,
+            surface_counts: SurfaceCounts::default(),
         })
+    }
+
+    /// The surface's configuration now.
+    pub(crate) fn configuration(&self) -> &wgpu::SurfaceConfiguration {
+        &self.configuration
+    }
+
+    /// What the surface supports on this adapter.
+    pub(crate) fn capabilities(&self) -> wgpu::SurfaceCapabilities {
+        self.surface.get_capabilities(&self.context.adapter)
+    }
+
+    pub(crate) fn surface_counts(&self) -> SurfaceCounts {
+        self.surface_counts
     }
 
     pub fn window(&self) -> &Arc<Window> {
@@ -148,24 +182,35 @@ impl WindowRenderer {
         text: &mut TextSystem,
         background: Color,
     ) -> Result<FrameOutcome, GfxError> {
-        let frame = match self.surface.get_current_texture() {
+        let acquiring = Instant::now();
+        let acquired = self.surface.get_current_texture();
+        let acquire_time = acquiring.elapsed();
+        let frame = match acquired {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Draw this one; the next frame gets a configuration that
                 // matches again.
+                self.surface_counts.suboptimal += 1;
                 self.surface
                     .configure(&self.context.device, &self.configuration);
                 frame
             }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.surface_counts.timeout += 1;
+                return Ok(FrameOutcome::Skipped);
+            }
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.surface_counts.occluded += 1;
                 return Ok(FrameOutcome::Skipped);
             }
             wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface_counts.outdated += 1;
                 self.surface
                     .configure(&self.context.device, &self.configuration);
                 return Ok(FrameOutcome::Skipped);
             }
             wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface_counts.lost += 1;
                 self.surface = self
                     .context
                     .instance
@@ -184,7 +229,7 @@ impl WindowRenderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let stats = self.renderer.render(
+        let mut stats = self.renderer.render(
             &self.context,
             Target {
                 view: &view,
@@ -196,8 +241,11 @@ impl WindowRenderer {
             text,
             background,
         )?;
+        let presenting = Instant::now();
         self.window.pre_present_notify();
         self.context.queue.present(frame);
+        stats.present_time = presenting.elapsed();
+        stats.acquire_time = acquire_time;
         Ok(FrameOutcome::Presented(stats))
     }
 }

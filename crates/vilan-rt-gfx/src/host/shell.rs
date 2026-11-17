@@ -56,7 +56,7 @@ use winit::window::{Window, WindowId};
 
 use super::access::{self, WindowAccess};
 use super::input::{RawEvent, enqueue};
-use super::{HostWake, STATE, TEXT_SCALE, with_text};
+use super::{HostWake, STATE, TEXT_SCALE, report, with_text};
 use crate::units::Units;
 use crate::window::{FrameOutcome, WindowRenderer};
 
@@ -80,6 +80,7 @@ pub(crate) fn run(event_loop: EventLoop<HostWake>, turn: &dyn Fn() -> Turn) {
         failure: None,
     };
     let ran = event_loop.run_app(&mut shell);
+    report::finish();
     let failure = shell.failure.take();
     // The windows go before the loop function returns: their surfaces first,
     // then the windows the program's slots still hold (a SIGTERM ends the
@@ -279,6 +280,7 @@ impl Shell<'_> {
                 };
                 match made {
                     Ok((renderer, access)) => {
+                        report::window_ready(id, &renderer);
                         let window = Arc::clone(renderer.window());
                         self.access.insert(id, access);
                         let size = renderer.size();
@@ -351,12 +353,20 @@ impl Shell<'_> {
             };
             let units = Units::new(scale_factor as f32, TEXT_SCALE as f32)
                 .map_err(|error| error.to_string())?;
+            let surface_before = renderer.surface_counts();
             let started = Instant::now();
             let rendered = with_text(|text| renderer.render(&scene, units, text, background));
-            let took = started.elapsed().as_secs_f64() * 1.0e6;
+            let finished = Instant::now();
+            let took = finished.duration_since(started).as_secs_f64() * 1.0e6;
+            let surface_after = renderer.surface_counts();
+            if surface_after != surface_before {
+                let size = renderer.size();
+                report::surface(id, surface_before, surface_after, (size.width, size.height));
+            }
             match rendered {
-                Ok(FrameOutcome::Presented(_)) => {
+                Ok(FrameOutcome::Presented(stats)) => {
                     super::with_window(id, |slot| slot.last_draw_us = took);
+                    report::presented(id, &stats, finished);
                     if self.shares_x_connection {
                         self.drain.presented(Instant::now());
                     }
@@ -364,7 +374,7 @@ impl Shell<'_> {
                 // A minimised or covered window, or a surface that had to be
                 // reconfigured: the system asks for a frame again when the
                 // window changes.
-                Ok(FrameOutcome::Skipped) => {}
+                Ok(FrameOutcome::Skipped) => report::skipped(),
                 Err(error) => return Err(format!("a `std::gfx` window's frame failed: {error}")),
             }
         }
@@ -475,6 +485,7 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
         });
         match event {
             WindowEvent::RedrawRequested => {
+                report::requested(id);
                 super::with_window(id, |slot| slot.frame_due = true);
                 self.turn_now(event_loop);
             }
@@ -483,8 +494,15 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
                 // size, and the frame at that size is presented before this
                 // handler returns.
                 if let Some(renderer) = self.renderers.get_mut(&id) {
+                    // The size as the system gave it: 0 x 0 is a minimised
+                    // window on Windows (the surface keeps 1 x 1).
+                    let surface = (size.width.max(1), size.height.max(1));
+                    if (renderer.size().width, renderer.size().height) != surface {
+                        report::resized(id, size.width, size.height);
+                    }
                     renderer.resize(size);
                 }
+                report::requested(id);
                 let scale = super::with_window(id, |slot| {
                     slot.device_size = (size.width.max(1), size.height.max(1));
                     slot.frame_due = true;
@@ -501,6 +519,10 @@ impl ApplicationHandler<HostWake> for Shell<'_> {
                 self.turn_now(event_loop);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                if let Some(renderer) = self.renderers.get(&id) {
+                    report::scale_changed(id, scale_factor, renderer.window());
+                }
+                report::requested(id);
                 super::with_window(id, |slot| {
                     slot.scale_factor = scale_factor;
                     slot.frame_due = true;

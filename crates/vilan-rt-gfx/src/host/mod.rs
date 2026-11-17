@@ -74,6 +74,7 @@ mod access;
 pub mod clipboard;
 mod input;
 mod paths;
+mod report;
 mod shell;
 pub mod ui;
 
@@ -269,14 +270,13 @@ pub fn install() {
             }));
             EVENT_LOOP.with(|slot| *slot.borrow_mut() = Some(event_loop));
             STATE.with(|state| state.borrow_mut().system = WindowSystem::Ready);
+            report::install(None);
         }
         Err(error) => {
             vilan_rt_poll::install();
-            STATE.with(|state| {
-                state.borrow_mut().system = WindowSystem::Unavailable(format!(
-                    "cannot open a window: the window system did not start ({error})"
-                ))
-            });
+            let reason = format!("cannot open a window: the window system did not start ({error})");
+            report::install(Some(&reason));
+            STATE.with(|state| state.borrow_mut().system = WindowSystem::Unavailable(reason));
         }
     }
 }
@@ -408,6 +408,7 @@ pub fn close(id: u32) {
 /// `__gfx_request_redraw(id)` — a frame, soon. Many requests before the frame
 /// is drawn are one frame.
 pub fn request_redraw(id: u32) {
+    report::requested(id);
     with_window(id, |slot| {
         slot.redraw_requests += 1;
         if let Some(window) = &slot.window {
@@ -609,7 +610,11 @@ impl IoSource for WindowSource {
                 true
             }
             Work::Frame(callback, size, scale_factor) => {
+                let started = report::active().then(std::time::Instant::now);
                 let scene = build_frame(size, scale_factor, callback.as_deref());
+                if let Some(started) = started {
+                    report::frame_built(self.id, started.elapsed());
+                }
                 with_window(self.id, |slot| slot.scene = Some(scene));
                 true
             }
