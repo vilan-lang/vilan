@@ -2368,6 +2368,27 @@ pub struct Enum<'src> {
     pub backing: Option<Backing>,
 }
 
+/// Whether the enum `enum_id` lowers to an IMMUTABLE JS primitive rather than
+/// the mutable `[index, ..data]` array: `bool` (a native boolean) and every
+/// BACKED enum (its bare number or string, `Enum::backing`). One rule, read by
+/// every classifier that asks "is this enum a JS scalar": the `&mut` view
+/// machinery (the analyzer's `is_scalar_view_pointee`, the transformer's
+/// `resolves_to_scalar_view_pointee`) and native `===` comparison. A view of
+/// such a value must be a `(base, key)` place — there is nothing to write in
+/// place — and B746 was a backed enum missing from the view classifiers: a
+/// `&mut` to one took the aggregate `Object.assign` path, which threw on a
+/// string and silently wrote nothing on a number.
+pub(crate) fn enum_lowers_to_js_primitive(
+    enum_id: Id,
+    bool_enum_id: Option<Id>,
+    enums: &IndexMap<Id, Enum<'_>>,
+) -> bool {
+    bool_enum_id == Some(enum_id)
+        || enums
+            .get(&enum_id)
+            .is_some_and(|enum_| enum_.backing.is_some())
+}
+
 /// Which scalar an enum's variants are backed by. Fixed by the first explicit
 /// backing value in declaration order; a later disagreement is a hard error
 /// (backed-enums.md §3.2 — an enum has ONE runtime representation).
@@ -26392,13 +26413,7 @@ impl<'src> Analyzer<'src> {
     fn is_native_operator_type(&self, type_: &Type) -> bool {
         match type_ {
             Type::Struct(_, _) => self.is_native_operator_primitive(type_),
-            Type::Enum(id, _) => {
-                self.bool_enum_id == Some(*id)
-                    || self
-                        .enums
-                        .get(id)
-                        .is_some_and(|enum_| enum_.backing.is_some())
-            }
+            Type::Enum(id, _) => enum_lowers_to_js_primitive(*id, self.bool_enum_id, &self.enums),
             _ => false,
         }
     }
@@ -28080,14 +28095,16 @@ impl<'src> Analyzer<'src> {
 
     /// Whether a type is a scalar for the **view** machinery — a `(base, key)`
     /// pair written through by `base[key] = v` rather than an aggregate reference.
-    /// The scalar primitives, plus `bool`: `bool` is a numeric *enum*, so
-    /// `is_scalar_primitive` (which checks struct ids) misses it, which used to
-    /// route `&mut bool` down the aggregate `Object.assign` path — a silent no-op
-    /// write (C5.3).
+    /// The rule: the type lowers to an immutable JS primitive. That is the
+    /// scalar primitives, plus the enums `enum_lowers_to_js_primitive` names —
+    /// `bool` and every backed enum. `is_scalar_primitive` checks struct ids
+    /// only, and each enum missing here routed its `&mut` down the aggregate
+    /// `Object.assign` path: `bool` wrote nothing (C5.3), a backed enum wrote
+    /// nothing on a number and threw on a string (B746).
     fn is_scalar_view_pointee(&self, type_: &Type) -> bool {
         match type_ {
             Type::Struct(id, _) => self.is_scalar_primitive(*id),
-            Type::Enum(id, _) => self.bool_enum_id == Some(*id),
+            Type::Enum(id, _) => enum_lowers_to_js_primitive(*id, self.bool_enum_id, &self.enums),
             _ => false,
         }
     }
