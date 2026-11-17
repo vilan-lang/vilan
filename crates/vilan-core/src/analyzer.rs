@@ -80294,14 +80294,26 @@ pub fn set_document_overlay(path: &Path, text: Option<String>) {
     let mut overlay = overlay
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match text {
-        Some(text) => {
-            overlay.insert(key, text);
-        }
-        None => {
-            overlay.remove(&key);
-        }
+    let membership_moved = match text {
+        Some(text) => overlay.insert(key, text).is_none(),
+        None => overlay.remove(&key).is_some(),
+    };
+    if membership_moved {
+        // Inside the lock, so a reader that sees the old count read the old set.
+        DOCUMENT_OVERLAY_MEMBERSHIP.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// How many times the overlay's SET of paths has changed — a buffer opened
+/// for a path it did not hold, or one closed. A buffer's text changing moves
+/// nothing here. M209's remembered reach walks read it: while it stands still,
+/// whether the overlay holds a path no file on disk answers for is still what
+/// it was (`crate::package_reach`).
+static DOCUMENT_OVERLAY_MEMBERSHIP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn document_overlay_membership() -> u64 {
+    DOCUMENT_OVERLAY_MEMBERSHIP.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Every path the overlay holds — the listing side of the overlay, for
@@ -80693,22 +80705,6 @@ fn parse_owned_module(path: &Path, source: String) -> LoadedModule {
 }
 
 pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
-    use std::collections::HashMap;
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::sync::{Mutex, OnceLock};
-
-    // A process-global, content-addressed cache for the rare NON-clean module —
-    // one that recovered from a parse error. Clean modules (the overwhelming
-    // case — std parses clean on every compile) go through the SHARED
-    // `parse_clean_cached` below, the same cache the CLI entry file and the
-    // language server use, so a module is parsed once per distinct content
-    // across the whole process (watch rounds included) instead of once per
-    // analysis. Keeping broken modules in their own cache leaves the shared one
-    // holding only clean, reusable trees.
-    static ERROR_CACHE: OnceLock<Mutex<HashMap<u64, LoadedModule>>> = OnceLock::new();
-    let error_cache = ERROR_CACHE.get_or_init(|| Mutex::new(HashMap::default()));
-
     // M9 (leak-soak.md §7.9.4): during an opted-in analysis — the language
     // server's — a module served from the OPEN-DOCUMENT overlay bypasses both
     // process-global caches below and parses into analysis-owned allocations.
@@ -80732,8 +80728,43 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
     // reader. It used to open-code that match here, which is precisely why the
     // overlay reached the module loader and nothing else.
     let (source, provenance) = crate::util::read_source_traced(path).ok()?;
+    Some(load_package_module_source(path, source, provenance))
+}
+
+/// [`load_package_module`] past its read: the module `path` names, parsed from
+/// `source`, which the caller read through the same overlay-then-disk seam
+/// (`provenance` says which side served it).
+///
+/// Split out for M209's recorded reach walk (`crate::package_reach`), which must
+/// know the exact text each module's import list was taken from — reading it a
+/// second time could answer differently — and so reads first and parses what it
+/// read. Everything past the read is this function, so the two cannot disagree
+/// about how a text becomes a module.
+pub(crate) fn load_package_module_source(
+    path: &Path,
+    source: String,
+    provenance: crate::util::SourceProvenance,
+) -> LoadedModule {
+    use std::collections::HashMap;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::sync::{Mutex, OnceLock};
+
+    // A process-global, content-addressed cache for the rare NON-clean module —
+    // one that recovered from a parse error. Clean modules (the overwhelming
+    // case — std parses clean on every compile) go through the SHARED
+    // `parse_clean_cached` below, the same cache the CLI entry file and the
+    // language server use, so a module is parsed once per distinct content
+    // across the whole process (watch rounds included) instead of once per
+    // analysis. Keeping broken modules in their own cache leaves the shared one
+    // holding only clean, reusable trees.
+    static ERROR_CACHE: OnceLock<Mutex<HashMap<u64, LoadedModule>>> = OnceLock::new();
+    let error_cache = ERROR_CACHE.get_or_init(|| Mutex::new(HashMap::default()));
+
+    let analysis_owns_overlay_loads =
+        crate::owned_modules::collecting() && !crate::macros::in_macro_world();
     if analysis_owns_overlay_loads && provenance == crate::util::SourceProvenance::Overlay {
-        return Some(parse_owned_module(path, source));
+        return parse_owned_module(path, source);
     }
     let key = {
         let mut hasher = DefaultHasher::new();
@@ -80747,18 +80778,18 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&key)
     {
-        return Some(*loaded);
+        return *loaded;
     }
 
     // The fast path: a clean module reuses the shared clean-parse cache, already
     // lift-rewritten and leaked to `'static`.
     if let Some(parsed) = crate::parse_clean_cached_with_warnings(&source) {
-        return Some(LoadedModule {
+        return LoadedModule {
             ast: parsed.ast,
             text: parsed.text,
             parse_errors: &[],
             parse_warnings: parsed.warnings,
-        });
+        };
     }
 
     // Non-clean and not yet seen: lex and parse for diagnostics. The source is
@@ -80826,7 +80857,7 @@ pub(crate) fn load_package_module(path: &Path) -> Option<LoadedModule> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, loaded);
-    Some(loaded)
+    loaded
 }
 
 /// Pushes one diagnostic per swallowed lex/parse error in a loaded package
@@ -82046,6 +82077,26 @@ fn module_path_display(name: &str) -> String {
 /// named `lib` with a body of its own (`a/lib/lib.vl`) is a module whose body
 /// file is its own, not `a`'s, and nothing about it is degenerate.
 fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
+    resolve_module_file_with(root, name, &mut module_file_exists)
+}
+
+/// Whether a module candidate file is there to load: on disk, or as an open
+/// buffer the editor has not saved yet. The one existence rule module
+/// resolution asks, named so M209's recorded reach walk
+/// (`crate::package_reach`) can ask it through a recorder.
+pub(crate) fn module_file_exists(candidate: &Path) -> bool {
+    candidate.exists() || document_overlay_contains(candidate)
+}
+
+/// [`resolve_module_file`] with its existence question asked through `exists`
+/// — always [`module_file_exists`]'s answer, possibly remembered: the recorded
+/// reach walk notes each candidate it probed so a later caller can re-ask
+/// exactly those questions instead of walking again.
+fn resolve_module_file_with(
+    root: &Path,
+    name: &str,
+    exists: &mut impl FnMut(&Path) -> bool,
+) -> Option<ModuleResolution> {
     let (prefix, last) = module_path_prefix(name)?;
     let flat_relative = prefix.join(format!("{last}.vl"));
     let nested_relative = prefix.join(last).join("lib.vl");
@@ -82057,7 +82108,6 @@ fn resolve_module_file(root: &Path, name: &str) -> Option<ModuleResolution> {
         root: root.to_path_buf(),
         relative,
     };
-    let exists = |candidate: &Path| candidate.exists() || document_overlay_contains(candidate);
     // The root's own `lib.vl` is untouched: a package's `lib` is a module (and
     // std's package surface), because the source root is nobody's body.
     let names_a_body_file = last == "lib" && !prefix.as_os_str().is_empty();
@@ -82784,9 +82834,22 @@ fn resolve_module_in_roots(roots: &[&Path], name: &str) -> Option<ModuleResoluti
 /// [`Analyzer::refuse_shadowed_submodules`]) — the same answer `a.vl` beside
 /// `a/lib.vl` gets — so neither rule decides a program's meaning silently.
 fn longest_module_prefix(roots: &[&Path], path: &str) -> Option<String> {
+    longest_module_prefix_with(roots, path, &mut module_file_exists)
+}
+
+/// [`longest_module_prefix`] with its existence question asked through
+/// `exists` (see [`resolve_module_file_with`]).
+fn longest_module_prefix_with(
+    roots: &[&Path],
+    path: &str,
+    exists: &mut impl FnMut(&Path) -> bool,
+) -> Option<String> {
     let mut candidate = path.to_string();
     loop {
-        if resolve_module_in_roots(roots, &candidate).is_some() {
+        if roots
+            .iter()
+            .any(|root| resolve_module_file_with(root, &candidate, exists).is_some())
+        {
             return Some(candidate);
         }
         let cut = candidate.rfind("::")?;
@@ -82983,8 +83046,9 @@ pub fn module_source_file(roots: &[&Path], name: &str) -> Option<PathBuf> {
 /// The caller is [`crate::platform_color::file_platforms`]: which entry
 /// *reaches* a module is which platform colors it, and a compile is far too
 /// expensive to ask that question with (the language server asks it per
-/// keystroke). Parses go through the loader's caches, so a saved sibling is
-/// parsed once per distinct content for the whole process.
+/// keystroke, through `crate::package_reach`'s remembered walks since M209).
+/// Parses go through the loader's caches, so a saved sibling is parsed once per
+/// distinct content for the whole process.
 ///
 /// Overlay-served content is **owned and reclaimed here** (`leak-soak.md`
 /// §7.5/§7.9.4): an open buffer's text is a keystroke's and can never recur, so
@@ -82992,6 +83056,21 @@ pub fn module_source_file(roots: &[&Path], name: &str) -> Option<PathBuf> {
 /// text + tree per landed keystroke. Inside an analysis's own collection scope
 /// the walk simply adopts into it, and the analysis reclaims as it always does.
 pub fn package_modules_reachable_from(entry: &Path, pkg_root: &Path) -> HashSet<PathBuf> {
+    package_module_walk(entry, pkg_root, None)
+}
+
+/// [`package_modules_reachable_from`]'s walk, optionally RECORDING every
+/// question it asked of the world (M209): the text each module's import list
+/// was taken from, each candidate file it probed for existence and the answer,
+/// and each path it canonicalized. The walk is a pure function of those
+/// answers, so a caller holding the record can re-ask exactly them and, when
+/// every answer is the same, keep the reach without walking
+/// (`crate::package_reach`). Unrecorded, it is the walk as it always was.
+pub(crate) fn package_module_walk(
+    entry: &Path,
+    pkg_root: &Path,
+    mut record: Option<&mut crate::package_reach::ReachRecord>,
+) -> HashSet<PathBuf> {
     // Activate a scope only when there is none: `CollectionScope` is not
     // re-entrant on a thread, and a walk running inside an analysis's scope
     // wants that analysis's ownership anyway.
@@ -82999,27 +83078,55 @@ pub fn package_modules_reachable_from(entry: &Path, pkg_root: &Path) -> HashSet<
         (!crate::owned_modules::collecting()).then(crate::owned_modules::CollectionScope::activate);
     let mut reached: HashSet<PathBuf> = HashSet::default();
     let mut queue = vec![entry.to_path_buf()];
-    reached.insert(crate::util::canonical_path(entry));
+    let canonical =
+        |path: &Path, record: &mut Option<&mut crate::package_reach::ReachRecord>| match record
+            .as_deref_mut()
+        {
+            None => crate::util::canonical_path(path),
+            Some(record) => record.canonical(path),
+        };
+    reached.insert(canonical(entry, &mut record));
     while let Some(path) = queue.pop() {
         // Names are copied out of the tree before the next iteration, so no
         // borrow of an owned allocation outlives the reclaim below.
-        let siblings: Vec<String> = match load_package_module(&path) {
-            Some(loaded) => collect_module_paths(&loaded.ast.0, "pkg")
-                .into_iter()
-                .map(|(module, _)| module.to_string())
-                .collect(),
-            None => Vec::new(),
+        let siblings: Vec<String> = match record.as_deref_mut() {
+            None => load_package_module(&path)
+                .map(|loaded| pkg_module_paths(&loaded))
+                .unwrap_or_default(),
+            // Recorded: read first, then parse exactly what was read, so the
+            // record's text is the one the import list came from.
+            Some(record) => {
+                let read = crate::util::read_source_traced(&path).ok();
+                let siblings = read.as_ref().map(|(source, provenance)| {
+                    pkg_module_paths(&load_package_module_source(
+                        &path,
+                        source.clone(),
+                        *provenance,
+                    ))
+                });
+                let names = siblings.clone().unwrap_or_default();
+                record.files.push(crate::package_reach::ReadModule {
+                    path: path.clone(),
+                    text: read.map(|(source, _)| source),
+                    siblings,
+                });
+                names
+            }
         };
         for module in siblings {
+            let mut exists = |candidate: &Path| match record.as_deref_mut() {
+                None => module_file_exists(candidate),
+                Some(record) => record.probe(candidate),
+            };
             // A65: the sibling is an import PATH; the longest prefix of it that
             // names a module under this root is the file it reaches.
-            let Some(path) = longest_module_prefix(&[pkg_root], &module) else {
+            let Some(path) = longest_module_prefix_with(&[pkg_root], &module, &mut exists) else {
                 continue;
             };
-            let Some(file) = resolve_module_file(pkg_root, &path) else {
+            let Some(file) = resolve_module_file_with(pkg_root, &path, &mut exists) else {
                 continue;
             };
-            if reached.insert(crate::util::canonical_path(&file.path)) {
+            if reached.insert(canonical(&file.path, &mut record)) {
                 queue.push(file.path);
             }
         }
@@ -83032,6 +83139,16 @@ pub fn package_modules_reachable_from(entry: &Path, pkg_root: &Path) -> HashSet<
         unsafe { scope.drain().reclaim() };
     }
     reached
+}
+
+/// The `pkg::` module paths a loaded module names — [`collect_module_paths`]'
+/// answer copied out of the tree, which is all the reach walk reads of a
+/// module.
+pub(crate) fn pkg_module_paths(loaded: &LoadedModule) -> Vec<String> {
+    collect_module_paths(&loaded.ast.0, "pkg")
+        .into_iter()
+        .map(|(module, _)| module.to_string())
+        .collect()
 }
 
 /// Every name an `import` may bind from the module file at `path`, loaded ON

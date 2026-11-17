@@ -22,11 +22,12 @@
 //! the server schedules, lands and publishes per world.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use vilan_core::Manifest;
 use vilan_core::Platform;
 use vilan_core::fx::FxHashSet as HashSet;
+use vilan_core::package_reach::ReachMemo;
 
 /// Which worlds a file is analysed in.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -53,7 +54,7 @@ pub struct RootResolver {
     /// canonical, with its platform.
     legs: Vec<(PathBuf, Platform)>,
     /// What each leg reaches, filled on first ask.
-    reach: Vec<OnceLock<HashSet<PathBuf>>>,
+    reach: Vec<OnceLock<Arc<HashSet<PathBuf>>>>,
 }
 
 impl RootResolver {
@@ -141,10 +142,29 @@ impl RootResolver {
     }
 
     fn reaches(&self, leg: usize) -> &HashSet<PathBuf> {
-        self.reach[leg].get_or_init(|| {
-            vilan_core::analyzer::package_modules_reachable_from(&self.legs[leg].0, &self.pkg_root)
-        })
+        self.reach[leg].get_or_init(|| package_reach(&self.legs[leg].0, &self.pkg_root))
     }
+}
+
+/// M209: what the walk from `entry` under `pkg_root` reaches
+/// (`analyzer::package_modules_reachable_from`), answered from the server's
+/// remembered walks — walked again only when a module's import list, a probed
+/// file's existence or a canonical path moved (`vilan_core::package_reach`
+/// holds the record and the argument). Every per-keystroke asker goes through
+/// here: this resolver, and the platform colour and dead-module slice of
+/// `document::resolve_project_context`.
+pub fn package_reach(entry: &Path, pkg_root: &Path) -> Arc<HashSet<PathBuf>> {
+    static MEMO: OnceLock<Mutex<ReachMemo>> = OnceLock::new();
+    MEMO.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reach(entry, pkg_root)
+}
+
+/// [`package_reach`] as the reachability question platform colouring asks
+/// (`platform_color::file_platform_choices_reached_by`).
+pub fn package_reaches(entry: &Path, pkg_root: &Path, file: &Path) -> bool {
+    package_reach(entry, pkg_root).contains(file)
 }
 
 /// Whether `text` declares a platform-fenced twin group. Syntactic, and
