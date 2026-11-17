@@ -33,7 +33,7 @@
 # is exactly the kind of change that moves a pixel.
 [package]
 name = "vilan-rt-gfx"
-version = "0.56.0"
+version = "0.56.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "The GPU graphics layer (std::gfx) of programs the vilan compiler emits as Rust."
