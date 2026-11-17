@@ -25,6 +25,9 @@ written down.
 
 ## Unreleased
 
+<!-- family: tooling -->
+**CI does not test a tree it has already passed, and `scripts/ci-local.sh --quick` runs the cheap legs before a push (N210).** A commit's tree is its whole content, the workflow file included, so two commits with one tree build and test identically. A release makes several: the fold merges the tag into `main` and fast-forwards `next`, both onto the tree CI passed on the release commit, and v0.56.0 and v0.56.1 spent four of their twelve full runs that way in one day. `ci.yml`'s `changes` job now asks `scripts/ci-already-green.sh` whether a push run of this workflow, in the last fourteen days, with every job successful (so its suite really ran), holds the head commit's tree; if so the leg jobs are skipped and `check` still reports, exactly as for a root-prose push. Anything short of a clear yes runs the suite: no such run, an API error, a missing `gh`. `[ci full]` in the head commit's message runs it regardless. The release workflow's own gate is unchanged. Separately, `scripts/ci-local.sh --quick` runs `fmt`, `vilan-fmt`, `clippy` and `audit`, the legs a green suite says nothing about; a pin holds it to a subset of the script's legs.
+
 ## v0.56.1 — 2026-11-16
 
 <!-- family: miscompile -->

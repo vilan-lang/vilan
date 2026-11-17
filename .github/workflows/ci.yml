@@ -60,8 +60,17 @@ jobs:
   # required check is a supply-chain surface for no gain.
   changes:
     runs-on: ubuntu-latest
+    # `actions: read` is for the `seen` step's two reads of this workflow's own
+    # runs; nothing else in the file is granted it.
+    permissions:
+      contents: read
+      actions: read
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      # The suite runs when a non-prose path changed (`filter`) AND CI has not
+      # already passed this exact tree (`seen`). Every leg job below reads this
+      # one output, so both reasons to skip arrive the same way and `check`
+      # still reports.
+      code: ${{ steps.filter.outputs.code == 'true' && steps.seen.outputs.green != 'true' }}
       # TRUSTED: the event's code is this repository's own — a push to a branch
       # here, or a pull request whose head repository is this one (Dependabot's
       # branches included). A fork's PR is not, whoever opened it. Only trusted
@@ -121,6 +130,31 @@ jobs:
           else
               echo "::notice::root prose only — the suite is skipped, and \`check\` still reports"
               echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+      # N210: a tree CI has already passed is not tested again. A release makes
+      # several commits with ONE tree (the fold merges the tag into `main` and
+      # fast-forwards `next` onto it), and a merge that changes no file is the
+      # same case; v0.56.0 and v0.56.1 spent four full runs that way in one day.
+      # `scripts/ci-already-green.sh` holds the rule and its reasons: a push run
+      # of this workflow, in the last fourteen days, in which EVERY job
+      # succeeded (so the suite really ran), on a head commit with this tree.
+      # It answers 1 for "no such run" and 2 for "cannot tell", and both run the
+      # suite. `[ci full]` in the head commit's message runs it regardless.
+      - id: seen
+        if: steps.filter.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          if git log -1 --format=%B | grep -qF '[ci full]'; then
+              echo "::notice::the head commit says [ci full] — the suite runs"
+              echo "green=false" >> "$GITHUB_OUTPUT"
+          elif found=$(sh scripts/ci-already-green.sh HEAD); then
+              echo "::notice title=This tree is already green::ci.yml passed tree $(git rev-parse --short HEAD^{tree}) in run ${found% *} (commit ${found#* }), every job — the suite is skipped, and \`check\` still reports"
+              echo "green=true" >> "$GITHUB_OUTPUT"
+          else
+              echo "::notice::no green run holds this tree — the suite runs"
+              echo "green=false" >> "$GITHUB_OUTPUT"
           fi
 
   test:

@@ -99,6 +99,11 @@ measurements). Run that binary under nextest.
   - touched the analyzer / type solver → `cargo test -p vilan-core --test inference`
   - touched std, a framework, or the language → `cargo test -p vilan-core --test docs`
   - touched module loading or paths → `cargo test -p vilan-core --test module_resolution`
+- **Before a push, run `scripts/ci-local.sh --quick`.** It is the cheap CI legs
+  (`fmt`, `vilan-fmt`, `clippy`, `audit`), about three minutes, and a green suite
+  says nothing about them: the suite does not run the formatter over the tree's
+  `.vl` files, so a new test program in the wrong layout is green locally and
+  red on CI. Each of these costs a whole CI cycle when it is the one that fails.
 - **`cargo build` first when the change might not compile.** A failed build
   inside `cargo test` costs the same as a successful one and tells you less.
 - **A new pin should be proven non-vacuous**, and that is cheap: plant the bug

@@ -326,3 +326,171 @@ fn n156_the_suite_legs_run_under_ci_test_and_the_default_profile_is_untouched() 
         "deep_nesting leaves the ci-test run and runs on the default profile:\n{test_leg}"
     );
 }
+
+// --- `--quick`: the cheap legs before a push ----------------------------------------
+
+/// `--quick` is a NAMED SUBSET of the legs, never a second list of commands.
+///
+/// On 2026-11-16 a lane ran the full suite green and the `vilan-fmt` leg was
+/// red on CI and at the seal, over the layout of two new test programs: the
+/// suite does not run the formatter over the tree. `--quick` is the three
+/// minutes that would have said so before the push. It stays honest only while
+/// it is a subset of `LEGS=` (so each of its legs is a ci.yml job's exact
+/// command) and holds the text gates a green suite says nothing about.
+#[test]
+fn the_quick_legs_are_a_subset_of_the_legs_and_hold_the_text_gates() {
+    let script = script();
+    let line = script
+        .lines()
+        .find(|line| line.starts_with("QUICK="))
+        .expect("ci-local.sh must declare `QUICK=` on one line — this file reads it");
+    let quick: Vec<&str> = line
+        .trim_start_matches("QUICK=")
+        .trim_matches('"')
+        .split_whitespace()
+        .collect();
+    let legs = declared_legs();
+    for leg in &quick {
+        assert!(
+            legs.iter().any(|declared| declared == leg),
+            "`--quick` names `{leg}`, which is not in `LEGS=`: {legs:?}"
+        );
+        assert!(
+            !LOCAL_ONLY.contains(leg),
+            "`--quick` is what CI will run next; `{leg}` is local-only"
+        );
+    }
+    for gate in ["fmt", "vilan-fmt", "clippy"] {
+        assert!(
+            quick.contains(&gate),
+            "`--quick` must hold `{gate}`: a green suite does not run it ({quick:?})"
+        );
+    }
+    for slow in ["test", "doctest", "perf", "gfx", "webview", "wasm"] {
+        assert!(
+            !quick.contains(&slow),
+            "`{slow}` is minutes, not seconds: it does not belong in `--quick`"
+        );
+    }
+    assert!(
+        script.contains("--quick)\n            requested=\"$requested $QUICK\""),
+        "the `--quick` option must add `$QUICK` to the requested legs"
+    );
+}
+
+// --- N210: a tree CI has already passed is not tested again --------------------------
+
+fn already_green_script() -> String {
+    let path = repository_root().join("scripts/ci-already-green.sh");
+    std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("ci-already-green.sh: {error}"))
+}
+
+/// The `changes` job's ONE output gates every leg job, and it is the AND of the
+/// two reasons the suite may be skipped. A leg job that read anything else
+/// would run (or skip) on its own rule.
+#[test]
+fn n210_every_leg_job_runs_on_the_one_output_that_knows_both_skips() {
+    let workflow = workflow();
+    let changes = job_body(&workflow, "changes");
+    assert!(
+        changes.contains(
+            "code: ${{ steps.filter.outputs.code == 'true' && steps.seen.outputs.green != 'true' }}"
+        ),
+        "`changes` must publish `code` as (a non-prose path changed) AND NOT (this tree is \
+         already green):\n{changes}"
+    );
+    for job in workflow_jobs(&workflow) {
+        if META_JOBS.contains(&job.as_str()) {
+            continue;
+        }
+        let body = job_body(&workflow, &job);
+        assert!(
+            body.contains("needs: changes")
+                && body.contains("if: needs.changes.outputs.code == 'true'"),
+            "`{job}` must run exactly when `changes` says the suite runs"
+        );
+    }
+}
+
+/// The tree lookup lives in the script (so a person can ask it the same
+/// question), the step that calls it fails OPEN, and `[ci full]` overrides it.
+#[test]
+fn n210_the_seen_step_calls_the_script_fails_open_and_has_its_override() {
+    let workflow = workflow();
+    let changes = job_body(&workflow, "changes");
+    let seen = changes
+        .split("- id: seen")
+        .nth(1)
+        .expect("`changes` has a step with `id: seen`");
+    assert!(
+        seen.contains("if: steps.filter.outputs.code == 'true'"),
+        "the lookup is not made for a push the path filter already skipped"
+    );
+    assert!(
+        seen.contains("elif found=$(sh scripts/ci-already-green.sh HEAD); then"),
+        "the step asks the script, and only its exit 0 is a yes:\n{seen}"
+    );
+    // Exactly one line says green=true, and it is the script's yes.
+    assert_eq!(
+        seen.matches("green=true").count(),
+        1,
+        "only the script's exit 0 may say the tree is green:\n{seen}"
+    );
+    assert!(
+        seen.contains("grep -qF '[ci full]'"),
+        "`[ci full]` in the head commit's message runs the suite regardless"
+    );
+    assert!(
+        changes.contains("actions: read"),
+        "the job needs `actions: read` to list this workflow's runs"
+    );
+}
+
+/// What the script counts as green. Each needle is one condition its header
+/// gives a reason for; dropping one silently widens the skip.
+#[test]
+fn n210_the_script_counts_only_a_push_run_whose_every_job_succeeded_on_this_tree() {
+    let script = already_green_script();
+    for (needle, why) in [
+        ("^{tree}", "it compares TREES, not commits"),
+        (
+            ".head_commit.tree_id == \\\"$tree\\\"",
+            "a run counts only when its head commit has this tree",
+        ),
+        ("-f status=success", "only a run that concluded success"),
+        (
+            "-f event=push",
+            "only a push to this repository, never a fork's pull request",
+        ),
+        (
+            "\"created=>=$since\"",
+            "only a recent run: runner images and advisories move",
+        ),
+        (
+            "select(.conclusion != \"success\")",
+            "every job succeeded, so nothing in that run was skipped",
+        ),
+        ("startswith(\"test (\")", "the run really had test jobs"),
+        (
+            "-f filter=latest",
+            "a re-run job is read at its latest attempt",
+        ),
+    ] {
+        assert!(
+            script.contains(needle),
+            "ci-already-green.sh lost `{needle}` ({why})"
+        );
+    }
+    // "Cannot tell" is never a yes: the only `exit 0` paths are the usage of
+    // `found`, and every API failure exits 2.
+    assert_eq!(
+        script.matches("exit 2").count(),
+        5,
+        "each way of not knowing (no gh, no such commit, no date arithmetic, two API reads) \
+         exits 2"
+    );
+    assert!(
+        script.trim_end().ends_with("printf '%s\\n' \"$found\""),
+        "the script's only success is printing the run it found"
+    );
+}

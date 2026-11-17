@@ -7,6 +7,7 @@
 #
 #   scripts/ci-local.sh                 # every leg, in order, then a verdict
 #   scripts/ci-local.sh fmt clippy      # just these
+#   scripts/ci-local.sh --quick         # the cheap legs only: run before a push
 #   scripts/ci-local.sh --list          # the legs, one per line
 #   scripts/ci-local.sh --log-dir DIR   # logs there instead of target/ci-local
 #
@@ -40,6 +41,13 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # suite, then the two builds, then the cross-check. THIS LIST IS THE JOB LIST —
 # ci_local_script.rs holds it against ci.yml's jobs in both directions.
 LEGS="fmt vilan-fmt clippy test doctest audit wasm perf webview gfx windows"
+
+# `--quick`: the legs that answer in about three minutes together and that a
+# green suite says nothing about. Each costs a whole CI cycle when it is the
+# one that is red: on 2026-11-16 a lane ran the full suite green and `vilan-fmt`
+# failed on CI and at the seal, over the layout of two new test programs. Run
+# this before every push. A subset of LEGS, held to that by the pin.
+QUICK="fmt vilan-fmt clippy audit"
 
 # Legs with no ci.yml job, and why (see THE WINDOWS LEG above). A leg named here
 # must not appear in any workflow `run:` step; the pin checks that too, so a leg
@@ -338,13 +346,17 @@ while [ $# -gt 0 ]; do
             for leg in $LEGS; do printf '%s\n' "$leg"; done
             exit 0
             ;;
+        --quick)
+            requested="$requested $QUICK"
+            shift
+            ;;
         --log-dir)
             [ $# -ge 2 ] || { echo "--log-dir needs a directory" >&2; exit 2; }
             log_dir=$2
             shift 2
             ;;
         -h|--help)
-            sed -n '2,25p' "$0"
+            sed -n '2,26p' "$0"
             exit 0
             ;;
         -*)
