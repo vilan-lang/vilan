@@ -15584,6 +15584,209 @@ fun main() {
     );
 }
 
+// --- B748: a payload-less enum is a value at every seam too ------------------
+//
+// A plain (unbacked) enum with no payload is the same `[index]` array, and B691
+// left it SHARED on the reasoning that a write through a view replaces the
+// whole value. That replacement is `__replace(target, value)`, an in-place
+// assignment into the array every copy shares, so `let copy = a; set(&mut a)`
+// moved `copy`. One pin per sharing seam, each written through a `&mut`; the
+// native half is `native_differential`'s
+// `b748_a_payload_less_enum_is_a_value_at_every_seam_on_both_backends`.
+
+const B748_PRELUDE: &str = "[derive(PartialEq)]
+enum Plain { X, Y }
+struct Holder { plain: Plain }
+fun set(slot: &mut Plain) { slot = Plain::Y; }
+fun shown(value: Plain): str { if value == Plain::X { \"X\" } else { \"Y\" } }
+";
+
+fn b748_runs(main_body: &str, expected: &str) {
+    assert_compiles_and_runs(
+        &format!("{B748_PRELUDE}fun main() {{\n{main_body}\n}}\n"),
+        expected,
+    );
+}
+
+#[test]
+fn b748_a_let_copy_of_a_payload_less_enum_keeps_its_value() {
+    // The item's repro.
+    b748_runs(
+        "\tmut a = Plain::X;\n\tlet copy = a;\n\tset(&mut a);\n\tprint(i\"{shown(a)} {shown(copy)}\");",
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_an_assignment_copies_a_payload_less_enum() {
+    b748_runs(
+        "\tmut a = Plain::X;\n\tmut b = Plain::Y;\n\tb = a;\n\tset(&mut a);\n\tprint(i\"{shown(a)} {shown(b)}\");",
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_struct_literal_field_copies_a_payload_less_enum() {
+    b748_runs(
+        "\tlet a = Plain::X;\n\tmut holder = Holder { plain = a };\n\tset(&mut holder.plain);\n\tprint(i\"{shown(a)} {shown(holder.plain)}\");",
+        "X Y\n",
+    );
+}
+
+#[test]
+fn b748_a_field_read_out_of_a_holder_keeps_its_value() {
+    b748_runs(
+        "\tmut holder = Holder { plain = Plain::X };\n\tlet taken = holder.plain;\n\tset(&mut holder.plain);\n\tprint(i\"{shown(taken)} {shown(holder.plain)}\");",
+        "X Y\n",
+    );
+}
+
+#[test]
+fn b748_a_list_element_copies_a_payload_less_enum() {
+    b748_runs(
+        "\tlet a = Plain::X;\n\tmut many = [a];\n\tset(&mut many[0]);\n\tmut read = many[0];\n\tset(&mut read);\n\tlet kept = [Plain::X];\n\tmut out = kept[0];\n\tset(&mut out);\n\tprint(i\"{shown(a)} {shown(many[0])} {shown(kept[0])}\");",
+        "X Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_return_copies_a_payload_less_enum() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B748_PRELUDE}fun keep(value: Plain): Plain {{ value }}
+fun main() {{
+\tmut a = Plain::X;
+\tlet returned = keep(a);
+\tset(&mut a);
+\tprint(i\"{{shown(a)}} {{shown(returned)}}\");
+}}
+"
+        ),
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_closure_capture_keeps_a_payload_less_enums_value() {
+    b748_runs(
+        "\tmut a = Plain::X;\n\tlet seen = a;\n\tlet read = || shown(seen);\n\tset(&mut a);\n\tprint(i\"{shown(a)} {read()}\");",
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_mut_parameter_copies_a_payload_less_enum_argument() {
+    assert_compiles_and_runs(
+        &format!(
+            "{B748_PRELUDE}fun through(mut value: Plain): str {{
+\tset(&mut value);
+\tshown(value)
+}}
+fun main() {{
+\tlet c = Plain::X;
+\tprint(i\"{{through(c)}} {{shown(c)}}\");
+}}
+"
+        ),
+        "Y X\n",
+    );
+}
+
+#[test]
+fn b748_a_mut_capture_and_a_destructure_copy_a_payload_less_enum() {
+    b748_runs(
+        "\tlet held: Option<Plain> = Some(Plain::X);\n\tmatch held {\n\t\tSome(mut p) => set(&mut p),\n\t\tNone => {},\n\t}\n\tlet pair = (Plain::X, 1);\n\tmut (q, _n) = pair;\n\tset(&mut q);\n\tprint(i\"{held == Some(Plain::X)} {shown(pair.0)} {shown(q)}\");",
+        "true X Y\n",
+    );
+}
+
+#[test]
+fn b748_a_mut_self_write_on_a_payload_less_enum_keeps_its_copies() {
+    // Direct, through a trait's generic `&mut self` (std's derived
+    // `store_apply_at` writes a field's enum this way), and a generic `&mut T`.
+    assert_compiles_and_runs(
+        &format!(
+            "{B748_PRELUDE}impl Plain {{ fun flip(&mut self) {{ self = Plain::Y; }} }}
+trait Reset {{ fun reset(&mut self); }}
+impl Plain with Reset {{ fun reset(&mut self) {{ self = Plain::Y; }} }}
+fun reset_any<T: Reset>(slot: &mut T) {{ slot.reset(); }}
+fun put<T>(slot: &mut T, value: T) {{ slot = value; }}
+fun main() {{
+\tmut f = Plain::X;
+\tlet f_copy = f;
+\tf.flip();
+\tmut g = Plain::X;
+\tlet g_copy = g;
+\treset_any(&mut g);
+\tmut h = Plain::X;
+\tlet h_copy = h;
+\tput(&mut h, Plain::Y);
+\tprint(i\"{{shown(f)}}{{shown(f_copy)}} {{shown(g)}}{{shown(g_copy)}} {{shown(h)}}{{shown(h_copy)}}\");
+}}
+"
+        ),
+        "YX YX YX\n",
+    );
+}
+
+#[test]
+fn b748_an_enum_with_a_payload_written_whole_keeps_its_copies() {
+    // B691 already copied these; the whole-value write is `__replace` the same.
+    assert_compiles_and_runs(
+        "[derive(PartialEq)]
+enum Kind { A, B(i32) }
+fun set_kind(slot: &mut Kind) { slot = Kind::B(2); }
+fun main() {
+\tmut k = Kind::A;
+\tlet copy = k;
+\tset_kind(&mut k);
+\tprint(i\"{copy == Kind::A} {k == Kind::B(2)}\");
+}
+",
+        "true true\n",
+    );
+}
+
+/// B748's cost, bounded: a payload-less enum is copied where it is SHARED, not
+/// where it is made. A bare variant (`mut out = Plain::X`), a derived `==` and
+/// a `match` over one copy nothing.
+#[test]
+fn b748_a_fresh_payload_less_variant_and_a_comparison_copy_nothing() {
+    let js = compile(&format!(
+        "{B748_PRELUDE}fun main() {{
+\tmut same = 0;
+\tmut round = 0;
+\tfor round < 100 {{
+\t\tmut out = Plain::X;
+\t\tif round > 50 {{
+\t\t\tout = Plain::Y;
+\t\t}}
+\t\tif out == Plain::Y {{
+\t\t\tsame += 1;
+\t\t}}
+\t\tmatch out {{
+\t\t\tPlain::X => same += 0,
+\t\t\tPlain::Y => same += 1,
+\t\t}}
+\t\tround += 1;
+\t}}
+\tprint(same);
+}}
+"
+    ))
+    .unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let counted = js.replace(
+        "function __clone(value) {",
+        "function __clone(value) { globalThis.__copies = (globalThis.__copies ?? 0) + 1;",
+    );
+    let counted = format!(
+        "process.on('exit', () => console.log('copies=' + (globalThis.__copies ?? 0)));\n{counted}"
+    );
+    let stdout = run_js(&counted).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(stdout.starts_with("98\n"), "{stdout}");
+    assert!(stdout.contains("copies=0\n"), "{stdout}");
+}
+
 // --- M199: a pattern over a `Shared` read copies only when it must ----------
 
 /// The JS text of one emitted function, from its `function name(` line to the

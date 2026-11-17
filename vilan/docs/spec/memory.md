@@ -130,7 +130,10 @@ derived `PartialEq` over an enum takes — is not a construction: nothing outliv
 the match, so its patterns bind pieces of the places it names, and each capture
 copies (or shares, when nothing can write the place) exactly as a capture of
 that place alone would. A payload-less variant named bare (`None`) names no
-place at all: every use is a fresh value.
+place at all: every use is a fresh value. A copy of an enum is a copy whatever
+its variants carry: after `let copy = level; set(&mut level)` over `enum Level
+{ Low, Mid, High }`, `copy` keeps its variant, through a field, an element, a
+capture, a return and a `&mut self` write alike (B748).
 
 The return reads **through** a view to reach the place, because a returned
 expression can name storage without being a place: `fun grab(&self): Inner {

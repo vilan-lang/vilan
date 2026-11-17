@@ -28110,8 +28110,9 @@ impl<'src> Analyzer<'src> {
     }
 
     /// Whether a type lowers to a mutable JS aggregate (a struct, `List`,
-    /// `Context`, or a tuple) — the types that alias under assignment and so
-    /// need a semantic copy (rule 1). Scalars and `bool` do not.
+    /// `Context`, a tuple, an unbacked enum) — the types that alias under
+    /// assignment and so need a semantic copy (rule 1). Scalars, `bool` and a
+    /// backed enum do not.
     fn is_cloneable_aggregate(&self, type_: &Type) -> bool {
         match type_ {
             // `Shared<T>` is a `{ v }` CELL, and `__clone` shares a plain object
@@ -28138,16 +28139,22 @@ impl<'src> Analyzer<'src> {
             // write, whatever the payload's type: `mut b = a` of an
             // `Option<List<i32>>` showed `b`'s push in `a`, and of an
             // `Option<i32>` showed `b`'s `+= 5` in `a`. Natively every binding
-            // is its own value. A payload-less enum has nothing to write in
-            // place (a write through a view replaces the whole value), and a
-            // backed one is a bare number or string: both stay scalar copies.
-            Type::Enum(id, _) => self.enums.get(id).is_some_and(|enum_| {
-                enum_.backing.is_none()
-                    && enum_
-                        .variants
-                        .iter()
-                        .any(|variant| !variant.data_type_ids.is_empty())
-            }),
+            // is its own value.
+            //
+            // B748: a PAYLOAD-LESS plain enum is the same `[index]` array, and
+            // it is written in place too. B691 left it shared on the reasoning
+            // that a write through a view replaces the whole value — but that
+            // replacement IS the in-place write: an aggregate view's whole
+            // write is `__replace(target, value)`, which assigns into the
+            // shared array, so `let copy = a; set(&mut a)` moved `copy`, and
+            // so did a field, an element, a capture, a return and a `mut`
+            // parameter's body-entry copy, under a `&mut` parameter and a
+            // `&mut self` method, direct or generic (std's derived
+            // `store_apply_at` writes a field's enum that way). So every enum
+            // whose JS value is a mutable array is copied; only those lowering
+            // to an immutable primitive (`bool`, a backed enum:
+            // `enum_lowers_to_js_primitive`) are not.
+            Type::Enum(id, _) => !enum_lowers_to_js_primitive(*id, self.bool_enum_id, &self.enums),
             _ => false,
         }
     }

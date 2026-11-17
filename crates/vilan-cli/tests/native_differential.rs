@@ -12861,6 +12861,28 @@ fn b691_an_enum_is_a_value_at_every_seam_on_both_backends() {
     );
 }
 
+/// B748: a payload-less plain enum is a value at every seam too — a binding,
+/// an assignment, a field in and out, a list element, a return, a closure
+/// capture, a `mut` parameter, a `mut` capture, a destructure — written through
+/// a `&mut` parameter, a `&mut self` method direct and generic, and a generic
+/// `&mut T`. JS shared the `[index]` array and the whole-value write
+/// (`__replace`) moved every copy; natively each was its own value.
+/// `inference::borrows`' `b748_*` pins hold the JS values per seam.
+#[test]
+fn b748_a_payload_less_enum_is_a_value_at_every_seam_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_payload_less_enum_value_seams.vl"),
+        include_str!("native/payload_less_enum_value_seams.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_payload_less_enum_value_seams.vl"),
+        Verdict::Identical,
+        "a payload-less enum must copy at every value seam on both backends"
+    );
+}
+
 /// B695: a cut inside a surrogate pair rounds to the code point on BOTH
 /// backends — `substring` at every position across `"a😀b"`, `code_at` of each
 /// half, `split("")`, `replace("", ..)` — where JS answered half a pair and the
