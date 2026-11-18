@@ -223,6 +223,11 @@ fn replay_the_classes() -> Replayed {
     {
         replay_from_the_base_text(fixture, "views.vl", &mut divergences, &mut censuses);
     }
+    // M208: the hot importers' item records — an untouched item of a
+    // re-walked file, served from the record the first analysis filed.
+    for fixture in ITEM_GRAIN_FIXTURES {
+        replay_from_the_base_text(fixture, "edited.vl", &mut divergences, &mut censuses);
+    }
     // M110 S3: the effect classes start from a served analysis of the BASE
     // text — the world's record is filed with every effect present, and each
     // edit then removes one (a seed that cannot shrink is the planted bug).
@@ -1330,6 +1335,7 @@ fn replay_the_lone_documents() -> (Vec<String>, Vec<Census>) {
         .chain(POST_PASS_FIXTURES)
         .chain(BOUND_FIXTURES)
         .chain(WINDOW_FIXTURES)
+        .chain(ITEM_GRAIN_FIXTURES)
     {
         let mut package = fixture.write();
         let mut opened: Vec<&str> = Vec::new();
@@ -1957,6 +1963,107 @@ fn the_differential_sees_an_item_record_served_over_a_dirty_dependency() {
         ),
         "the unguarded-record plant must turn a push into another module's binding red; \
          it found: {divergences:#?}"
+    );
+}
+
+/// M208's plant for the bound audit at item grain: the late-declaration
+/// epoch a constant, so a served item's sites are skipped whatever was
+/// declared since. The impl a cold generic's bound is satisfied by,
+/// re-pointed at another type in the edited module, then leaves the call in
+/// the OTHER re-walked module's untouched item unasked — the gate must see
+/// it. (The impl REMOVED is a differential class too, and green under the
+/// plant for a reason worth knowing: the stored world's key holds the late
+/// files' impls, so that keystroke builds a new world and serves no record.)
+#[test]
+fn the_differential_sees_a_bound_site_served_past_a_changed_impl() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::BoundEpochUnguarded);
+    assert!(
+        divergences.iter().any(|divergence| divergence
+            .contains("the impl's header re-pointed at another type")
+            && divergence.contains("does not implement trait 'Greet'")),
+        "the unguarded-epoch plant must turn the re-pointed impl red; it found: {divergences:#?}"
+    );
+}
+
+/// M208's plant for the item signature's per-source index: the signature
+/// computed without its written type references. A name an import re-binds
+/// then leaves the item that only writes it served — the gate must see it.
+#[test]
+fn the_differential_sees_an_item_signature_without_its_type_references() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let divergences = replay_with_plant(Plant::ItemSignatureWithoutTypeReferences);
+    assert!(
+        divergences
+            .iter()
+            .any(|divergence| divergence.contains("a written type name re-bound by an import")),
+        "the reference-less signature plant must turn the re-bound name red; it found: \
+         {divergences:#?}"
+    );
+}
+
+/// **M208**: the bound audit at ITEM grain for a re-walked file. The first
+/// seeded analysis audits every site and files each item's record with the
+/// epoch it was clean under; a body keystroke beside the impl serves the
+/// untouched importer's site (the audit asks fewer sites than the open did),
+/// and the keystroke that removes the impl asks it again and refuses it.
+#[test]
+fn a_body_keystroke_serves_the_hot_importers_bound_sites() {
+    let _switch = SWITCH_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    set_plant(None);
+    vilan_core::analyzer::base_cache_clear();
+    let fixture = &ITEM_GRAIN_FIXTURES[0];
+    let mut package = fixture.write();
+    let seed = vec![package.path("edited.vl")];
+    let first = observe(&package, seed.clone(), Leg::Incremental);
+    let base = package.text("edited.vl").to_string();
+    let apply = |edit: &Edit| {
+        let (find, replace) = edit.replacements[0];
+        base.replacen(find, replace, 1)
+    };
+    package.set("edited.vl", apply(&fixture.edits[0]));
+    let body = observe(&package, seed.clone(), Leg::Incremental);
+    package.set("edited.vl", apply(&fixture.edits[2]));
+    let removed = observe(&package, seed.clone(), Leg::Incremental);
+    package.remove();
+    vilan_core::analyzer::base_cache_clear();
+    eprintln!(
+        "M208: bound sites checked: first {} body keystroke {} impl removed {}",
+        first.census.bound_sites_checked,
+        body.census.bound_sites_checked,
+        removed.census.bound_sites_checked
+    );
+    assert!(
+        body.census.item_records_served > 0 && body.census.base_hits > 0,
+        "the body keystroke was served from the world's records: {:#?}",
+        body.census
+    );
+    assert!(
+        body.census.bound_sites_checked < first.census.bound_sites_checked,
+        "the untouched importer's bound site was asked again on a body keystroke \
+         (first {}, keystroke {})",
+        first.census.bound_sites_checked,
+        body.census.bound_sites_checked
+    );
+    assert!(
+        removed.census.bound_sites_checked > body.census.bound_sites_checked,
+        "the impl's removal must put the importer's site back in the audit \
+         (keystroke {}, removed {})",
+        body.census.bound_sites_checked,
+        removed.census.bound_sites_checked
+    );
+    assert!(
+        removed
+            .rendering
+            .contains("does not implement trait 'Greet'"),
+        "the removed impl's call is refused: {}",
+        removed.rendering
     );
 }
 

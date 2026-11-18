@@ -216,6 +216,17 @@ pub(super) struct ItemRecord {
     /// The record proper: the shape M19's per-source record has, minus the
     /// bound audit's half (live for items).
     pub module: ModuleDiagnostics,
+    /// M208: the bound audit's half, as ONE fact — every site of the item
+    /// was audited live under this late-declaration epoch
+    /// ([`Analyzer::bound_epoch`]) and none was refused or stood down. `None`
+    /// when a site said anything, or no epoch could be formed. The audit's
+    /// answer at a site is a function of the item's own resolve (what the
+    /// record's validators hold), of the declarations the item reads (the
+    /// dirty closure), of the stored world's impls (the key) and of the
+    /// declarations past the stored world (the epoch) — so an item served
+    /// under the epoch it was clean under is clean, and its sites are not
+    /// asked.
+    pub bound_clean: Option<u64>,
 }
 
 impl ItemRecord {
@@ -280,6 +291,16 @@ pub(super) struct ItemState {
     derived: HashMap<usize, ModuleDiagnostics>,
     /// Windows whose output reaches outside what a record may carry.
     unrecordable: HashSet<usize>,
+    /// M208: this analysis's late-declaration epoch ([`Analyzer::bound_epoch`]).
+    bound_epoch: Option<u64>,
+    /// M208: the served windows whose bound audit is served too — their
+    /// entity ranges, sorted and disjoint (the audit's skip) — and the
+    /// windows themselves.
+    bound_ranges: Vec<(u32, u32)>,
+    bound_windows: HashSet<usize>,
+    /// M208: the windows one of whose sites the audit refused or stood down
+    /// at, this analysis.
+    bound_unclean: HashSet<usize>,
 }
 
 /// Where an id lives relative to the windows: in one (by index and offset),
@@ -672,7 +693,11 @@ impl<'src> Analyzer<'src> {
     /// with; for every written type reference in its region the entity it
     /// bound to and its slot's place. Answers the fingerprint and the
     /// windows and prefix tail slots it reached — the read edges.
-    fn item_signature(&self, window: usize) -> (u64, Reached) {
+    fn item_signature(
+        &self,
+        window: usize,
+        type_reference_rows: &HashMap<SourceId, Vec<usize>>,
+    ) -> (u64, Reached) {
         let item = &self.id_windows.windows[window];
         let mut hash = hasher();
         let mut reached = Reached::default();
@@ -704,9 +729,35 @@ impl<'src> Analyzer<'src> {
             && let Some((region_start, region_end, _)) =
                 rows.iter().find(|(_, _, index)| *index == window)
         {
-            for (source, span, target, type_id) in &self.type_references {
-                if *source != item.source || span.start < *region_start || span.start >= *region_end
-                {
+            // M208: the item's source's rows alone, in the table's own order
+            // (`type_reference_rows_by_source`) — the scan this replaces read
+            // every row of the program once per laid-out item, 1,837 items
+            // against 90,758 rows on a kolt keystroke in a widely imported
+            // module. The same rows in the same order, so the same hash.
+            let rows_of_source: &[usize] = match crate::incremental::planted(
+                crate::incremental::Plant::ItemSignatureWithoutTypeReferences,
+            ) {
+                true => &[],
+                false => type_reference_rows
+                    .get(&item.source)
+                    .map_or(&[], Vec::as_slice),
+            };
+            debug_assert!(
+                crate::incremental::planted(
+                    crate::incremental::Plant::ItemSignatureWithoutTypeReferences
+                ) || rows_of_source.iter().copied().eq(self
+                    .type_references
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (source, ..))| *source == item.source)
+                    .map(|(index, _)| index)),
+                "the per-source index holds the source's rows in the table's order"
+            );
+            for (_, span, target, type_id) in rows_of_source
+                .iter()
+                .map(|index| &self.type_references[*index])
+            {
+                if span.start < *region_start || span.start >= *region_end {
                     continue;
                 }
                 // Relative to the region (M110 S7b): the absolute offset moves
@@ -726,6 +777,24 @@ impl<'src> Analyzer<'src> {
             .retain(|reached_window| *reached_window != window);
         reached.settle();
         (hash.finish(), reached)
+    }
+
+    /// The written type references of every source that holds a laid-out
+    /// item, as row indices into `type_references` in the table's own order
+    /// — what [`Self::item_signature`] reads per item (M208).
+    fn type_reference_rows_by_source(&self) -> HashMap<SourceId, Vec<usize>> {
+        let mut rows: HashMap<SourceId, Vec<usize>> = self
+            .items
+            .spans
+            .keys()
+            .map(|source| (*source, Vec::new()))
+            .collect();
+        for (index, (source, ..)) in self.type_references.iter().enumerate() {
+            if let Some(of_source) = rows.get_mut(source) {
+                of_source.push(index);
+            }
+        }
+        rows
     }
 
     /// The text region of a laid-out window: its start and the item's span
@@ -769,6 +838,10 @@ impl<'src> Analyzer<'src> {
         self.items.facts.clear();
         self.items.derived.clear();
         self.items.unrecordable.clear();
+        self.items.bound_epoch = None;
+        self.items.bound_ranges.clear();
+        self.items.bound_windows.clear();
+        self.items.bound_unclean.clear();
         if !self.items.enabled {
             return;
         }
@@ -776,17 +849,19 @@ impl<'src> Analyzer<'src> {
         if laid.is_empty() {
             return;
         }
+        self.items.bound_epoch = self.bound_epoch(alias_reaching);
         let unguarded = crate::incremental::planted(crate::incremental::Plant::ItemRecordUnguarded);
         let window_count = self.id_windows.windows.len();
         let mut reads: HashMap<usize, Reached> = HashMap::default();
         let mut candidate: HashMap<usize, Arc<ItemRecord>> = HashMap::default();
         let mut stale: u64 = 0;
+        let type_reference_rows = self.type_reference_rows_by_source();
         for &window in &laid {
             let Some((region_start, text_hash)) = self.item_text(window) else {
                 self.items.unrecordable.insert(window);
                 continue;
             };
-            let (signature, reached) = self.item_signature(window);
+            let (signature, reached) = self.item_signature(window, &type_reference_rows);
             let item = &self.id_windows.windows[window];
             let record = records.get(&item.key).cloned();
             let mut deps: Vec<ItemKey> = reached
@@ -926,9 +1001,18 @@ impl<'src> Analyzer<'src> {
                     self.items.hover_windows.insert(window);
                 }
             }
+            // M208: the bound audit's half rides when the record was clean
+            // under THIS analysis's epoch.
+            let bound_served =
+                record.bound_clean.is_some() && record.bound_clean == self.items.bound_epoch;
+            if bound_served {
+                self.items.bound_ranges.extend(own.iter().copied());
+                self.items.bound_windows.insert(window);
+            }
             self.items.served_set.insert(window);
             self.items.served.push((window, record.clone()));
         }
+        self.items.bound_ranges.sort_unstable();
         ranges.sort_unstable();
         table_ranges.sort_unstable();
         label_ranges.sort_unstable();
@@ -949,6 +1033,166 @@ impl<'src> Analyzer<'src> {
                 census.item_records_served += served;
                 census.item_records_stale += stale;
             });
+        }
+    }
+
+    /// M208: the LATE-DECLARATION EPOCH — a hash of everything past the
+    /// stored world that the bound audit can read beside a site's own item
+    /// and the declarations that item reads: the text of every re-walked
+    /// file (the hot set's and the entry's) with two kinds of range cut out
+    /// — a function's declaration (a free function, a method of an `impl`,
+    /// a trait's default) and a binding's initializer — plus how many impls
+    /// sit past the stored world.
+    ///
+    /// Why that is enough. A bound's answer at a site reads the impl table
+    /// and the trait hierarchy. The stored world's impls are the key's. An
+    /// impl past it is a row whose subject, traits and binder bounds are a
+    /// function of its header's text and of what the names in it bind to;
+    /// a name in a header binds to a type or a trait (a length is a number
+    /// or a binder, never a `const`), and which declaration that is can
+    /// change only where an import line, an export, a declaration or an
+    /// attribute changes — all text this hash keeps. A function's text and
+    /// an initializer's name no type a header can reach (a method's own
+    /// bounds are its item's, which the site's item reads); a declaration
+    /// NESTED in one would, so an impl whose header (or whose `[derive]`
+    /// origin) sits inside a cut range refuses the epoch.
+    ///
+    /// `None` — no item's bound half is served or recorded — when the
+    /// stored world's boundary is unknown, when a prefix module's slots
+    /// were written past the store or an alias of the entry reaches one
+    /// (its impls are then not the key's alone), or when an impl past the
+    /// store cannot be placed in the kept text.
+    fn bound_epoch(&self, alias_reaching: &HashSet<SourceId>) -> Option<u64> {
+        if crate::incremental::planted(crate::incremental::Plant::BoundEpochUnguarded) {
+            return Some(0);
+        }
+        let boundary = self.prefix_entity_end?;
+        let rewalked = |source: SourceId| self.item_source(source);
+        if !alias_reaching.is_empty()
+            || self
+                .entry_dirty_sources
+                .iter()
+                .any(|source| *source != DERIVED_SOURCE && !rewalked(*source))
+        {
+            return None;
+        }
+        // The cut ranges, per source: every function declared past the stored
+        // world (a free function, a method, a trait's default — its whole
+        // span) and every binding's initializer, merged.
+        let mut cut: HashMap<SourceId, Vec<(usize, usize)>> = HashMap::default();
+        let mut cut_span = |id: Id| {
+            if id.0 < boundary {
+                return;
+            }
+            if let (Some(source), Some(span)) = (self.source_of_id(id), self.span_map.get(&id))
+                && rewalked(source)
+                && span.start < span.end
+            {
+                cut.entry(source).or_default().push((span.start, span.end));
+            }
+        };
+        for (function_id, function) in &self.functions {
+            if function.has_body {
+                cut_span(*function_id);
+            }
+        }
+        for variable in self.variables.values() {
+            if let Some(initial) = variable.initial {
+                cut_span(initial);
+            }
+        }
+        for ranges in cut.values_mut() {
+            ranges.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+            for (start, end) in ranges.drain(..) {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                    _ => merged.push((start, end)),
+                }
+            }
+            *ranges = merged;
+        }
+        let inside_a_cut = |source: SourceId, offset: usize| {
+            cut.get(&source).is_some_and(|ranges| {
+                let index = ranges.partition_point(|(start, _)| *start <= offset);
+                index > 0 && offset < ranges[index - 1].1
+            })
+        };
+        let mut hash = hasher();
+        let mut late_impls = 0u32;
+        for implementation in &self.implementations {
+            if implementation.impl_id.0 < boundary {
+                continue;
+            }
+            late_impls += 1;
+            // Where the block's text is: its own header in a re-walked file,
+            // or the item a `[derive]` generated it from.
+            let (source, offset) = match implementation.source {
+                DERIVED_SOURCE => {
+                    let (_, origin, origin_source) =
+                        self.derived_origin_row(implementation.impl_id)?;
+                    (*origin_source, origin.start)
+                }
+                source => (source, implementation.header_span.start),
+            };
+            if source == DERIVED_SOURCE || (rewalked(source) && inside_a_cut(source, offset)) {
+                return None;
+            }
+        }
+        late_impls.hash(&mut hash);
+        let mut texts: Vec<(u64, SourceId, &str)> = self
+            .source_texts
+            .iter()
+            .filter(|(source, _)| rewalked(*source))
+            .map(|(source, text)| {
+                (
+                    self.id_windows
+                        .source_keys
+                        .get(source.0 as usize)
+                        .copied()
+                        .unwrap_or(0),
+                    *source,
+                    *text,
+                )
+            })
+            .collect();
+        texts.sort_unstable_by_key(|(key, source, _)| (*key, *source));
+        for (key, source, text) in texts {
+            key.hash(&mut hash);
+            let mut from = 0usize;
+            for (start, end) in cut.get(&source).map_or(&[][..], Vec::as_slice) {
+                if *start > from {
+                    text.get(from..*start)?.hash(&mut hash);
+                }
+                from = from.max(*end);
+            }
+            text.get(from..)?.hash(&mut hash);
+        }
+        Some(hash.finish())
+    }
+
+    /// M208: whether any item's bound half is served this analysis — never
+    /// on a cold check, which keeps no item records.
+    pub(super) fn serves_bound_sites(&self) -> bool {
+        !self.items.bound_ranges.is_empty()
+    }
+
+    /// M208: whether the bound audit skips the site `call_id` — a site of a
+    /// served item whose bound half is served ([`ItemRecord::bound_clean`]).
+    pub(super) fn bound_site_served(&self, call_id: Id) -> bool {
+        let ranges = &self.items.bound_ranges;
+        let index = ranges.partition_point(|(start, _)| *start <= call_id.0);
+        index > 0 && call_id.0 < ranges[index - 1].1
+    }
+
+    /// M208: the audit refused the site `call_id`, or stood down at it — its
+    /// item's bound half is not clean this analysis.
+    pub(super) fn note_bound_site_unclean(&mut self, call_id: Id) {
+        if !self.items.enabled {
+            return;
+        }
+        if let Some(window) = self.id_windows.window_of_entity(call_id) {
+            self.items.bound_unclean.insert(window);
         }
     }
 
@@ -1358,10 +1602,36 @@ impl<'src> Analyzer<'src> {
                     signature: facts.signature,
                     deps: facts.deps.clone(),
                     module,
+                    // M208: every site of a re-derived item was audited live.
+                    bound_clean: self
+                        .items
+                        .bound_epoch
+                        .filter(|_| !self.items.bound_unclean.contains(&window)),
                 },
             ));
         }
         let count = filed.len() as u64;
+        // M208: a SERVED item whose bound half was not served was audited
+        // live too; found clean, its record is filed again with this epoch,
+        // so one changed declaration costs the hot set one live audit and
+        // not one per keystroke after it. (Not counted as a filed record:
+        // nothing of the item was re-derived but its sites' verdicts.)
+        if let Some(epoch) = self.items.bound_epoch {
+            for (window, record) in &self.items.served {
+                if self.items.bound_windows.contains(window)
+                    || self.items.bound_unclean.contains(window)
+                    || record.bound_clean == Some(epoch)
+                {
+                    continue;
+                }
+                let Some(facts) = self.items.facts.get(window) else {
+                    continue;
+                };
+                let mut refreshed = ItemRecord::clone(record);
+                refreshed.bound_clean = Some(epoch);
+                filed.push((facts.key, refreshed));
+            }
+        }
         if !crate::macros::in_macro_world() {
             crate::incremental::update_census(|census| census.item_records_filed += count);
         }
