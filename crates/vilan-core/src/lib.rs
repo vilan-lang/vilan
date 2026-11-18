@@ -52,6 +52,7 @@ pub mod mono;
 pub mod node;
 pub mod options;
 pub mod owned_modules;
+pub mod package_reach;
 pub mod parsing;
 pub mod platform_color;
 pub(crate) mod prefix_file;

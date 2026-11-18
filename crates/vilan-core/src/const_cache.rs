@@ -296,7 +296,7 @@ struct Keyer<'k, 'a> {
     snapshots: bool,
     world: &'k [&'a js::Node<'a>],
     /// A world declaration's name → its index in `world`.
-    by_name: std::collections::HashMap<&'a str, usize>,
+    by_name: HashMap<&'a str, usize>,
     digests: &'k mut HashMap<usize, u64>,
     in_progress: Vec<usize>,
     /// Markers emitted so far: a digest computed across one is not memoized.
@@ -307,8 +307,8 @@ struct Keyer<'k, 'a> {
 /// body) binds, and the ordinals it has handed out.
 #[derive(Default)]
 struct Scope {
-    locals: std::collections::HashSet<String>,
-    ordinals: std::collections::HashMap<String, u32>,
+    locals: crate::fx::FxHashSet<String>,
+    ordinals: HashMap<String, u32>,
 }
 
 impl Scope {
@@ -711,17 +711,25 @@ pub(crate) fn site_key(
     limits.call_depth.hash(&mut hasher);
     let with_world = !crate::incremental::planted(crate::incremental::Plant::ConstKeyWithoutWorld);
     let world: &[&js::Node<'_>] = if with_world { &site.world } else { &[] };
-    let by_name = world
-        .iter()
-        .enumerate()
-        .filter_map(|(index, declaration)| match declaration {
-            js::Node::Function(function) => Some((function.name.as_str(), index)),
-            js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
-                Some((variable.name.as_str(), index))
+    // M210: lookup-only maps (nothing iterates them, and a name's ordinal is
+    // `ordinals.len()` at its first use), so their hasher decides no answer —
+    // FxHash rather than SipHash, and `by_name` sized once rather than grown:
+    // the key is rebuilt for every site on every pass, hit or miss. When the
+    // world names one declaration twice the LAST index wins, as `collect`
+    // into any map does.
+    let mut by_name: HashMap<&str, usize> = HashMap::default();
+    by_name.reserve(world.len());
+    for (index, declaration) in world.iter().enumerate() {
+        match declaration {
+            js::Node::Function(function) => {
+                by_name.insert(function.name.as_str(), index);
             }
-            _ => None,
-        })
-        .collect();
+            js::Node::ConstVariable(variable) | js::Node::LetVariable(variable) => {
+                by_name.insert(variable.name.as_str(), index);
+            }
+            _ => {}
+        }
+    }
     let mut keyer = Keyer {
         snapshots,
         world,

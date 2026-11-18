@@ -193,6 +193,15 @@ struct ProjectReader {
     /// yet", and `staged` says so rather than guessing, because until the last
     /// site has run a token may still be about to be named.
     live_tokens: RefCell<Option<Liveness>>,
+    /// `asset::read`'s answers this pass, by resolved path: the text and its
+    /// tracked hash, or the read error as it renders (M210). A pass reads the
+    /// project as ONE snapshot — its input list holds one row per path after
+    /// the dedup — and on kolt 124 `search_dict` sites read 105 distinct
+    /// shards 774 times per keystroke, each read re-hashing the whole shard
+    /// (every cache hit asks its transcript again). The second read of a path
+    /// is served here; every read still TRACKS, so the inputs and the facts
+    /// each site registers are exactly what they were.
+    read_memo: RefCell<HashMap<PathBuf, Result<(String, u64), String>>>,
 }
 
 /// The tokens a build still NAMES, in the two shapes a name reaches a const
@@ -629,17 +638,27 @@ impl interpreter::AssetReader for ProjectReader {
         // before any filesystem look, so the refusal itself is deterministic.
         let requested = contained_input(path, "asset::read")?;
         let resolved = self.root.join(requested);
-        match crate::util::read_source(&resolved) {
-            Ok(text) => {
-                // Through the one rule, over the text's own bytes — which is
-                // `content_hash(&text)` for anything `read_source` can return,
-                // and says so at the site rather than leaving a reader to
-                // re-derive that the two agree (B276).
-                self.track(
-                    resolved,
-                    Some(tracked_input_hash_of_bytes(text.as_bytes())),
-                    "asset::read",
-                );
+        let answer = self
+            .read_memo
+            .borrow_mut()
+            .entry(resolved.clone())
+            .or_insert_with(|| {
+                crate::util::read_source(&resolved)
+                    .map(|text| {
+                        // Through the one rule, over the text's own bytes —
+                        // which is `content_hash(&text)` for anything
+                        // `read_source` can return, and says so at the site
+                        // rather than leaving a reader to re-derive that the
+                        // two agree (B276).
+                        let hash = tracked_input_hash_of_bytes(text.as_bytes());
+                        (text, hash)
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .clone();
+        match answer {
+            Ok((text, hash)) => {
+                self.track(resolved, Some(hash), "asset::read");
                 Ok(text)
             }
             Err(error) => {
@@ -975,6 +994,7 @@ pub fn evaluate(program: &Program, options: &BuildOptions, graph: &CallGraph) ->
         facts: RefCell::new(Vec::new()),
         staged: RefCell::new(Vec::new()),
         live_tokens: RefCell::new(None),
+        read_memo: RefCell::new(HashMap::default()),
     };
     let mut world = transformer::ConstWorld::new(program, options);
     let mut state = State::new(program, Mode::Explicit, HashSet::default(), Some(&reader));

@@ -300,6 +300,26 @@ pub fn unreached_module_entries(
     file: &Path,
     choices: &[PlatformChoice],
 ) -> Option<Vec<String>> {
+    unreached_module_entries_reached_by(
+        manifest_dir,
+        manifest,
+        file,
+        choices,
+        &mut crate::platform_color::walk_reaches,
+    )
+}
+
+/// [`unreached_module_entries`] with its one walk (the single-entry form's)
+/// asked through `reaches` — see
+/// [`crate::platform_color::file_platform_choices_reached_by`], whose
+/// reachability question it is.
+pub fn unreached_module_entries_reached_by(
+    manifest_dir: &Path,
+    manifest: &Manifest,
+    file: &Path,
+    choices: &[PlatformChoice],
+    reaches: &mut dyn FnMut(&Path, &Path, &Path) -> bool,
+) -> Option<Vec<String>> {
     let package = manifest.package.as_ref()?;
     let pkg_root = crate::util::canonical_path(manifest_dir.join(package.root()));
     let file = crate::util::canonical_path(file);
@@ -311,7 +331,7 @@ pub fn unreached_module_entries(
         // `PackageTarget` here without walking, so the walk is this function's
         // to pay — once, over one entry.
         let entry = pkg_root.join(package.entry());
-        if crate::analyzer::package_modules_reachable_from(&entry, &pkg_root).contains(&file) {
+        if reaches(&entry, &pkg_root, &file) {
             return None;
         }
         return Some(vec![package.entry().display().to_string()]);

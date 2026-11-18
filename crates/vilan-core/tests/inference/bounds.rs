@@ -5461,6 +5461,84 @@ fn a_const_read_parses_the_books_largest_page_within_budget() {
     );
 }
 
+/// [`const_reads`], also counting the source texts the analysis thread
+/// materialized (`util::source_read_count`).
+fn const_reads_counted(
+    source: &str,
+    root: &Path,
+) -> (
+    Vec<vilan_core::interpreter::ConstValue>,
+    Vec<(PathBuf, Option<u64>)>,
+    u64,
+) {
+    let source = source.to_string();
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let leaked: &'static str = Box::leak(source.into_boxed_str());
+            let before = vilan_core::util::source_read_count();
+            let (program, errors) = analyze_source(
+                leaked,
+                &std_spec(),
+                &root,
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let reads = vilan_core::util::source_read_count() - before;
+            assert!(errors.is_empty(), "expected a clean analysis: {errors:#?}");
+            let program = program.expect("a clean analysis leaves a program");
+            let mut values: Vec<_> = program.const_results.values().cloned().collect();
+            values.sort_by_key(|value| format!("{value:?}"));
+            (values, program.const_input_files.clone(), reads)
+        })
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn a_const_pass_reads_each_asset_once_however_many_sites_read_it() {
+    // M210: on kolt, 124 `search_dict` sites read 105 distinct shards 774
+    // times per keystroke, each read re-hashing the shard. A pass reads the
+    // project as one snapshot, so the second read of a path is served from
+    // the first — and every site still gets the same text, and the path still
+    // lands on the tracked inputs exactly once, hashed.
+    let root = scratch_dir(&format!("vilan-m210-reads-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("a fixture root");
+    std::fs::write(root.join("shard.txt"), "alpha beta").expect("the shard");
+    let program = |sites: usize| {
+        let mut body = String::new();
+        for index in 0..sites {
+            body.push_str(&format!(
+                "    let _text_{index} = const asset::read(\"shard.txt\") + \"{index}\";\n"
+            ));
+        }
+        format!("import std::web::asset;\nfun main() {{\n{body}}}\nmain();\n")
+    };
+    // Warm the process-global caches (std's modules are read once per
+    // process), so the two counted analyses differ only in their sites.
+    let _ = const_reads_counted(&program(2), &root);
+    let (one_value, one_inputs, one_read) = const_reads_counted(&program(1), &root);
+    let (values, inputs, reads) = const_reads_counted(&program(4), &root);
+    assert_eq!(one_value.len(), 1);
+    assert_eq!(values.len(), 4, "four folded sites: {values:?}");
+    for (index, value) in values.iter().enumerate() {
+        assert!(
+            matches!(value, vilan_core::interpreter::ConstValue::Str(text) if *text == format!("alpha beta{index}")),
+            "site {index} reads the shard's text: {value:?}"
+        );
+    }
+    assert_eq!(inputs, one_inputs, "one tracked, hashed input either way");
+    assert!(inputs.len() == 1 && inputs[0].1.is_some(), "{inputs:?}");
+    assert_eq!(
+        reads, one_read,
+        "three more sites reading the same file read it no more times"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_missing_read_is_a_clean_diagnostic_at_the_read_site() {
     assert_fails_spanning(

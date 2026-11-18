@@ -264,8 +264,12 @@ fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
         // Each color with the REASON it was chosen (E119) — the same function
         // `vilan check <file>` calls, so the two surfaces cannot come to two
         // conclusions about why a file is colored either.
-        let choices = vilan_core::platform_color::file_platform_choices_for(
-            &pkg_root, &manifest, entry_path, text,
+        let choices = vilan_core::platform_color::file_platform_choices_reached_by(
+            &pkg_root,
+            &manifest,
+            entry_path,
+            text,
+            &mut crate::world::package_reaches,
         );
         let platform_reasons: Vec<(BuildPlatform, String)> = choices
             .iter()
@@ -279,8 +283,13 @@ fn resolve_project_context(entry_path: &Path, text: &str) -> ProjectContext {
         // choice with reason `ReachedBy` means an entry loads this file, so for
         // a multi-entry package the answer is already in hand and the slice is
         // free. See `dead_items::unreached_module_entries`.
-        let unloaded_by_entries =
-            vilan_core::dead_items::unreached_module_entries(root, &manifest, entry_path, &choices);
+        let unloaded_by_entries = vilan_core::dead_items::unreached_module_entries_reached_by(
+            root,
+            &manifest,
+            entry_path,
+            &choices,
+            &mut crate::world::package_reaches,
+        );
         let generated = vilan_core::dead_items::is_generated(root, &manifest, entry_path);
         let mut platforms = choices.into_iter().map(|choice| choice.platform);
         let platform = platforms.next();
@@ -1983,10 +1992,11 @@ impl Document {
         // Timed for the same reason the core pipeline's phases are (E106): this
         // is not a lookup. `platform_color::file_platforms` walks the loader's
         // `pkg::` graph from EVERY entry of the manifest until one reaches this
-        // file (E113), and the walk resolves and parses each module it reaches
-        // — per analysis, so per keystroke — while `resolve_dependencies`
-        // re-reads the manifest closure beside it. The core line cannot see any
-        // of it: it starts inside `analyze`.
+        // file (E113) — remembered since M209 (`world::package_reach`), so a
+        // keystroke re-reads each reached module and re-probes each import
+        // path, and walks only when one of them moved — while
+        // `resolve_dependencies` re-reads the manifest closure beside it. The
+        // core line cannot see any of it: it starts inside `analyze`.
         let phase_context_start = vilan_core::PhaseClock::now();
         let mut context = resolve_project_context(entry_path, text);
         context.workspace.hot_seeds = hot_seeds;
@@ -33443,3 +33453,7 @@ mod auto_editor_tests {
 #[cfg(test)]
 #[path = "editor_review_tests.rs"]
 mod editor_review_tests;
+
+#[cfg(test)]
+#[path = "platform_reach_tests.rs"]
+mod platform_reach_tests;

@@ -1759,7 +1759,7 @@ pub fn file_platform_choices(
     let text = crate::util::read_source(file).ok();
     let declared = text.as_deref().and_then(declared_platform);
     let choices = apply_declared(
-        colored_platform_choices(pkg_root, manifest, file),
+        colored_platform_choices(pkg_root, manifest, file, &mut walk_reaches),
         declared.as_ref(),
     );
     match text {
@@ -1776,13 +1776,38 @@ pub fn file_platform_choices_for(
     file: &Path,
     text: &str,
 ) -> Vec<PlatformChoice> {
+    file_platform_choices_reached_by(pkg_root, manifest, file, text, &mut walk_reaches)
+}
+
+/// [`file_platform_choices_for`] with the reachability question — does the
+/// walk from `entry` under `pkg_root` reach `file` (canonical)? — asked
+/// through `reaches`, whose answer must be
+/// [`crate::analyzer::package_modules_reachable_from`]'s. The language server
+/// answers it from its remembered walks (M209, `crate::package_reach`), so a
+/// keystroke that moves no import walks nothing; everything else here — the
+/// manifest's legs, the buffer's own declaration, its twins — is read afresh
+/// on every ask.
+pub fn file_platform_choices_reached_by(
+    pkg_root: &Path,
+    manifest: &Manifest,
+    file: &Path,
+    text: &str,
+    reaches: &mut dyn FnMut(&Path, &Path, &Path) -> bool,
+) -> Vec<PlatformChoice> {
     with_twin_legs(
         apply_declared(
-            colored_platform_choices(pkg_root, manifest, file),
+            colored_platform_choices(pkg_root, manifest, file, reaches),
             declared_platform(text).as_ref(),
         ),
         text,
     )
+}
+
+/// The reachability question answered by walking:
+/// [`crate::analyzer::package_modules_reachable_from`]`(entry, pkg_root)`
+/// holds `file`.
+pub fn walk_reaches(entry: &Path, pkg_root: &Path, file: &Path) -> bool {
+    crate::analyzer::package_modules_reachable_from(entry, pkg_root).contains(file)
 }
 
 /// `choices` with the legs the file's platform-fenced twins add (F27 R3,
@@ -1811,6 +1836,7 @@ fn colored_platform_choices(
     pkg_root: &Path,
     manifest: &Manifest,
     file: &Path,
+    reaches: &mut dyn FnMut(&Path, &Path, &Path) -> bool,
 ) -> Vec<PlatformChoice> {
     let Some(package) = manifest.package.as_ref() else {
         return Vec::new();
@@ -1846,7 +1872,7 @@ fn colored_platform_choices(
             continue;
         }
         let entry = pkg_root.join(manifest.entries[*name].path(name));
-        if crate::analyzer::package_modules_reachable_from(&entry, pkg_root).contains(&file) {
+        if reaches(&entry, pkg_root, &file) {
             choices.push(PlatformChoice {
                 platform: *platform,
                 reason: PlatformReason::ReachedBy((*name).to_string()),
