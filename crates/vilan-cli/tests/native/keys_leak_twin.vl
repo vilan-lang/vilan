@@ -1,0 +1,40 @@
+// B711 S1b: `keys_leak.vl` with every key replaced by the field it names —
+// the census its keyed twin must match.
+import std::hash_map::HashMap;
+import std::shared::Shared;
+
+struct Meta {
+	owner: str,
+	stars: i32,
+}
+
+struct Task {
+	title: str,
+	meta: Meta,
+}
+
+struct Holder {
+	keys: List<i32>,
+}
+
+fun main() {
+	let tally: Shared<i32> = Shared::new(0);
+	mut t = Task { title = "a", meta = Meta { owner = "ada", stars = 0 } };
+	mut held: List<i32> = [];
+	mut named: HashMap<str, i32> = HashMap::new();
+	mut i = 0;
+	for i < 50 {
+		held.push(1);
+		t.meta.stars += 1;
+		named.insert("meta.owner", i);
+		tally.write() = tally.read() + 1;
+		i += 1;
+	}
+	let holder = Holder { keys = held };
+	let first = holder.keys[0];
+	let read = |task: Task| task.meta.stars * first;
+	print(read(t));
+	print(holder.keys.len());
+	print(named.len());
+	print(tally.read());
+}

@@ -1,0 +1,193 @@
+// B711 S1b: a struct key's place natively — `s[k]` read, assigned, compound
+// assigned, written into (`s[k].inner = v`), lent (`&s[k]`, `&mut s[k]`),
+// over a view and a type-parameter subject, through a literal (the plain field
+// chain) and through a key held in a value (its access), and the generic
+// accessor returning the place as a view at a scalar and a struct field.
+
+struct Meta {
+	owner: str,
+	stars: i32,
+}
+
+struct Task {
+	title: str,
+	status: str,
+	meta: Meta,
+}
+
+struct C {
+	z: i32,
+}
+
+struct B {
+	c: C,
+}
+
+struct A {
+	b: B,
+	n: i32,
+}
+
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+struct Boxed {
+	pair: Pair<str>,
+}
+
+fun task(): Task {
+	Task { title = "a", status = "open", meta = Meta { owner = "ada", stars = 1 } }
+}
+
+fun bump(n: &mut i32) {
+	n += 1;
+}
+
+fun rename(m: &mut Meta) {
+	m.owner = "cy";
+}
+
+fun peek(n: &i32): i32 {
+	*n
+}
+
+fun through(t: &mut Task, k: Key<Task, i32>) {
+	bump(&mut t[k]);
+}
+
+fun read_view(t: &Task, k: Key<Task, str>): str {
+	t[k]
+}
+
+fun at<F>(t: &mut Task, k: Key<Task, F>): &mut F borrows t {
+	t[k]
+}
+
+fun read<F>(t: Task, k: Key<Task, F>): F {
+	t[k]
+}
+
+fun write<F>(t: &mut Task, k: Key<Task, F>, v: F) {
+	t[k] = v;
+}
+
+fun read_any<S, F>(s: S, k: Key<S, F>): F {
+	s[k]
+}
+
+fun write_any<S, F>(s: &mut S, k: Key<S, F>, v: F) {
+	s[k] = v;
+}
+
+fun pick<T>(p: Pair<T>, k: Key<Pair<T>, T>): T {
+	p[k]
+}
+
+fun places() {
+	mut t = task();
+	let title = Task.title;
+	let meta = Task.meta;
+	t[title] = "b";
+	t[Task.status] = "closed";
+	t[Task.meta.stars] += 2;
+	t[meta].owner = "bob";
+	t[Task.meta].stars *= 10;
+	print(t.title);
+	print(t.status);
+	print(t.meta.stars);
+	print(t.meta.owner);
+	mut copied = t[meta];
+	copied.owner = "copy";
+	print(t.meta.owner);
+	print(copied.owner);
+	let stars = Task.meta.stars;
+	t[stars] -= 5;
+	t[stars] = t[stars] + t[Task.meta.stars];
+	print(t[stars]);
+	t[meta][Meta.owner] = "nested";
+	print(t.meta.owner);
+}
+
+fun views() {
+	mut t = task();
+	bump(&mut t[Task.meta.stars]);
+	let stars = Task.meta.stars;
+	bump(&mut t[stars]);
+	through(&mut t, stars);
+	rename(&mut t[Task.meta]);
+	print(t.meta.stars);
+	print(t.meta.owner);
+	print(peek(&t[stars]));
+	print(peek(&t[Task.meta.stars]));
+	let r = &mut t[stars];
+	r = 10;
+	print(t.meta.stars);
+	print(read_view(&t, Task.meta.owner));
+	let owner = Task.meta.owner;
+	print(read_view(&t, owner));
+}
+
+fun accessor() {
+	mut t = task();
+	at(&mut t, Task.status) = "closed";
+	at(&mut t, Task.meta.stars) += 4;
+	print(t.status);
+	print(t.meta.stars);
+	print(*at(&mut t, Task.title));
+	let m = at(&mut t, Task.meta);
+	m.owner = "dee";
+	print(t.meta.owner);
+	let k = Task.meta.owner;
+	at(&mut t, k) = "eve";
+	print(t.meta.owner);
+	let held = Task.meta;
+	at(&mut t, held).stars = 99;
+	print(t.meta.stars);
+}
+
+fun generics() {
+	mut t = task();
+	write(&mut t, Task.meta.owner, "bob");
+	write(&mut t, Task.meta.stars, 9);
+	print(read(t, Task.meta.owner));
+	print(read(t, Task.meta.stars));
+	print(read(t, Task.meta).owner);
+	print(read_any(t, Task.title));
+	print(read_any(t.meta, Meta.stars));
+	write_any(&mut t, Task.title, "generic");
+	write_any(&mut t.meta, Meta.stars, 3);
+	print(t.title);
+	print(t.meta.stars);
+}
+
+fun paths() {
+	mut a = A { b = B { c = C { z = 1 } }, n = 5 };
+	let deep: Key<A, i32> = A.b.c.z;
+	a[deep] = 7;
+	print(a.b.c.z);
+	a[A.b.c.z] += 1;
+	print(a[deep]);
+	print(a[A.n]);
+	let bx = Boxed { pair = Pair { left = "q", right = "r" } };
+	print(bx[Boxed.pair.right]);
+	mut p = Pair { left = 1, right = 2 };
+	let left: Key<Pair<i32>, i32> = Pair.left;
+	print(p[left]);
+	print(p[Pair.right]);
+	print(pick(p, Pair.right));
+	p[Pair.left] = 5;
+	print(p.left);
+	let s = Pair { left = "x", right = "y" };
+	print(s[Pair.left]);
+	print(pick(s, Pair.left));
+}
+
+fun main() {
+	places();
+	views();
+	accessor();
+	generics();
+	paths();
+}

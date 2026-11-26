@@ -79131,6 +79131,9 @@ pub struct Program<'src> {
     /// B711: the subscripts (`Expr::Index`) that reach a struct field through a
     /// key — `s[k]` — rather than a list element.
     pub key_subscripts: HashSet<Id>,
+    /// B711: std's `Key<S, F>` declaration, when `std::key` is loaded — the
+    /// struct the native backend gives a key's access to (S1b, R11).
+    pub key_struct_id: Option<Id>,
     pub bitwise_u32: HashSet<Id>,
     pub bitwise_generic_lhs: HashMap<Id, TypeId>,
     pub integer_division: HashSet<Id>,
@@ -95256,6 +95259,7 @@ fn analyze_over_world<'src>(
         lift_dispatch: analyzer.lift_dispatch,
         compound_rereads: analyzer.compound_reread_ids,
         key_subscripts: analyzer.key_subscript_ids,
+        key_struct_id: analyzer.key_struct_id,
         bitwise_u32: analyzer.bitwise_u32,
         integer_division: analyzer.integer_division,
         division_generic_lhs: analyzer.division_generic_lhs,

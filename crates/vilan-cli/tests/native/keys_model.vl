@@ -1,0 +1,5 @@
+// The module `keys_module_root.vl` reaches its key's root through.
+export struct Task {
+	title: str,
+	done: bool,
+}

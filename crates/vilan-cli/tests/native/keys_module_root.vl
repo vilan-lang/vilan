@@ -1,0 +1,22 @@
+// B711 S1b: a key whose root is written through its module
+// (`model::Task.title`) natively — read, written and held — and its step's
+// owner is the declaring file's, so the same-named struct here is another
+// step.
+import pkg::native_probe_keys_model as model;
+
+struct Task {
+	title: str,
+}
+
+fun main() {
+	mut t = model::Task { title = "x", done = false };
+	print(t[model::Task.title]);
+	t[model::Task.done] = true;
+	let title = model::Task.title;
+	t[title] = "y";
+	print(t.title);
+	print(t.done);
+	print(model::Task.title.path().steps()[0].owner());
+	print(model::Task.title.path() == Task.title.path());
+	print(model::Task.title.name() == Task.title.name());
+}

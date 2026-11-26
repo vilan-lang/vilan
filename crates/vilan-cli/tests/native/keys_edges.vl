@@ -1,0 +1,118 @@
+// B711 S1b: struct keys over the places the native backend reaches by its own
+// lowerings — a method's `self`, a mutating call through the place, a
+// pattern subject, a tuple destructure, a closure field (R12), a captured
+// `mut` binding, a `Shared` cell's views, a module-level binding, and a literal
+// key inside a generic function — each through a literal and a held key.
+import std::display::Display;
+import std::shared::Shared;
+
+struct Meta {
+	owner: str,
+	stars: i32,
+}
+
+struct Task {
+	title: str,
+	tags: List<str>,
+	maybe: Option<i32>,
+	pair: (i32, str),
+	meta: Meta,
+	run: || i32,
+}
+
+impl Task {
+	fun get<F>(self, k: Key<Task, F>): F {
+		self[k]
+	}
+
+	fun set<F>(&mut self, k: Key<Task, F>, v: F) {
+		self[k] = v;
+	}
+}
+
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+fun lefts<T>(p: Pair<T>): T {
+	p[Pair.left]
+}
+
+fun push_to(list: &mut List<str>, item: str) {
+	list.push(item);
+}
+
+mut global = Meta { owner = "g", stars = 0 };
+
+fun task(): Task {
+	Task {
+		title = "a",
+		tags = [],
+		maybe = Some(3),
+		pair = (1, "one"),
+		meta = Meta { owner = "ada", stars = 1 },
+		run = || 42,
+	}
+}
+
+fun main() {
+	let title = Task.title;
+	let tags = Task.tags;
+	let stars = Task.meta.stars;
+	mut t = task();
+	t.set(title, "set");
+	print(t.get(title));
+	print(t.get(Task.meta.owner));
+	t[title] += "!";
+	t[Task.title] += "?";
+	print(t.title);
+	t[tags].push("x");
+	t[Task.tags].push("y");
+	push_to(&mut t[tags], "z");
+	push_to(&mut t[Task.tags], "w");
+	print(t.tags.len());
+	print(t[tags][2]);
+	match t[Task.maybe] {
+		Some(let n) => print(n),
+		None => print("none"),
+	}
+	let maybe = Task.maybe;
+	match t[maybe] {
+		Some(let n) => print(n + 1),
+		None => print("none"),
+	}
+	let (n, word) = t[Task.pair];
+	print(word);
+	let pair = Task.pair;
+	let (m, _) = t[pair];
+	print(n + m);
+	print((t[Task.run])());
+	let run = Task.run;
+	print((t[run])());
+	// a captured mutable subject
+	mut c = task();
+	let bump = || {
+		c[stars] += 1;
+		c[Task.meta.stars] += 1;
+	};
+	bump();
+	bump();
+	print(c[stars]);
+	print(c.meta.stars);
+	let peek = || c[stars];
+	print(peek());
+	// a cell
+	let cell: Shared<Task> = Shared::new(task());
+	cell.write()[stars] = 9;
+	cell.write()[Task.meta.owner] = "cell";
+	print(cell.read()[stars]);
+	print(cell.read()[Task.meta.owner]);
+	// a module binding
+	global[Meta.stars] = 5;
+	let owner = Meta.owner;
+	global[owner] = "G";
+	print(global[owner] + global.stars.to_string());
+	print(lefts(Pair { left = "l", right = "r" }));
+	print(lefts(Pair { left = 1, right = 2 }));
+}

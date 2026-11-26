@@ -1861,8 +1861,15 @@ The laws a program may rely on:
   places: a write through one cannot change what the other reads.
 - **K5.** `a.then(b).path() == a.path().then(b.path())`.
 
-*Implementation note: keys are emitted by the JS backend only; the native
-backend refuses a program that uses one by name (`does not emit ... a struct
-key`) until B711's S1b. A key into a place that may be missing (`MaybeKey`),
-field syntax on a handle and keys parsed from run-time data are later
-stages.*
+*Implementation note: both backends emit keys, with the same output. On JS a
+key is its path, and a subscript through a key held in a value walks the
+path's steps. Natively (B711 S1b, the paper's R11) a key also carries the
+field's two accessors, `&S -> &F` and `&mut S -> &mut F`, beside the path that
+gives it its identity. A literal's accessors are two plain functions, and
+`then` composes the two keys' accessors in one shared allocation. On both
+backends a subscript through a key LITERAL is the plain field access. The
+native backend refuses one shape by name: a call handed two loans into one
+value where one goes through a key held in a value (`both(&mut s[j], &mut
+s[k])`), because Rust cannot see two run-time places apart. A key into a place
+that may be missing (`MaybeKey`), field syntax on a handle and keys parsed
+from run-time data are later stages.*

@@ -1,0 +1,45 @@
+// B711 S1b: struct keys leave nothing live natively. Keys composed with
+// `then` in a loop are stored in a list, a struct, a map and a closure's
+// capture, read and written through, and dropped with the program: a key
+// holds no cell, so at exit no composition is live and the program's counted
+// cells are exactly its keyless twin's (`keys_leak_twin.vl`).
+import std::hash_map::HashMap;
+import std::shared::Shared;
+
+struct Meta {
+	owner: str,
+	stars: i32,
+}
+
+struct Task {
+	title: str,
+	meta: Meta,
+}
+
+struct Holder {
+	keys: List<Key<Task, i32>>,
+}
+
+fun main() {
+	let tally: Shared<i32> = Shared::new(0);
+	mut t = Task { title = "a", meta = Meta { owner = "ada", stars = 0 } };
+	mut held: List<Key<Task, i32>> = [];
+	mut named: HashMap<Key<Task, str>, i32> = HashMap::new();
+	mut i = 0;
+	for i < 50 {
+		let stars = Task.meta.then(Meta.stars);
+		held.push(stars);
+		t[stars] += 1;
+		let owner = Task.meta.then(Meta.owner);
+		named.insert(owner, i);
+		tally.write() = tally.read() + 1;
+		i += 1;
+	}
+	let holder = Holder { keys = held };
+	let first = holder.keys[0];
+	let read = |task: Task| task[first];
+	print(read(t));
+	print(holder.keys.len());
+	print(named.len());
+	print(tally.read());
+}

@@ -375,9 +375,12 @@ every rule of this chapter reads it as that field access, rooted at `s`. A
 read copies the field (rule 1), a write needs a mutable root, `&mut s[k]` is a
 view of the field — at a scalar field the `(base, key)` pair of the struct
 holding it and the field's position, as `&mut s.x` is — and a `borrows` return
-may hand it back (§6.5). Where the key is held in a value, the analyses that
+may hand it back (§6.5). Natively a view of `s[k]` is a Rust reference to the
+field, as one of `s.x` is. Where the key is held in a value, the analyses that
 ask which field a place is (rule 4's disjointness, a lent place written by a
-later argument) count it as reaching ANY field of `s`.
+later argument) count it as reaching ANY field of `s`. Natively that is also
+why a call handed two loans into one `s`, one of them `&mut` and one through a
+held key, is refused by name: nothing shows the two places apart.
 
 ## 6.4 Rule 4 — no invalidating mutation under a live view
 
