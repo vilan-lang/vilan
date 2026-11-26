@@ -41,6 +41,8 @@ mod sticky_span_tests;
 #[cfg(test)]
 mod trait_import_tests;
 #[cfg(test)]
+mod universal_member_tests;
+#[cfg(test)]
 mod written_autofocus_tests;
 
 use std::collections::HashMap;

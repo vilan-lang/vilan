@@ -1982,7 +1982,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 }
             }
             for item in &mut items {
-                item.admission = steers.get(item.label.as_str()).cloned();
+                if let Some(steer) = steers.get(item.label.as_str()) {
+                    item.admission = Some(steer.clone());
+                }
             }
             if !chain {
                 // Undotted: the chain form is offered in its own spelling, dot
@@ -2349,6 +2351,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// traits (and their supertraits) declare, under the analyzer's admission
     /// rule — and a name already offered (a field, the nominal's own member)
     /// keeps its first answer.
+    ///
+    /// E371: where several applying blankets DECLARE one name (`impl type T
+    /// with MaybeSignal<T>` and `impl type F: Flow<type T> with
+    /// MaybeSignal<T>` on a `SignalCell<i32>`), the candidate is the member of
+    /// the most specific of them — the solver's own order
+    /// ([`vilan_core::impl_select::declaring_maxima`], what a call dispatches
+    /// through), so the signature, doc and definition the popup shows are the
+    /// ones the call reaches. An unranked set keeps the first in declaration
+    /// order, as before. And a member of a UNIVERSAL trait is admitted only to
+    /// a typed prefix ([`Self::universal_admission`]).
     fn push_blanket_methods(&self, type_id: TypeId, items: &mut Vec<Completion>) {
         let program = self.program;
         let mut offered: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
@@ -2362,16 +2374,28 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .into_iter()
             .filter(|implementation| nominal_type_id(program, implementation.subject).is_none())
             .collect();
+        // Every blanket that declares each name, names in first-declared order.
+        let mut declaring: Vec<(&str, Vec<(&Implementation, Id)>)> = Vec::new();
         for implementation in &blankets {
             for (name, member_id) in &implementation.declarations {
-                if is_self_method(program, *member_id) && offered.insert(name.to_string()) {
-                    items.push(self.entity_completion(
-                        name.to_string(),
-                        *member_id,
-                        CompletionKind::Method,
-                    ));
+                if !is_self_method(program, *member_id) || offered.contains(*name) {
+                    continue;
+                }
+                match declaring.iter_mut().find(|(seen, _)| seen == name) {
+                    Some((_, declarers)) => declarers.push((implementation, *member_id)),
+                    None => declaring.push((name, vec![(implementation, *member_id)])),
                 }
             }
+        }
+        for (name, declarers) in declaring {
+            let (implementation, member_id) =
+                self.most_specific_declarer(type_id, name, &declarers);
+            offered.insert(name.to_string());
+            let mut completion =
+                self.entity_completion(name.to_string(), member_id, CompletionKind::Method);
+            completion.admission =
+                self.universal_admission(declaring_trait(program, implementation, name));
+            items.push(completion);
         }
         for implementation in &blankets {
             for trait_id in &implementation.trait_ids {
@@ -2385,16 +2409,68 @@ impl<'a, 'src> Analysis<'a, 'src> {
                             && is_self_method(program, *member_id)
                             && offered.insert(name.to_string())
                         {
-                            items.push(self.entity_completion(
+                            let mut completion = self.entity_completion(
                                 name.to_string(),
                                 *member_id,
                                 CompletionKind::Method,
-                            ));
+                            );
+                            completion.admission = self.universal_admission(Some(home_id));
+                            items.push(completion);
                         }
                     }
                 }
             }
         }
+    }
+
+    /// E371 rule 2: of the blankets that declare `name` for `receiver`, the one
+    /// the solver's specificity order ranks above the rest
+    /// ([`vilan_core::impl_select::declaring_maxima`] — the maxima a call
+    /// dispatches among). Where it finds no unique maximum among them, the
+    /// first in declaration order, which is the answer before the order was
+    /// read here.
+    fn most_specific_declarer(
+        &self,
+        receiver: TypeId,
+        name: &str,
+        declarers: &[(&'a Implementation<'src>, Id)],
+    ) -> (&'a Implementation<'src>, Id) {
+        if let [only] = declarers {
+            return *only;
+        }
+        let maxima = vilan_core::impl_select::declaring_maxima(
+            self.program,
+            Some(self.focus),
+            receiver,
+            name,
+        );
+        if let [winner] = maxima.as_slice()
+            && let Some(declarer) = declarers
+                .iter()
+                .find(|(implementation, _)| std::ptr::eq(*implementation, *winner))
+        {
+            return *declarer;
+        }
+        declarers[0]
+    }
+
+    /// E371 rule 1: the admission reason for a member of `trait_id` when that
+    /// trait is UNIVERSAL — implemented for every type through a blanket over
+    /// a bare binder ([`vilan_core::impl_select::is_universal_trait`]), so its
+    /// members are members of every value and would otherwise open every
+    /// popup (`.bind`, `.store_diff` on an `i32`). Offered to a typed prefix
+    /// alone, by E213's rule, like a B620 head method. `None` for a member of
+    /// no trait (an inherent blanket's `derive`, `track`) or of a trait the
+    /// analysis cannot prove universal.
+    fn universal_admission(&self, trait_id: Option<Id>) -> Option<String> {
+        let trait_id = trait_id?;
+        if !vilan_core::impl_select::is_universal_trait(self.program, trait_id) {
+            return None;
+        }
+        let name = self.program.traits.get(&trait_id)?.name;
+        Some(format!(
+            "every type has this: `{name}` is implemented for all types"
+        ))
     }
 
     /// The fields + methods of one nominal type — the member-completion list.
@@ -3650,11 +3726,12 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 continue;
             }
             if offered.insert(&member.name) {
-                items.push(self.entity_completion(
-                    member.name.clone(),
-                    member.id,
-                    CompletionKind::Method,
-                ));
+                let mut completion =
+                    self.entity_completion(member.name.clone(), member.id, CompletionKind::Method);
+                // E371: a NOMINAL impl of a universal trait (a derive's `impl
+                // User with Storable`) offers what every type already has.
+                completion.admission = self.universal_admission(member.home_trait);
+                items.push(completion);
             }
         }
     }
@@ -4438,6 +4515,10 @@ struct TableMember {
     name: String,
     id: Id,
     subject: TypeId,
+    /// The trait the member belongs to — the impl's trait that declares it, or
+    /// the trait whose default it inherits — or `None` for an inherent
+    /// member. What E371's universal-trait admission is read from.
+    home_trait: Option<Id>,
 }
 
 impl MemberTable {
@@ -4472,6 +4553,7 @@ impl MemberTable {
                         name: name.to_string(),
                         id: *member_id,
                         subject,
+                        home_trait: declaring_trait(program, implementation, name),
                     };
                     if is_self_method(program, *member_id) {
                         if instance_names.insert((name, subject)) {
@@ -4513,6 +4595,7 @@ impl MemberTable {
                                     name: name.to_string(),
                                     id: *member_id,
                                     subject,
+                                    home_trait: Some(home_id),
                                 });
                             }
                         }
@@ -4587,6 +4670,23 @@ fn trait_with_supertraits(program: &Program, trait_id: Id) -> Vec<Id> {
         }
     }
     result
+}
+
+/// The trait whose member an impl's declaration `name` is (E371): the first of
+/// the impl's `with` traits, supertraits included, that declares the name.
+/// `None` for an inherent impl, which implements no trait — its members belong
+/// to no trait at all.
+fn declaring_trait(program: &Program, implementation: &Implementation, name: &str) -> Option<Id> {
+    implementation
+        .trait_ids
+        .iter()
+        .flat_map(|trait_id| trait_with_supertraits(program, *trait_id))
+        .find(|home_id| {
+            program
+                .traits
+                .get(home_id)
+                .is_some_and(|home| home.declarations.contains_key(name))
+        })
 }
 
 /// Whether a trait member has a source-provided body — a DEFAULT method,

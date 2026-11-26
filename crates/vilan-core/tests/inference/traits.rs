@@ -10648,3 +10648,90 @@ fun main() {
         "21\n",
     );
 }
+
+// --- E371: which traits every type implements ---
+//
+// `impl_select::is_universal_trait` is what member completion reads to keep a
+// universal trait's members (`bind`, `store_diff`) out of every popup: a trait
+// with an impl over a bare binder whose every bound is itself universal. The
+// fixpoint, the bounded tiers that do not count, the tuple bound and the
+// trait with no bare-binder impl at all, each by name.
+#[test]
+fn e371_universal_traits_are_the_bare_binder_fixpoint() {
+    let source = r#"
+        import std::compare::PartialEq;
+        import std::display::Display;
+        trait Differs { fun differs_from(&self, other: &Self): bool; }
+        impl type T with Differs { fun differs_from(&self, other: &T): bool { true } }
+        impl type T: PartialEq with Differs { fun differs_from(&self, other: &T): bool { *self != *other } }
+        trait Second { fun second_opinion(&self): bool; }
+        impl type T: Differs with Second { fun second_opinion(&self): bool { true } }
+        trait Third { fun third(&self): bool; }
+        impl type T: Second + Differs with Third { fun third(&self): bool { true } }
+        trait Shout { fun shout(self): str; }
+        impl type T: Display with Shout { fun shout(self): str { self.to_string() } }
+        trait Mixed { fun mixed(&self): bool; }
+        impl type T: Differs + Display with Mixed { fun mixed(&self): bool { true } }
+        trait Pairs { fun pairs(&self): bool; }
+        impl type T: (2..) with Pairs { fun pairs(&self): bool { true } }
+        struct Point { x: i32 }
+        trait Named { fun named(&self): bool; }
+        impl Point with Named { fun named(&self): bool { true } }
+        fun main() {}
+        "#;
+    let answers = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (program, errors) = analyze_source(
+                source,
+                &std_spec(),
+                Path::new("."),
+                Path::new("test.vl"),
+                Some(Platform::default()),
+                &Workspace::default(),
+            );
+            let messages: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+            assert!(
+                messages.is_empty(),
+                "expected a clean analysis, got: {messages:#?}"
+            );
+            let program = program.expect("analysis should produce a program");
+            let universal = |name: &str| {
+                let (id, _) = program
+                    .traits
+                    .iter()
+                    .find(|(_, trait_)| trait_.name == name)
+                    .unwrap_or_else(|| panic!("the trait {name} is in the program"));
+                vilan_core::impl_select::is_universal_trait(&program, *id)
+            };
+            [
+                "Differs",
+                "Second",
+                "Third",
+                "Shout",
+                "Mixed",
+                "Pairs",
+                "Named",
+                "PartialEq",
+                "Display",
+            ]
+            .map(|name| (name, universal(name)))
+        })
+        .expect("spawn worker")
+        .join()
+        .expect("worker panicked");
+    assert_eq!(
+        answers,
+        [
+            ("Differs", true),
+            ("Second", true),
+            ("Third", true),
+            ("Shout", false),
+            ("Mixed", false),
+            ("Pairs", false),
+            ("Named", false),
+            ("PartialEq", false),
+            ("Display", false),
+        ]
+    );
+}
