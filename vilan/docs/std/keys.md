@@ -24,7 +24,7 @@ program that uses one by name.*
 | `k.name()` | method | the field names joined with `.`: `"meta.owner"` |
 | `k.starts_with(prefix)` | method | whether `prefix`'s path starts this key's (a key starts with itself) |
 | `KeyPath` | struct | an erased path: `name()`, `steps()`, `starts_with(p)`, `then(p)`; `PartialEq`, `Hashable` |
-| `KeyStep` | struct | one step: `name()`, `index()`, `owner()` (the declaring struct, `src/model.vl::Task`) |
+| `KeyStep` | struct | one step: `name()`, `index()`, `owner()` (the declaring struct, `src/model.vl::Task`, for display) |
 
 ## Reading and writing through a key
 
@@ -84,6 +84,13 @@ fun main() {
 A step is the field of one struct declaration: `Left.x` and `Right.x` are
 different steps even when both are their struct's first field, and
 `Pair<i32>.left` and `Pair<str>.left` are the same step.
+
+`KeyStep::owner()` names that declaration for a reader: the declaring file, the
+items it sits inside, and the struct (`src/model.vl::Task`,
+`src/app.vl::render::Row`, a `#2` where one function declares two of a name).
+It is for display and debugging, NOT a stable storage format: it moves when the
+file is renamed or its declarations move. Data that outlives a build stores a
+key by `name()` (`"meta.owner"`), which a later stage reads back.
 
 ## What a key does not reach
 

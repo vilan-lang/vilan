@@ -718,3 +718,164 @@ fn keys_a_literal_is_one_hoisted_constant_and_a_field_chain() {
         "no walk for a literal key:\n{js}"
     );
 }
+
+// --- review follow-ups ------------------------------------------------------
+
+/// A generic struct's key literal where only its ROOT is expected — the
+/// argument of `then`, whose `next: Key<F, G>` knows `F` from the receiver and
+/// leaves `G` for the literal to answer. The struct's arguments come from the
+/// expected root, the field's type is computed under them, and that binds `G`:
+/// with and without an annotation, compared, through a path literal over a
+/// generic, and with a root whose argument the field type does not depend on.
+#[test]
+fn keys_a_generic_literal_takes_its_arguments_from_the_expected_root() {
+    assert_compiles_and_runs(
+        r#"
+        struct Pair<T> { left: T, right: T }
+        struct Wrap<T> { inner: Pair<T>, note: Meta, v: T }
+        struct Meta { pair: Pair<i32>, owner: str }
+        struct Task { meta: Meta, wrap: Wrap<str> }
+
+        fun names<T>(w: Wrap<T>, k: Key<Wrap<T>, str>): str {
+            w[k]
+        }
+
+        fun main() {
+            let annotated: Key<Task, i32> = Task.meta.pair.then(Pair.left);
+            let inferred = Task.meta.pair.then(Pair.left);
+            print(annotated == inferred);
+            print(annotated == Task.meta.then(Meta.pair).then(Pair.left));
+            let plain = Task.meta.then(Meta.owner);
+            let through = Task.wrap.then(Wrap.inner.left);
+            let stepwise = Task.wrap.then(Wrap.inner).then(Pair.right);
+            let independent = Task.wrap.then(Wrap.note.owner);
+            let task = Task {
+                meta = Meta { pair = Pair { left = 1, right = 2 }, owner = "o" },
+                wrap = Wrap {
+                    inner = Pair { left = "l", right = "r" },
+                    note = Meta { pair = Pair { left = 5, right = 6 }, owner = "n" },
+                    v = "v",
+                },
+            };
+            print(task[inferred] + 10);
+            print(task[plain]);
+            print(task[through] + task[stepwise]);
+            print(task[independent]);
+            print(through.name());
+            let w = Wrap {
+                inner = Pair { left = 1.5, right = 2.5 },
+                note = Meta { pair = Pair { left = 5, right = 6 }, owner = "m" },
+                v = 9.0,
+            };
+            print(names(w, Wrap.note.owner));
+        }
+        "#,
+        "true\ntrue\n11\no\nlr\nn\nwrap.inner.left\nm\n",
+    );
+}
+
+/// The checker half: what `then` answers for a generic literal is the field's
+/// type, so a mismatch against it is refused as any other.
+#[test]
+fn keys_a_generic_literal_after_then_is_typed_by_its_field() {
+    assert_fails_with(
+        r#"
+        struct Pair<T> { left: T, right: T }
+        struct Meta { pair: Pair<i32> }
+        struct Task { meta: Meta }
+        fun main() {
+            let k: Key<Task, str> = Task.meta.pair.then(Pair.left);
+        }
+        "#,
+        "Expected Key<Task, str>, but got Key<Task, i32> instead",
+    );
+}
+
+/// A step's owner is unique per declaration: two structs of one name in two
+/// functions of one file, an inline module's beside the file's top level, and
+/// two in sibling blocks of one function make different steps, each spelled
+/// readably.
+#[test]
+fn keys_a_local_structs_step_is_its_own() {
+    assert_compiles_and_runs(
+        r#"
+        import std::key::KeyPath;
+
+        mod inner {
+            export struct Inner { x: i32 }
+            export fun path(): KeyPath { Inner.x.path() }
+        }
+
+        struct Inner { x: i32 }
+
+        fun local_a(): KeyPath {
+            struct Inner { x: i32 }
+            Inner.x.path()
+        }
+
+        fun local_b(): KeyPath {
+            struct Inner { x: i32 }
+            Inner.x.path()
+        }
+
+        fun blocks(): bool {
+            let a = { struct Row { x: i32 } Row.x.path() };
+            let b = { struct Row { x: i32 } Row.x.path() };
+            a == b
+        }
+
+        fun main() {
+            print(local_a() == local_b());
+            print(local_a() == local_a());
+            print(inner::path() == Inner.x.path());
+            print(blocks());
+            print(local_a().steps()[0].owner().ends_with("::local_a::Inner"));
+            print(inner::path().steps()[0].owner().ends_with("::inner::Inner"));
+        }
+        "#,
+        "false\ntrue\nfalse\nfalse\ntrue\ntrue\n",
+    );
+}
+
+/// A struct a derive generates is owned at the attribute that generated it:
+/// the same generated name in two inline modules of one file makes two steps
+/// (generated code has no file of its own, so the attribute's place decides).
+#[test]
+fn keys_a_generated_structs_step_is_its_attributes() {
+    assert_compiles_and_runs(
+        r#"
+        macro fun Companion(item: Item): Source {
+            import macro_std::source;
+            import macro_std::meta::{ Item, Source, StructItem };
+            import macro_std::option::Option::{ self, Some, None };
+
+            let target = match item.as_struct() {
+                Some(let found) => found,
+                None => StructItem { name = "?", fields = [], generics = [] },
+            };
+            source("struct " + target.name + "Shadow {\n\tx: i32,\n}\n")
+        }
+
+        mod one {
+            import std::key::KeyPath;
+            [derive(Companion)]
+            struct A { x: i32 }
+            export fun path(): KeyPath { AShadow.x.path() }
+        }
+
+        mod two {
+            import std::key::KeyPath;
+            [derive(Companion)]
+            struct A { x: i32 }
+            export fun path(): KeyPath { AShadow.x.path() }
+        }
+
+        fun main() {
+            print(one::path() == two::path());
+            print(one::path() == one::path());
+            print(one::path().steps()[0].owner().ends_with("::one::AShadow"));
+        }
+        "#,
+        "false\ntrue\ntrue\n",
+    );
+}

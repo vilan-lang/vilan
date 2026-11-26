@@ -154,8 +154,9 @@ export impl KeyStep {
 		self.index
 	}
 
-	/// The struct that declares the field, by its file and name
-	/// (`src/model.vl::Task`).
+	/// The struct that declares the field, for display: its file, the items it sits
+	/// inside and its name (`src/model.vl::Task`, `src/app.vl::render::Row`). Not a
+	/// storage format — it moves with the file; stored data uses `name()`.
 	fun owner(self): str {
 		self.owner
 	}

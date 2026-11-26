@@ -51130,7 +51130,7 @@ impl<'src> Analyzer<'src> {
             // recorded its type when it resolved.
             Expr::Key(steps) => {
                 let steps = steps.clone();
-                self.key_literal_type(&steps, &constraint)
+                self.key_literal_type(&steps, &constraint, substitution_context)
             }
             Expr::Struct(struct_id) => Type::Struct(*struct_id, Vec::new()),
             Expr::Enum(enum_id) => Type::Enum(*enum_id, Vec::new()),
@@ -70366,7 +70366,12 @@ impl<'src> Analyzer<'src> {
     /// (`let k: Key<Pair<i32>, i32> = Pair.left`, a parameter, the subject of
     /// `p[Pair.left]`), as a struct literal's are. Without one the arguments are
     /// holes, as a bare `None`'s are; a subscript through such a key is refused.
-    fn key_literal_type(&mut self, steps: &[(Id, usize)], constraint: &Type) -> Type {
+    fn key_literal_type(
+        &mut self,
+        steps: &[(Id, usize)],
+        constraint: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> Type {
         let (Some(key_struct_id), Some(&(root, _))) = (self.key_struct_id, steps.first()) else {
             return Type::Unresolved;
         };
@@ -70382,7 +70387,12 @@ impl<'src> Analyzer<'src> {
             Type::Struct(wanted_key, wanted)
                 if *wanted_key == key_struct_id && wanted.len() == 2 =>
             {
-                match wanted[0].get_type(self) {
+                // The expected ROOT is what decides, written in the terms of
+                // the call it lands in: `then`'s `next: Key<F, G>` expects a
+                // root `F` its receiver binds, and the field type `G` is what
+                // this literal answers for the call to bind.
+                let wanted_root = wanted[0].get_type(self);
+                match self.substitute_type(&wanted_root, substitution_context) {
                     Type::Struct(wanted_root, arguments)
                         if wanted_root == root && arguments.len() == generics.len() =>
                     {
@@ -80304,21 +80314,113 @@ impl<'src> Program<'src> {
     }
 
     /// B711: a key step's OWNER — the struct declaring the field — as its key
-    /// value spells it: the declaring file as a location prints it and the
-    /// struct's name, `src/model.vl::Task`. The spelling is the step's
-    /// identity, so two structs of one name in two files make unequal keys
-    /// (`Left.x != Right.x` however the fields line up), and one declaration
-    /// makes one owner whatever its type arguments. Portable across hosts, as
-    /// a location is.
+    /// value spells it: the declaring file as a location prints it, the items
+    /// the declaration sits inside (an inline `mod`, a function or method), and
+    /// the struct's name — `src/model.vl::Task`, `src/app.vl::render::Row`.
+    /// The spelling is the step's identity, so two structs of one name in two
+    /// files, or in two functions of one file, make unequal keys, and one
+    /// declaration makes one owner whatever its type arguments. Where even
+    /// that is shared (two blocks of one function), the declarations are
+    /// numbered by their order in the file (`..::Row#2`). It reads only the
+    /// declaring file's text, so it is stable across builds and machines and
+    /// moves only when that file's declarations do; it is a name for display,
+    /// not a storage format (stored data writes a key by `name()`).
     pub fn key_step_owner(&self, struct_id: Id) -> String {
+        let Some((spelling, source)) = self.key_step_spelling(struct_id) else {
+            return self
+                .structs
+                .get(&struct_id)
+                .map_or(String::new(), |struct_| struct_.name.to_string());
+        };
         let name = self
             .structs
             .get(&struct_id)
             .map_or("", |struct_| struct_.name);
-        match self.source_of(struct_id) {
-            Some(source) => format!("{}::{name}", self.source_display_path(source)),
-            None => name.to_string(),
+        let mut twins: Vec<(usize, Id)> = self
+            .structs
+            .values()
+            .filter(|other| {
+                other.name == name
+                    && self.key_step_site(other.id).map(|(site, _)| site) == Some(source)
+                    && self
+                        .key_step_spelling(other.id)
+                        .is_some_and(|(other_spelling, _)| other_spelling == spelling)
+            })
+            .map(|other| {
+                let start = self
+                    .key_step_site(other.id)
+                    .map_or(0, |(_, span)| span.start);
+                (start, other.id)
+            })
+            .collect();
+        if twins.len() < 2 {
+            return spelling;
         }
+        twins.sort_unstable_by_key(|(start, id)| (*start, id.0));
+        let ordinal = twins
+            .iter()
+            .position(|(_, other)| *other == struct_id)
+            .map_or(1, |position| position + 1);
+        format!("{spelling}#{ordinal}")
+    }
+
+    /// Where a struct is declared for its key steps: its file and span — for a
+    /// struct a macro or a derive generated, the file and span of the attribute
+    /// that generated it (generated code has no file of its own).
+    fn key_step_site(&self, struct_id: Id) -> Option<(SourceId, Span)> {
+        if let Some((span, source)) = self.derived_origin(struct_id) {
+            return Some((source, span));
+        }
+        let source = self.source_of(struct_id)?;
+        let span = self
+            .span_map
+            .get(&struct_id)
+            .map_or(EMPTY_SPAN, |span| **span);
+        Some((source, span))
+    }
+
+    /// [`Self::key_step_owner`] before the ordinal, and the declaring file.
+    fn key_step_spelling(&self, struct_id: Id) -> Option<(String, SourceId)> {
+        let name = self.structs.get(&struct_id)?.name;
+        let (source, span) = self.key_step_site(struct_id)?;
+        let mut spelling = self.source_display_path(source);
+        if span.start == span.end {
+            return Some((format!("{spelling}::{name}"), source));
+        }
+        // An item encloses the declaration when its own span (a non-empty one:
+        // a FILE's module has none) holds the declaration's, in the same file.
+        let encloses = |id: Id| {
+            self.span_map.get(&id).is_some_and(|outer| {
+                outer.start < outer.end
+                    && outer.start <= span.start
+                    && span.end <= outer.end
+                    && (outer.start, outer.end) != (span.start, span.end)
+            }) && self.source_of(id) == Some(source)
+        };
+        let mut enclosing: Vec<(usize, std::cmp::Reverse<usize>, &str)> = self
+            .modules
+            .values()
+            .filter(|module| encloses(module.id))
+            .map(|module| (module.id, module.name))
+            .chain(
+                self.functions
+                    .values()
+                    .filter(|function| encloses(function.id))
+                    .map(|function| (function.id, function.name)),
+            )
+            .filter_map(|(id, item_name)| {
+                let outer = self.span_map.get(&id)?;
+                Some((outer.start, std::cmp::Reverse(outer.end), item_name))
+            })
+            .collect();
+        enclosing.sort_unstable();
+        for (_, _, item_name) in enclosing {
+            spelling.push_str("::");
+            spelling.push_str(item_name);
+        }
+        spelling.push_str("::");
+        spelling.push_str(name);
+        Some((spelling, source))
     }
 
     /// [`Self::source_of`], hoisted out of a whole-program loop (M27).

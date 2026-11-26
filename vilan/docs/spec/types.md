@@ -1826,7 +1826,10 @@ fun main() {
 - **Generic structs.** A key over a generic struct takes the struct's
   arguments from the expected type, as a struct literal does: `let k:
   Key<Pair<i32>, i32> = Pair.left`, a parameter of that type, or the subject
-  of `p[Pair.left]`. A key whose arguments nothing determines is refused where
+  of `p[Pair.left]`. Where only the expected ROOT is known — the argument of
+  `then`, whose field type is the call's to infer — the arguments come from
+  the root and the literal answers its field's type under them:
+  `Task.meta.pair.then(Pair.left)` is a `Key<Task, i32>`. A key whose arguments nothing determines is refused where
   it is used.
 - **A value.** A key is copied, stored in a struct or a `List`, captured,
   passed and returned like any other value. `Key<S, F>` implements
@@ -1843,8 +1846,8 @@ key over another struct than the subject's is refused.
 
 **Identity.** Two keys are equal when their PATHS are, however each was
 written: `Task.meta.owner == Task.meta.then(Meta.owner)`. A step is the field
-of one struct DECLARATION: same-named structs in two files make different
-steps, and a generic struct's step is the same at every argument.
+of one struct DECLARATION: same-named structs in two files, two inline
+modules or two functions make different steps, and a generic struct's step is the same at every argument.
 `k.path()` is the key with its types erased — a `KeyPath`, with equality, a
 hash, `name()` (the field names joined with `.`), `steps()`, `starts_with(p)`
 and `then(p)`; it reaches nothing. `k.name()` and `k.starts_with(other)`
