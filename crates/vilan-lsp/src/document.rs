@@ -5067,6 +5067,11 @@ impl Document {
         }
         let name = self.analyzed_text().get(member_span.into_range())?;
         let type_label = self.analysis(program).hover_label(id)?;
+        // B711 S1c: a key literal's STEP — the key it spells, with its type,
+        // then the field the step names (its declaration and `///`).
+        if let Some(Expr::Key(steps)) = program.entity_map.get(&id) {
+            return self.key_step_hover(program, id, steps, &type_label);
+        }
         let mut out = HoverBlocks::new();
         // E307: a FIELD read names the struct it belongs to, as its
         // declaration and an initializer key do.
@@ -5102,6 +5107,41 @@ impl Document {
                 .get(&id)
                 .and_then(|type_id| definition_paragraph(program, *type_id)),
         );
+        Some(out)
+    }
+
+    /// B711 S1c: the hover of a key literal's step `id` — `Task.meta` in
+    /// `Task.meta.owner` hovers as the key `Task.meta: Key<Task, Meta>`, then
+    /// `meta`'s declaration in `Task` and its `///`.
+    fn key_step_hover(
+        &self,
+        program: &Program,
+        id: Id,
+        steps: &[(Id, usize)],
+        type_label: &str,
+    ) -> Option<HoverBlocks> {
+        let &(owner, index) = steps.last()?;
+        let field = program.structs.get(&owner)?.fields.get(index)?;
+        let written = program
+            .span_map
+            .get(&id)
+            .and_then(|span| self.analyzed_text().get(span.into_range()))
+            .map(|text| text.split_whitespace().collect::<String>())?;
+        let field_line = self
+            .analysis(program)
+            .field_type_label(owner, index, field.name)
+            .map(|field_type| {
+                owned_field_line(program, owner, &format!("{}: {field_type}", field.name))
+            });
+        let mut out = HoverBlocks::new();
+        out.push_code(
+            Block::Signature,
+            &match field_line {
+                Some(field_line) => format!("{written}: {type_label}\n\n{field_line}"),
+                None => format!("{written}: {type_label}"),
+            },
+        );
+        out.push_some(Block::Doc, self.struct_field_docs(program, owner, index));
         Some(out)
     }
 
@@ -6454,6 +6494,12 @@ impl Document {
                     Some((program.source_of(*binding)?, span_of(program, *binding)?))
                 }
                 Expr::Field(_, struct_id, index) => {
+                    let field = program.structs.get(struct_id)?.fields.get(*index)?;
+                    Some((program.source_of(*struct_id)?, field.name_span))
+                }
+                // B711 S1c: a key literal's step names the field it reaches.
+                Expr::Key(steps) => {
+                    let (struct_id, index) = steps.last()?;
                     let field = program.structs.get(struct_id)?.fields.get(*index)?;
                     Some((program.source_of(*struct_id)?, field.name_span))
                 }
