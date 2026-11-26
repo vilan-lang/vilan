@@ -31292,18 +31292,26 @@ impl<'src> Analyzer<'src> {
 
     /// The `&place` expressions whose representation the ANALYZER fixes,
     /// which the JS emitter must not re-decide per instance (B506): a view
-    /// handed back through a RETURN: a return leaf, or the payload of a
+    /// handed back through a RETURN that is not itself a view — a return
+    /// leaf of a by-value return (the seam reads it), or the payload of a
     /// wrapped-view constructor at one (`Some(&self.slots[i].value)`).
     ///
-    /// The caller reads a `borrows` call's result, or a wrapped view's
-    /// capture, by the callee's DECLARED pointee
-    /// (`function_returns_scalar_view`, `wrapped_view_captures`), never by an
-    /// instance's. So the protocol is the generic body's verdict — a `&T`
-    /// comes back as the element's own value for every `T` — and both sides
-    /// read it. Every OTHER view (an argument, a receiver, a binding's
-    /// initializer, an inline transient's payload) is consumed by code of the
-    /// same instance, and is a `(base, key)` pair exactly when its pointee is
-    /// a scalar there.
+    /// A wrapped view's capture is read by the callee's DECLARED pointee
+    /// (`wrapped_view_captures`), never by an instance's, so the protocol is
+    /// the generic body's verdict and both sides read it.
+    ///
+    /// A BARE view return (`&T` / `&mut T`) is not here (B758): its caller
+    /// knows the instance — the call's binding of the callee's generics —
+    /// and reads the result as a `(base, key)` pair exactly when the pointee
+    /// is a scalar there (the transformer's `view_call_is_scalar`), so the
+    /// callee's leaf is decided at the same instance. Fixed at the generic
+    /// body's verdict, `fun same<T>(x: &mut T): &mut T borrows x { x }` at
+    /// `T = i32` handed back the pair it was lent while its caller read an
+    /// aggregate, and `{ b.value }` handed back the value: a write through
+    /// either was lost. Every OTHER view (an argument, a receiver, a
+    /// binding's initializer, an inline transient's payload) is likewise
+    /// consumed by code of the same instance, and is a pair exactly when its
+    /// pointee is a scalar there.
     fn compute_fixed_view_refs(&self) -> HashSet<Id> {
         let mut refs = HashSet::default();
         let add_leaves = |value_id: Id, refs: &mut HashSet<Id>| {
@@ -31331,11 +31339,20 @@ impl<'src> Analyzer<'src> {
                 }
             }
         };
-        for (_, value_id) in &self.return_sites {
+        let returns_a_bare_view =
+            |function: &Function| function.returns_view || function.returns_mut_view;
+        for (function_id, value_id) in &self.return_sites {
+            if self
+                .functions
+                .get(function_id)
+                .is_some_and(returns_a_bare_view)
+            {
+                continue;
+            }
             add_leaves(*value_id, &mut refs);
         }
         for function in self.functions.values() {
-            if function.has_body {
+            if function.has_body && !returns_a_bare_view(function) {
                 add_leaves(function.body.1, &mut refs);
             }
         }

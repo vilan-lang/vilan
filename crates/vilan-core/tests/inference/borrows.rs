@@ -17145,3 +17145,460 @@ fn b753_a_conditional_tail_arm_naming_a_local_is_refused() {
         "a view cannot escape its scope",
     );
 }
+
+// --- B758: a generic view return is decided at the instance -------------------
+
+/// The shared declarations of B758's pins: the identity view returns over a
+/// bare `T` (the tail `x`, the written `&mut x`, and the readonly pair), a
+/// generic container reached into, and a concrete `&mut i32` writer a
+/// returned view is handed on to.
+const B758_PRELUDE: &str = r#"
+fun same<T>(x: &mut T): &mut T borrows x {
+    x
+}
+
+fun same_w<T>(x: &mut T): &mut T borrows x {
+    &mut x
+}
+
+fun look<T>(x: &T): &T borrows x {
+    x
+}
+
+fun look_w<T>(x: &T): &T borrows x {
+    &x
+}
+
+struct Box<T> {
+    value: T,
+}
+
+fun inner<T>(b: &mut Box<T>): &mut T borrows b {
+    b.value
+}
+
+fun inner_w<T>(b: &mut Box<T>): &mut T borrows b {
+    &mut b.value
+}
+
+fun inner_ro<T>(b: &Box<T>): &T borrows b {
+    b.value
+}
+
+fun set_to(n: &mut i32, value: i32) {
+    n = value;
+}
+"#;
+
+fn b758_runs(body: &str, expected_stdout: &str) {
+    assert_compiles_and_runs(&format!("{B758_PRELUDE}\n{body}"), expected_stdout);
+}
+
+/// B758, the item's repro: `same<T>` at `T = i32` and `T = str`. The callee
+/// handed back the `(base, key)` pair it was lent, and the caller read the
+/// result by the DECLARED pointee `T` (never a scalar), as an aggregate: the
+/// write was lost (`1`, `a`, `3`) and `*same(..)` printed the pair (`1,0`).
+#[test]
+fn b758_the_item_repro_writes_and_reads_through_a_generic_view_at_a_scalar() {
+    b758_runs(
+        r#"
+        fun main() {
+            mut n = 1;
+            same(&mut n) = 2;
+            print(n);
+            print(*same(&mut n));
+            mut s = "a";
+            same(&mut s) = "b";
+            print(s);
+            mut k = 3;
+            same_w(&mut k) = 4;
+            print(k);
+        }
+        "#,
+        "2\n2\nb\n4\n",
+    );
+}
+
+/// B758: every scalar pointee the view machinery pairs — an integer, `str`,
+/// `bool`, a float and a backed enum — written (assignment, compound
+/// assignment) and read, through the tail `x` and the written `&mut x`, the
+/// readonly `&T` as well.
+#[test]
+fn b758_a_generic_view_return_at_each_scalar_pointee() {
+    b758_runs(
+        r#"
+        enum Mode { Off = "off", On = "on" }
+
+        fun main() {
+            mut i = 1;
+            same(&mut i) = 2;
+            same_w(&mut i) += 3;
+            print(*look(&i) + *look_w(&i));
+            mut s = "a";
+            same(&mut s) = "b";
+            same_w(&mut s) += "c";
+            print(*look(&s));
+            mut flag = false;
+            same(&mut flag) = true;
+            print(*look(&flag));
+            same_w(&mut flag) = !*look_w(&flag);
+            print(flag);
+            mut f = 1.5;
+            same(&mut f) += 0.25;
+            print(*look(&f));
+            mut m = Mode::Off;
+            same(&mut m) = Mode::On;
+            print(*look(&m) == Mode::On);
+            same_w(&mut m) = Mode::Off;
+            print(m == Mode::Off);
+        }
+        "#,
+        "10\nbc\ntrue\nfalse\n1.75\ntrue\ntrue\n",
+    );
+}
+
+/// B758: a readonly generic view at a scalar is read at every value position
+/// — an operand, a by-value argument, an interpolation hole, a comparison, a
+/// bare `print`, a condition through `*` — and a BY-VALUE return of one reads
+/// it at the seam (`get`), into a generic container too (`get_b`).
+#[test]
+fn b758_a_readonly_generic_view_at_a_scalar_reads_at_every_value_position() {
+    b758_runs(
+        r#"
+        fun takes(x: i32): i32 {
+            x + 100
+        }
+
+        fun get<T>(x: &T): T {
+            look(x)
+        }
+
+        fun get_b<T>(b: &Box<T>): T {
+            inner_ro(b)
+        }
+
+        fun main() {
+            let n = 6;
+            print(look(&n) + 1);
+            print(takes(look(&n)));
+            print(i"{look(&n)}");
+            print(look(&n) == 6);
+            print(look(&n));
+            let b = Box { value = 3 };
+            print(inner_ro(&b) * 2);
+            print(get(&n));
+            print(get_b(&b));
+            let s = "q";
+            print(look(&s));
+            let flag = true;
+            if *look(&flag) {
+                print("yes");
+            }
+        }
+        "#,
+        "7\n106\n6\ntrue\n6\n6\n6\n3\nq\nyes\n",
+    );
+}
+
+/// B758: an AGGREGATE instance keeps the aggregate protocol — the view is the
+/// value's own reference — for a struct (a field written through the result,
+/// the whole replaced), a tagged enum, a `List` (a method through it, an
+/// element of it) and an `Option`.
+#[test]
+fn b758_a_generic_view_return_at_an_aggregate_still_writes_through() {
+    b758_runs(
+        r#"
+        enum Shape { Dot, Line(i32) }
+
+        struct User {
+            name: str,
+            age: i32,
+        }
+
+        fun main() {
+            mut u = User { name = "a", age = 1 };
+            same(&mut u).name = "z";
+            same_w(&mut u).age += 2;
+            print(look(&u).name);
+            print(u.age);
+            same(&mut u) = User { name = "y", age = 7 };
+            print(u.name);
+            mut sh = Shape::Dot;
+            same(&mut sh) = Shape::Line(4);
+            match *look(&sh) {
+                Shape::Line(let k) => print(k),
+                Shape::Dot => print("dot"),
+            }
+            mut xs = [1, 2, 3];
+            same(&mut xs).push(4);
+            same_w(&mut xs)[0] = 9;
+            print(look(&xs).len());
+            print(xs[0]);
+            mut o: Option<i32> = None;
+            same(&mut o) = Some(5);
+            print(look(&o).unwrap_or(0));
+        }
+        "#,
+        "z\n3\ny\n4\n4\n9\n5\n",
+    );
+}
+
+/// B758: a generic reaching INTO a generic container — `inner<T>(b: &mut
+/// Box<T>): &mut T` — the accessor shape struct keys rest on (B711 S1). At a
+/// scalar `T` the callee handed back the field's VALUE and the write was
+/// lost; at a struct, a `List` and an `Option` it is the field's reference.
+/// Also two levels deep, a second type parameter's field, a list's element,
+/// and a conditional tail choosing between two fields.
+#[test]
+fn b758_a_generic_view_into_a_generic_container() {
+    b758_runs(
+        r#"
+        struct Pair<A, B> {
+            left: A,
+            right: B,
+        }
+
+        struct User {
+            name: str,
+            age: i32,
+        }
+
+        fun deep<T>(b: &mut Box<Box<T>>): &mut T borrows b {
+            inner(&mut b.value)
+        }
+
+        fun right<A, B>(p: &mut Pair<A, B>): &mut B borrows p {
+            p.right
+        }
+
+        fun first<T>(xs: &mut List<T>): &mut T borrows xs {
+            xs[0]
+        }
+
+        fun choose<T>(p: &mut Pair<T, T>, left: bool): &mut T borrows p {
+            if left { p.left } else { p.right }
+        }
+
+        fun main() {
+            mut bi = Box { value = 1 };
+            inner(&mut bi) = 2;
+            inner_w(&mut bi) += 3;
+            print(*inner_ro(&bi));
+            mut bs = Box { value = "a" };
+            inner(&mut bs) += "b";
+            print(bs.value);
+            mut bu = Box { value = User { name = "a", age = 1 } };
+            inner(&mut bu).age = 30;
+            inner_w(&mut bu).name = "n";
+            print(inner_ro(&bu).name);
+            print(bu.value.age);
+            inner(&mut bu) = User { name = "w", age = 2 };
+            print(bu.value.name);
+            mut bl = Box { value = [1, 2] };
+            inner(&mut bl).push(3);
+            inner(&mut bl)[0] = 7;
+            print(bl.value.len());
+            print(bl.value[0]);
+            mut bo: Box<Option<str>> = Box { value = None };
+            inner(&mut bo) = Some("x");
+            print(bo.value.unwrap_or("none"));
+            mut bb = Box { value = Box { value = 5 } };
+            deep(&mut bb) = 6;
+            print(bb.value.value);
+            mut p = Pair { left = "l", right = 1 };
+            right(&mut p) += 41;
+            print(p.right);
+            mut xs = [1, 2];
+            first(&mut xs) = 8;
+            print(xs[0]);
+            mut q = Pair { left = 1, right = 2 };
+            choose(&mut q, false) = 20;
+            choose(&mut q, true) += 10;
+            print(q.left + q.right);
+        }
+        "#,
+        "5\nab\nn\n30\nw\n3\n7\nx\n6\n42\n8\n31\n",
+    );
+}
+
+/// B758: a generic calling a generic forwards what its own instance makes
+/// (`outer` over `same`); a concrete `&mut i32` call under a generic outer
+/// keeps its pair (`pick`); a mid-body `ret` and the tail agree (`early`).
+#[test]
+fn b758_a_generic_view_return_through_a_generic_and_a_concrete_call() {
+    b758_runs(
+        r#"
+        fun outer<T>(x: &mut T): &mut T borrows x {
+            same(x)
+        }
+
+        fun same_c(x: &mut i32): &mut i32 borrows x {
+            x
+        }
+
+        fun pick<T>(x: &mut T, n: &mut i32): &mut i32 borrows n {
+            same_c(n)
+        }
+
+        fun early<T>(x: &mut T, flag: bool): &mut T borrows x {
+            if flag {
+                ret x;
+            }
+            same(x)
+        }
+
+        fun main() {
+            mut n = 1;
+            outer(&mut n) = 2;
+            print(n);
+            mut s = "a";
+            outer(&mut s) += "b";
+            print(s);
+            mut z = 0;
+            pick(&mut z, &mut n) = 3;
+            print(n);
+            early(&mut n, true) = 8;
+            print(n);
+            early(&mut n, false) += 1;
+            print(n);
+        }
+        "#,
+        "2\nab\n3\n8\n9\n",
+    );
+}
+
+/// B758: a generic METHOD on a generic type (`Box<T>::get`, and one generic
+/// in a type parameter of its own), and a trait method whose return is the
+/// trait's type parameter, called statically, through a bound inside
+/// another generic (at a scalar and at a struct impl), and through `dyn`.
+#[test]
+fn b758_a_generic_method_and_a_trait_view_method() {
+    b758_runs(
+        r#"
+        impl Box<type T> {
+            fun get(&mut self): &mut T borrows self {
+                self.value
+            }
+
+            fun peek(&self): &T borrows self {
+                self.value
+            }
+
+            fun at<U>(&mut self, other: &mut U): &mut U borrows other {
+                other
+            }
+        }
+
+        fun via<T>(b: &mut Box<T>): &mut T borrows b {
+            b.get()
+        }
+
+        trait Cell<T> {
+            fun cell(&mut self): &mut T borrows self;
+        }
+
+        struct Counter {
+            count: i32,
+        }
+
+        impl Counter with Cell<i32> {
+            fun cell(&mut self): &mut i32 borrows self {
+                self.count
+            }
+        }
+
+        impl Box<type T> with Cell<T> {
+            fun cell(&mut self): &mut T borrows self {
+                self.value
+            }
+        }
+
+        fun set_through<T, C: Cell<T>>(c: &mut C, value: T) {
+            c.cell() = value;
+        }
+
+        fun bump_through<C: Cell<i32>>(c: &mut C) {
+            c.cell() += 1;
+        }
+
+        fun set_dyn(c: &mut dyn Cell<i32>) {
+            c.cell() = 3;
+        }
+
+        fun main() {
+            mut b = Box { value = 10 };
+            b.get() = 11;
+            b.get() += 1;
+            print(*b.peek());
+            mut n = 1;
+            b.at(&mut n) = 4;
+            print(n);
+            via(&mut b) = 13;
+            print(b.value);
+            mut c = Counter { count = 0 };
+            c.cell() = 5;
+            c.cell() += 1;
+            print(c.count);
+            bump_through(&mut c);
+            print(c.count);
+            set_through(&mut c, 40);
+            print(c.count);
+            set_through(&mut b, 77);
+            bump_through(&mut b);
+            print(b.value);
+            mut sb = Box { value = "a" };
+            set_through(&mut sb, "q");
+            print(sb.value);
+            set_dyn(&mut c);
+            set_dyn(&mut b);
+            print(c.count + b.value);
+        }
+        "#,
+        "12\n4\n13\n6\n7\n40\n78\nq\n6\n",
+    );
+}
+
+/// B758: the result's uses at a scalar — handed on to a concrete `&mut i32`
+/// parameter, bound to a view binding that is written and read, a field of
+/// a struct result handed on — and a list element or a tuple position as
+/// the lent place.
+#[test]
+fn b758_uses_of_a_generic_view_result_and_element_and_tuple_places() {
+    b758_runs(
+        r#"
+        struct User {
+            name: str,
+            age: i32,
+        }
+
+        fun main() {
+            mut n = 1;
+            set_to(same(&mut n), 5);
+            print(n);
+            let v = same(&mut n);
+            v += 1;
+            print(*v);
+            print(n);
+            mut b = Box { value = 2 };
+            set_to(inner(&mut b), 9);
+            print(b.value);
+            let w = inner(&mut b);
+            w = 10;
+            print(b.value);
+            mut u = User { name = "a", age = 1 };
+            set_to(&mut same(&mut u).age, 99);
+            print(u.age);
+            mut xs = [1, 2, 3];
+            same(&mut xs[0]) = 9;
+            same_w(&mut xs[1]) += 10;
+            print(*look(&xs[0]) + *look(&xs[1]));
+            mut t = (1, "q");
+            same(&mut t.0) = 4;
+            same(&mut t.1) = "r";
+            print(t.0);
+            print(t.1);
+        }
+        "#,
+        "5\n6\n6\n9\n10\n99\n21\n4\nr\n",
+    );
+}

@@ -1,0 +1,292 @@
+// B758: a GENERIC view return is decided at the instance. JS read a call's
+// result by the callee's DECLARED pointee, and a type parameter is never a
+// scalar there, while the callee handed back what its instance made: at a
+// scalar `T`, `same<T>(x: &mut T): &mut T borrows x { x }` returned the
+// `(base, key)` pair it was lent and its caller treated it as an aggregate
+// (the write was lost, `*same(&mut n)` printed `1,0`), and `inner<T>(b: &mut
+// Box<T>): &mut T borrows b { b.value }` returned the field's value. Natively
+// both were right. One block per case: the identity at each scalar pointee
+// and at the aggregates, tail and written `&mut x`, readonly too; the result
+// read at every value position and returned by value; a generic reaching
+// into a generic container; a generic calling a generic; a mid-body `ret`;
+// a generic method; a trait method through a bound; a view binding of the
+// result; a field of a struct result handed on; an element and a tuple
+// position as the lent place.
+fun same<T>(x: &mut T): &mut T borrows x {
+	x
+}
+
+fun same_w<T>(x: &mut T): &mut T borrows x {
+	&mut x
+}
+
+fun look<T>(x: &T): &T borrows x {
+	x
+}
+
+fun look_w<T>(x: &T): &T borrows x {
+	&x
+}
+
+fun outer<T>(x: &mut T): &mut T borrows x {
+	same(x)
+}
+
+fun early<T>(x: &mut T, flag: bool): &mut T borrows x {
+	if flag {
+		ret x;
+	}
+	same(x)
+}
+
+fun get<T>(x: &T): T {
+	look(x)
+}
+
+enum Mode {
+	Off = "off",
+	On = "on",
+}
+
+enum Shape {
+	Dot,
+	Line(i32),
+}
+
+struct User {
+	name: str,
+	age: i32,
+}
+
+struct Box<T> {
+	value: T,
+}
+
+struct Pair<A, B> {
+	left: A,
+	right: B,
+}
+
+impl Box<type T> {
+	fun get(&mut self): &mut T borrows self {
+		self.value
+	}
+
+	fun peek(&self): &T borrows self {
+		self.value
+	}
+}
+
+fun inner<T>(b: &mut Box<T>): &mut T borrows b {
+	b.value
+}
+
+fun inner_w<T>(b: &mut Box<T>): &mut T borrows b {
+	&mut b.value
+}
+
+fun inner_ro<T>(b: &Box<T>): &T borrows b {
+	b.value
+}
+
+fun deep<T>(b: &mut Box<Box<T>>): &mut T borrows b {
+	inner(&mut b.value)
+}
+
+fun right<A, B>(p: &mut Pair<A, B>): &mut B borrows p {
+	p.right
+}
+
+fun first<T>(xs: &mut List<T>): &mut T borrows xs {
+	xs[0]
+}
+
+fun choose<T>(p: &mut Pair<T, T>, left: bool): &mut T borrows p {
+	if left {
+		p.left
+	} else {
+		p.right
+	}
+}
+
+fun via<T>(b: &mut Box<T>): &mut T borrows b {
+	b.get()
+}
+
+fun get_b<T>(b: &Box<T>): T {
+	inner_ro(b)
+}
+
+trait Cell<T> {
+	fun cell(&mut self): &mut T borrows self;
+}
+
+struct Counter {
+	count: i32,
+}
+
+impl Counter with Cell<i32> {
+	fun cell(&mut self): &mut i32 borrows self {
+		self.count
+	}
+}
+
+impl Box<type T> with Cell<T> {
+	fun cell(&mut self): &mut T borrows self {
+		self.value
+	}
+}
+
+fun set_through<T, C: Cell<T>>(c: &mut C, value: T) {
+	c.cell() = value;
+}
+
+fun bump_through<C: Cell<i32>>(c: &mut C) {
+	c.cell() += 1;
+}
+
+fun set_to(n: &mut i32, value: i32) {
+	n = value;
+}
+
+fun takes(x: i32): i32 {
+	x + 100
+}
+
+fun main() {
+	// The item's repro.
+	mut n = 1;
+	same(&mut n) = 2;
+	print(n);
+	print(*same(&mut n));
+	same_w(&mut n) += 3;
+	print(*look(&n) + *look_w(&n));
+	// Each scalar pointee.
+	mut s = "a";
+	same(&mut s) = "b";
+	same_w(&mut s) += "c";
+	print(*look(&s));
+	mut flag = false;
+	same(&mut flag) = true;
+	print(*look(&flag));
+	same_w(&mut flag) = !*look_w(&flag);
+	print(flag);
+	mut f = 1.5;
+	same(&mut f) += 0.25;
+	print(*look(&f));
+	mut m = Mode::Off;
+	same(&mut m) = Mode::On;
+	print(*look(&m) == Mode::On);
+	// The aggregates.
+	mut u = User { name = "a", age = 1 };
+	same(&mut u).name = "z";
+	same_w(&mut u).age += 2;
+	print(look(&u).name);
+	print(u.age);
+	same(&mut u) = User { name = "y", age = 7 };
+	print(u.name);
+	mut sh = Shape::Dot;
+	same(&mut sh) = Shape::Line(4);
+	match *look(&sh) {
+		Shape::Line(let k) => print(k),
+		Shape::Dot => print("dot"),
+	}
+	mut xs = [1, 2, 3];
+	same(&mut xs).push(4);
+	print(look(&xs).len());
+	mut o: Option<i32> = None;
+	same(&mut o) = Some(5);
+	print(look(&o).unwrap_or(0));
+	// A readonly result at every value position, and returned by value.
+	let six = 6;
+	print(look(&six) + 1);
+	print(takes(look(&six)));
+	print(i"{look(&six)}");
+	print(look(&six) == 6);
+	print(look(&six));
+	print(get(&six));
+	// Into a generic container.
+	mut bi = Box { value = 1 };
+	inner(&mut bi) = 2;
+	inner_w(&mut bi) += 3;
+	print(*inner_ro(&bi));
+	print(get_b(&bi));
+	mut bs = Box { value = "a" };
+	inner(&mut bs) += "b";
+	print(bs.value);
+	mut bu = Box { value = User { name = "a", age = 1 } };
+	inner(&mut bu).age = 30;
+	inner_w(&mut bu).name = "n";
+	print(inner_ro(&bu).name);
+	print(bu.value.age);
+	mut bl = Box { value = [1, 2] };
+	inner(&mut bl).push(3);
+	inner(&mut bl)[0] = 7;
+	print(bl.value.len());
+	print(bl.value[0]);
+	mut bo: Box<Option<str>> = Box { value = None };
+	inner(&mut bo) = Some("x");
+	print(bo.value.unwrap_or("none"));
+	mut bb = Box { value = Box { value = 5 } };
+	deep(&mut bb) = 6;
+	print(bb.value.value);
+	mut p = Pair { left = "l", right = 1 };
+	right(&mut p) += 41;
+	print(p.right);
+	mut ys = [1, 2];
+	first(&mut ys) = 8;
+	print(ys[0]);
+	mut q = Pair { left = 1, right = 2 };
+	choose(&mut q, false) = 20;
+	choose(&mut q, true) += 10;
+	print(q.left + q.right);
+	// A generic calling a generic, and a mid-body `ret`.
+	outer(&mut n) = 2;
+	print(n);
+	outer(&mut s) += "d";
+	print(s);
+	early(&mut n, true) = 8;
+	print(n);
+	early(&mut n, false) += 1;
+	print(n);
+	// A generic method, and a trait method through a bound.
+	mut b = Box { value = 10 };
+	b.get() = 11;
+	b.get() += 1;
+	print(*b.peek());
+	via(&mut b) = 13;
+	print(b.value);
+	mut c = Counter { count = 0 };
+	c.cell() = 5;
+	c.cell() += 1;
+	print(c.count);
+	bump_through(&mut c);
+	set_through(&mut c, c.count + 33);
+	print(c.count);
+	set_through(&mut b, 77);
+	bump_through(&mut b);
+	print(b.value);
+	mut sb = Box { value = "a" };
+	set_through(&mut sb, "q");
+	print(sb.value);
+	// The result handed on, bound, a field of it handed on; an element and a
+	// tuple position lent.
+	set_to(same(&mut n), 5);
+	print(n);
+	let v = same(&mut n);
+	v += 1;
+	print(*v);
+	set_to(inner(&mut bi), 9);
+	print(bi.value);
+	set_to(&mut same(&mut u).age, 99);
+	print(u.age);
+	mut zs = [1, 2, 3];
+	same(&mut zs[0]) = 9;
+	same_w(&mut zs[1]) += 10;
+	print(*look(&zs[0]) + *look(&zs[1]));
+	mut t = (1, "q");
+	same(&mut t.0) = 4;
+	same(&mut t.1) = "r";
+	print(t.0);
+	print(t.1);
+}
