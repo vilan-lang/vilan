@@ -41,6 +41,7 @@
 - [Paths](std/paths.md)
 - [Numbers](std/numbers.md)
 - [Core traits](std/traits.md)
+- [Struct keys](std/keys.md)
 - [Cells](std/cells.md)
 - [Time](std/time.md)
 - [Encoding](std/encoding.md)

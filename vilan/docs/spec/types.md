@@ -1782,3 +1782,84 @@ declaration's asyncness binds there, where through a generic bound an
 implementation may differ from it. A value whose implementation of a member is `async`
 cannot be coerced into an object whose trait declares that member sync; an
 `async` declaration admits both.
+
+## 5.13 Struct keys (`Key<S, F>`)
+
+A **key** is a value that names a field of a struct, checked when the program
+is built (B711, `proposal/struct-keys.md`). `S.x`, where `S` names a struct
+type and `x` one of its fields, is a value of type `Key<S, F>`, `F` the
+field's type; a path `S.a.b` is ONE key of the leaf's type, each step a field
+of the struct the step before it reached:
+
+```vilan
+struct Meta { owner: str }
+struct Task { title: str, meta: Meta }
+
+fun read<F>(task: Task, key: Key<Task, F>): F {
+	task[key]
+}
+
+fun main() {
+	let task = Task { title = "a", meta = Meta { owner = "ada" } };
+	let owner: Key<Task, str> = Task.meta.owner;
+	print(read(task, owner));             // ada
+	print(owner == Task.meta.then(Meta.owner));   // true
+	print(owner.name());                  // meta.owner
+}
+```
+
+- **The type.** `Key` is std's (`std::key`, in the prelude). The field type is
+  in the key's type, as an element type is in `TupleKey<T, U>`'s: a generic
+  over keys is generic over the FIELD TYPE, never over a key. There are no
+  indexed-access types.
+- **No constructor.** A key literal is the only source of a key: `Key`, its
+  erased `KeyPath` and a path's `KeyStep` keep their insides in std-internal
+  fields (§3.3's `[internal]`), so no literal outside std can write one and no
+  code outside std can read one. A key therefore always names a real field.
+- **Steps reach struct fields only.** Every step but the last must reach a
+  struct the program declares: a step into an `Option` or another enum's
+  variant, a list element, a map entry, a tuple position, a type parameter, a
+  host (`external`) type or a resource is refused by name. A key TO a field of
+  any type is fine (`Doc.title` over `title: Option<str>` is a
+  `Key<Doc, Option<str>>`). A field std marks `[internal]` has no key outside
+  std, as it is no member there.
+- **Generic structs.** A key over a generic struct takes the struct's
+  arguments from the expected type, as a struct literal does: `let k:
+  Key<Pair<i32>, i32> = Pair.left`, a parameter of that type, or the subject
+  of `p[Pair.left]`. A key whose arguments nothing determines is refused where
+  it is used.
+- **A value.** A key is copied, stored in a struct or a `List`, captured,
+  passed and returned like any other value. `Key<S, F>` implements
+  `PartialEq` and `Hashable` (so it keys a `HashMap`), with the identity below.
+
+**Access.** For `s: S` (a view of one, or a type parameter `S` the key is
+over) and `k: Key<S, F>`, `s[k]` is a **place** of type `F` under the rules of
+the field access it names (memory §6.3): a read copies only the field; `s[k] =
+v`, compound assignment and `s[k].inner = v` write it in place through a
+mutable subject; `&s[k]` and `&mut s[k]` are views of the field, and a
+`borrows` return may hand one back (`fun at<F>(s: &mut S, k: Key<S, F>): &mut F
+borrows s { s[k] }`). A key cannot miss, so `s[k]` never fails at run time. A
+key over another struct than the subject's is refused.
+
+**Identity.** Two keys are equal when their PATHS are, however each was
+written: `Task.meta.owner == Task.meta.then(Meta.owner)`. A step is the field
+of one struct DECLARATION: same-named structs in two files make different
+steps, and a generic struct's step is the same at every argument.
+`k.path()` is the key with its types erased — a `KeyPath`, with equality, a
+hash, `name()` (the field names joined with `.`), `steps()`, `starts_with(p)`
+and `then(p)`; it reaches nothing. `k.name()` and `k.starts_with(other)`
+forward to the path, and `a.then(b)` composes a `Key<S, M>` with a `Key<M, F>`.
+The laws a program may rely on:
+
+- **K1.** `s[k] = v; s[k] == v`.
+- **K2.** `s[k] = s[k]` changes nothing.
+- **K3.** Keys with equal paths reach the same place.
+- **K4.** Keys where neither path starts with the other reach disjoint
+  places: a write through one cannot change what the other reads.
+- **K5.** `a.then(b).path() == a.path().then(b.path())`.
+
+*Implementation note: keys are emitted by the JS backend only; the native
+backend refuses a program that uses one by name (`does not emit ... a struct
+key`) until B711's S1b. A key into a place that may be missing (`MaybeKey`),
+field syntax on a handle and keys parsed from run-time data are later
+stages.*
