@@ -1,0 +1,27 @@
+// B711 S1b: generic structs on a key's path natively — a literal after `then`
+// typed from its expected root, an ascribed literal, and a chain of `then`s.
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+struct Meta {
+	pair: Pair<i32>,
+}
+
+struct Task {
+	meta: Meta,
+}
+
+fun main() {
+	mut t = Task { meta = Meta { pair = Pair { left = 1, right = 2 } } };
+	let k = Task.meta.pair.then(Pair.left);
+	t[k] += 10;
+	print(t[k]);
+	let s = Pair { left = "x", right = "y" };
+	print(s[Pair.right as Key<Pair<str>, str>]);
+	print(Pair.left as Key<Pair<str>, str> == Pair.left as Key<Pair<str>, str>);
+	let r = Task.meta.then(Meta.pair).then(Pair.right);
+	t[r] = 7;
+	print(t.meta.pair.right);
+}

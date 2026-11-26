@@ -1,0 +1,200 @@
+// B711 S1b: a struct key as an ordinary value natively — stored in a struct
+// and a list, captured by a closure, passed, returned, copied, composed with
+// `then`, compared, hashed (a key and a `KeyPath` keying a `HashMap` and a
+// `HashSet`), named, prefix-tested, erased to its `KeyPath` and its steps,
+// printed, folded in a `const` — and the laws K1-K5 of the paper's §3.3.
+import std::display::Display;
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::key::{ KeyPath, KeyStep };
+
+struct Meta {
+	owner: str,
+	stars: i32,
+}
+
+struct Task {
+	title: str,
+	status: str,
+	meta: Meta,
+}
+
+struct Column {
+	key: Key<Task, str>,
+	label: str,
+}
+
+struct Left {
+	x: i32,
+}
+
+struct Right {
+	x: i32,
+}
+
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+fun task(): Task {
+	Task { title = "a", status = "open", meta = Meta { owner = "ada", stars = 1 } }
+}
+
+fun owner_key(): Key<Task, str> {
+	Task.meta.owner
+}
+
+fun read<F>(t: Task, k: Key<Task, F>): F {
+	t[k]
+}
+
+fun renamed(k: Key<Task, str>): Task {
+	mut t = task();
+	t[k] = "const";
+	let v = &mut t[Task.meta.owner];
+	v = *v + "!";
+	t
+}
+
+fun ordinary() {
+	let t = task();
+	let columns = [
+		Column { key = Task.title, label = "T" },
+		Column { key = owner_key(), label = "O" },
+		Column { key = Task.meta.then(Meta.owner), label = "M" },
+	];
+	for column in columns {
+		print(column.label + "=" + t[column.key]);
+	}
+	let keys: List<Key<Task, str>> = [Task.status, Task.title];
+	print(t[keys[0]]);
+	print(t[keys[1]]);
+	let k = Task.status;
+	let read_it = |x: Task| x[k];
+	print(read_it(t));
+	let composed = Task.meta.then(Meta.owner);
+	let read_composed = |x: Task| x[composed];
+	print(read_composed(t));
+	let copy = k;
+	print(copy == k);
+	print(t[copy]);
+	mut moved = columns[2];
+	moved.label = "moved";
+	print(moved.label + "=" + t[moved.key]);
+	print(columns[2].label);
+}
+
+fun maps() {
+	mut labels: HashMap<Key<Task, str>, str> = HashMap::new();
+	labels.insert(Task.title, "title");
+	labels.insert(Task.meta.owner, "owner");
+	print(labels.get(Task.meta.then(Meta.owner)).unwrap_or("none"));
+	print(labels.get(Task.status).unwrap_or("none"));
+	mut seen: HashSet<Key<Task, str>> = HashSet::new();
+	seen.insert(Task.meta.owner);
+	seen.insert(Task.meta.then(Meta.owner));
+	seen.insert(Task.title);
+	print(seen.len());
+	mut by_path: HashMap<KeyPath, i32> = HashMap::new();
+	by_path.insert(Task.meta.owner.path(), 1);
+	by_path.insert(Task.meta.stars.path(), 2);
+	by_path.insert(Task.meta.path().then(Meta.owner.path()), 3);
+	print(by_path.len());
+	print(by_path.get(Task.meta.owner.path()).unwrap_or(0));
+	mut paths: HashSet<KeyPath> = HashSet::new();
+	paths.insert(Task.meta.owner.path());
+	paths.insert(Task.meta.stars.path());
+	paths.insert(Task.meta.then(Meta.stars).path());
+	print(paths.len());
+}
+
+fun identity() {
+	let owner = Task.meta.owner;
+	print(owner == Task.meta.then(Meta.owner));
+	print(Task.meta.then(Meta.stars) == Task.meta.stars);
+	print(owner.name());
+	print(Task.title.name());
+	print(owner.starts_with(Task.meta));
+	print(owner.starts_with(owner));
+	print(Task.meta.starts_with(owner));
+	print(owner.starts_with(Task.title));
+	let path: KeyPath = owner.path();
+	print(path.name());
+	print(path.starts_with(Task.meta.path()));
+	let steps: List<KeyStep> = path.steps();
+	print(steps.len());
+	print(steps[0].name() + "@" + steps[0].index().to_string() + " in " + steps[0].owner());
+	print(steps[1].name() + "@" + steps[1].index().to_string() + " in " + steps[1].owner());
+	print(path == Task.meta.path().then(Meta.owner.path()));
+	print(path.hash() == Task.meta.path().then(Meta.owner.path()).hash());
+	print(owner.hash() == Task.meta.then(Meta.owner).hash());
+	print(path == Task.title.path());
+	print(Left.x.path() == Right.x.path());
+	print(Left.x.name() == Right.x.name());
+	let a: Key<Pair<i32>, i32> = Pair.left;
+	let b: Key<Pair<str>, str> = Pair.left;
+	print(a.path() == b.path());
+	mut copied = Task.meta.owner.path().steps();
+	copied.pop();
+	print(copied.len());
+	print(Task.meta.owner.path().steps().len());
+	print(Task.title);
+	print(Task.meta.then(Meta.stars));
+	print(Task.title.path());
+}
+
+fun laws() {
+	// K1: s[k] = v; s[k] == v
+	mut t = task();
+	let k = Task.meta.owner;
+	t[k] = "zed";
+	print(t[k] == "zed");
+	t[Task.meta.stars] = 4;
+	print(t[Task.meta.stars] == 4);
+	// K2: s[k] = s[k] changes nothing
+	let before = t.title + t.status + t.meta.owner + t.meta.stars.to_string();
+	t[k] = t[k];
+	t[Task.meta] = t[Task.meta];
+	print(before == t.title + t.status + t.meta.owner + t.meta.stars.to_string());
+	// K3: keys with equal paths reach the same place
+	let a = Task.meta.owner;
+	let b = Task.meta.then(Meta.owner);
+	print(a == b);
+	t[a] = "via a";
+	print(t[b]);
+	t[b] = "via b";
+	print(t[a]);
+	// K4: keys where neither path starts with the other are disjoint
+	let x = Task.meta.owner;
+	let y = Task.meta.stars;
+	let z = Task.title;
+	print(!x.starts_with(z) && !z.starts_with(x));
+	let stars = t[y];
+	let title = t[z];
+	t[x] = "disjoint";
+	print(t[y] == stars && t[z] == title);
+	// K5: a.then(b).path() == a.path().then(b.path())
+	print(Task.meta.then(Meta.owner).path() == Task.meta.path().then(Meta.owner.path()));
+	print(Task.meta.then(Meta.stars).path() == Task.meta.path().then(Meta.stars.path()));
+}
+
+fun consts() {
+	let name = const Task.meta.owner.name();
+	let owner = const read(renamed(Task.meta.owner), Task.meta.owner);
+	print(name);
+	print(owner);
+	let key = const Task.meta.stars;
+	mut t = task();
+	t[key] = 12;
+	print(t.meta.stars);
+	print(key.name());
+}
+
+fun main() {
+	ordinary();
+	maps();
+	identity();
+	laws();
+	consts();
+}

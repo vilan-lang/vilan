@@ -42,11 +42,14 @@ pub mod fs;
 pub mod http;
 pub mod inspect;
 pub mod json;
+pub mod key;
 pub mod process;
 pub mod show;
 pub mod time;
 pub mod url;
 pub mod ws;
+
+pub use key::{KeyAccess, key_mut, key_ref};
 
 // ---------------------------------------------------------------- strings ---
 
@@ -646,6 +649,15 @@ pub fn main_guard(body: impl FnOnce() + Send + 'static) {
             "vilan-native: cells minted={minted} live={}",
             minted - released
         );
+        // B711 S1b: a program that composed struct keys (`then`) says how many
+        // compositions outlived it — none can, a key holding no cell.
+        let (composed, dropped) = key::key_census();
+        if composed > 0 {
+            eprintln!(
+                "vilan-native: key compositions minted={composed} live={}",
+                composed - dropped
+            );
+        }
         if failed {
             std::process::exit(1);
         }

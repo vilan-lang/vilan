@@ -19503,33 +19503,250 @@ fn b758_a_generic_view_return_agrees_at_every_instance_on_both_backends() {
     );
 }
 
-/// B711 S1a: struct keys are JS-only until S1b gives a native key its access
-/// (R11). A program using one is refused by name — the literal, and a
-/// subscript through a key held in a value — never handed to rustc.
+/// B711 S1b: struct keys natively (R11) — every shape S1a pinned on JS, built
+/// both ways and compared: the places (`s[k]` read, assigned, compound
+/// assigned, written into, lent, over a view and a type-parameter subject,
+/// through a literal and a held key, the generic accessor at scalar and struct
+/// fields, paths, generic structs), the values (stored, captured, passed,
+/// returned, composed, compared, hashed, named, erased, printed, folded in a
+/// `const`, K1-K5), the places the backend lowers its own way (`self`, a
+/// mutating call, a pattern subject, a captured `mut` binding, a `Shared`
+/// cell, a module binding), B760's lifetime as a two-view key accessor meets
+/// it, and the corpus program `struct-keys.vl`.
 #[test]
-fn keys_a_struct_key_is_refused_by_name_natively() {
+fn keys_struct_keys_build_the_same_on_both_backends() {
     let staged = stage();
-    std::fs::write(staged.join("native_probe_keys.vl"), KEYS_PROBE).expect("write the probe");
-    match compare(&staged, "native_probe_keys.vl") {
+    let mut programs = Vec::new();
+    for (name, program) in [
+        (
+            "native_probe_keys_places.vl",
+            include_str!("native/keys_places.vl"),
+        ),
+        (
+            "native_probe_keys_values.vl",
+            include_str!("native/keys_values.vl"),
+        ),
+        (
+            "native_probe_keys_edges.vl",
+            include_str!("native/keys_edges.vl"),
+        ),
+        (
+            "native_probe_keys_borrowed_lifetime.vl",
+            include_str!("native/keys_borrowed_lifetime.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        programs.push(name);
+    }
+    programs.push("struct-keys.vl");
+    let verdicts = legs_in_parallel("keys", programs.clone(), |program, target| {
+        compare_in(&staged, program, target)
+    });
+    for (program, verdict) in programs.iter().zip(verdicts) {
+        assert_eq!(
+            verdict,
+            Verdict::Identical,
+            "{program}: struct keys must build and answer the same on both backends"
+        );
+    }
+}
+
+/// B711 S1b: a key rooted through its module (`model::Task.title`) natively,
+/// its step owned by the declaring file.
+#[test]
+fn keys_a_module_qualified_root_builds_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_keys_model.vl"),
+        include_str!("native/keys_model.vl"),
+    )
+    .expect("write the model module");
+    std::fs::write(
+        staged.join("native_probe_keys_module_root.vl"),
+        include_str!("native/keys_module_root.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_keys_module_root.vl"),
+        Verdict::Identical,
+        "a module-qualified key root must build and answer the same on both backends"
+    );
+}
+
+/// B711 S1b, the aliasing decision. Vilan declines exclusivity, so two
+/// writable views into one value through two keys are accepted by the
+/// checker, as two `&mut p.a` are. Natively a key LITERAL is its field
+/// chain, so it is exactly the field form; a key HELD in a value names a place
+/// chosen at run time, so a call handed two loans into one value through one
+/// is refused by name (rustc would refuse the emitted call, E0499) — while
+/// loans into two different values through the same keys build, and a
+/// `&mut` place through a held key beside a by-value read of it settles the
+/// read first.
+#[test]
+fn keys_two_loans_into_one_value_through_a_held_key_are_refused_by_name() {
+    let staged = stage();
+    let shared = concat!(
+        "struct P {\n",
+        "\ta: i32,\n",
+        "\tb: i32,\n",
+        "}\n",
+        "\n",
+        "fun both(x: &mut i32, y: &mut i32) {\n",
+        "\tx += 1;\n",
+        "\ty += 10;\n",
+        "}\n",
+        "\n",
+        "fun take(x: &mut i32, y: i32) {\n",
+        "\tx += y;\n",
+        "}\n",
+        "\n",
+    );
+    std::fs::write(
+        staged.join("native_probe_keys_apart.vl"),
+        format!(
+            "{shared}{}",
+            concat!(
+                "fun main() {\n",
+                "\tmut p = P { a = 1, b = 2 };\n",
+                "\tmut q = P { a = 1, b = 2 };\n",
+                "\tlet j = P.a;\n",
+                "\tlet k = P.b;\n",
+                "\tboth(&mut p[j], &mut q[k]);\n",
+                "\tboth(&mut p[P.a], &mut p[P.b]);\n",
+                "\ttake(&mut p[j], p[j]);\n",
+                "\tprint(p.a + p.b + q.a + q.b);\n",
+                "}\n",
+            )
+        ),
+    )
+    .expect("write the apart probe");
+    std::fs::write(
+        staged.join("native_probe_keys_aliased.vl"),
+        format!(
+            "{shared}{}",
+            concat!(
+                "fun main() {\n",
+                "\tmut p = P { a = 1, b = 2 };\n",
+                "\tlet j = P.a;\n",
+                "\tlet k = P.b;\n",
+                "\tboth(&mut p[j], &mut p[k]);\n",
+                "\tprint(p.a + p.b);\n",
+                "}\n",
+            )
+        ),
+    )
+    .expect("write the aliased probe");
+    assert_eq!(
+        compare(&staged, "native_probe_keys_apart.vl"),
+        Verdict::Identical,
+        "loans into two values, a literal's field chains, and a read beside a held key's loan \
+         must build"
+    );
+    match compare(&staged, "native_probe_keys_aliased.vl") {
         Verdict::Refused(reason) => assert!(
-            reason.contains("a struct key (`Task.title`)")
-                || reason.contains("a subscript through a struct key (`s[k]`)"),
+            reason.contains("through a struct key held in a value"),
             "refused for another reason: {reason}"
         ),
         other => panic!("expected a refusal by name, got {other:?}"),
     }
 }
 
-const KEYS_PROBE: &str = concat!(
-    "struct Task {\n",
-    "\ttitle: str,\n",
-    "}\n",
-    "\n",
-    "fun read(task: Task, key: Key<Task, str>): str {\n",
-    "\ttask[key]\n",
-    "}\n",
-    "\n",
-    "fun main() {\n",
-    "\tprint(read(Task { title = \"a\" }, Task.title));\n",
-    "}\n",
-);
+/// B711 S1b, NOT BUILT: two `let` views into one value through two DIFFERENT
+/// keys held in values, both live at once. The field form (`&mut p.a` and
+/// `&mut p.b`) builds, because rustc sees two disjoint fields; a held key's
+/// place is chosen at run time, so rustc refuses the second borrow (E0499) and
+/// the program reads a backend defect. Two live views of the SAME field fail
+/// the same way through fields and through keys alike. Un-ignore when the
+/// emitter refuses this by name or lowers it (a liveness question the call
+/// form above does not need).
+#[test]
+#[ignore = "B711 S1b leaves two live local views through two held keys to rustc (E0499)"]
+fn keys_two_live_views_through_two_held_keys_build() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_keys_live_views.vl"),
+        concat!(
+            "struct P {\n",
+            "\ta: i32,\n",
+            "\tb: i32,\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut p = P { a = 1, b = 2 };\n",
+            "\tlet j = P.a;\n",
+            "\tlet k = P.b;\n",
+            "\tlet u = &mut p[j];\n",
+            "\tlet v = &mut p[k];\n",
+            "\tu += 1;\n",
+            "\tv += 10;\n",
+            "\tprint(p.a + p.b);\n",
+            "}\n",
+        ),
+    )
+    .expect("write the probe");
+    assert_eq!(
+        compare(&staged, "native_probe_keys_live_views.vl"),
+        Verdict::Identical
+    );
+}
+
+/// B711 S1b: keys leave nothing live natively. `keys_leak.vl` composes keys
+/// with `then` in a loop and stores them in a list, a struct, a map and a
+/// closure's capture; at exit no composition is live, and its counted cells
+/// are exactly those of its keyless twin.
+#[test]
+fn keys_composed_keys_leave_nothing_live_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_keys_leak.vl"),
+        include_str!("native/keys_leak.vl"),
+    )
+    .expect("write the keyed probe");
+    std::fs::write(
+        staged.join("native_probe_keys_leak_twin.vl"),
+        include_str!("native/keys_leak_twin.vl"),
+    )
+    .expect("write the keyless twin");
+    assert_eq!(
+        compare(&staged, "native_probe_keys_leak.vl"),
+        Verdict::Identical,
+        "the keyed probe must answer the same on both backends"
+    );
+    let census = |program: &str| {
+        let output = vilan(&staged)
+            .env("VILAN_NATIVE_LEAK_CENSUS", "1")
+            .args(["run", "--backend", "rust", program])
+            .output()
+            .expect("run the program natively");
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let counts = |prefix: &str| {
+            stderr
+                .lines()
+                .find(|line| line.starts_with(prefix))
+                .map(|line| {
+                    line[prefix.len()..]
+                        .split(|character: char| !character.is_ascii_digit())
+                        .filter(|piece| !piece.is_empty())
+                        .map(|piece| piece.parse::<u64>().expect("a count"))
+                        .collect::<Vec<_>>()
+                })
+        };
+        (
+            counts("vilan-native: cells minted=")
+                .unwrap_or_else(|| panic!("{program} reported no leak census:\n{stderr}")),
+            counts("vilan-native: key compositions minted="),
+        )
+    };
+    let (cells, compositions) = census("native_probe_keys_leak.vl");
+    let (twin_cells, twin_compositions) = census("native_probe_keys_leak_twin.vl");
+    assert_eq!(cells, twin_cells, "keys add no counted cell");
+    assert_eq!(
+        compositions,
+        Some(vec![100, 0]),
+        "a hundred compositions, none live at exit"
+    );
+    assert_eq!(
+        twin_compositions, None,
+        "a keyless program composes nothing"
+    );
+}

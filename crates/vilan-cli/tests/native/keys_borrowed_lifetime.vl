@@ -1,0 +1,47 @@
+// B760 (met by B711 S1b's key accessors): a view return that borrows one of
+// two view parameters names its lifetime natively — a field form and a key
+// form, scalar and struct fields, the view used as a place.
+
+struct Meta {
+	owner: str,
+}
+
+struct Task {
+	title: str,
+	n: i32,
+	meta: Meta,
+}
+
+fun left_n(left: &mut Task, right: &Task): &mut i32 borrows left {
+	left.n = right.n;
+	left.n
+}
+
+fun from_left<F>(left: &mut Task, right: &Task, k: Key<Task, F>): &mut F borrows left {
+	left[k] = right[k];
+	left[k]
+}
+
+fun pick(first: &Task, second: &Task, first_wins: bool): &str {
+	if first_wins {
+		first.title
+	} else {
+		second.title
+	}
+}
+
+fun main() {
+	mut a = Task { title = "a", n = 1, meta = Meta { owner = "ada" } };
+	let b = Task { title = "b", n = 2, meta = Meta { owner = "bob" } };
+	left_n(&mut a, &b) += 3;
+	print(a.n);
+	from_left(&mut a, &b, Task.n) += 5;
+	print(a.n);
+	from_left(&mut a, &b, Task.meta).owner = "cy";
+	print(a.meta.owner);
+	print(*pick(&a, &b, true));
+	print(*pick(&a, &b, false));
+	let title = Task.title;
+	print(*from_left(&mut a, &b, title));
+	print(*pick(&a, &b, true));
+}

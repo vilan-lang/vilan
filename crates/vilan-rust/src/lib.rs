@@ -420,6 +420,35 @@ enum Step {
     Slot(String),
     /// A subscript: the subscript expression and its index expression (F90).
     Index(Id, Id),
+    /// A subscript through a struct key HELD in a value (B711 S1b): the key
+    /// expression. A literal key's subscript is its field chain, a `Slot`.
+    Key(Id),
+}
+
+/// The Rust field a native `Key<S, F>` carries its access in (B711 S1b, R11):
+/// no vilan field, so no source can name it.
+const KEY_ACCESS: &str = "__access";
+
+/// The positions of a `const` key's path, out of `std::key`'s layout (`[[parts]]`,
+/// each part `[owner, index, name]`).
+fn const_key_positions(items: &[vilan_core::interpreter::ConstValue]) -> Option<Vec<usize>> {
+    use vilan_core::interpreter::ConstValue;
+    let [ConstValue::Array(path)] = items else {
+        return None;
+    };
+    let [ConstValue::Array(parts)] = path.as_slice() else {
+        return None;
+    };
+    parts
+        .iter()
+        .map(|part| match part {
+            ConstValue::Array(step) => match step.get(1) {
+                Some(ConstValue::Number(index)) if *index >= 0.0 => Some(*index as usize),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 /// What a [`Step`] spine reads through: a `Shared` view call's cell, or a
@@ -512,6 +541,9 @@ struct Emitter<'a, 'src> {
     /// Nominal type declarations, keyed by (declaration, its concrete
     /// arguments). `Pair<i32>` and `Pair<str>` are two Rust structs.
     types: BTreeMap<usize, String>,
+    /// B711 S1b: each distinct key literal's value, to the function that
+    /// copies it out of its `thread_local!` ([`Emitter::key_literal`]).
+    key_literals: HashMap<String, String>,
     type_instances: HashMap<(Id, Vec<String>), Reserved>,
     /// The next reserved slot. Functions and types number independently
     /// (they are two sections of the file).
@@ -947,6 +979,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             context_assumptions: Vec::new(),
             dispatched_bindings: HashMap::default(),
             types: BTreeMap::new(),
+            key_literals: HashMap::default(),
             type_instances: HashMap::default(),
             next_function_slot: 0,
             next_type_slot: 0,
@@ -1456,6 +1489,77 @@ impl<'a, 'src> Emitter<'a, 'src> {
             loans.push((*group, writes, *argument));
         }
         Ok(())
+    }
+
+    /// B711 S1b: a call handed two loans into one binding, one of them `&mut`
+    /// and one reaching its place through a struct key HELD in a value —
+    /// `both(&mut s[j], &mut s[k])`. Vilan declines exclusivity, so the
+    /// checker accepts it, as it accepts `both(&mut s.a, &mut s.b)`. Rust takes
+    /// two `&mut` into one value only where it can see the places are
+    /// disjoint fields; a held key's place is chosen at run time (as a list
+    /// element's is), so rustc would refuse the emitted call (E0499) and the
+    /// user would read a backend defect. It is refused by name instead. A key
+    /// LITERAL's place is its field chain, so it is the field form, whatever
+    /// that answers.
+    fn refuse_two_loans_through_a_held_key(
+        &self,
+        conventions: &[Receiving],
+        argument_ids: &[Id],
+    ) -> Result<(), Error> {
+        if self.program.key_subscripts.is_empty() {
+            return Ok(());
+        }
+        let mut loans: Vec<(Id, bool, bool)> = Vec::new();
+        for (index, argument) in argument_ids.iter().enumerate() {
+            let writes = match conventions.get(index) {
+                Some(Receiving::RefMut) => true,
+                Some(Receiving::Ref) => false,
+                _ => continue,
+            };
+            let place = match self.program.entity_map.get(argument) {
+                Some(&Expr::Reference(place, _)) => place,
+                _ => continue,
+            };
+            let Some(root) = self.root_binding_of_place(place) else {
+                continue;
+            };
+            let through_a_key = self.place_reaches_through_a_held_key(place);
+            if loans.iter().any(|(other_root, other_writes, other_key)| {
+                *other_root == root && (writes || *other_writes) && (through_a_key || *other_key)
+            }) {
+                return Err(unsupported(
+                    "two loans into one value at a call, one of them `&mut` and one through a \
+                     struct key held in a value (`both(&mut s[j], &mut s[k])`: the key's place is \
+                     chosen at run time, so Rust cannot see the two are apart)",
+                    self.span_of(*argument),
+                ));
+            }
+            loans.push((root, writes, through_a_key));
+        }
+        Ok(())
+    }
+
+    /// Whether a place spine passes through a subscript by a struct key held
+    /// in a value (B711 S1b).
+    fn place_reaches_through_a_held_key(&self, mut place: Id) -> bool {
+        loop {
+            match self.program.entity_map.get(&place) {
+                Some(&Expr::Index(subject, index)) => {
+                    if self.program.key_subscripts.contains(&place)
+                        && self.key_literal_steps(index).is_none()
+                    {
+                        return true;
+                    }
+                    place = subject;
+                }
+                Some(
+                    &Expr::Field(subject, _, _)
+                    | &Expr::TupleIndex(subject, _, _)
+                    | &Expr::Dereference(subject),
+                ) => place = subject,
+                _ => return false,
+            }
+        }
     }
 
     /// F124: the ROOT binding a borrowed place names — a local `let` (a
@@ -3806,8 +3910,19 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .filter(|field| self.owes_a_teardown(field.type_id, &mut HashSet::new()))
             .count();
         let holds_a_resource = teardown_fields > 1;
+        // B711 S1b (R11): std's `Key<S, F>` carries its ACCESS natively, beside
+        // the `erased` path that is its identity on both backends — see
+        // [`vilan_rt::KeyAccess`]. It is no declared field, so the renderings
+        // below (`Js`, `Json`) and every field walk leave it out, and its
+        // `PartialEq` answers `true`, so the derived one compares the paths.
+        let key_access = if self.program.key_struct_id == Some(id) {
+            Some(self.key_access_type(&entries, span))
+        } else {
+            None
+        };
         self.current_substitution = saved;
         let rendered_types = rendered_types?;
+        let key_access = key_access.transpose()?;
         // Two questions, not one. `PartialEq` needs to know which FIELDS are
         // themselves closures (those compare by `ptr_eq`); `Js` and `Json` need
         // to know whether a closure is reachable at all, since a container of
@@ -3849,6 +3964,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         for (name, rendered) in declared {
             let _ = writeln!(out, "    {}: {rendered},", sanitize(name));
+        }
+        if let Some(access) = &key_access {
+            let _ = writeln!(out, "    {KEY_ACCESS}: {access},");
         }
         let _ = writeln!(out, "}}");
         // F97: the `Drop` impl's body runs first, then the fields drop.
@@ -4581,6 +4699,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     steps.push(Step::Slot(self.tuple_slot_path(current, offset, width)?));
                     current = subject;
                 }
+                Expr::Index(subject, index) if self.program.key_subscripts.contains(&current) => {
+                    match self.key_literal_steps(index) {
+                        Some(key_steps) => {
+                            steps.push(Step::Slot(
+                                self.key_field_chain(&key_steps, self.span_of(current))
+                                    .ok()?,
+                            ));
+                        }
+                        None => steps.push(Step::Key(index)),
+                    }
+                    current = subject;
+                }
                 Expr::Index(subject, index) => {
                     steps.push(Step::Index(current, index));
                     current = subject;
@@ -4628,6 +4758,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     // a cell panics in vilan's words at its vilan site.
                     let location = self.subscript_location(node, depth)?;
                     path = format!("(*({path}).vilan_at(({name}) as usize, {location}))");
+                }
+                // B711 S1b: a held key's access, settled with the subscripts.
+                Step::Key(index) => {
+                    let access = self.held_key_access(index, depth, true)?;
+                    let name = format!("{prefix}{settled}");
+                    *settled += 1;
+                    let _ = write!(subscripts, "let {name} = &{access}; ");
+                    path = format!("(*vilan_rt::key_ref({name}, &{path}))");
                 }
             }
         }
@@ -5374,7 +5512,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     && referenced.contains(parameter)
             })
             .collect();
-        let parameters: Vec<String> = parameters
+        let parameters: Vec<(Id, String)> = parameters
             .into_iter()
             .filter(|(parameter, _)| {
                 !self
@@ -5383,11 +5521,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     .contains_key(parameter)
                     || declared.contains(parameter)
             })
-            .map(|(_, rendered)| rendered)
             .collect();
         if let Some(record) = self.instance_contexts.get_mut(name) {
             record.declared = Some(declared);
         }
+        let (parameters, returned, lifetimes) =
+            Self::name_the_borrowed_lifetime(function, parameters, returned);
 
         let mut out = String::new();
         // F25: whether `main`'s body was opened inside a `main_guard` closure
@@ -5436,7 +5575,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         } else {
             let _ = writeln!(
                 out,
-                "{}fn {name}({}) -> {returned} {{",
+                "{}fn {name}{lifetimes}({}) -> {returned} {{",
                 if is_async { "async " } else { "" },
                 parameters.join(", ")
             );
@@ -5482,6 +5621,56 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// `Self`, and reading only the declaration emitted `-> ()` for a body that
     /// hands back an `Id` — rustc's `expected Id_8605, found ()`. JavaScript
     /// never had to ask, which is why the gap survived S1a.
+    /// B760: a view return over two or more reference parameters names its
+    /// lifetime. Rust elides an output lifetime only from a lone reference
+    /// input, so `fun from_left(left: &mut T, right: &T): &mut F borrows left`
+    /// was rustc's E0106. The parameters the return BORROWS (its `borrows`
+    /// positions) and the return share one named lifetime, `'v`; every other
+    /// reference keeps its own elided one, which is what the `borrows` clause
+    /// says (the view does not outlive `right`'s loan only if it borrows it).
+    /// A view inside a returned payload (`Option<&mut T>`) is not covered.
+    fn name_the_borrowed_lifetime(
+        function: &vilan_core::analyzer::Function<'src>,
+        parameters: Vec<(Id, String)>,
+        returned: String,
+    ) -> (Vec<String>, String, &'static str) {
+        let reference_of = |rendered: &str| rendered.find(": &").map(|at| at + 2);
+        let references = parameters
+            .iter()
+            .filter(|(_, rendered)| reference_of(rendered).is_some())
+            .count();
+        let returns_a_reference = returned.starts_with('&');
+        if !(function.returns_view || function.returns_mut_view)
+            || !returns_a_reference
+            || references < 2
+            || function.borrows.is_empty()
+        {
+            return (
+                parameters
+                    .into_iter()
+                    .map(|(_, rendered)| rendered)
+                    .collect(),
+                returned,
+                "",
+            );
+        }
+        let parameters = parameters
+            .into_iter()
+            .map(|(parameter, mut rendered)| {
+                let borrowed = function
+                    .parameters
+                    .iter()
+                    .position(|declared| *declared == parameter)
+                    .is_some_and(|position| function.borrows.contains(&(position as u32)));
+                if borrowed && let Some(at) = reference_of(&rendered) {
+                    rendered.insert_str(at + 1, "'v ");
+                }
+                rendered
+            })
+            .collect();
+        (parameters, format!("&'v {}", &returned[1..]), "<'v>")
+    }
+
     fn return_type_of(&self, function: &vilan_core::analyzer::Function<'src>) -> Option<TypeId> {
         if let Some(type_id) = function.return_type_id {
             return Some(type_id);
@@ -6084,6 +6273,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 self.number_literal(id, whole, fraction, suffix, span)?
             }
             Expr::String(text) => format!("vilan_rt::str_new({})", rust_string(text)),
+            Expr::Key(steps) => self.key_literal(id, &steps, span)?,
             // debugging.md S0: a `[track_caller]` call's location argument, a
             // `Copy` handle over a `&'static str`.
             Expr::CallerLocation(anchor) => format!(
@@ -6271,11 +6461,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let field = self.field_name(subject, index, span)?;
                 format!("{subject_text}.{field}")
             }
-            Expr::Index(..) if self.program.key_subscripts.contains(&id) => {
-                return Err(unsupported(
-                    "the expression form a subscript through a struct key (`s[k]`)",
-                    span,
-                ));
+            // B711 S1b: `s[k]` — the field chain through a literal, the field
+            // borrowed through a held key's access (R11).
+            Expr::Index(subject, index) if self.program.key_subscripts.contains(&id) => {
+                if let Some(read) = self.shared_view_field_read(id, depth)? {
+                    return Ok(read);
+                }
+                let subject_text = self.expression(subject, depth)?;
+                self.key_subscript_read(&subject_text, index, depth, span)?
             }
             Expr::Index(subject, index) => {
                 if let Some(read) = self.shared_view_field_read(id, depth)? {
@@ -7648,6 +7841,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         depth: usize,
     ) -> Result<(), Error> {
         match self.program.entity_map.get(&place).cloned() {
+            Some(Expr::Index(subject, index)) if self.program.key_subscripts.contains(&place) => {
+                self.hoist_subscripts(subject, prelude, depth)?;
+                if let Some(name) = self.hoist_key_index(index, prelude, depth)? {
+                    self.hoisted.insert(index, name);
+                }
+                Ok(())
+            }
             Some(Expr::Index(subject, index)) => {
                 self.hoist_subscripts(subject, prelude, depth)?;
                 let name = format!("__hoist{}", self.hoisted.len());
@@ -7869,6 +8069,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.program.entity_map.get(&target).cloned(),
             self.program.entity_map.get(&reread).cloned(),
         ) {
+            (
+                Some(Expr::Index(target_subject, target_index)),
+                Some(Expr::Index(reread_subject, reread_index)),
+            ) if self.program.key_subscripts.contains(&target) => {
+                self.pair_places(target_subject, reread_subject, prelude, depth)?;
+                if let Some(name) = self.hoist_key_index(target_index, prelude, depth)? {
+                    self.hoisted.insert(target_index, name.clone());
+                    self.hoisted.insert(reread_index, name);
+                }
+                Ok(())
+            }
             (
                 Some(Expr::Index(target_subject, target_index)),
                 Some(Expr::Index(reread_subject, reread_index)),
@@ -9410,6 +9621,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
         self.current_substitution = saved;
         if let Some(error) = failed {
             return Err(error);
+        }
+        // B711 S1b: a `const` key (`const Task.meta.owner`) is its path; its
+        // access is rebuilt from the path's positions over its root type.
+        if self.program.key_struct_id == Some(struct_id) {
+            let positions = const_key_positions(items).ok_or_else(|| {
+                unsupported("a `const` key whose path this backend cannot read", span)
+            })?;
+            let access = self.key_access_from_positions(arguments, &positions, span)?;
+            fields.push(format!("{KEY_ACCESS}: {access}"));
         }
         Ok(format!("{name} {{ {} }}", fields.join(", ")))
     }
@@ -11187,7 +11407,341 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.current_substitution = saved;
             parts.push(format!("{name}: {}", rendered?));
         }
+        if self.program.key_struct_id == Some(struct_id) {
+            let access = self.composed_key_access(fields, depth, span)?;
+            parts.push(format!("{KEY_ACCESS}: {access}"));
+        }
         Ok(format!("{} {{ {} }}", instance.name, parts.join(", ")))
+    }
+
+    // --- B711 S1b: struct keys natively (R11) ----------------------------------
+
+    /// The Rust type of a `Key<S, F>` instance's access, `entries` its two
+    /// bindings.
+    fn key_access_type(
+        &mut self,
+        entries: &[(TypeId, TypeId)],
+        span: Span,
+    ) -> Result<String, Error> {
+        let [(_, root), (_, field)] = entries else {
+            return Err(unsupported(
+                "a `Key` whose type arguments are not two",
+                span,
+            ));
+        };
+        let root = self.rust_type(*root, span)?;
+        let field = self.rust_type(*field, span)?;
+        Ok(format!("vilan_rt::KeyAccess<{root}, {field}>"))
+    }
+
+    /// The `S` and `F` of a key-typed expression, as Rust types.
+    fn key_type_arguments(&mut self, key: Id, span: Span) -> Result<Vec<TypeId>, Error> {
+        // A generic struct's literal (`Pair.left`) takes its arguments from
+        // where it lands (R8), so its own record may be open where the
+        // position's is not.
+        let recorded = self
+            .settled_value_type(key)
+            .map(|type_id| self.deeply_resolved(type_id))
+            .filter(|type_id| self.is_grounded(*type_id));
+        let type_id = recorded
+            .or_else(|| {
+                let expected = self.expected_type?;
+                let expected = self.deeply_resolved(expected);
+                self.is_grounded(expected).then_some(expected)
+            })
+            .ok_or_else(|| unsupported("a struct key of an unresolved type", span))?;
+        match self.resolve(type_id) {
+            Some(Type::Struct(struct_id, arguments))
+                if self.program.key_struct_id == Some(*struct_id) && arguments.len() == 2 =>
+            {
+                Ok(arguments.clone())
+            }
+            _ => Err(unsupported("a struct key of an unresolved type", span)),
+        }
+    }
+
+    /// `.a.b` — the Rust field chain of a key's steps, each step the struct
+    /// that declares the field and the field's position.
+    fn key_field_chain(&self, steps: &[(Id, usize)], span: Span) -> Result<String, Error> {
+        let mut chain = String::new();
+        for (owner, index) in steps {
+            let field = self
+                .program
+                .structs
+                .get(owner)
+                .and_then(|declaration| declaration.fields.get(*index))
+                .ok_or_else(|| unsupported("a struct key step past its struct's fields", span))?;
+            let _ = write!(chain, ".{}", sanitize(field.name));
+        }
+        Ok(chain)
+    }
+
+    /// The access of a key over `S` (`arguments` = `[S, F]`) whose field chain
+    /// is `chain`: two non-capturing functions, so a literal allocates nothing
+    /// for it.
+    fn key_field_access(
+        &mut self,
+        arguments: &[TypeId],
+        chain: &str,
+        span: Span,
+    ) -> Result<String, Error> {
+        let [root, field] = arguments else {
+            return Err(unsupported(
+                "a `Key` whose type arguments are not two",
+                span,
+            ));
+        };
+        let root = self.rust_type(*root, span)?;
+        let field = self.rust_type(*field, span)?;
+        Ok(format!(
+            "vilan_rt::KeyAccess::<{root}, {field}>::field(|subject| &subject{chain}, \
+             |subject| &mut subject{chain})"
+        ))
+    }
+
+    /// A key's access from its path's POSITIONS alone (a `const` key), walking
+    /// the declared field types down from the root struct.
+    fn key_access_from_positions(
+        &mut self,
+        arguments: &[TypeId],
+        positions: &[usize],
+        span: Span,
+    ) -> Result<String, Error> {
+        let root = arguments
+            .first()
+            .copied()
+            .ok_or_else(|| unsupported("a `Key` with no root type", span))?;
+        let root = self.deeply_resolved(root);
+        let mut owner = match self.resolve(root) {
+            Some(Type::Struct(struct_id, _)) => Some(*struct_id),
+            _ => None,
+        };
+        let mut steps = Vec::new();
+        for position in positions {
+            let struct_id =
+                owner.ok_or_else(|| unsupported("a `const` key through a non-struct", span))?;
+            steps.push((struct_id, *position));
+            owner = self
+                .program
+                .structs
+                .get(&struct_id)
+                .and_then(|declaration| declaration.fields.get(*position))
+                .and_then(|field| match self.resolve(field.type_id) {
+                    Some(Type::Struct(next, _)) => Some(*next),
+                    _ => None,
+                });
+        }
+        let chain = self.key_field_chain(&steps, span)?;
+        self.key_field_access(arguments, &chain, span)
+    }
+
+    /// A key LITERAL (`Task.meta.owner`) as a value: `std::key`'s layout —
+    /// the path that is its identity — and its access, two non-capturing
+    /// functions over the field chain.
+    fn key_literal(&mut self, id: Id, steps: &[(Id, usize)], span: Span) -> Result<String, Error> {
+        let arguments = self.key_type_arguments(id, span)?;
+        let key_id = self
+            .program
+            .key_struct_id
+            .ok_or_else(|| unsupported("a struct key without `std::key`", span))?;
+        let key = self.ensure_struct(key_id, &arguments, span)?.name;
+        let path_id = self
+            .program
+            .structs
+            .get(&key_id)
+            .and_then(|declaration| declaration.fields.first())
+            .and_then(|field| match self.resolve(field.type_id) {
+                Some(Type::Struct(path_id, _)) => Some(*path_id),
+                _ => None,
+            })
+            .ok_or_else(|| unsupported("a `Key` whose path is no struct", span))?;
+        let step_id = self
+            .program
+            .structs
+            .get(&path_id)
+            .and_then(|declaration| declaration.fields.first())
+            .and_then(|field| match self.resolve(field.type_id) {
+                Some(Type::Struct(_, element)) => element.first().copied(),
+                _ => None,
+            })
+            .and_then(|element| match self.resolve(element) {
+                Some(Type::Struct(step_id, _)) => Some(*step_id),
+                _ => None,
+            })
+            .ok_or_else(|| unsupported("a `KeyPath` whose steps are no list of structs", span))?;
+        let path = self.ensure_struct(path_id, &[], span)?.name;
+        let step = self.ensure_struct(step_id, &[], span)?.name;
+        let mut parts = Vec::new();
+        for (owner, index) in steps {
+            let name = self
+                .program
+                .structs
+                .get(owner)
+                .and_then(|declaration| declaration.fields.get(*index))
+                .map_or("", |field| field.name);
+            parts.push(format!(
+                "{step} {{ owner: vilan_rt::str_new({}), index: {index}usize, name: vilan_rt::str_new({}) }}",
+                rust_literal(&self.program.key_step_owner(*owner)),
+                rust_literal(name),
+            ));
+        }
+        let chain = self.key_field_chain(steps, span)?;
+        let access = self.key_field_access(&arguments, &chain, span)?;
+        let value = format!(
+            "{key} {{ erased: {path} {{ parts: vec![{}] }}, {KEY_ACCESS}: {access} }}",
+            parts.join(", ")
+        );
+        // Built once per thread and copied where it is written, as the JS
+        // emitter hoists one constant per distinct literal: evaluating a
+        // literal is a copy (one allocation, the path's list; its strings are
+        // counted and its access is two function pointers).
+        if let Some(name) = self.key_literals.get(&value) {
+            return Ok(format!("{name}()"));
+        }
+        let name = format!("__key_literal{}", self.key_literals.len());
+        let slot = self.next_type_slot;
+        self.next_type_slot += 1;
+        let mut out = String::new();
+        let _ = writeln!(out, "fn {name}() -> {key} {{");
+        let _ = writeln!(out, "    thread_local! {{ static KEY: {key} = {value}; }}");
+        let _ = writeln!(out, "    KEY.with(|key| key.clone())");
+        let _ = writeln!(out, "}}");
+        self.types.insert(slot, out);
+        self.key_literals.insert(value, name.clone());
+        Ok(format!("{name}()"))
+    }
+
+    /// The access of the one `Key` literal std writes: `then`'s `Key { erased
+    /// = self.erased.then(next.erased) }`. The path is composed by std's code,
+    /// and the access composes the same two keys' accesses, in the same
+    /// order, so the two cannot disagree (K5). A `Key` built any other way has
+    /// no access to give it, and is refused by name.
+    fn composed_key_access(
+        &mut self,
+        fields: &[(usize, Id)],
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        let refused = || unsupported("a `Key` built other than by a key literal or `then`", span);
+        let Some(&(_, erased)) = fields.iter().find(|(index, _)| *index == 0) else {
+            return Err(refused());
+        };
+        let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&erased) else {
+            return Err(refused());
+        };
+        let call = self
+            .program
+            .function_calls
+            .get(&call_id)
+            .ok_or_else(refused)?;
+        let mut halves = Vec::new();
+        for argument in call.argument_ids.clone() {
+            let Some(&Expr::Field(key, struct_id, 0)) = self.program.entity_map.get(&argument)
+            else {
+                return Err(refused());
+            };
+            if self.program.key_struct_id != Some(struct_id) {
+                return Err(refused());
+            }
+            halves.push(self.expecting_nothing(|emitter| emitter.expression(key, depth))?);
+        }
+        let [first, next] = halves.as_slice() else {
+            return Err(refused());
+        };
+        Ok(format!(
+            "vilan_rt::KeyAccess::then(&({first}).{KEY_ACCESS}, &({next}).{KEY_ACCESS})"
+        ))
+    }
+
+    /// The field positions of a key subscript's index when it is written as a
+    /// key LITERAL (`s[Task.meta.owner]`) — the place is then the plain field
+    /// chain, as on JS. `None` for a key held in a value.
+    fn key_literal_steps(&self, index: Id) -> Option<Vec<(Id, usize)>> {
+        let mut current = index;
+        while let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&current) {
+            current = *inner;
+        }
+        match self.program.entity_map.get(&current) {
+            Some(Expr::Key(steps)) if !self.program.const_results.contains_key(&current) => {
+                Some(steps.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The access a subscript through a key HELD in a value reaches with: the
+    /// temp a hoist settled it in, or the key's own. A WRITE takes a copy (two
+    /// pointers or a count), so the place holds no borrow of the key while it
+    /// borrows the subject mutably: `s[s.k] = v` writes a field of `s` through
+    /// a key `s` holds.
+    fn held_key_access(&mut self, index: Id, depth: usize, writes: bool) -> Result<String, Error> {
+        if let Some(name) = self.hoisted.get(&index) {
+            return Ok(name.clone());
+        }
+        let key = self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
+        if writes {
+            return Ok(format!("({key}).{KEY_ACCESS}.clone()"));
+        }
+        Ok(format!("({key}).{KEY_ACCESS}"))
+    }
+
+    /// `s[k]` read, over the rendered subject: the field chain for a literal,
+    /// the field borrowed through the access for a held key.
+    fn key_subscript_read(
+        &mut self,
+        subject_text: &str,
+        index: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if let Some(steps) = self.key_literal_steps(index) {
+            return Ok(format!(
+                "{subject_text}{}",
+                self.key_field_chain(&steps, span)?
+            ));
+        }
+        let access = self.held_key_access(index, depth, false)?;
+        Ok(format!("(*vilan_rt::key_ref(&{access}, &{subject_text}))"))
+    }
+
+    /// `s[k]` as a place the program writes, over the rendered subject place.
+    fn key_subscript_place(
+        &mut self,
+        subject: Id,
+        index: Id,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if let Some(steps) = self.key_literal_steps(index) {
+            let subject_text = self.mutable_place(subject, depth)?;
+            return Ok(format!(
+                "{subject_text}{}",
+                self.key_field_chain(&steps, span)?
+            ));
+        }
+        let subject_text = self.mutable_receiver(subject, depth)?;
+        let access = self.held_key_access(index, depth, true)?;
+        Ok(format!(
+            "(*vilan_rt::key_mut(&{access}, &mut {subject_text}))"
+        ))
+    }
+
+    /// The hoist of a key subscript's index ahead of a write (B105's order):
+    /// a held key's access is settled in a `let`; a literal settles nothing,
+    /// its place being a field chain.
+    fn hoist_key_index(
+        &mut self,
+        index: Id,
+        prelude: &mut String,
+        depth: usize,
+    ) -> Result<Option<String>, Error> {
+        if self.key_literal_steps(index).is_some() {
+            return Ok(None);
+        }
+        let access = self.held_key_access(index, depth, true)?;
+        let name = format!("__hoist{}", self.hoisted.len());
+        let _ = write!(prelude, "let {name} = {access}; ");
+        Ok(Some(name))
     }
 
     fn for_each(
@@ -15353,8 +15907,18 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 _ => None,
             };
             place
-                .and_then(|place| self.place_spine(place))
-                .is_some_and(|(root, _)| {
+                .and_then(|place| {
+                    self.place_spine(place)
+                        .map(|(root, _)| root)
+                        // B711 S1b: a place through a held key borrows its
+                        // whole root for the call, as it is chosen at run time.
+                        .or_else(|| {
+                            self.place_reaches_through_a_held_key(place)
+                                .then(|| self.root_binding_of_place(place))
+                                .flatten()
+                        })
+                })
+                .is_some_and(|root| {
                     argument_ids
                         .iter()
                         .enumerate()
@@ -15444,6 +16008,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let mut views = 0;
         self.refuse_a_closure_beside_a_cell_view(&conventions, argument_ids)?;
         self.refuse_two_loans_of_one_promoted_root(&conventions, argument_ids)?;
+        self.refuse_two_loans_through_a_held_key(&conventions, argument_ids)?;
         // The callee's WHOLE parameter list, hidden context parameters
         // included (they have no `parameters` record, so `declared` omits
         // them). A call can carry MORE arguments than that: the context pass
@@ -16069,7 +16634,8 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Some((CellRoot::Boxed(_), steps)) => (
                 false,
                 steps.iter().any(|step| {
-                    matches!(step, Step::Index(_, subscript) if !self.runs_no_code(*subscript))
+                    matches!(step, Step::Index(_, subscript) | Step::Key(subscript)
+                        if !self.runs_no_code(*subscript))
                 }),
             ),
             None => match self.module_place_subscripts_run_code(place) {
@@ -16517,6 +17083,15 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &Expr::Field(subject, _, index) => {
                 let (binding, mut path) = self.place_spine(subject)?;
                 path.push(index);
+                Some((binding, path))
+            }
+            // B711 S1b: a subscript through a key LITERAL is its field chain,
+            // so it is the field spine its steps spell. A key held in a value
+            // names no field the emitter can see, as a list element names none.
+            &Expr::Index(subject, index) if self.program.key_subscripts.contains(&id) => {
+                let steps = self.key_literal_steps(index)?;
+                let (binding, mut path) = self.place_spine(subject)?;
+                path.extend(steps.iter().map(|(_, position)| *position));
                 Some((binding, path))
             }
             _ => None,
@@ -18554,6 +19129,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let field = self.field_name(subject, index, self.span_of(id))?;
                 Ok(format!("{subject_text}.{field}"))
             }
+            Some(Expr::Index(subject, index)) if self.program.key_subscripts.contains(&id) => {
+                self.key_subscript_place(subject, index, depth, self.span_of(id))
+            }
             Some(Expr::Index(subject, index)) => {
                 let subject_text = self.mutable_place(subject, depth)?;
                 let index_text =
@@ -19165,8 +19743,6 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
         Expr::Destructure(_, _) => "a destructuring binding",
         Expr::Generic(_) => "a generic type reference",
         Expr::Macro => "a macro name",
-        // B711 S1a: keys are JS-only until S1b gives a native key its access.
-        Expr::Key(_) => "a struct key (`Task.title`)",
         _ => "an unsupported form",
     }
 }

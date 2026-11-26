@@ -9,8 +9,13 @@ where a program writes their types:
 import std::key::{ KeyPath, KeyStep };
 ```
 
-*Keys are emitted by the JS backend only for now: a native build refuses a
-program that uses one by name.*
+Keys work on both backends, with the same output. One shape is still
+refused by the native backend (`--backend rust`), by name: a call handed two
+loans into one value where one reaches through a key held in a value,
+`both(&mut s[j], &mut s[k])`. Rust cannot see that two run-time places are
+apart, so the build names the shape rather than failing in rustc. A key
+literal there is its field chain, so `both(&mut s[S.a], &mut s[S.b])` builds,
+as `both(&mut s.a, &mut s.b)` does.
 
 ## At a glance
 
@@ -60,6 +65,22 @@ fun main() {
 	print(pair[Pair.right]);  // 2: the subject gives the arguments
 }
 ```
+
+## What a key costs
+
+A key is a plain value with no cycles: copying one is cheap, and storing one
+keeps nothing else alive.
+
+- **A subscript through a literal** (`task[Task.meta.owner]`) is the field
+  access itself, on both backends: no key value is built.
+- **A key held in a value** reaches its field through the steps it carries on
+  the JS backend. Natively it carries the field's two accessors, one to read
+  and one to write, beside its path.
+- **A literal as a value** is one constant per distinct literal, copied where
+  it is written. Natively a copy allocates the path's list once. The step
+  names are shared, and a literal's accessors are two plain functions.
+- **`then`** builds the joined path and, natively, one shared allocation for
+  the composed accessors. A copy of the result shares that allocation.
 
 ## Identity
 
