@@ -1230,7 +1230,7 @@ DEALINGS IN THE SOFTWARE.
 --------------------------------------------------------------------------------
 MIT License
 
-Covers: cookie 0.18.2
+Covers: cookie 0.18.3
 
 Copyright (c) 2017 Sergio Benitez
 Copyright (c) 2014 Alex Crichton
