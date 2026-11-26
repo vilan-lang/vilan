@@ -246,6 +246,15 @@ macro_rules! tuple_at_for_tuple {
                 }
             }
         }
+
+        impl<$($name: 'static),+> TupleAtMut for ($($name,)+) {
+            fn element_at_mut(&mut self, at: usize) -> Option<&mut dyn std::any::Any> {
+                match at {
+                    $($at => Some(&mut self.$at),)+
+                    _ => None,
+                }
+            }
+        }
     };
 }
 
@@ -254,6 +263,14 @@ impl<T: TupleAt + ?Sized> TupleAt for &T {
     fn element_at(&self, at: usize) -> Option<&dyn std::any::Any> {
         (**self).element_at(at)
     }
+}
+
+/// [`TupleAt`]'s writable twin (B711 S1c): each position's element as a
+/// `&mut dyn Any`, so [`tuple_mut`] can hand back a real `&mut` to it at the
+/// type the place names — `t[k] = v`, `&mut t[k]`, a view return of `t[k]`.
+pub trait TupleAtMut: TupleAt {
+    /// The element at `at`, or `None` past the end.
+    fn element_at_mut(&mut self, at: usize) -> Option<&mut dyn std::any::Any>;
 }
 
 tuple_at_for_tuple!(A 0);
@@ -279,6 +296,55 @@ pub fn tuple_get<U: Clone + 'static>(tuple: &impl TupleAt, key: TupleKey) -> U {
             key.0
         )),
     }
+}
+
+/// `t[k]` (B711 S1c): a tuple's element reached through a [`TupleKey`], in
+/// place. Methods, so a call through a VIEW of a tuple (`t: &T`) borrows the
+/// tuple it views rather than the binding: the emitted program brings the
+/// trait into scope only where it subscripts a tuple by a key.
+///
+/// Each is one match on the position and one type-id comparison. The compiler
+/// proved the key names a position of this tuple's family holding a `U`, so a
+/// miss is a backend defect and says so.
+pub trait TupleKeyed {
+    /// The element `key` names, borrowed at the type `U` the place has: a read
+    /// copies only what it reads through this.
+    fn tuple_ref<U: 'static>(&self, key: TupleKey) -> &U;
+
+    /// The element as a place written — `t[k] = v`, `&mut t[k]`, a view
+    /// return of it: a real `&mut` to the element.
+    fn tuple_mut<U: 'static>(&mut self, key: TupleKey) -> &mut U;
+}
+
+impl<T: TupleAtMut + ?Sized> TupleKeyed for T {
+    fn tuple_ref<U: 'static>(&self, key: TupleKey) -> &U {
+        match self
+            .element_at(key.0)
+            .and_then(|element| element.downcast_ref::<U>())
+        {
+            Some(element) => element,
+            None => tuple_key_miss(key),
+        }
+    }
+
+    fn tuple_mut<U: 'static>(&mut self, key: TupleKey) -> &mut U {
+        match self
+            .element_at_mut(key.0)
+            .and_then(|element| element.downcast_mut::<U>())
+        {
+            Some(element) => element,
+            None => tuple_key_miss(key),
+        }
+    }
+}
+
+#[cold]
+fn tuple_key_miss(key: TupleKey) -> ! {
+    panic_with(&format!(
+        "a tuple key at position {} does not name an element of the type it was read as \
+         (a backend defect)",
+        key.0
+    ))
 }
 
 /// A `List` is a JS array: node's layout ([`inspect::array`]). At the top of a

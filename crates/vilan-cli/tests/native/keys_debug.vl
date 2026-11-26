@@ -1,0 +1,28 @@
+// B711 S1c: `Debug` for keys natively and on JS - a derived `Debug` over a
+// struct holding a `Key` and a `KeyPath`, and a step's `debug()`.
+import std::key::{ KeyPath, KeyStep };
+
+struct Meta {
+	owner: str,
+}
+
+struct Task {
+	title: str,
+	meta: Meta,
+}
+
+[derive(Debug)]
+struct Row {
+	key: Key<Task, str>,
+	path: KeyPath,
+	label: str,
+}
+
+fun main() {
+	let k = Task.meta.owner;
+	let r = Row { key = k, path = k.path(), label = "x" };
+	print(r.debug());
+	print(k.debug());
+	print(k.path().steps()[1].debug());
+	dbg(r);
+}

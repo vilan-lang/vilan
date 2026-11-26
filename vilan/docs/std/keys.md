@@ -113,6 +113,15 @@ It is for display and debugging, NOT a stable storage format: it moves when the
 file is renamed or its declarations move. Data that outlives a build stores a
 key by `name()` (`"meta.owner"`), which a later stage reads back.
 
+## Debug
+
+`Key`, `KeyPath` and `KeyStep` implement `Debug`, so `[derive(Debug)]` takes a
+struct holding one. A key debugs as it is written — `Task.meta.owner`, its root
+struct's name and its fields' — a path as `KeyPath(Task.meta.owner)` and a step
+as `KeyStep(Meta.owner)`. `print` and `dbg` show a key's layout instead.
+`[derive(Json)]` and `[derive(Wire)]` refuse a struct with a key field: a key's
+encoding (by index on the wire, by name in stored data) is a later stage.
+
 ## What a key does not reach
 
 A key's steps reach the fields of structs the program declares. A step into an

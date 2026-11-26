@@ -161,3 +161,50 @@ export impl KeyStep {
 		self.owner
 	}
 }
+
+// B711 S1c: `Debug` for keys. (Imported here, below everything above, so the lines
+// above keep their positions.)
+
+import pkg::debug::Debug;
+
+/// A key debugs as it is written: `Task.meta.owner` — its root struct's name and
+/// its fields', as `S.x` spells it in source.
+export impl Key<type S, type F> with Debug {
+	fun debug(self): str {
+		written(self.erased)
+	}
+}
+
+/// `KeyPath(Task.meta.owner)`: the path as its key is written.
+export impl KeyPath with Debug {
+	fun debug(self): str {
+		i"KeyPath({written(self)})"
+	}
+}
+
+/// `KeyStep(Task.meta)`: the field, by its struct's name and its own.
+export impl KeyStep with Debug {
+	fun debug(self): str {
+		i"KeyStep({owner_name(self)}.{self.name})"
+	}
+}
+
+/// A path as a key literal writes it, `Task.meta.owner`: the root's name, then each
+/// step's field (`Debug`'s spelling). A key always has a step.
+fun written(path: KeyPath): str {
+	if path.parts.len() == 0 {
+		ret "";
+	}
+	mut out = owner_name(path.parts[0]);
+	for step in path.parts {
+		out = out + "." + step.name;
+	}
+	out
+}
+
+/// A step's owner by its struct's name alone, without its file, enclosing items or
+/// ordinal: `Task` for `src/model.vl::Task`.
+fun owner_name(step: KeyStep): str {
+	let segments = step.owner.split("::");
+	segments[segments.len() - 1].split("#")[0]
+}

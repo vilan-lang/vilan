@@ -76,3 +76,39 @@ impl type T: (2..) with Tuple {
 
 	external fun map<F>(self, transform: F): T;
 }
+
+// B711 S1c (`proposal/struct-keys.md` R10): a key's identity. For `t` of the family
+// and `k: TupleKey<T, U>`, `t[k]` is the element as a place: read it, assign it,
+// take `&t[k]` or `&mut t[k]`, or hand it back from a view return. (Imported
+// here, below everything above, so the lines above keep their positions.)
+
+import pkg::compare::PartialEq;
+import pkg::debug::Debug;
+import pkg::hash::{ Hash, Hashable, canonical_hash };
+
+impl TupleKey<type T, type U> {
+	/// The position this key names, counting from 0.
+	external fun index(self): usize;
+}
+
+/// Two keys of one family and element type are equal when they name the same
+/// position.
+impl TupleKey<type T, type U> with PartialEq {
+	fun eq(self, other: TupleKey<T, U>): bool {
+		self.index() == other.index()
+	}
+}
+
+/// A key hashes as its position, so it keys a `HashMap` or a `HashSet`.
+impl TupleKey<type T, type U> with Hashable {
+	fun hash(self): Hash {
+		canonical_hash(self.index())
+	}
+}
+
+/// `TupleKey(1)`: the position.
+impl TupleKey<type T, type U> with Debug {
+	fun debug(self): str {
+		i"TupleKey({self.index()})"
+	}
+}

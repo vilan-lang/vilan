@@ -1,0 +1,60 @@
+// B711 S1c: tuple keys in place natively and on JS - reads, writes, compound
+// writes, member writes, views, the generic accessor at a scalar and a struct,
+// identity (==, hash, a map and a set key), a nested tuple read and written whole.
+import std::hash_map::HashMap;
+import std::hash_set::HashSet;
+import std::tuple::{ Tuple, TupleKey };
+
+struct P {
+	x: i32,
+	y: i32,
+}
+
+fun at<T: (2..), U>(t: &mut T, k: TupleKey<T, U>): &mut U borrows t {
+	t[k]
+}
+
+fun peek<T: (2..), U>(t: &T, k: TupleKey<T, U>): &U borrows t {
+	t[k]
+}
+
+fun bump(x: &mut i32) {
+	x += 100;
+}
+
+fun main() {
+	mut t = (1, "a", P { x = 1, y = 2 });
+	let (a, b, c) = t.keys();
+	print(t[a]);
+	print(t[b]);
+	t[a] = 5;
+	t[a] += 2;
+	t[b] = t[b] + "z";
+	t[c].x = 40;
+	bump(&mut t[a]);
+	print(t);
+	let r = &t[c];
+	print(r.y);
+	at(&mut t, a) += 1;
+	at(&mut t, c).y = 9;
+	print(peek(&t, b));
+	print(t);
+	print((a.index(), b.index(), c.index()));
+	print((a == a, a.debug()));
+	mut seen: HashMap<TupleKey<(i32, i32), i32>, str> = HashMap::new();
+	let (p, q) = (3, 4).keys();
+	seen.insert(p, "p");
+	seen.insert(q, "q");
+	print((seen.get(p), seen.len(), p == q));
+	mut set: HashSet<TupleKey<(i32, i32), i32>> = HashSet::new();
+	set.insert(p);
+	set.insert(p);
+	print(set.len());
+	mut n = (1, (2, 3), 4);
+	let (n0, n1, n2) = n.keys();
+	print((n[n1], n[n2]));
+	n[n2] = 9;
+	n[n1] = (7, 8);
+	n[n0] += 1;
+	print(n);
+}

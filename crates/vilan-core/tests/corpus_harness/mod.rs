@@ -214,6 +214,7 @@ macro_rules! corpus_manifest {
             transparent_references => "transparent-references.vl",
             try_assert => "try-assert.vl",
             tuple_access => "tuple-access.vl",
+            tuple_keys => "tuple-keys.vl",
             tuple_spread => "tuple-spread.vl",
             unary_minus => "unary-minus.vl",
             unsigned_saturate => "unsigned-saturate.vl",

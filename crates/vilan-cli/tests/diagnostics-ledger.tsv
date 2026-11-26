@@ -812,3 +812,6 @@ NEW	-	`{field}` is an `[internal]` field of std's `{owner}`, and an internal std
 NEW	-	struct '{owner}' has no field '{field}'{suggestion}
 NEW	-	this key's struct type arguments are never determined: give the key its type where it is made
 NEW	-	this key reaches into a `{key}`, and the subject is a `{subject}`: a key indexes only the struct it was made from
+NEW	-	this tuple key names an element that is itself a tuple, `{element}`, and {what} is refused: tuples store flat, so a nested tuple reached through a key is no place of its own
+NEW	-	`{name}` is an `external` struct, which no literal can build: {origin}
+NEW	-	this key is a `{key}`, and the subject is a `{subject}`: a tuple key indexes only a tuple of the family it was minted for, or a tuple mapped from that family

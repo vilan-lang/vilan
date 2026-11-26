@@ -1131,6 +1131,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
 
         let mut source = String::from(PRELUDE);
+        // B711 S1c: a tuple key's place is a method (`t.tuple_ref::<U>(k)`),
+        // so a view of a tuple reaches its element through the view, not
+        // through a borrow of the binding holding it.
+        if !self.program.tuple_key_subscripts.is_empty() {
+            source.push_str("use vilan_rt::TupleKeyed as _;\n");
+        }
         for declaration in self.types.values() {
             source.push('\n');
             source.push_str(declaration);
@@ -1509,7 +1515,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if self.program.key_subscripts.is_empty() {
             return Ok(());
         }
-        let mut loans: Vec<(Id, bool, bool)> = Vec::new();
+        let mut loans: Vec<(Id, bool, bool, Id)> = Vec::new();
         for (index, argument) in argument_ids.iter().enumerate() {
             let writes = match conventions.get(index) {
                 Some(Receiving::RefMut) => true,
@@ -1524,17 +1530,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 continue;
             };
             let through_a_key = self.place_reaches_through_a_held_key(place);
-            if loans.iter().any(|(other_root, other_writes, other_key)| {
-                *other_root == root && (writes || *other_writes) && (through_a_key || *other_key)
-            }) {
+            if let Some(&(_, _, _, other_place)) =
+                loans
+                    .iter()
+                    .find(|(other_root, other_writes, other_key, _)| {
+                        *other_root == root
+                            && (writes || *other_writes)
+                            && (through_a_key || *other_key)
+                    })
+            {
+                // B711 S1c: a tuple key's position is chosen at run time too.
+                let tuple = [place, other_place]
+                    .iter()
+                    .any(|place| self.place_reaches_through_a_held_tuple_key(*place));
                 return Err(unsupported(
-                    "two loans into one value at a call, one of them `&mut` and one through a \
-                     struct key held in a value (`both(&mut s[j], &mut s[k])`: the key's place is \
-                     chosen at run time, so Rust cannot see the two are apart)",
+                    if tuple {
+                        "two loans into one value at a call, one of them `&mut` and one through a \
+                         tuple key held in a value (`both(&mut t[j], &mut t[k])`: the key's \
+                         position is chosen at run time, so Rust cannot see the two are apart)"
+                    } else {
+                        "two loans into one value at a call, one of them `&mut` and one through a \
+                         struct key held in a value (`both(&mut s[j], &mut s[k])`: the key's place \
+                         is chosen at run time, so Rust cannot see the two are apart)"
+                    },
                     self.span_of(*argument),
                 ));
             }
-            loans.push((root, writes, through_a_key));
+            loans.push((root, writes, through_a_key, place));
         }
         Ok(())
     }
@@ -1548,6 +1570,27 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     if self.program.key_subscripts.contains(&place)
                         && self.key_literal_steps(index).is_none()
                     {
+                        return true;
+                    }
+                    place = subject;
+                }
+                Some(
+                    &Expr::Field(subject, _, _)
+                    | &Expr::TupleIndex(subject, _, _)
+                    | &Expr::Dereference(subject),
+                ) => place = subject,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether a place spine passes through a subscript by a TUPLE key
+    /// (B711 S1c) — always held in a value.
+    fn place_reaches_through_a_held_tuple_key(&self, mut place: Id) -> bool {
+        loop {
+            match self.program.entity_map.get(&place) {
+                Some(&Expr::Index(subject, index)) => {
+                    if self.program.tuple_key_subscripts.contains_key(&index) {
                         return true;
                     }
                     place = subject;
@@ -4764,6 +4807,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     let access = self.held_key_access(index, depth, true)?;
                     let name = format!("{prefix}{settled}");
                     *settled += 1;
+                    if let Some(element) = self.tuple_key_element(index) {
+                        let _ = write!(subscripts, "let {name} = {access}; ");
+                        path = format!("(*({path}).tuple_ref{element}({name}))");
+                        continue;
+                    }
                     let _ = write!(subscripts, "let {name} = &{access}; ");
                     path = format!("(*vilan_rt::key_ref({name}, &{path}))");
                 }
@@ -11678,6 +11726,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if let Some(name) = self.hoisted.get(&index) {
             return Ok(name.clone());
         }
+        // B711 S1c: a tuple key is its position, `Copy`: it is its own access.
+        if self.program.tuple_key_subscripts.contains_key(&index) {
+            return self.expecting_nothing(|emitter| emitter.value_of(index, depth));
+        }
         let key = self.expecting_nothing(|emitter| emitter.expression(index, depth))?;
         if writes {
             return Ok(format!("({key}).{KEY_ACCESS}.clone()"));
@@ -11701,6 +11753,9 @@ impl<'a, 'src> Emitter<'a, 'src> {
             ));
         }
         let access = self.held_key_access(index, depth, false)?;
+        if let Some(element) = self.tuple_key_element(index) {
+            return Ok(format!("(*({subject_text}).tuple_ref{element}({access}))"));
+        }
         Ok(format!("(*vilan_rt::key_ref(&{access}, &{subject_text}))"))
     }
 
@@ -11721,9 +11776,31 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         let subject_text = self.mutable_receiver(subject, depth)?;
         let access = self.held_key_access(index, depth, true)?;
+        if let Some(element) = self.tuple_key_element(index) {
+            return Ok(format!("(*({subject_text}).tuple_mut{element}({access}))"));
+        }
         Ok(format!(
             "(*vilan_rt::key_mut(&{access}, &mut {subject_text}))"
         ))
+    }
+
+    /// B711 S1c: for a subscript through a TUPLE key, the turbofish naming the
+    /// element's Rust type under this instance (`::<i32>`) — empty where the
+    /// type does not render, leaving it to rustc — and `None` for any other
+    /// subscript. A tuple key reaches its element through `Any`
+    /// (`vilan_rt::tuple_ref` / `tuple_mut`), because a key minted for `T` also
+    /// indexes every tuple mapped from `T`, so no one typed accessor fits it.
+    fn tuple_key_element(&mut self, index: Id) -> Option<String> {
+        let subscript = *self.program.tuple_key_subscripts.get(&index)?;
+        let span = self.span_of(subscript);
+        Some(
+            self.type_of(subscript)
+                .map(|type_id| self.deeply_resolved(type_id))
+                .filter(|type_id| self.is_grounded(*type_id))
+                .and_then(|type_id| self.rust_type(type_id, span).ok())
+                .map(|element| format!("::<{element}>"))
+                .unwrap_or_default(),
+        )
     }
 
     /// The hoist of a key subscript's index ahead of a write (B105's order):
@@ -18816,6 +18893,14 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         if matches!(intrinsic, Intrinsic::ListToArray) {
             return self.list_to_array(argument_ids, call, depth, span);
+        }
+        // B711 S1c: a tuple key's position.
+        if matches!(intrinsic, Intrinsic::TupleKeyIndex) {
+            let Some(&key) = argument_ids.first() else {
+                return Err(unsupported("a tuple key's `index` with no key", span));
+            };
+            let key_text = self.expecting_nothing(|emitter| emitter.value_of(key, depth))?;
+            return Ok(format!("({key_text}).0"));
         }
         // Argument 0 of an intrinsic is its RECEIVER, and every arm below
         // renders it as a place (`&`, `&mut`, or a method receiver). The rest

@@ -7612,6 +7612,93 @@ impl<'src> Transformer<'src> {
         }
     }
 
+    /// B711 S1c: where a `TupleKey` subscript's element sits in its subject's
+    /// FLAT array at this instance (tuples store flat, so a position's slot is
+    /// a property of the whole tuple type, as `get` reads it): the offset, as
+    /// an expression over the key's position `key[0]` — the position itself
+    /// where every element is one slot, else a lookup in the layout's offsets
+    /// — and, for an element that is itself a tuple, its width. `None` when
+    /// the subscript is through no tuple key.
+    fn tuple_key_slot(
+        &mut self,
+        subject_id: Id,
+        index_id: Id,
+        key: js::Node<'src>,
+    ) -> Option<(js::Node<'src>, Option<usize>)> {
+        let subscript_id = *self.program.tuple_key_subscripts.get(&index_id)?;
+        let at = js::Node::PropertyIndex(
+            Box::new(key),
+            Box::new(js::Node::Number("0".to_string(), None)),
+        );
+        let positions = self
+            .expr_type_id(subject_id)
+            .and_then(|type_id| self.tuple_positions(type_id));
+        let offset = match positions {
+            Some(positions)
+                if positions
+                    .iter()
+                    .enumerate()
+                    .any(|(at, (offset, width, _))| *width != 1 || *offset != at) =>
+            {
+                js::Node::PropertyIndex(
+                    Box::new(js::Node::Array(
+                        positions
+                            .iter()
+                            .map(|(offset, _, _)| js::Node::Number(offset.to_string(), None))
+                            .collect(),
+                    )),
+                    Box::new(at),
+                )
+            }
+            _ => at,
+        };
+        let element_width = self
+            .expr_type_id(subscript_id)
+            .map(|type_id| self.resolve_type_id(type_id))
+            .filter(|type_id| {
+                matches!(
+                    self.program.type_id_to_type_map.get(type_id),
+                    Some(Type::Tuple(..))
+                )
+            })
+            .map(|type_id| self.flat_width(type_id));
+        Some((offset, element_width))
+    }
+
+    /// `(($tuple, $offset[, $value]) => body)(tuple, offset[, value])`: a body
+    /// that reads its tuple and offset more than once, evaluating each once.
+    fn over_tuple_and_offset(
+        tuple: js::Node<'src>,
+        offset: js::Node<'src>,
+        value: Option<js::Node<'src>>,
+        body: impl FnOnce(js::Node<'src>, js::Node<'src>, Option<js::Node<'src>>) -> Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let names = ["$tuple", "$offset", "$value"];
+        let count = if value.is_some() { 3 } else { 2 };
+        let local = |name: &str| js::Node::Local(name.to_string());
+        let body = body(
+            local(names[0]),
+            local(names[1]),
+            value.is_some().then(|| local(names[2])),
+        );
+        let mut arguments = vec![tuple, offset];
+        arguments.extend(value);
+        js::Node::Call(
+            Box::new(js::Node::Closure(js::Closure {
+                parameters: names[..count]
+                    .iter()
+                    .map(|name| js::Parameter {
+                        name: name.to_string(),
+                    })
+                    .collect(),
+                body,
+                is_async: false,
+                origin: None,
+            })),
+            arguments,
+        )
+    }
+
     /// `subject[i0][i1]..` over the given positions.
     fn field_chain(subject: js::Node<'src>, positions: &[usize]) -> js::Node<'src> {
         positions.iter().fold(subject, |place, index| {
@@ -7637,6 +7724,27 @@ impl<'src> Transformer<'src> {
             return Self::field_chain(subject, &positions);
         }
         let key = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+        if let Some(slot) = self.tuple_key_slot(subject_id, index_id, key.clone()) {
+            return match slot {
+                (offset, None) => js::Node::PropertyIndex(Box::new(subject), Box::new(offset)),
+                // An element that is itself a tuple is its slots, copied out.
+                (offset, Some(width)) => {
+                    Self::over_tuple_and_offset(subject, offset, None, |tuple, offset, _| {
+                        vec![js::Node::Return(Box::new(js::Node::Call(
+                            Box::new(js::Node::Property(Box::new(tuple), "slice".to_string())),
+                            vec![
+                                offset.clone(),
+                                js::Node::Binary(
+                                    BinaryOp::Add,
+                                    Box::new(offset),
+                                    Box::new(js::Node::Number(width.to_string(), None)),
+                                ),
+                            ],
+                        )))]
+                    })
+                }
+            };
+        }
         self.used_helpers.insert("__key_at");
         js::Node::Call(
             Box::new(js::Node::Local("__key_at".to_string())),
@@ -7662,6 +7770,43 @@ impl<'src> Transformer<'src> {
             );
         }
         let key = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+        if let Some(slot) = self.tuple_key_slot(subject_id, index_id, key.clone()) {
+            return match slot {
+                (offset, None) => js::Node::Assignment(
+                    Box::new(js::Node::PropertyIndex(Box::new(subject), Box::new(offset))),
+                    Box::new(value),
+                ),
+                // An element that is itself a tuple writes each of its slots.
+                (offset, Some(width)) => Self::over_tuple_and_offset(
+                    subject,
+                    offset,
+                    Some(value),
+                    |tuple, offset, value| {
+                        let value = value.unwrap_or(js::Node::Void);
+                        let mut body: Vec<js::Node<'src>> = (0..width)
+                            .map(|slot| {
+                                js::Node::Assignment(
+                                    Box::new(js::Node::PropertyIndex(
+                                        Box::new(tuple.clone()),
+                                        Box::new(js::Node::Binary(
+                                            BinaryOp::Add,
+                                            Box::new(offset.clone()),
+                                            Box::new(js::Node::Number(slot.to_string(), None)),
+                                        )),
+                                    )),
+                                    Box::new(js::Node::PropertyIndex(
+                                        Box::new(value.clone()),
+                                        Box::new(js::Node::Number(slot.to_string(), None)),
+                                    )),
+                                )
+                            })
+                            .collect();
+                        body.push(js::Node::Return(Box::new(value)));
+                        body
+                    },
+                ),
+            };
+        }
         self.used_helpers.insert("__key_put");
         js::Node::Call(
             Box::new(js::Node::Local("__key_put".to_string())),
@@ -7689,6 +7834,11 @@ impl<'src> Transformer<'src> {
             ]);
         }
         let key = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+        // A scalar element of a tuple is a slot of its flat array, as `&mut
+        // t.1` is (B453).
+        if let Some((offset, _)) = self.tuple_key_slot(subject_id, index_id, key.clone()) {
+            return js::Node::Array(vec![subject, offset]);
+        }
         self.used_helpers.insert("__key_view");
         js::Node::Call(
             Box::new(js::Node::Local("__key_view".to_string())),
@@ -12365,6 +12515,11 @@ impl<'src> Transformer<'src> {
                 let transform = args.next().unwrap_or(js::Node::Void);
                 self.emit_tuple_map(receiver, transform, call_expr_id)
             }
+            // B711 S1c: a key's position, `[at]`'s one slot.
+            Intrinsic::TupleKeyIndex => js::Node::PropertyIndex(
+                Box::new(args.next().unwrap_or(js::Node::Void)),
+                Box::new(js::Node::Number("0".to_string(), None)),
+            ),
             Intrinsic::TupleLen
             | Intrinsic::TupleKeys
             | Intrinsic::TupleEntries
