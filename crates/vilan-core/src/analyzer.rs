@@ -4208,6 +4208,20 @@ struct GuardContinuation<'src> {
     captures: Vec<(&'src str, Id, usize)>,
 }
 
+/// B753: whether an expression NAMES a place — a binding, a field or tuple
+/// position, an element, a `*v` — so that, as a view return's leaf, it is the
+/// view of that place (`Analyzer::walk_view_return_leaf`).
+fn names_a_place(node: &Node<'_>) -> bool {
+    match node {
+        Node::Accessor(_) | Node::Index(..) | Node::Dereference(_) => true,
+        Node::MemberAccessor(_, member) => matches!(
+            crate::node::unmark_head_link(member).0.0,
+            Node::Accessor(_) | Node::Number(..)
+        ),
+        _ => false,
+    }
+}
+
 /// Whether a node is part of an `if` condition's BOOLEAN SPINE — the operators
 /// whose truth the branches are selected by, and the `is` test itself (B195).
 ///
@@ -5583,6 +5597,16 @@ pub struct Analyzer<'src> {
     // to an error entity without a second (misleading) message.
     #[serde(skip)]
     macro_failed_sites: HashSet<usize>,
+    /// B753: the return LEAVES of the function bodies being walked whose
+    /// declared return is a view (`&T` / `&mut T`), keyed by the leaf node's
+    /// address, each with the view's writability. A leaf that names a place
+    /// (`t.title`, `xs[0]`, `*v`, a binding) walks as the view of that place
+    /// the signature says it is — exactly the `&[mut] place` it abbreviates
+    /// (spec memory.md §6.5) — so every check and both emitters see one
+    /// spelling. Filled for a body's tail and each `ret` value just before
+    /// that node is walked; an entry is consumed when its node is.
+    #[serde(skip)]
+    view_return_leaves: HashMap<usize, bool>,
     // Scopes that are a module's top level: the entry file's global scope, each
     // loaded file's namespace scope, and every `mod { .. }` body. `export` is
     // legal exactly in these (a block-scoped `import` is not exportable, H2).
@@ -8502,6 +8526,7 @@ impl<'src> Analyzer<'src> {
             tier_oracle: None,
             macro_expression_expansions: HashMap::default(),
             macro_failed_sites: HashSet::default(),
+            view_return_leaves: HashMap::default(),
             module_scope_ids: HashSet::default(),
             entry_scope_id: None,
             prepped_locals: Vec::new(),
@@ -31443,6 +31468,13 @@ impl<'src> Analyzer<'src> {
                     self.place_is_scalar(*lhs) && self.place_is_scalar(*rhs)
                 }
                 Some(Expr::Unary(_, operand)) => self.place_is_scalar(*operand),
+                // B753: `*v` names the place `v` views, so it is a scalar when
+                // that place is — `&mut *n` over `n: &mut i32` re-lends the
+                // pair (the emitters' "a view of a view is the view"). It
+                // keeps no type row of its own, and read as "not a scalar"
+                // `&mut *n` handed back the VALUE where its caller reads a
+                // pair.
+                Some(Expr::Dereference(operand)) => self.place_is_scalar(*operand),
                 _ => false,
             },
         }
@@ -42261,6 +42293,14 @@ impl<'src> Analyzer<'src> {
             self.entry_labels.insert(value_id, label);
             return value_id;
         }
+        if !self.view_return_leaves.is_empty()
+            && let Some(mutable) = self
+                .view_return_leaves
+                .remove(&(node as *const Spanned<Node> as usize))
+            && names_a_place(&node.0)
+        {
+            return self.walk_view_return_leaf(node, mutable, scope_id);
+        }
         let id = self.new_entity_id();
 
         let entity = match &node.0 {
@@ -44270,7 +44310,7 @@ impl<'src> Analyzer<'src> {
         // function has nothing to check against — a clean error (v1;
         // proposal/try-and-lift.md §2).
         match self.return_type_stack.last() {
-            Some(ReturnFrame::Function(_, declared)) => {
+            Some(ReturnFrame::Function(_, declared, _)) => {
                 let return_type_id = *declared;
                 self.constraints.push(Constraint::TryAssert {
                     id,
@@ -44394,6 +44434,75 @@ impl<'src> Analyzer<'src> {
         None
     }
 
+    /// B753: record the return LEAVES of `value` — a return position (a body's
+    /// tail, a `ret`'s value) of a function whose declared return is a view —
+    /// so that [`Self::walk_view_return_leaf`] walks each as the view it is.
+    /// A leaf is what the position evaluates to: an `if`'s arms, a `match`'s
+    /// legs and a block's tail are looked through, anything else is one. The
+    /// recursion stops there, so a closure's tail is never this function's.
+    fn register_view_return_leaves(&mut self, value: &'src Spanned<Node<'src>>, mutable: bool) {
+        match &value.0 {
+            Node::Block(body) => self.register_view_return_leaves(&body.0.1, mutable),
+            Node::LiftGroup(inner) => self.register_view_return_leaves(inner, mutable),
+            Node::If(branch) => self.register_view_return_leaves_if(branch, mutable),
+            Node::Match(_, legs) => {
+                for (_, _, body) in &legs.0 {
+                    self.register_view_return_leaves(body, mutable);
+                }
+            }
+            _ => {
+                self.view_return_leaves
+                    .insert(value as *const Spanned<Node> as usize, mutable);
+            }
+        }
+    }
+
+    fn register_view_return_leaves_if(&mut self, branch: &'src NodeIfBranch<'src>, mutable: bool) {
+        match branch {
+            NodeIfBranch::If(if_) => {
+                self.register_view_return_leaves(&if_.then.0.1, mutable);
+                if let Some((else_, _)) = &if_.else_ {
+                    self.register_view_return_leaves_if(else_, mutable);
+                }
+            }
+            NodeIfBranch::Else((body, _)) => self.register_view_return_leaves(&body.1, mutable),
+        }
+    }
+
+    /// B753: a return leaf of a view-returning function (spec memory.md §6.5).
+    /// The signature says a view leaves, so a leaf that names a PLACE — a
+    /// binding, a field or tuple position, an element, a `*v` — is the view
+    /// of that place: `fun title_of(t: &mut Task): &mut str borrows t {
+    /// t.title }` means `&mut t.title`, and walks as exactly that `Reference`
+    /// over the leaf, so the checks a written `&mut place` meets (rule 3's
+    /// escape, a writable view of a readonly root) and both emitters'
+    /// treatment of one apply to it unchanged. Before this the leaf walked as
+    /// a value: the JS emitter handed back a scalar field's value where the
+    /// caller reads a `(base, key)` pair, the Rust emitter rendered a value
+    /// against a `&mut` signature, and a leaf naming a local escaped the
+    /// check that refuses `&mut local`.
+    ///
+    /// Any other leaf ([`names_a_place`] says which) walks as itself: a call
+    /// already answers a view or is refused as one, and a value (`5`, `a +
+    /// b`) has no place to view.
+    #[inline(never)]
+    fn walk_view_return_leaf(
+        &mut self,
+        node: &'src Spanned<Node<'src>>,
+        mutable: bool,
+        scope_id: Id,
+    ) -> Id {
+        // The leaf's own entry was consumed by the caller, so this walks it
+        // as the expression it is.
+        let operand_id = self.walk_expr_node(node, scope_id);
+        let id = self.new_entity_id();
+        self.expr_id_to_expr_map
+            .insert(id, Expr::Reference(operand_id, mutable));
+        self.span_map.insert(id, &node.1);
+        self.expr_id_to_scope_id_map.insert(id, scope_id);
+        id
+    }
+
     /// `walk_expr_node_inner`'s `Node::FuncReturn` arm, out of line (N169): its
     /// locals live only while this arm runs, not in the recursion's shared
     /// frame (the `tests/deep_nesting.rs` header measures that frame).
@@ -44406,6 +44515,14 @@ impl<'src> Analyzer<'src> {
         let Node::FuncReturn(value) = &node.0 else {
             unreachable!("only the `Node::FuncReturn` arm walks here")
         };
+        // B753: under a view return, the value's leaves are return leaves
+        // exactly as the tail's are.
+        if let (Some(value), Some(ReturnFrame::Function(_, _, Some(mutable)))) =
+            (value, self.return_type_stack.last())
+        {
+            let mutable = *mutable;
+            self.register_view_return_leaves(value, mutable);
+        }
         let value_id = value
             .as_ref()
             .map(|value| self.walk_expr_node(value, scope_id));
@@ -44418,7 +44535,7 @@ impl<'src> Analyzer<'src> {
         // part in the inferred return type instead
         // (proposal/ret-checking.md rules 3 and 4).
         match self.return_type_stack.last_mut() {
-            Some(ReturnFrame::Function(function_id, declared)) => {
+            Some(ReturnFrame::Function(function_id, declared, _)) => {
                 let function_id = *function_id;
                 let return_type_id = *declared;
                 let checked_id = value_id.unwrap_or_else(|| {
@@ -44691,8 +44808,14 @@ impl<'src> Analyzer<'src> {
             // return type; without one they COLLECT, and the function's
             // return type is inferred from them together with its tail
             // (proposal/ret-checking.md rules 2 and 3).
+            // B753: a declared VIEW return makes every return leaf that names a
+            // place the view of it (`view_return_leaves`).
+            let view_return = match function.return_type.as_deref().map(|spanned| &spanned.0) {
+                Some(Node::Reference(mutable, _)) => Some(*mutable),
+                _ => None,
+            };
             self.return_type_stack.push(match return_type_id {
-                Some(declared) => ReturnFrame::Function(id, declared),
+                Some(declared) => ReturnFrame::Function(id, declared, view_return),
                 None => ReturnFrame::Inferred { rets: Vec::new() },
             });
             let (ids, expr_id, body_statement_ids) = match &function.body {
@@ -44709,6 +44832,9 @@ impl<'src> Analyzer<'src> {
                     // (S3, editing-dx.md §3.7).
                     let body_statement_ids = statement_ids.clone();
                     ids.extend(statement_ids);
+                    if let Some(mutable) = view_return {
+                        self.register_view_return_leaves(&body.0.1, mutable);
+                    }
                     let expr_id = self.walk_expr_node(&body.0.1, body_scope_id);
                     (ids, expr_id, body_statement_ids)
                 }
@@ -77967,8 +78093,10 @@ const WEB_PRELUDE_MARK: &str = "web-prelude:";
 enum ReturnFrame {
     /// A function with a declared return type — rets check against it. Carries
     /// the function's id so a `ret` site can be attributed to its function
-    /// (async return-divergence checking reads `return_sites`).
-    Function(Id, TypeId),
+    /// (async return-divergence checking reads `return_sites`), and, when the
+    /// declared return is a VIEW, its writability (B753: a `ret`'s value is a
+    /// return leaf like the tail's — `view_return_leaves`).
+    Function(Id, TypeId, Option<bool>),
     /// A callable whose return type is INFERRED — a closure, an `async` block,
     /// or a function with no declared return type: rets collect here (span +
     /// optional value) and take part in that inference — the unification of

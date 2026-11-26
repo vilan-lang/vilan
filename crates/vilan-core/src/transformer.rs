@@ -6904,6 +6904,9 @@ impl<'src> Transformer<'src> {
                 self.value_resolves_to_scalar(*lhs) && self.value_resolves_to_scalar(*rhs)
             }
             Some(Expr::Unary(_, operand)) => self.value_resolves_to_scalar(*operand),
+            // B753: `*v` is the place `v` views (the analyzer's
+            // `place_is_scalar` answers it the same way).
+            Some(Expr::Dereference(operand)) => self.value_resolves_to_scalar(*operand),
             _ => false,
         }
     }

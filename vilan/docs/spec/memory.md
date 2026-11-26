@@ -418,6 +418,15 @@ value — the return copies it out of the loan — and projects nothing, so its
 result is an ordinary owned binding (`mut c = h.copy()` is legal). Change the
 return type to `&mut Holder` and the same body is a projection.
 
+Under a view return, a return leaf (the tail, each `ret`'s value, each arm of
+an `if` or `match` among them) that names a place — a binding, a field, a
+tuple position, an element, a `*v` — **is** the view of that place, exactly as
+if `&place` / `&mut place` were written: `fun title(t: &mut Task): &mut str {
+t.title }` is `&mut t.title`, a view like any other, a scalar's as an
+aggregate's. It meets the same checks as the written form, so a leaf naming a
+local or a by-value parameter is refused as an escape, and a `&mut` return
+naming a place under a readonly root is refused as a writable view of it.
+
 That agreement is exact for a **forwarded parameter** and conservative for the
 other leaf shapes: a by-value return whose tail is `&self.inner`, a `borrows`
 call, or a wrapped `Some(&mut self.x)` still *projects* at the call site, even

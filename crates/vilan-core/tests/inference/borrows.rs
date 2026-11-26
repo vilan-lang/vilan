@@ -16760,3 +16760,388 @@ fn b685_a_view_fallback_is_read_out_where_the_option_is_consumed() {
         "4\n1\n1\n5\n1\n40\n0\n4\n0\n0\n1\n",
     );
 }
+
+// --- B753: a view return's place leaf is the view of that place --------------
+
+/// The shared declarations of B753's pins: a struct with scalar, nested,
+/// tuple and aggregate fields, and the `set`/`bump` writers a view made at the
+/// call site is handed to.
+const B753_PRELUDE: &str = r#"
+struct Meta {
+    owner: str,
+    n: i32,
+}
+
+struct Task {
+    title: str,
+    status: str,
+    meta: Meta,
+    pair: (i32, str),
+}
+
+fun task(): Task {
+    Task { title = "a", status = "open", meta = Meta { owner = "x", n = 1 }, pair = (1, "one") }
+}
+
+fun set(place: &mut str, value: str) {
+    place = value;
+}
+
+fun bump(n: &mut i32) {
+    n += 1;
+}
+"#;
+
+fn b753_runs(body: &str, expected_stdout: &str) {
+    assert_compiles_and_runs(&format!("{B753_PRELUDE}\n{body}"), expected_stdout);
+}
+
+/// B753, the item's repro: a scalar field returned through `borrows`, handed
+/// to a `&mut` parameter. JS returned the field's VALUE and the write threw
+/// `TypeError: Cannot create property 'undefined' on string 'a'`.
+#[test]
+fn b753_a_scalar_field_view_return_is_written_through_a_mut_parameter() {
+    b753_runs(
+        r#"
+        fun title_of(t: &mut Task): &mut str borrows t {
+            t.title
+        }
+
+        fun main() {
+            mut t = task();
+            set(title_of(&mut t), "b");
+            print(t.title);
+        }
+        "#,
+        "b\n",
+    );
+}
+
+/// B753: the same view assigned through directly, as `meta_of(&mut t).owner
+/// = ..` is through an aggregate one, read with `*`, and bound to a view
+/// binding that is written.
+#[test]
+fn b753_a_scalar_field_view_return_is_assigned_read_and_bound() {
+    b753_runs(
+        r#"
+        fun title_of(t: &mut Task): &mut str borrows t {
+            t.title
+        }
+
+        fun main() {
+            mut t = task();
+            title_of(&mut t) = "c";
+            print(t.title);
+            print(*title_of(&mut t));
+            let view = title_of(&mut t);
+            view = "d";
+            print(t.title);
+        }
+        "#,
+        "c\nc\nd\n",
+    );
+}
+
+/// B753: a readonly scalar view return read at the value positions of B749's
+/// rule: `*`, a `&str` parameter, an interpolation hole, a comparison and an
+/// arithmetic operand (a call's view is read through where it is not named).
+#[test]
+fn b753_a_readonly_scalar_view_return_reads_at_every_value_position() {
+    b753_runs(
+        r#"
+        fun title_of(t: &Task): &str borrows t {
+            t.title
+        }
+
+        fun n_of(t: &Task): &i32 borrows t {
+            t.meta.n
+        }
+
+        fun show(text: &str) {
+            print(*text);
+        }
+
+        fun main() {
+            let t = task();
+            print(*title_of(&t));
+            show(title_of(&t));
+            print(i"[{title_of(&t)}]");
+            print(title_of(&t) == "a");
+            print(n_of(&t) + 1);
+        }
+        "#,
+        "a\na\n[a]\ntrue\n2\n",
+    );
+}
+
+/// B753: a scalar reached through a nested path, through a tuple position,
+/// and through another view-returning call (a projection of a projection).
+#[test]
+fn b753_a_nested_a_tuple_and_a_projected_scalar_view_return() {
+    b753_runs(
+        r#"
+        fun meta_of(t: &mut Task): &mut Meta borrows t {
+            t.meta
+        }
+
+        fun owner_deep(t: &mut Task): &mut str borrows t {
+            t.meta.owner
+        }
+
+        fun owner_of(t: &mut Task): &mut str borrows t {
+            meta_of(t).owner
+        }
+
+        fun second_of(t: &mut Task): &mut str borrows t {
+            t.pair.1
+        }
+
+        fun main() {
+            mut t = task();
+            owner_deep(&mut t) = "y";
+            print(t.meta.owner);
+            owner_of(&mut t) = "z";
+            print(t.meta.owner);
+            set(owner_of(&mut t), "w");
+            print(t.meta.owner);
+            second_of(&mut t) = "two";
+            print(t.pair.1);
+        }
+        "#,
+        "y\nz\nw\ntwo\n",
+    );
+}
+
+/// B753: a list element returned as a view (`xs[0]` meaning `&mut xs[0]`,
+/// the checked mint), and a `*n` leaf re-lending the view a parameter holds.
+#[test]
+fn b753_an_element_and_a_deref_view_return() {
+    b753_runs(
+        r#"
+        fun first(xs: &mut List<i32>): &mut i32 borrows xs {
+            xs[0]
+        }
+
+        fun through(n: &mut i32): &mut i32 borrows n {
+            *n
+        }
+
+        fun main() {
+            mut xs = [1, 2, 3];
+            first(&mut xs) = 10;
+            bump(first(&mut xs));
+            print(xs);
+            print(*first(&mut xs));
+            mut count = 5;
+            through(&mut count) = 6;
+            bump(through(&mut count));
+            print(count);
+        }
+        "#,
+        "[11, 2, 3]\n11\n7\n",
+    );
+}
+
+/// B753: the explicit `&mut *n` the `*n` leaf abbreviates. It handed back the
+/// value on JS too (the analyzer read `*n` as "not a scalar"), so the
+/// caller's write through the pair threw.
+#[test]
+fn b753_an_explicit_reborrow_of_a_scalar_view_returns_the_view() {
+    b753_runs(
+        r#"
+        fun through(n: &mut i32): &mut i32 borrows n {
+            &mut *n
+        }
+
+        fun main() {
+            mut count = 5;
+            through(&mut count) = 6;
+            print(count);
+            print(*through(&mut count));
+        }
+        "#,
+        "6\n6\n",
+    );
+}
+
+/// B753: every return leaf is a view, a mid-body `ret`'s as the tail's, and
+/// each arm of an `if` or `match` tail choosing between places of one type.
+#[test]
+fn b753_a_ret_and_a_conditional_tail_return_views_of_their_places() {
+    b753_runs(
+        r#"
+        fun early(t: &mut Task, flag: bool): &mut str borrows t {
+            if flag {
+                ret t.title;
+            }
+            t.status
+        }
+
+        fun pick(t: &mut Task, flag: bool): &mut str borrows t {
+            if flag { t.title } else { t.status }
+        }
+
+        fun chosen(t: &mut Task, which: i32): &mut str borrows t {
+            match which {
+                0 => t.title,
+                1 => t.status,
+                _ => t.meta.owner,
+            }
+        }
+
+        fun main() {
+            mut t = task();
+            early(&mut t, true) = "e1";
+            early(&mut t, false) = "e2";
+            print(i"{t.title} {t.status}");
+            pick(&mut t, true) = "p1";
+            pick(&mut t, false) = "p2";
+            print(i"{t.title} {t.status}");
+            chosen(&mut t, 0) = "m0";
+            chosen(&mut t, 1) = "m1";
+            chosen(&mut t, 2) = "m2";
+            print(i"{t.title} {t.status} {t.meta.owner}");
+        }
+        "#,
+        "e1 e2\np1 p2\nm0 m1 m2\n",
+    );
+}
+
+/// B753: a method returning a view of a scalar field of `self`, written
+/// through its call, passed on, and read.
+#[test]
+fn b753_a_method_returning_a_scalar_field_view() {
+    b753_runs(
+        r#"
+        impl Task {
+            fun title(&mut self): &mut str borrows self {
+                self.title
+            }
+
+            fun status(&self): &str borrows self {
+                self.status
+            }
+        }
+
+        fun main() {
+            mut t = task();
+            t.title() = "b";
+            print(t.title);
+            set(t.title(), "c");
+            print(*t.title());
+            print(*t.status());
+        }
+        "#,
+        "b\nc\nopen\n",
+    );
+}
+
+/// B753: the aggregate field view that worked on JS keeps working, and a
+/// generic forwarding its parameter keeps working at a struct.
+#[test]
+fn b753_an_aggregate_field_view_return_still_writes_through() {
+    b753_runs(
+        r#"
+        fun meta_of(t: &mut Task): &mut Meta borrows t {
+            t.meta
+        }
+
+        fun same<T>(x: &mut T): &mut T borrows x {
+            x
+        }
+
+        fun main() {
+            mut t = task();
+            meta_of(&mut t).owner = "y";
+            meta_of(&mut t).n += 1;
+            print(i"{t.meta.owner} {t.meta.n}");
+            same(&mut t.meta).n = 7;
+            print(t.meta.n);
+        }
+        "#,
+        "y 2\n7\n",
+    );
+}
+
+/// B753: a by-value return of the same place still copies (rule 1): only the
+/// signature's `&`/`&mut` makes the leaf a view.
+#[test]
+fn b753_a_by_value_return_of_a_field_still_copies() {
+    b753_runs(
+        r#"
+        fun meta_copy(t: &Task): Meta {
+            t.meta
+        }
+
+        fun main() {
+            let t = task();
+            mut copy = meta_copy(&t);
+            copy.owner = "changed";
+            print(t.meta.owner);
+        }
+        "#,
+        "x\n",
+    );
+}
+
+/// B753's refusals. The leaf is the `&mut place` it abbreviates, so it meets
+/// the checks that one meets; each was accepted before, and handed out a view
+/// of a dying local, of a by-value parameter's copy, or a writable view of a
+/// readonly root.
+#[test]
+fn b753_a_view_return_of_a_local_field_is_refused_as_an_escape() {
+    assert_fails_with(
+        &format!(
+            "{B753_PRELUDE}\nfun local_title(t: &mut Task): &mut str borrows t {{\n    mut other = task();\n    other.title\n}}\n\nfun main() {{\n    mut t = task();\n    set(local_title(&mut t), \"b\");\n}}\n"
+        ),
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b753_a_view_return_of_a_scalar_local_is_refused_as_an_escape() {
+    assert_fails_with(
+        "fun local_count(n: &mut i32): &mut i32 borrows n {\n    mut other = 1;\n    other\n}\n\nfun main() {\n    mut n = 1;\n    print(*local_count(&mut n));\n}\n",
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b753_a_view_return_of_a_by_value_parameter_is_refused_as_an_escape() {
+    assert_fails_with(
+        &format!(
+            "{B753_PRELUDE}\nfun title_of(t: Task): &str {{\n    t.title\n}}\n\nfun main() {{\n    print(*title_of(task()));\n}}\n"
+        ),
+        "a view cannot escape its scope",
+    );
+}
+
+#[test]
+fn b753_a_writable_view_return_of_a_readonly_root_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B753_PRELUDE}\nfun title_of(t: &Task): &mut str borrows t {{\n    t.title\n}}\n\nfun main() {{\n    let t = task();\n    set(title_of(&t), \"b\");\n}}\n"
+        ),
+        "cannot take a writable view of immutable 't'",
+    );
+}
+
+#[test]
+fn b753_a_writable_view_return_forwarding_a_readonly_view_is_refused() {
+    assert_fails_with(
+        "fun widen(n: &i32): &mut i32 borrows n {\n    n\n}\n\nfun main() {\n    let n = 1;\n    print(*widen(&n));\n}\n",
+        "cannot take a writable view of immutable 'n'",
+    );
+}
+
+/// B753: one arm of a conditional tail naming a local is refused there, while
+/// the other arm's place would be admitted.
+#[test]
+fn b753_a_conditional_tail_arm_naming_a_local_is_refused() {
+    assert_fails_with(
+        &format!(
+            "{B753_PRELUDE}\nfun pick(t: &mut Task, flag: bool): &mut str borrows t {{\n    mut other = task();\n    if flag {{ t.title }} else {{ other.status }}\n}}\n\nfun main() {{\n    mut t = task();\n    set(pick(&mut t, true), \"b\");\n}}\n"
+        ),
+        "a view cannot escape its scope",
+    );
+}
