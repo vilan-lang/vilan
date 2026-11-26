@@ -42,6 +42,7 @@
 
 use crate::analyzer::{Implementation, Program, SourceId};
 use crate::fx::FxHashMap as HashMap;
+use crate::fx::FxHashSet as HashSet;
 use crate::id::Id;
 use crate::type_::{Type, TypeId};
 
@@ -1290,6 +1291,10 @@ pub struct SelectionMemos {
     /// Per trait, the impls whose `with` clause provides it or a subtrait of
     /// it ([`provided_trait_ids`]), in declaration order.
     providers: std::sync::OnceLock<HashMap<Id, Vec<usize>>>,
+    /// [`is_universal_trait`]'s answer for the whole program (E371), filled on
+    /// first ask: a fixpoint over every impl, which no single request should
+    /// pay for twice.
+    universal_traits: std::sync::OnceLock<HashSet<Id>>,
 }
 
 impl std::fmt::Debug for SelectionMemos {
@@ -1346,6 +1351,11 @@ impl SelectionMemos {
             })
             .get(&trait_id)
             .map_or(&[], Vec::as_slice)
+    }
+
+    fn universal_traits(&self, program: &Program) -> &HashSet<Id> {
+        self.universal_traits
+            .get_or_init(|| universal_trait_set(program))
     }
 }
 
@@ -1606,4 +1616,84 @@ pub fn applying_trait_ids(program: &Program, file: Option<SourceId>, concrete: T
         .chain(applying.iter())
         .flat_map(|implementation| implementation.trait_ids.iter().copied())
         .collect()
+}
+
+/// E371: whether EVERY type implements `trait_id` — the bottom tier of std's
+/// impl-specialization pattern (`impl type T with MaybeSignal<T>`, B158), whose
+/// members are therefore members of every value in the program.
+///
+/// A trait is universal when it has an impl whose subject is a bare binder
+/// (`impl type T with Trait`, `impl type T: B1 + B2 with Trait`) and every
+/// bound on that binder is itself a universal trait. No bound is vacuously
+/// universal; the set is a fixpoint, so `impl type T: StoreLeaf with Storable`
+/// makes `Storable` universal through `StoreLeaf`'s own unbounded impl. A bound
+/// that is not a universal trait (`F: Flow<type T>`, `T: PartialEq`, a tuple
+/// bound) keeps its impl from counting, and so does a bound written at
+/// ARGUMENTS (`T: MaybeSignal<i32>`): a universal trait's blanket provides it
+/// at the arguments its own subject reaches (`MaybeSignal<T>` for `T`), not at
+/// every argument, and proving otherwise is a question this does not ask — a
+/// trait it cannot prove universal is answered "no". Supertraits play no part.
+///
+/// Computed once per program and cached on it (beside M98's memos); the editor
+/// asks it per completion candidate.
+pub fn is_universal_trait(program: &Program, trait_id: Id) -> bool {
+    program
+        .selection_memos()
+        .universal_traits(program)
+        .contains(&trait_id)
+}
+
+/// [`is_universal_trait`]'s fixpoint.
+fn universal_trait_set(program: &Program) -> HashSet<Id> {
+    // Every impl over a bare binder, with that binder's bounds; tuple-bounded
+    // binders (`impl type T: (2..)`) cover tuples only and never count.
+    let binder_impls: Vec<(&[Id], Vec<TypeId>)> = program
+        .implementations
+        .iter()
+        .filter(|implementation| !implementation.trait_ids.is_empty())
+        .filter_map(|implementation| {
+            match program.type_id_to_type_map.get(&implementation.subject) {
+                Some(Type::Generic(constraint_id))
+                    if !program.tuple_bound_arities.contains_key(constraint_id) =>
+                {
+                    Some((
+                        implementation.trait_ids.as_slice(),
+                        bound_type_ids(program, *constraint_id),
+                    ))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let mut universal: HashSet<Id> = HashSet::default();
+    loop {
+        let mut grew = false;
+        for (trait_ids, bounds) in &binder_impls {
+            if trait_ids
+                .iter()
+                .all(|trait_id| universal.contains(trait_id))
+            {
+                continue;
+            }
+            let bounds_universal = bounds.iter().all(|bound| {
+                match program.type_id_to_type_map.get(bound) {
+                    Some(Type::Any) => true,
+                    Some(Type::Trait(trait_id, arguments)) => {
+                        arguments.is_empty() && universal.contains(trait_id)
+                    }
+                    // An unresolved bound proves nothing (a degraded
+                    // analysis): the impl does not count.
+                    _ => false,
+                }
+            });
+            if bounds_universal {
+                for trait_id in *trait_ids {
+                    grew |= universal.insert(*trait_id);
+                }
+            }
+        }
+        if !grew {
+            return universal;
+        }
+    }
 }

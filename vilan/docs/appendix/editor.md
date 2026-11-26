@@ -284,7 +284,12 @@ Where the cursor is decides what is offered.
   defaults** — `xs.iter().` offers the whole `Iterator` surface, not the one
   method `ListIterator`'s own `impl` block writes out, and a type that
   implements `Ord` offers `min`/`max`/`clamp` with the comparisons its
-  supertraits provide.
+  supertraits provide. A method **every type has** — one of a trait
+  implemented for all types by a blanket `impl type T with …`, such as
+  `bind` or `store_diff` — is offered the way an `[internal]` name is: only
+  once three characters of it are typed, sorted last, with a detail naming
+  the trait. A blanket's method that only some types have (`derive` on a
+  flow) is offered as any other.
 - **Inside a struct initializer** — `Point { ` — offers that struct's
   **fields**, and nothing that is merely in scope: the one thing you are
   writing there is a field name. The fields you have already written drop out
