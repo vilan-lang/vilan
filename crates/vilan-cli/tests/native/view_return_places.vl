@@ -1,0 +1,196 @@
+// B753: a function whose declared return is a view hands back a view of the
+// PLACE its return leaf names, `fun title_of(t: &mut Task): &mut str borrows t
+// { t.title }` meaning `&mut t.title`. JS returned a scalar field's value where
+// its caller reads a `(base, key)` pair (`TypeError: Cannot create property
+// 'undefined' on string 'a'`); natively the leaf was rendered as a value
+// against the `&mut` signature (rustc E0308). One block per case: a scalar
+// field read and written every way a view made at the call site is, a
+// readonly view, a nested path, a list element, a projection of a projection,
+// a tuple position, a `*v` leaf, a mid-body `ret`, an `if`/`match` tail over
+// two places, a method, a generic instantiated at a struct, and the aggregate
+// field view that already worked on JS.
+struct Meta {
+	owner: str,
+	n: i32,
+}
+
+struct Task {
+	title: str,
+	status: str,
+	done: bool,
+	meta: Meta,
+	pair: (i32, str),
+}
+
+impl Task {
+	fun title(&mut self): &mut str borrows self {
+		self.title
+	}
+
+	fun status(&self): &str borrows self {
+		self.status
+	}
+}
+
+fun meta_of(t: &mut Task): &mut Meta borrows t {
+	t.meta
+}
+
+fun title_of(t: &mut Task): &mut str borrows t {
+	t.title
+}
+
+fun done_of(t: &mut Task): &mut bool borrows t {
+	t.done
+}
+
+fun read_title(t: &Task): &str borrows t {
+	t.title
+}
+
+fun read_n(t: &Task): &i32 borrows t {
+	t.meta.n
+}
+
+fun owner_deep(t: &mut Task): &mut str borrows t {
+	t.meta.owner
+}
+
+fun owner_of(t: &mut Task): &mut str borrows t {
+	meta_of(t).owner
+}
+
+fun second_of(t: &mut Task): &mut str borrows t {
+	t.pair.1
+}
+
+fun first(xs: &mut List<i32>): &mut i32 borrows xs {
+	xs[0]
+}
+
+fun through(n: &mut i32): &mut i32 borrows n {
+	*n
+}
+
+fun early(t: &mut Task, flag: bool): &mut str borrows t {
+	if flag {
+		ret t.title;
+	}
+	t.status
+}
+
+fun pick(t: &mut Task, flag: bool): &mut str borrows t {
+	if flag {
+		t.title
+	} else {
+		t.status
+	}
+}
+
+fun chosen(t: &mut Task, which: i32): &mut str borrows t {
+	match which {
+		0 => t.title,
+		1 => t.status,
+		_ => t.meta.owner,
+	}
+}
+
+fun same<T>(x: &mut T): &mut T borrows x {
+	x
+}
+
+fun set(place: &mut str, value: str) {
+	place = value;
+}
+
+fun bump(n: &mut i32) {
+	n += 1;
+}
+
+fun show(text: &str) {
+	print(*text);
+}
+
+fun main() {
+	mut t = Task {
+		title = "a",
+		status = "open",
+		done = false,
+		meta = Meta { owner = "x", n = 1 },
+		pair = (1, "one"),
+	};
+
+	// A scalar field: passed on to a `&mut` parameter, assigned, read with `*`,
+	// bound to a view binding and written through it.
+	set(title_of(&mut t), "b");
+	print(t.title);
+	title_of(&mut t) = "c";
+	print(t.title);
+	print(*title_of(&mut t));
+	let view = title_of(&mut t);
+	view = "d";
+	print(t.title);
+	done_of(&mut t) = true;
+	print(t.done);
+	print(*done_of(&mut t) then "done" else "open");
+
+	// A readonly view: `*`, a `&str` parameter, an interpolation, a comparison,
+	// an arithmetic operand.
+	print(*read_title(&t));
+	show(read_title(&t));
+	print(i"[{read_title(&t)}]");
+	print(read_title(&t) == "d");
+	print(read_n(&t) + 1);
+
+	// A nested path, a projection of a projection, a tuple position.
+	owner_deep(&mut t) = "y";
+	print(t.meta.owner);
+	owner_of(&mut t) = "z";
+	print(t.meta.owner);
+	set(owner_of(&mut t), "w");
+	print(t.meta.owner);
+	second_of(&mut t) = "two";
+	print(t.pair.1);
+
+	// A list element, and a `*v` leaf.
+	mut xs = [1, 2, 3];
+	first(&mut xs) = 10;
+	bump(first(&mut xs));
+	print(xs);
+	print(*first(&mut xs));
+	mut count = 5;
+	through(&mut count) = 6;
+	bump(through(&mut count));
+	print(count);
+
+	// A mid-body `ret`, and `if` / `match` tails choosing between places.
+	early(&mut t, true) = "e1";
+	early(&mut t, false) = "e2";
+	print(t.title);
+	print(t.status);
+	pick(&mut t, true) = "p1";
+	pick(&mut t, false) = "p2";
+	print(t.title);
+	print(t.status);
+	chosen(&mut t, 0) = "m0";
+	chosen(&mut t, 1) = "m1";
+	chosen(&mut t, 2) = "m2";
+	print(t.title);
+	print(t.status);
+	print(t.meta.owner);
+
+	// Methods.
+	t.title() = "method";
+	print(t.title);
+	set(t.title(), "method2");
+	print(*t.title());
+	print(*t.status());
+
+	// A generic view return at a struct, and the aggregate field view.
+	same(&mut t.meta).n = 7;
+	print(t.meta.n);
+	meta_of(&mut t).owner = "aggregate";
+	print(t.meta.owner);
+	meta_of(&mut t).n += 1;
+	print(t.meta.n);
+}

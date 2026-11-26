@@ -19455,3 +19455,26 @@ fn b750_a_str_tested_through_a_view_or_by_is_builds_on_both_backends() {
         "a str tested by `is` or an inline `match &place` must build and agree on both backends"
     );
 }
+
+/// B753: a view return whose leaf NAMES a place hands back the view of it —
+/// a scalar field passed on, assigned, read with `*` and bound; a readonly one
+/// at every value position; a nested path, a projection of a projection, a
+/// tuple position, a list element, a `*v` leaf; a mid-body `ret`; `if` and
+/// `match` tails over different places; methods; a generic at a struct; the
+/// aggregate field view — the same on both backends. JS returned the scalar's
+/// value where the caller reads a pair (a TypeError at the write); natively
+/// the leaf was a value against the `&mut` signature (rustc E0308).
+#[test]
+fn b753_a_view_return_of_a_named_place_is_its_view_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_view_return_places.vl"),
+        include_str!("native/view_return_places.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_view_return_places.vl"),
+        Verdict::Identical,
+        "a view return's place leaf must hand back its view on both backends"
+    );
+}
