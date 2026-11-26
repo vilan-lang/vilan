@@ -903,6 +903,7 @@ impl Liveness<'_, '_> {
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
             | Expr::Null
+            | Expr::Key(_)
             | Expr::Void
             | Expr::Error
             | Expr::LiftBinder

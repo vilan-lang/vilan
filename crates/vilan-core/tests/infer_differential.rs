@@ -201,6 +201,7 @@ const FOLDS: &[&str] = &[
     "remainder.vl",
     "resource_take.vl",
     "set.vl",
+    "struct-keys.vl",
     "time.vl",
     "tuple-access.vl",
     "tuple-spread.vl",

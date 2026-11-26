@@ -19502,3 +19502,34 @@ fn b758_a_generic_view_return_agrees_at_every_instance_on_both_backends() {
         "a generic view return must hand back, and its caller read, the same view at every instance"
     );
 }
+
+/// B711 S1a: struct keys are JS-only until S1b gives a native key its access
+/// (R11). A program using one is refused by name — the literal, and a
+/// subscript through a key held in a value — never handed to rustc.
+#[test]
+fn keys_a_struct_key_is_refused_by_name_natively() {
+    let staged = stage();
+    std::fs::write(staged.join("native_probe_keys.vl"), KEYS_PROBE).expect("write the probe");
+    match compare(&staged, "native_probe_keys.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("a struct key (`Task.title`)")
+                || reason.contains("a subscript through a struct key (`s[k]`)"),
+            "refused for another reason: {reason}"
+        ),
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
+const KEYS_PROBE: &str = concat!(
+    "struct Task {\n",
+    "\ttitle: str,\n",
+    "}\n",
+    "\n",
+    "fun read(task: Task, key: Key<Task, str>): str {\n",
+    "\ttask[key]\n",
+    "}\n",
+    "\n",
+    "fun main() {\n",
+    "\tprint(read(Task { title = \"a\" }, Task.title));\n",
+    "}\n",
+);

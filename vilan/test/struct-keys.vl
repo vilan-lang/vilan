@@ -1,0 +1,51 @@
+// B711 S1a — struct keys (proposal/struct-keys.md): `S.x` and paths as
+// `Key<S, F>` values, `s[k]` as a place, `then`, identity and `KeyPath`.
+// The corpus gate compares emitted bytes, so what this pins is the emission: a
+// literal key is one hoisted constant and a subscript through it is the plain
+// field chain; a key held in a value walks its steps (`__key_at`, `__key_put`,
+// `__key_view`).
+import std::hash_map::HashMap;
+import std::io::assert;
+
+struct Meta {
+	owner: str,
+	stars: i32,
+}
+
+struct Task {
+	title: str,
+	meta: Meta,
+}
+
+fun read<F>(task: Task, key: Key<Task, F>): F {
+	task[key]
+}
+
+fun write<F>(task: &mut Task, key: Key<Task, F>, value: F) {
+	task[key] = value;
+}
+
+fun at<F>(task: &mut Task, key: Key<Task, F>): &mut F borrows task {
+	task[key]
+}
+
+fun main() {
+	mut task = Task { title = "a", meta = Meta { owner = "ada", stars = 1 } };
+	task[Task.meta.owner] = "bob";
+	task[Task.meta.stars] += 2;
+	assert(task.meta.owner == "bob", "a literal key writes the field");
+	write(&mut task, Task.title, "b");
+	assert(read(task, Task.title) == "b", "a key held in a value reads and writes");
+	at(&mut task, Task.meta.stars) = 7;
+	assert(task.meta.stars == 7, "a view return through a key at a scalar");
+	at(&mut task, Task.meta).owner = "cy";
+	assert(task.meta.owner == "cy", "and at a struct");
+	let owner = Task.meta.owner;
+	assert(owner == Task.meta.then(Meta.owner), "equal paths are equal keys");
+	assert(owner.name() == "meta.owner", owner.name());
+	assert(owner.starts_with(Task.meta), "a path starts with its prefix");
+	mut labels: HashMap<Key<Task, str>, str> = HashMap::new();
+	labels.insert(owner, "owner");
+	assert(labels.get(Task.meta.then(Meta.owner)).unwrap_or("") == "owner", "a key keys a map");
+	print(task[owner]);
+}

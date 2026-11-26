@@ -805,3 +805,10 @@ NEW	-	`on:` is the web element's event form: on `<{tag}>`, an event is a method 
 NEW	-	a `.method(…)` link is the web element's head form: on `<{tag}>`, every head item is an attribute, a method of what `{tag}()` returns, written without the dot
 NEW	-	{taker}: write `&mut {place}`; a `&` view cannot be written through
 NEW	-	{taker}, and this view is readonly (`&`): pass a writable one, `&mut <place>`
+NEW	-	a key reaches only struct fields: `{path}` has type `{type}`, and a step into an `Option` or an enum's variant may find nothing there
+NEW	-	a key reaches only struct fields: `{path}` {what}
+NEW	-	`{owner}` is a resource, and a key cannot reach into a resource's fields
+NEW	-	`{field}` is an `[internal]` field of std's `{owner}`, and an internal std field is not a member outside std, so it has no key: {reason}
+NEW	-	struct '{owner}' has no field '{field}'{suggestion}
+NEW	-	this key's struct type arguments are never determined: give the key its type where it is made
+NEW	-	this key reaches into a `{key}`, and the subject is a `{subject}`: a key indexes only the struct it was made from

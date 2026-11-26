@@ -438,6 +438,7 @@ fn expr_ids(expr: &Expr<'_>, ids: &mut Vec<Id>, types: &mut Vec<TypeId>) {
         | Expr::LiftBinder
         | Expr::Jump(_)
         | Expr::Null
+        | Expr::Key(_)
         | Expr::Number(..)
         | Expr::String(_)
         | Expr::MultilineString(_)

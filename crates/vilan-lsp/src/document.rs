@@ -33457,3 +33457,7 @@ mod editor_review_tests;
 #[cfg(test)]
 #[path = "platform_reach_tests.rs"]
 mod platform_reach_tests;
+
+#[cfg(test)]
+#[path = "struct_key_tests.rs"]
+mod struct_key_tests;

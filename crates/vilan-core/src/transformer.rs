@@ -3134,6 +3134,33 @@ fn helper_source(name: &str) -> &'static str {
              \tthrow __panic(\"index out of bounds: the length is \" + list.length + \" but the index is \" + index, location);\n\
              }"
         }
+        // B711: a key's place (`s[k]`, `s[k] = v`, `&mut s[k]` at a scalar
+        // field). A key is `std::key`'s layout, `[[parts]]`, each part
+        // `[owner, index, name]`; the walk reads each part's `index`. A key
+        // always names a real field, so none of the three can fail.
+        "__key_at" => {
+            "function __key_at(value, key) {\n\
+             \tconst parts = key[0][0];\n\
+             \tfor (let at = 0; at < parts.length; at++) value = value[parts[at][1]];\n\
+             \treturn value;\n\
+             }"
+        }
+        "__key_put" => {
+            "function __key_put(value, key, field) {\n\
+             \tconst parts = key[0][0];\n\
+             \tconst last = parts.length - 1;\n\
+             \tfor (let at = 0; at < last; at++) value = value[parts[at][1]];\n\
+             \treturn value[parts[last][1]] = field;\n\
+             }"
+        }
+        "__key_view" => {
+            "function __key_view(value, key) {\n\
+             \tconst parts = key[0][0];\n\
+             \tconst last = parts.length - 1;\n\
+             \tfor (let at = 0; at < last; at++) value = value[parts[at][1]];\n\
+             \treturn [ value, parts[last][1] ];\n\
+             }"
+        }
         // `&mut list[i]` — the checked view mint: the scalar `(base, key)` pair
         // exists only for an in-bounds element.
         "__at_view" => {
@@ -3928,6 +3955,10 @@ struct Transformer<'src> {
     /// M89: the emitted tables by SLOT SET — every slot a named function, in
     /// order — so two pairs whose tables would be identical share one object.
     vtables_by_slots: HashMap<Vec<(String, String)>, String>,
+    /// B711: the hoisted constant for each distinct key literal, by its steps —
+    /// `Task.meta.owner` allocates nothing where it is written, however often
+    /// that runs.
+    key_literals: HashMap<Vec<(Id, usize)>, String>,
     // Per-type `__drop` helpers (destruction.md §7), keyed by `type_key`. `None`
     // records a type whose destruction is a complete no-op (no `Drop` impl, no
     // resource members) so callers skip it; `Some(name)` is the emitted helper.
@@ -4256,6 +4287,8 @@ struct EmissionRecorder {
     /// G25: a trait object's table, by its emitted NAME — the memo answers a
     /// name, and an M89 alias names the table it repeats.
     vtables: HashMap<String, EmissionId>,
+    /// B711: a key literal's hoisted constant, by its emitted name.
+    key_literals: HashMap<String, EmissionId>,
 }
 
 thread_local! {
@@ -4495,6 +4528,7 @@ impl<'src> Transformer<'src> {
             current_self_type: None,
             default_instances: HashMap::default(),
             vtables: HashMap::default(),
+            key_literals: HashMap::default(),
             vtables_by_slots: HashMap::default(),
             drop_helpers: HashMap::default(),
             shared_bodies: HashMap::default(),
@@ -5879,6 +5913,11 @@ impl<'src> Transformer<'src> {
         // creates a slot (growth is `push`), so an out-of-bounds write
         // panics. The read side is `__at`; an assignment target can't
         // be a call, so the write gets its own helper.
+        if let Some(&Expr::Index(subject_id, index_id)) = self.program.entity_map.get(&target_id)
+            && self.program.key_subscripts.contains(&target_id)
+        {
+            return Some(self.key_subscript_write(subject_id, index_id, value, block));
+        }
         if let Some(&Expr::Index(subject_id, index_id)) = self.program.entity_map.get(&target_id) {
             let subject = self
                 .walk_entity(subject_id, block)
@@ -6055,6 +6094,10 @@ impl<'src> Transformer<'src> {
             Expr::Lift(subject, _, continuation) => {
                 self.expr_has_side_effects(*subject) || self.expr_has_side_effects(*continuation)
             }
+            // A key subscript (B711) cannot fail: it is as pure as its operands.
+            Expr::Index(subject, index) if self.program.key_subscripts.contains(&expr_id) => {
+                self.expr_has_side_effects(*subject) || self.expr_has_side_effects(*index)
+            }
             // A checked subscript can panic, so an indexing expression is
             // effectful in itself: dropping it would drop its bounds check.
             Expr::Index(_, _) => true,
@@ -6105,7 +6148,8 @@ impl<'src> Transformer<'src> {
                 .is_some_and(|value_id| self.expr_has_side_effects(value_id)),
             // Pure: literals and names, a closure that is defined and not called,
             // and the declaration forms, which emit nothing here at all.
-            Expr::Bool(_)
+            Expr::Key(_)
+            | Expr::Bool(_)
             | Expr::Closure(_)
             | Expr::Enum(_)
             | Expr::EnumVariant(_, _)
@@ -7037,6 +7081,11 @@ impl<'src> Transformer<'src> {
             // `(base, key)` pair exists only for an in-bounds element, so a
             // view of an absent element panics at the `&mut`, not at first use
             // through it.
+            Some(&Expr::Index(subject, index))
+                if self.program.key_subscripts.contains(&operand) =>
+            {
+                return self.key_subscript_view(subject, index, block);
+            }
             Some(Expr::Index(subject, index)) => {
                 let base = self.walk_entity(*subject, block).unwrap_or(js::Node::Void);
                 let key = self.walk_entity(*index, block).unwrap_or(js::Node::Void);
@@ -7503,6 +7552,150 @@ impl<'src> Transformer<'src> {
         ))
     }
 
+    /// B711: a key literal (`Task.meta.owner`) as `std::key`'s layout —
+    /// `Key { erased = KeyPath { parts = [KeyStep { owner, index, name }, ..] } }`,
+    /// so `[[[[owner, index, name], ..]]]` — hoisted to one module constant per
+    /// distinct literal and named where it is written. A key's parts are std's
+    /// internal fields and nothing writes them, so the one value is shared.
+    fn emit_key_literal(&mut self, steps: &[(Id, usize)]) -> String {
+        if let Some(name) = self.key_literals.get(steps) {
+            let name = name.clone();
+            self.record_hit(|recorder| recorder.key_literals.get(&name).copied());
+            return name;
+        }
+        let name = self.ng.next_name();
+        self.key_literals.insert(steps.to_vec(), name.clone());
+        let emission = self.record_keyed(|recorder, id| {
+            recorder.key_literals.insert(name.clone(), id);
+        });
+        let frame = self.record_enter();
+        let parts = steps
+            .iter()
+            .map(|(owner, index)| {
+                let field_name = self
+                    .program
+                    .structs
+                    .get(owner)
+                    .and_then(|struct_| struct_.fields.get(*index))
+                    .map_or("", |field| field.name);
+                js::Node::Array(vec![
+                    js::Node::String(Cow::Owned(self.program.key_step_owner(*owner))),
+                    js::Node::Number(index.to_string(), None),
+                    js::Node::String(Cow::Owned(field_name.to_string())),
+                ])
+            })
+            .collect();
+        self.monomorphized
+            .push(js::Node::ConstVariable(js::Variable {
+                name: name.clone(),
+                value: Box::new(js::Node::Array(vec![js::Node::Array(vec![
+                    js::Node::Array(parts),
+                ])])),
+            }));
+        self.record_leave(frame, emission);
+        self.record_landed(emission);
+        name
+    }
+
+    /// B711: the field positions of a key subscript's index when it is written
+    /// as a key LITERAL (`s[Task.meta.owner]`): the place is then a plain field
+    /// chain, emitted as `s.x` would be. `None` for a key held in a value.
+    fn key_literal_positions(&self, index_id: Id) -> Option<Vec<usize>> {
+        let mut current = index_id;
+        // An ascription is transparent (`s[Pair.left as Key<..>]`).
+        while let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&current) {
+            current = *inner;
+        }
+        match self.program.entity_map.get(&current) {
+            Some(Expr::Key(steps)) => Some(steps.iter().map(|(_, index)| *index).collect()),
+            _ => None,
+        }
+    }
+
+    /// `subject[i0][i1]..` over the given positions.
+    fn field_chain(subject: js::Node<'src>, positions: &[usize]) -> js::Node<'src> {
+        positions.iter().fold(subject, |place, index| {
+            js::Node::PropertyIndex(
+                Box::new(place),
+                Box::new(js::Node::Number(index.to_string(), None)),
+            )
+        })
+    }
+
+    /// B711: `s[k]` read — the field the key's steps reach. Never fails: a key
+    /// always names a real field.
+    fn key_subscript_read(
+        &mut self,
+        subject_id: Id,
+        index_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let subject = self
+            .walk_entity(subject_id, block)
+            .unwrap_or(js::Node::Void);
+        if let Some(positions) = self.key_literal_positions(index_id) {
+            return Self::field_chain(subject, &positions);
+        }
+        let key = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+        self.used_helpers.insert("__key_at");
+        js::Node::Call(
+            Box::new(js::Node::Local("__key_at".to_string())),
+            vec![subject, key],
+        )
+    }
+
+    /// B711: `s[k] = v`.
+    fn key_subscript_write(
+        &mut self,
+        subject_id: Id,
+        index_id: Id,
+        value: js::Node<'src>,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let subject = self
+            .walk_entity(subject_id, block)
+            .unwrap_or(js::Node::Void);
+        if let Some(positions) = self.key_literal_positions(index_id) {
+            return js::Node::Assignment(
+                Box::new(Self::field_chain(subject, &positions)),
+                Box::new(value),
+            );
+        }
+        let key = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+        self.used_helpers.insert("__key_put");
+        js::Node::Call(
+            Box::new(js::Node::Local("__key_put".to_string())),
+            vec![subject, key, value],
+        )
+    }
+
+    /// B711: `&mut s[k]` at a SCALAR field — the existing `(base, key)` view
+    /// pair: the struct holding the field, and the field's position in it.
+    fn key_subscript_view(
+        &mut self,
+        subject_id: Id,
+        index_id: Id,
+        block: &mut Vec<js::Node<'src>>,
+    ) -> js::Node<'src> {
+        let subject = self
+            .walk_entity(subject_id, block)
+            .unwrap_or(js::Node::Void);
+        if let Some(positions) = self.key_literal_positions(index_id)
+            && let Some((last, parents)) = positions.split_last()
+        {
+            return js::Node::Array(vec![
+                Self::field_chain(subject, parents),
+                js::Node::Number(last.to_string(), None),
+            ]);
+        }
+        let key = self.walk_entity(index_id, block).unwrap_or(js::Node::Void);
+        self.used_helpers.insert("__key_view");
+        js::Node::Call(
+            Box::new(js::Node::Local("__key_view".to_string())),
+            vec![subject, key],
+        )
+    }
+
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {
         // B462: a tuple variant standing for a closure is its eta-expansion,
         // `(a, b) => variant(a, b)`, built at the site.
@@ -7783,6 +7976,7 @@ impl<'src> Transformer<'src> {
                 )
             }
             Expr::Void => js::Node::Void,
+            Expr::Key(steps) => js::Node::Local(self.emit_key_literal(steps)),
             Expr::Null => js::Node::Null,
             Expr::Bool(x) => js::Node::Bool(*x),
             // array-lengths.md §5.3: a length parameter read as a value is the
@@ -7961,6 +8155,10 @@ impl<'src> Transformer<'src> {
             }
             // `list[i]` — the checked read (`__at`): an out-of-bounds subscript
             // panics; `get` is the total, Option-returning form.
+            Expr::Index(subject_id, index_id) if self.program.key_subscripts.contains(&id) => {
+                let (subject_id, index_id) = (*subject_id, *index_id);
+                self.key_subscript_read(subject_id, index_id, block)
+            }
             Expr::Index(subject_id, index_id) => {
                 let subject = self
                     .walk_entity(*subject_id, block)
@@ -11423,6 +11621,12 @@ impl<'src> Transformer<'src> {
                 )
             };
             match self.program.entity_map.get(&element).cloned() {
+                Some(Expr::Index(subject_id, index_id))
+                    if self.program.key_subscripts.contains(&element) =>
+                {
+                    let write = self.key_subscript_write(subject_id, index_id, slot, block);
+                    block.push(write);
+                }
                 Some(Expr::Index(subject_id, index_id)) => {
                     let subject = self
                         .walk_entity(subject_id, block)

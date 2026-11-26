@@ -35,6 +35,7 @@ mod generics;
 mod hmr;
 mod index_type;
 mod iterators;
+mod keys;
 mod lazy;
 mod lifetimes;
 mod liveness;
