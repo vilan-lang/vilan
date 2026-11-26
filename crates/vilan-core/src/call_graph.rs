@@ -1188,6 +1188,7 @@ impl<'a, 'src> Collector<'a, 'src> {
             | Expr::Jump(_)
             | Expr::Module(_)
             | Expr::Null
+            | Expr::Key(_)
             | Expr::Number(_, _, _)
             | Expr::LengthValue(_)
             | Expr::String(_)

@@ -1073,6 +1073,7 @@ impl<'a, 'src> LoadTimeWalk<'a, 'src> {
             // Scalars, strings, and the empty/erroneous values.
             Expr::Bool(_)
             | Expr::Null
+            | Expr::Key(_)
             | Expr::Number(..)
             | Expr::LengthValue(_)
             | Expr::String(_)

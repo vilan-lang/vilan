@@ -861,8 +861,15 @@ pub enum Expr<'src> {
     ExternalFunction(Id),
     Field(Id, Id, usize),
     // `subject[index]` — a `List` element place: subject and index expr ids. Its
-    // type is the list's element type (resolved like a field accessor).
+    // type is the list's element type (resolved like a field accessor). Also a
+    // struct field reached through a KEY (`s[k]`, B711): the same place shape
+    // rooted at the subject, told apart by `Program::key_subscripts`.
     Index(Id, Id),
+    /// A key literal (B711, `proposal/struct-keys.md`): `Task.meta.owner` as a
+    /// `Key<Task, str>`. Its steps, root first, each the struct that DECLARES
+    /// the field and the field's position in it. A constant: it has no operand
+    /// to evaluate, and every emitter builds `std::key`'s layout from the steps.
+    Key(Vec<(Id, usize)>),
     // A loop: the optional condition and the body (statements, trailing expr).
     For(Option<Id>, (Vec<Id>, Id)),
     // `for item in iterable` — the iterable, the optional element binding (None
@@ -5546,6 +5553,16 @@ pub struct Analyzer<'src> {
     // `Program`, because the re-read is also a second walk of the target's
     // SUBSCRIPT and the emission has to evaluate that only once (B105).
     compound_reread_ids: HashSet<Id>,
+    // B711: a bare name written as the subject of a member access (`Task` in
+    // `Task.title`), which may name a struct TYPE and so root a key literal.
+    // Asked when the name resolves: one that names a struct is no value error
+    // there, and its member access becomes the key (`resolve_key_step`).
+    key_root_uses: HashSet<Id>,
+    // B711: the subscripts that reach a struct field through a key (`s[k]`),
+    // an `Expr::Index` each. Published on `Program` as `key_subscripts`: every
+    // place analysis reads them as the element place they share a shape with,
+    // and each emitter walks the key's steps instead of indexing a list.
+    key_subscript_ids: HashSet<Id>,
     // Literal-element diagnostics already emitted (keyed by the offending item's
     // expr id, or the literal's own id for a count mismatch). These checks run
     // inside type INFERENCE, which the constraint fixpoint may re-run after a
@@ -6733,6 +6750,9 @@ pub struct Analyzer<'src> {
     // `map`'s desugar keys on the trait, the key's family rule on the struct.
     tuple_trait_id: Option<Id>,
     tuple_key_struct_id: Option<Id>,
+    // B711: `std::key`'s `Key<S, F>`, by identity — the type of a key literal
+    // and of the index a struct subscript takes.
+    key_struct_id: Option<Id>,
     /// The std `Callable` marker (B340), resolved by identity from
     /// `std::operators` after loading. `x(args)` on a receiver whose type
     /// implements it resolves as the method `call`; keyed on the real std
@@ -8514,6 +8534,8 @@ impl<'src> Analyzer<'src> {
             pinned_diagnostic_anchors: Vec::new(),
             prepped_assignments: Vec::new(),
             compound_reread_ids: HashSet::default(),
+            key_root_uses: HashSet::default(),
+            key_subscript_ids: HashSet::default(),
             reported_literal_errors: HashSet::default(),
             binding_annotation_view: HashMap::default(),
             prepped_imports: Vec::new(),
@@ -8745,6 +8767,7 @@ impl<'src> Analyzer<'src> {
             try_trait_id: None,
             tuple_trait_id: None,
             tuple_key_struct_id: None,
+            key_struct_id: None,
             lift_trait_id: None,
             callable_trait_id: None,
             hmr_stash_fn_id: None,
@@ -16273,6 +16296,7 @@ impl<'src> Analyzer<'src> {
             | Expr::String(_)
             | Expr::MultilineString(_)
             | Expr::Null
+            | Expr::Key(_)
             | Expr::Void
             | Expr::Error
             | Expr::Jump(_)
@@ -17106,6 +17130,7 @@ impl<'src> Analyzer<'src> {
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
             | Expr::Null
+            | Expr::Key(_)
             | Expr::Void
             | Expr::Error
             | Expr::Jump(_)
@@ -18192,6 +18217,7 @@ impl<'src> Analyzer<'src> {
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
             | Expr::Null
+            | Expr::Key(_)
             | Expr::Void
             | Expr::Error
             | Expr::Jump(_)
@@ -21736,6 +21762,7 @@ impl<'src> Analyzer<'src> {
             | Expr::MultilineString(_)
             | Expr::CallerLocation(_)
             | Expr::Null
+            | Expr::Key(_)
             | Expr::Void
             | Expr::Error
             | Expr::Jump(_)
@@ -31002,6 +31029,16 @@ impl<'src> Analyzer<'src> {
             Expr::TupleIndex(subject_id, offset, _) => {
                 let (root, mut path) = self.place_path(*subject_id)?;
                 path.push(PlaceStep::Slot(*offset));
+                Some((root, path))
+            }
+            // B711: a key subscript is the field chain its literal names, and a
+            // key held in a value may name any field — its place is the
+            // subject's whole, which nests with every place under it.
+            Expr::Index(subject_id, index_id) if self.key_subscript_ids.contains(&expr_id) => {
+                let (root, mut path) = self.place_path(*subject_id)?;
+                if let Some(Expr::Key(steps)) = self.expr_id_to_expr_map.get(index_id) {
+                    path.extend(steps.iter().map(|(_, index)| PlaceStep::Field(*index)));
+                }
                 Some((root, path))
             }
             Expr::Index(subject_id, _) => {
@@ -42734,6 +42771,15 @@ impl<'src> Analyzer<'src> {
         let subject_id = self.walk_expr_node(subject, scope_id);
         match &member.0 {
             Node::Accessor(name) => {
+                // B711: `Task.title`, `model::Task.title` — a name or a path
+                // here may be a struct type rooting a key literal; its
+                // resolution decides.
+                if matches!(
+                    subject.0,
+                    Node::Accessor(_) | Node::StaticAccessor(_, _, None)
+                ) {
+                    self.key_root_uses.insert(subject_id);
+                }
                 self.member_name_spans.insert(id, member.1);
                 self.constraints
                     .push(Constraint::FieldAccessor(FieldAccessorConstraint {
@@ -51080,6 +51126,12 @@ impl<'src> Analyzer<'src> {
                 }
             }
             Expr::Function(function_id) => Type::Function(*function_id),
+            // B711: a key literal over a generic struct; one over any other struct
+            // recorded its type when it resolved.
+            Expr::Key(steps) => {
+                let steps = steps.clone();
+                self.key_literal_type(&steps, &constraint, substitution_context)
+            }
             Expr::Struct(struct_id) => Type::Struct(*struct_id, Vec::new()),
             Expr::Enum(enum_id) => Type::Enum(*enum_id, Vec::new()),
             // A bare variant reference is a value of the enum (e.g. `None`); a
@@ -69833,6 +69885,9 @@ impl<'src> Analyzer<'src> {
         if !self.expr_id_to_expr_map.contains_key(&subject_id) {
             return Resolution::Deferred;
         }
+        if let Some(resolution) = self.resolve_key_step(id, subject_id, member_name) {
+            return resolution;
+        }
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
         match subject_type {
             Type::Unresolved => Resolution::Deferred,
@@ -70080,6 +70135,352 @@ impl<'src> Analyzer<'src> {
                 self.expr_id_to_expr_map.insert(id, Expr::Error);
                 Resolution::Failed
             }
+        }
+    }
+
+    /// B711: `S.x` and `S.a.b`, key literals (`proposal/struct-keys.md` §3.1).
+    ///
+    /// `subject` is either a struct TYPE written as a bare name (the root,
+    /// admitted by `resolve_prepped_local` from `key_root_uses`) or a key
+    /// literal already resolved (a path continues: `Task.meta` then `.owner`).
+    /// Answers `None` for every other subject, which is then the ordinary member
+    /// access — a value named like a type never gets here (R9).
+    ///
+    /// The step names a field of the struct the path has reached so far, under
+    /// the rules a member access `s.x` of that struct follows: an `[internal]`
+    /// std field is no member outside std. A key reaches ONLY a struct's own
+    /// fields: a step into an `Option`, an enum, a list, a map, a tuple or a
+    /// type parameter is refused (a partial place is `MaybeKey`, a later stage).
+    fn resolve_key_step(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        member_name: &'src str,
+    ) -> Option<Resolution> {
+        let key_struct_id = self.key_struct_id?;
+        let (root, mut steps) = match self.expr_id_to_expr_map.get(&subject_id) {
+            Some(Expr::Local(target)) if self.key_root_uses.contains(&subject_id) => {
+                match self.expr_id_to_expr_map.get(target) {
+                    Some(Expr::Struct(struct_id)) => (*struct_id, Vec::new()),
+                    _ => return None,
+                }
+            }
+            Some(Expr::Key(steps)) => (steps.first()?.0, steps.clone()),
+            _ => return None,
+        };
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let reached = self.key_path_type(root, &steps)?;
+        let refuse = |this: &mut Self, msg: String| {
+            this.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg,
+            });
+            this.expr_id_to_expr_map.insert(id, Expr::Error);
+            Some(Resolution::Failed)
+        };
+        let root_name = self.structs.get(&root).map_or("", |struct_| struct_.name);
+        let path_so_far = {
+            let mut path = root_name.to_string();
+            for (owner, index) in &steps {
+                if let Some(field) = self
+                    .structs
+                    .get(owner)
+                    .and_then(|struct_| struct_.fields.get(*index))
+                {
+                    path.push('.');
+                    path.push_str(field.name);
+                }
+            }
+            path
+        };
+        let reached_name = self.pretty_print_type(&reached, &HashMap::default());
+        let (owner, arguments) = match &reached {
+            Type::Struct(owner, arguments)
+                if self
+                    .structs
+                    .get(owner)
+                    .is_some_and(|struct_| !struct_.external) =>
+            {
+                (*owner, arguments.clone())
+            }
+            Type::Enum(..) => {
+                return refuse(
+                    self,
+                    format!(
+                        "a key reaches only struct fields: `{path_so_far}` has type \
+                         `{reached_name}`, and a step into an `Option` or an enum's variant \
+                         may find nothing there (a key to a place that may be missing, \
+                         `MaybeKey`, is a later stage)"
+                    ),
+                );
+            }
+            _ => {
+                let what = match &reached {
+                    Type::Tuple(..) => {
+                        format!(
+                            "has type `{reached_name}`, and a key does not step into a tuple's positions"
+                        )
+                    }
+                    Type::Generic(_) => format!(
+                        "has type `{reached_name}`, a type parameter, whose fields a key cannot name"
+                    ),
+                    _ if steps.is_empty() => {
+                        "is an external type, which has no fields a key can name".to_string()
+                    }
+                    _ => format!(
+                        "has type `{reached_name}`, which has no fields a key can name (a list \
+                         element or a map entry, `MaybeKey`, is a later stage)"
+                    ),
+                };
+                return refuse(
+                    self,
+                    format!("a key reaches only struct fields: `{path_so_far}` {what}"),
+                );
+            }
+        };
+        let (owner_name, resource, field) = {
+            let struct_ = self.structs.get(&owner)?;
+            let field = struct_
+                .fields
+                .iter()
+                .enumerate()
+                .find(|(_, field)| field.name == member_name)
+                .map(|(index, field)| (index, field.type_id));
+            (struct_.name, struct_.resource, field)
+        };
+        let owner_type = Type::Struct(owner, arguments).get_type_id(self);
+        if resource || self.type_is_resource(owner_type) {
+            return refuse(
+                self,
+                format!(
+                    "`{owner_name}` is a resource, and a key cannot reach into a resource's \
+                     fields: a resource is moved, never copied, and a key's place reads by copy"
+                ),
+            );
+        }
+        let hidden = field.and_then(|(index, _)| self.internal_field_hidden(owner, index, id));
+        if let (Some(_), Some(reason)) = (field, hidden) {
+            return refuse(
+                self,
+                format!(
+                    "`{member_name}` is an `[internal]` field of std's `{owner_name}`, and an \
+                     internal std field is not a member outside std, so it has no key: {reason}"
+                ),
+            );
+        }
+        let Some((field_index, _)) = field else {
+            let candidates: Vec<&str> = self
+                .structs
+                .get(&owner)
+                .map(|struct_| {
+                    struct_
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| {
+                            self.internal_field_hidden(owner, *index, id).is_none()
+                        })
+                        .map(|(_, field)| field.name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let suggestion = closest_name::closest_name(member_name, candidates.iter().copied())
+                .map(|name| format!("; did you mean `{name}`?"))
+                .unwrap_or_default();
+            return refuse(
+                self,
+                format!("struct '{owner_name}' has no field '{member_name}'{suggestion}"),
+            );
+        };
+        steps.push((owner, field_index));
+        let root_is_generic = self
+            .structs
+            .get(&root)
+            .is_some_and(|struct_| !struct_.generic_parameter_constraint_ids.is_empty());
+        self.expr_id_to_expr_map
+            .insert(id, Expr::Key(steps.clone()));
+        // A generic root's arguments come from where the key lands (R8), so its
+        // type is the expectation's, asked afresh each time (`key_literal_type`).
+        if !root_is_generic {
+            let field_type = self.key_path_type(root, &steps)?.get_type_id(self);
+            let root_type = Type::Struct(root, Vec::new()).get_type_id(self);
+            let key_type =
+                Type::Struct(key_struct_id, vec![root_type, field_type]).get_type_id(self);
+            self.expr_id_to_type_id_map.insert(id, key_type);
+            self.resolved_types.insert(id, key_type);
+        }
+        Some(Resolution::Resolved)
+    }
+
+    /// B711: the type a key's steps reach from `root`, written in the ROOT's own
+    /// terms — a generic root's parameters stay its `Generic`s, and each step's
+    /// field type is substituted with the arguments of the struct it is a field
+    /// of. `None` when a step does not name a field of the struct reached (which
+    /// `resolve_key_step` never builds).
+    fn key_path_type(&mut self, root: Id, steps: &[(Id, usize)]) -> Option<Type> {
+        let root_generics = self
+            .structs
+            .get(&root)?
+            .generic_parameter_constraint_ids
+            .clone();
+        let mut reached = Type::Struct(
+            root,
+            root_generics
+                .iter()
+                .map(|constraint| Type::Generic(*constraint).get_type_id(self))
+                .collect(),
+        );
+        for (owner, index) in steps {
+            let Type::Struct(reached_owner, arguments) = &reached else {
+                return None;
+            };
+            if reached_owner != owner {
+                return None;
+            }
+            let (generics, field_type) = {
+                let struct_ = self.structs.get(owner)?;
+                (
+                    struct_.generic_parameter_constraint_ids.clone(),
+                    struct_.fields.get(*index)?.type_id,
+                )
+            };
+            let declared = field_type.get_type(self);
+            reached = if generics.is_empty() || arguments.is_empty() {
+                declared
+            } else {
+                let substitution: SubstitutionContext = generics
+                    .iter()
+                    .copied()
+                    .zip(arguments.iter().copied())
+                    .collect();
+                self.substitute_type(&declared, &substitution)
+            };
+        }
+        Some(reached)
+    }
+
+    /// B711 (R8): the type of a key literal whose root is GENERIC — `Pair.left`
+    /// is a `Key<Pair<A>, A>` at the arguments the expectation gives `Pair`
+    /// (`let k: Key<Pair<i32>, i32> = Pair.left`, a parameter, the subject of
+    /// `p[Pair.left]`), as a struct literal's are. Without one the arguments are
+    /// holes, as a bare `None`'s are; a subscript through such a key is refused.
+    fn key_literal_type(
+        &mut self,
+        steps: &[(Id, usize)],
+        constraint: &Type,
+        substitution_context: &SubstitutionContext,
+    ) -> Type {
+        let (Some(key_struct_id), Some(&(root, _))) = (self.key_struct_id, steps.first()) else {
+            return Type::Unresolved;
+        };
+        let generics = self
+            .structs
+            .get(&root)
+            .map(|struct_| struct_.generic_parameter_constraint_ids.clone())
+            .unwrap_or_default();
+        let Some(field_type) = self.key_path_type(root, steps) else {
+            return Type::Unresolved;
+        };
+        let expected_arguments = match constraint {
+            Type::Struct(wanted_key, wanted)
+                if *wanted_key == key_struct_id && wanted.len() == 2 =>
+            {
+                // The expected ROOT is what decides, written in the terms of
+                // the call it lands in: `then`'s `next: Key<F, G>` expects a
+                // root `F` its receiver binds, and the field type `G` is what
+                // this literal answers for the call to bind.
+                let wanted_root = wanted[0].get_type(self);
+                match self.substitute_type(&wanted_root, substitution_context) {
+                    Type::Struct(wanted_root, arguments)
+                        if wanted_root == root && arguments.len() == generics.len() =>
+                    {
+                        Some(arguments)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let arguments = expected_arguments.unwrap_or_else(|| {
+            let hole = Type::Unknown.get_type_id(self);
+            vec![hole; generics.len()]
+        });
+        let substitution: SubstitutionContext = generics
+            .iter()
+            .copied()
+            .zip(arguments.iter().copied())
+            .collect();
+        let field_type = self
+            .substitute_type(&field_type, &substitution)
+            .get_type_id(self);
+        let root_type = Type::Struct(root, arguments).get_type_id(self);
+        Type::Struct(key_struct_id, vec![root_type, field_type])
+    }
+
+    /// B711: `subject[key]` — a struct field reached through a `Key<S, F>`
+    /// (`proposal/struct-keys.md` §3.2). The subject is any value of the key's
+    /// struct type `S` (a view of one too, and a type parameter `S` the key is
+    /// over); the place has the field's type `F`. A key always names a real
+    /// field, so the subscript never fails at run time. `None` when the index is
+    /// no key, which leaves the ordinary refusal to speak.
+    fn resolve_key_subscript(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        index_id: Id,
+        subject_type: &Type,
+    ) -> Option<Resolution> {
+        let key_struct_id = self.key_struct_id?;
+        let subject_type_id = subject_type.clone().get_type_id(self);
+        let hole = Type::Unknown.get_type_id(self);
+        let expected = Type::Struct(key_struct_id, vec![subject_type_id, hole]);
+        let index_type = self.infer_type(index_id, &expected, &HashMap::default());
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        match index_type {
+            Type::Unresolved => Some(Resolution::Deferred),
+            Type::Unknown if self.is_unknown_closure_parameter(index_id) => {
+                Some(Resolution::Deferred)
+            }
+            Type::Struct(key, arguments) if key == key_struct_id && arguments.len() == 2 => {
+                let key_subject = arguments[0];
+                let refusal = if self.type_has_an_unknown_hole(&key_subject.get_type(self)) {
+                    Some(
+                        "this key's struct type arguments are never determined: give the key \
+                         its type where it is made (`let k: Key<Pair<i32>, i32> = Pair.left`)"
+                            .to_string(),
+                    )
+                } else if !self.same_type_structure(key_subject, subject_type_id, 0) {
+                    let key_name =
+                        self.pretty_print_type(&key_subject.get_type(self), &HashMap::default());
+                    let subject_name = self.pretty_print_type(subject_type, &HashMap::default());
+                    Some(format!(
+                        "this key reaches into a `{key_name}`, and the subject is a \
+                         `{subject_name}`: a key indexes only the struct it was made from"
+                    ))
+                } else {
+                    None
+                };
+                if let Some(msg) = refusal {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span,
+                        msg,
+                    });
+                    self.expr_id_to_expr_map.insert(id, Expr::Error);
+                    return Some(Resolution::Failed);
+                }
+                let field_type = arguments[1];
+                self.key_subscript_ids.insert(id);
+                self.expr_id_to_expr_map
+                    .insert(id, Expr::Index(subject_id, index_id));
+                self.expr_id_to_type_id_map.insert(id, field_type);
+                self.resolved_types.insert(id, field_type);
+                Some(Resolution::Resolved)
+            }
+            _ => None,
         }
     }
 
@@ -70427,6 +70828,11 @@ impl<'src> Analyzer<'src> {
                 Resolution::Resolved
             }
             subject_type => {
+                if let Some(resolution) =
+                    self.resolve_key_subscript(id, subject_id, index_id, &subject_type)
+                {
+                    return resolution;
+                }
                 let subject_str = self.pretty_print_type(&subject_type, &HashMap::default());
                 self.diagnostics.push(Error {
                     trace: Vec::new(),
@@ -70877,6 +71283,26 @@ impl<'src> Analyzer<'src> {
                     let length = Type::Generic(constraint_id).get_type_id(self);
                     self.expr_id_to_expr_map
                         .insert(id, Expr::LengthValue(length));
+                    return;
+                }
+                // B711: a struct TYPE written as a member access's subject
+                // roots a key literal (`Task.title`). It stays a reference to
+                // the declaration, which the access reads as the key's root
+                // (`resolve_key_step`) and never as a value. A name that
+                // resolves to a value is the ordinary access (R9: the value
+                // wins), since only a type gets here.
+                // Every other candidate leaves the set here, so it holds only
+                // the roots the member accesses ask about.
+                if self.key_root_uses.remove(&id)
+                    && matches!(
+                        self.expr_id_to_expr_map.get(&subject_id),
+                        Some(Expr::Struct(_))
+                    )
+                {
+                    self.key_root_uses.insert(id);
+                    let rc = self.reference_count.entry(subject_id).or_insert(0);
+                    *rc += 1;
+                    self.expr_id_to_expr_map.insert(id, Expr::Local(subject_id));
                     return;
                 }
                 if let Some(message) = self.bare_name_not_a_value(subject_id, name)
@@ -78702,6 +79128,9 @@ pub struct Program<'src> {
     /// it to recognize a compound write and evaluate an INDEXED target's subscript
     /// exactly once (B105) — `ys[bump()] += 1` ran `bump()` twice.
     pub compound_rereads: HashSet<Id>,
+    /// B711: the subscripts (`Expr::Index`) that reach a struct field through a
+    /// key — `s[k]` — rather than a list element.
+    pub key_subscripts: HashSet<Id>,
     pub bitwise_u32: HashSet<Id>,
     pub bitwise_generic_lhs: HashMap<Id, TypeId>,
     pub integer_division: HashSet<Id>,
@@ -79882,6 +80311,116 @@ impl<'src> Program<'src> {
     /// disjoint, so the answer is the scan's under every ordering.
     pub fn source_of(&self, id: Id) -> Option<SourceId> {
         self.source_lookup().of(id)
+    }
+
+    /// B711: a key step's OWNER — the struct declaring the field — as its key
+    /// value spells it: the declaring file as a location prints it, the items
+    /// the declaration sits inside (an inline `mod`, a function or method), and
+    /// the struct's name — `src/model.vl::Task`, `src/app.vl::render::Row`.
+    /// The spelling is the step's identity, so two structs of one name in two
+    /// files, or in two functions of one file, make unequal keys, and one
+    /// declaration makes one owner whatever its type arguments. Where even
+    /// that is shared (two blocks of one function), the declarations are
+    /// numbered by their order in the file (`..::Row#2`). It reads only the
+    /// declaring file's text, so it is stable across builds and machines and
+    /// moves only when that file's declarations do; it is a name for display,
+    /// not a storage format (stored data writes a key by `name()`).
+    pub fn key_step_owner(&self, struct_id: Id) -> String {
+        let Some((spelling, source)) = self.key_step_spelling(struct_id) else {
+            return self
+                .structs
+                .get(&struct_id)
+                .map_or(String::new(), |struct_| struct_.name.to_string());
+        };
+        let name = self
+            .structs
+            .get(&struct_id)
+            .map_or("", |struct_| struct_.name);
+        let mut twins: Vec<(usize, Id)> = self
+            .structs
+            .values()
+            .filter(|other| {
+                other.name == name
+                    && self.key_step_site(other.id).map(|(site, _)| site) == Some(source)
+                    && self
+                        .key_step_spelling(other.id)
+                        .is_some_and(|(other_spelling, _)| other_spelling == spelling)
+            })
+            .map(|other| {
+                let start = self
+                    .key_step_site(other.id)
+                    .map_or(0, |(_, span)| span.start);
+                (start, other.id)
+            })
+            .collect();
+        if twins.len() < 2 {
+            return spelling;
+        }
+        twins.sort_unstable_by_key(|(start, id)| (*start, id.0));
+        let ordinal = twins
+            .iter()
+            .position(|(_, other)| *other == struct_id)
+            .map_or(1, |position| position + 1);
+        format!("{spelling}#{ordinal}")
+    }
+
+    /// Where a struct is declared for its key steps: its file and span — for a
+    /// struct a macro or a derive generated, the file and span of the attribute
+    /// that generated it (generated code has no file of its own).
+    fn key_step_site(&self, struct_id: Id) -> Option<(SourceId, Span)> {
+        if let Some((span, source)) = self.derived_origin(struct_id) {
+            return Some((source, span));
+        }
+        let source = self.source_of(struct_id)?;
+        let span = self
+            .span_map
+            .get(&struct_id)
+            .map_or(EMPTY_SPAN, |span| **span);
+        Some((source, span))
+    }
+
+    /// [`Self::key_step_owner`] before the ordinal, and the declaring file.
+    fn key_step_spelling(&self, struct_id: Id) -> Option<(String, SourceId)> {
+        let name = self.structs.get(&struct_id)?.name;
+        let (source, span) = self.key_step_site(struct_id)?;
+        let mut spelling = self.source_display_path(source);
+        if span.start == span.end {
+            return Some((format!("{spelling}::{name}"), source));
+        }
+        // An item encloses the declaration when its own span (a non-empty one:
+        // a FILE's module has none) holds the declaration's, in the same file.
+        let encloses = |id: Id| {
+            self.span_map.get(&id).is_some_and(|outer| {
+                outer.start < outer.end
+                    && outer.start <= span.start
+                    && span.end <= outer.end
+                    && (outer.start, outer.end) != (span.start, span.end)
+            }) && self.source_of(id) == Some(source)
+        };
+        let mut enclosing: Vec<(usize, std::cmp::Reverse<usize>, &str)> = self
+            .modules
+            .values()
+            .filter(|module| encloses(module.id))
+            .map(|module| (module.id, module.name))
+            .chain(
+                self.functions
+                    .values()
+                    .filter(|function| encloses(function.id))
+                    .map(|function| (function.id, function.name)),
+            )
+            .filter_map(|(id, item_name)| {
+                let outer = self.span_map.get(&id)?;
+                Some((outer.start, std::cmp::Reverse(outer.end), item_name))
+            })
+            .collect();
+        enclosing.sort_unstable();
+        for (_, _, item_name) in enclosing {
+            spelling.push_str("::");
+            spelling.push_str(item_name);
+        }
+        spelling.push_str("::");
+        spelling.push_str(name);
+        Some((spelling, source))
     }
 
     /// [`Self::source_of`], hoisted out of a whole-program loop (M27).
@@ -91686,6 +92225,12 @@ fn analyze_inner<'src>(
             .get(scope_id)
             .and_then(|scope| scope.name_to_id_map.get("TupleKey").copied())
     });
+    analyzer.key_struct_id = module_scopes.get("key").and_then(|scope_id| {
+        analyzer
+            .scopes
+            .get(scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("Key").copied())
+    });
     analyzer.try_trait_id = module_scopes.get("operators").and_then(|scope_id| {
         analyzer
             .scopes
@@ -94710,6 +95255,7 @@ fn analyze_over_world<'src>(
         try_dispatch: analyzer.try_dispatch,
         lift_dispatch: analyzer.lift_dispatch,
         compound_rereads: analyzer.compound_reread_ids,
+        key_subscripts: analyzer.key_subscript_ids,
         bitwise_u32: analyzer.bitwise_u32,
         integer_division: analyzer.integer_division,
         division_generic_lhs: analyzer.division_generic_lhs,

@@ -203,6 +203,7 @@ macro_rules! corpus_manifest {
             stdin_lines => "stdin-lines.vl",
             string_interpolation => "string-interpolation.vl",
             string_methods => "string-methods.vl",
+            struct_keys => "struct-keys.vl",
             struct_literal_call => "struct-literal-call.vl",
             style => "style.vl",
             style_when => "style-when.vl",

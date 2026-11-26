@@ -249,7 +249,10 @@ pub fn thread_locations(program: &mut Program, graph: &CallGraph) {
         pending.push(function.body.1);
         let mut subscripts = Vec::new();
         while let Some(id) = pending.pop() {
-            if matches!(program.entity_map.get(&id), Some(Expr::Index(_, _))) {
+            // A key subscript (B711) cannot fail, so it reports no site.
+            if matches!(program.entity_map.get(&id), Some(Expr::Index(_, _)))
+                && !program.key_subscripts.contains(&id)
+            {
                 subscripts.push(id);
             }
             own_body_children(program, id, &mut pending);
@@ -694,6 +697,7 @@ fn own_body_children(program: &Program, id: Id, out: &mut Vec<Id>) {
         | Expr::String(_)
         | Expr::MultilineString(_)
         | Expr::Null
+        | Expr::Key(_)
         | Expr::Void
         | Expr::Error
         | Expr::Jump(_)
@@ -833,6 +837,13 @@ impl Program<'_> {
     /// column in characters. A call anchors at its callee's NAME (`unwrap`
     /// in `rows.first().unwrap()`), as Rust's `#[track_caller]` does, so a
     /// chain's links read apart; any other anchor at its own start.
+    /// A source's path as a location prints it (`src/model.vl`, `std/src/..`,
+    /// `<package>/src/..`): portable, and distinct per file of the build.
+    pub fn source_display_path(&self, source: SourceId) -> String {
+        let locator = self.site_locator.get_or_init(|| SiteLocator::build(self));
+        locator.path(self, source).to_string()
+    }
+
     pub fn site_location(&self, anchor: Id) -> String {
         let locator = self.site_locator.get_or_init(|| SiteLocator::build(self));
         let source = self.source_of(anchor).unwrap_or(SourceId(0));

@@ -2497,6 +2497,39 @@ impl<'a> Interpreter<'a> {
                     Err(index_out_of_bounds(list.len(), index))
                 }
             }
+            // B711: a key's place, matching the emitted helpers: the key's
+            // parts are `key[0][0]`, each `[owner, index, name]`.
+            "__key_at" => {
+                let mut value = take(0);
+                for index in key_positions(&take(1))? {
+                    value = array_slot(&value, index)?;
+                }
+                Ok(value)
+            }
+            "__key_put" | "__key_view" => {
+                let mut value = take(0);
+                let positions = key_positions(&take(1))?;
+                let Some((last, parents)) = positions.split_last() else {
+                    return Err(Failure::internal("a key with no steps".to_string()));
+                };
+                for index in parents {
+                    value = array_slot(&value, *index)?;
+                }
+                let holder = expect_array(&value)?;
+                if name == "__key_view" {
+                    return Ok(Value::Array(Rc::new(RefCell::new(vec![
+                        Value::Array(holder),
+                        Value::Number(*last as f64),
+                    ]))));
+                }
+                let field = take(2);
+                let mut slots = holder.borrow_mut();
+                match slots.get_mut(*last) {
+                    Some(slot) => *slot = field.clone(),
+                    None => return Err(Failure::internal("a key past its struct".to_string())),
+                }
+                Ok(field)
+            }
             "__at_view" => {
                 let list = expect_array(&take(0))?;
                 let index = expect_number(&take(1))?;
@@ -3758,6 +3791,26 @@ fn expect_number(value: &Value) -> Result<f64, Failure> {
 /// The checked-subscript panic (`__at`/`__at_put`/`__at_view`), worded exactly
 /// as the emitted helpers throw it. `Thrown`, not `Internal`: an out-of-bounds
 /// subscript is the macro's own bug, like a `panic` in its body.
+/// B711: the field positions a key value's steps name, root first.
+fn key_positions(key: &Value) -> Result<Vec<usize>, Failure> {
+    let parts = array_slot(&array_slot(key, 0)?, 0)?;
+    let parts = expect_array(&parts)?;
+    let parts = parts.borrow();
+    parts
+        .iter()
+        .map(|part| expect_number(&array_slot(part, 1)?).map(|index| index as usize))
+        .collect()
+}
+
+/// Slot `index` of an array value (B711's key walk).
+fn array_slot<'a>(value: &Value<'a>, index: usize) -> Result<Value<'a>, Failure> {
+    expect_array(value)?
+        .borrow()
+        .get(index)
+        .cloned()
+        .ok_or_else(|| Failure::internal(format!("no slot {index} in a struct value")))
+}
+
 fn index_out_of_bounds(length: usize, index: f64) -> Failure {
     Failure::new(
         FailureKind::Thrown,

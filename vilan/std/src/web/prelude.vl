@@ -10,6 +10,9 @@
 // std does not get a merge mechanism its users lack.
 export import pkg::io::print;
 export import pkg::iterator::Iterator;
+// `Key` (B711): the type of a struct key (`Task.title`), restated from the base
+// prelude, which the language produces where nothing imported it.
+export import pkg::key::Key;
 export import pkg::option::Option::{ self, None, Some };
 export import pkg::result::Result::{ self, Err, Ok };
 

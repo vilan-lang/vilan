@@ -22,10 +22,17 @@
 // accident: a prelude's ambient names are exactly the names it publishes, so a
 // reader answers "what is in scope here" by reading this file.
 //
+// `Key` joined with struct keys (B711, `proposal/struct-keys.md`): the language
+// itself produces one (`Task.title` is a `Key<Task, str>`), and a function that
+// takes a key names its type, so it needs nothing to import. Its erased companion
+// `KeyPath` is reached through `k.path()` and imported by name from `std::key`
+// where a program writes the type.
+//
 // Selected as `prelude = "std::prelude"`, which is also what omitting the key
 // means. The web set is next door in `web.vl`.
 export import pkg::debug::{ dbg, dbg_stack };
 export import pkg::io::print;
 export import pkg::iterator::Iterator;
+export import pkg::key::Key;
 export import pkg::option::Option::{ self, None, Some };
 export import pkg::result::Result::{ self, Err, Ok };

@@ -1,0 +1,163 @@
+// `std::key` — typed paths into a struct (B711, `proposal/struct-keys.md`).
+//
+// `S.x`, where `S` names a struct TYPE and `x` one of its fields, is a value of
+// type `Key<S, F>`, `F` the field's type. A path is one key: `Task.meta.owner` is a
+// `Key<Task, str>` with two steps. For `s: S` and `k: Key<S, F>`, `s[k]` is the
+// field as a place, under the rules of `s.x`: read it, assign it, take `&s[k]` or
+// `&mut s[k]`, or hand it back from a view return.
+//
+// A key is an ordinary value — copied, stored, captured, passed, compared and
+// hashed — and it always names a real field: `S.x` is the only way to make one (the
+// fields below are std's own, so no literal outside std can write them, and no code
+// outside std can read them).
+//
+// THE COMPILER BUILDS THESE VALUES. A key literal is emitted as this layout
+// directly —
+// `Key { erased = KeyPath { parts = [KeyStep { owner, index, name }, ..] } }` — and
+// `s[k]` walks `parts` reading each step's `index`, so the field ORDER of all three
+// structs is the representation. `keys_std_layout` in the compiler's tests pins it.
+
+import pkg::compare::PartialEq;
+import pkg::hash::{ Hash, Hashable, canonical_hash };
+
+/// A path into a struct with its types erased: the steps and nothing else.
+///
+/// What a table is keyed by when its entries are keys of different field types,
+/// and what an event names a place with. It has equality, a hash, a name and a
+/// prefix test; it cannot reach anything. Made by `Key::path`.
+export struct KeyPath {
+	[internal("a key path's steps; read them through `steps()`")] parts: List<KeyStep>,
+}
+
+/// One step of a path: a field of a struct, by its declaring struct and its
+/// position. Two paths agree at a step when both name the same field of the same
+/// struct declaration — `Left.x` and `Right.x` are different steps even when
+/// both are each struct's first field, and `Pair<i32>.left` and `Pair<str>.left`
+/// are the same step (the field of one declaration).
+export struct KeyStep {
+	[internal("the declaring struct, by its file and name; read it through `owner()`")] owner: str,
+	[internal("the field's position; read it through `index()`")] index: usize,
+	[internal("the field's name; read it through `name()`")] name: str,
+}
+
+/// A field of `S` (or a path of fields from `S`) whose type is `F`.
+///
+/// Written `S.x` or `S.a.b`; there is no other constructor. For `s: S`, `s[k]` is
+/// the field as a place.
+export struct Key<S, F> {
+	[internal("a key's erased path; read it through `path()`")] erased: KeyPath,
+}
+
+export impl Key<type S, type F> {
+	/// The path with its types erased.
+	fun path(self): KeyPath {
+		self.erased
+	}
+
+	/// The field names joined with `.`: `"meta.owner"` for `Task.meta.owner`.
+	fun name(self): str {
+		self.erased.name()
+	}
+
+	/// Whether `prefix`'s path is the start of this one (a key starts with itself).
+	fun starts_with<G>(self, prefix: Key<S, G>): bool {
+		self.erased.starts_with(prefix.erased)
+	}
+
+	/// This key followed by `next`: `Task.meta.then(Meta.owner)` is
+	/// `Task.meta.owner`.
+	fun then<G>(self, next: Key<F, G>): Key<S, G> {
+		Key { erased = self.erased.then(next.erased) }
+	}
+}
+
+/// Two keys are equal when their paths are, however each was written.
+export impl Key<type S, type F> with PartialEq {
+	fun eq(self, other: Key<S, F>): bool {
+		self.erased == other.erased
+	}
+}
+
+export impl Key<type S, type F> with Hashable {
+	fun hash(self): Hash {
+		canonical_hash(self.erased.parts)
+	}
+}
+
+export impl KeyPath {
+	/// The field names joined with `.`.
+	fun name(self): str {
+		mut name = "";
+		for step in self.parts {
+			if name != "" {
+				name = name + ".";
+			}
+			name = name + step.name;
+		}
+		name
+	}
+
+	/// The steps, root first.
+	fun steps(self): List<KeyStep> {
+		self.parts
+	}
+
+	/// Whether `prefix` is the start of this path (a path starts with itself).
+	fun starts_with(self, prefix: KeyPath): bool {
+		if prefix.parts.len() > self.parts.len() {
+			ret false;
+		}
+		mut at: usize = 0;
+		for step in prefix.parts {
+			let own = self.parts[at];
+			if step.index != own.index || step.owner != own.owner {
+				ret false;
+			}
+			at += 1;
+		}
+		true
+	}
+
+	/// This path followed by `next`.
+	fun then(self, next: KeyPath): KeyPath {
+		mut parts: List<KeyStep> = [];
+		for step in self.parts {
+			parts.push(step);
+		}
+		for step in next.parts {
+			parts.push(step);
+		}
+		KeyPath { parts }
+	}
+}
+
+export impl KeyPath with PartialEq {
+	fun eq(self, other: KeyPath): bool {
+		canonical_hash(self.parts) == canonical_hash(other.parts)
+	}
+}
+
+export impl KeyPath with Hashable {
+	fun hash(self): Hash {
+		canonical_hash(self.parts)
+	}
+}
+
+export impl KeyStep {
+	/// The field's name.
+	fun name(self): str {
+		self.name
+	}
+
+	/// The field's position in its struct, counting from 0.
+	fun index(self): usize {
+		self.index
+	}
+
+	/// The struct that declares the field, for display: its file, the items it sits
+	/// inside and its name (`src/model.vl::Task`, `src/app.vl::render::Row`). Not a
+	/// storage format — it moves with the file; stored data uses `name()`.
+	fun owner(self): str {
+		self.owner
+	}
+}

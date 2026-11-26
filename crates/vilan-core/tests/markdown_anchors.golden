@@ -412,6 +412,7 @@ spec/types.md h3 labelled-tuples
 spec/types.md h2 510---and-
 spec/types.md h2 511-type-errors-of-note
 spec/types.md h2 512-trait-objects-dyn-trait
+spec/types.md h2 513-struct-keys-keys-f
 std/browser.md h1 browser-modules-reference
 std/browser.md h2 stdwebdom
 std/browser.md h2 stdwebui
@@ -482,6 +483,11 @@ std/image.md h2 avatars-one-upload-three-sizes
 std/image.md h2 what-decode-does-for-you
 std/image.md h2 encoding
 std/image.md h2 cost-and-what-runs-it
+std/keys.md h1 stdkey-reference
+std/keys.md h2 at-a-glance
+std/keys.md h2 reading-and-writing-through-a-key
+std/keys.md h2 identity
+std/keys.md h2 what-a-key-does-not-reach
 std/lens.md h1 stdreactivelens-reference
 std/lens.md h2 at-a-glance
 std/lens.md h2 a-sequence-lens

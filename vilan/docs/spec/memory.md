@@ -369,6 +369,16 @@ mutate the *caller's* value, use `&mut`. `mut` combines with neither
 `own` nor a view — an `own` parameter is already the callee's own storage
 and is writable without it, so `mut own x` is a parse error.
 
+**A key subscript is a field access.** `s[k]`, for a struct key `k:
+Key<S, F>` (types §5.13), is the place `s.x` its key names, chosen at run time:
+every rule of this chapter reads it as that field access, rooted at `s`. A
+read copies the field (rule 1), a write needs a mutable root, `&mut s[k]` is a
+view of the field — at a scalar field the `(base, key)` pair of the struct
+holding it and the field's position, as `&mut s.x` is — and a `borrows` return
+may hand it back (§6.5). Where the key is held in a value, the analyses that
+ask which field a place is (rule 4's disjointness, a lent place written by a
+later argument) count it as reaching ANY field of `s`.
+
 ## 6.4 Rule 4 — no invalidating mutation under a live view
 
 While a view of a place is live, mutations that would **invalidate** the

@@ -755,6 +755,19 @@ the rule leaves exactly as it was. A space on the dot's own line is refused
 with the member still read; a line break after the dot takes nothing from
 the next line.
 
+A **key expression** is a member access whose subject names a struct TYPE
+rather than a value: `Task.title`, a path `Task.meta.owner`, or a root written
+through its module, `model::Task.title` (B711). The grammar is the member
+access's own; name resolution decides. Where the subject's name resolves to a
+value — a binding, a parameter, a module binding — the access is the ordinary
+field read, so no program that names a value changes meaning (R9); where it
+resolves to a struct declaration, the access is a key of type `Key<S, F>`
+(types §5.13). A member written after a key expression continues its path: it
+names a field of the field type, never a member of `Key` (`Task.title.name()`
+is a method call on the key; `Task.title.erased` is a step into `str`, and
+refused). The generic arguments of a key's root are not written —
+`Pair<i32>.left` reads `<` as a comparison — they come from the expected type.
+
 `Name<Args>` is read as a generic path head only when `::` immediately
 follows (`List<str>::new()`); otherwise `<` is a comparison. A fixed-array
 type heads a path the same way (A171): `[i32; 3]::default()`,

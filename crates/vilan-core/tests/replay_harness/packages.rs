@@ -1767,6 +1767,14 @@ pub const ITEM_REFERENCE_TWO: &str = "export struct Bar {\n\tn: i32,\n}\n";
 
 pub const ITEM_REFERENCE_EDITED: &str = "import pkg::one::Foo;\nimport pkg::two::Bar;\n\nexport fun pad(): i32 {\n\t1\n}\n\nexport fun show(x: Foo): i32 {\n\t1\n}\n";
 
+pub const ITEM_KEYS_MAIN: &str = "import pkg::edited::pad;\nimport pkg::user::owner;\n\nfun main() {\n\tprint(pad());\n\tprint(owner());\n}\n";
+
+pub const ITEM_KEYS_MODEL: &str = "export struct Meta {\n\towner: str,\n}\n\nexport struct Task {\n\ttitle: str,\n\tmeta: Meta,\n}\n";
+
+pub const ITEM_KEYS_EDITED: &str = "import pkg::model::{ Meta, Task };\n\nexport fun pad(): str {\n\tlet t = Task { title = \"a\", meta = Meta { owner = \"b\" } };\n\tt[Task.title]\n}\n\nexport fun title_key(): Key<Task, str> {\n\tTask.title\n}\n";
+
+pub const ITEM_KEYS_USER: &str = "import pkg::model::{ Meta, Task };\nimport pkg::edited::title_key;\n\nexport fun owner(): str {\n\tmut t = Task { title = \"a\", meta = Meta { owner = \"b\" } };\n\tt[title_key()] = \"c\";\n\tt[Task.meta.owner] + t.title\n}\n";
+
 pub const ITEM_GRAIN_FIXTURES: &[Fixture] = &[
     Fixture {
         name: "item_bound_epoch",
@@ -1829,6 +1837,34 @@ pub const ITEM_GRAIN_FIXTURES: &[Fixture] = &[
                 "import pkg::one::Foo as Baz;\nimport pkg::two::Bar as Foo;\n",
             )],
         }],
+        dependencies: &[],
+    },
+    Fixture {
+        name: "item_struct_keys",
+        platform: NODE,
+        files: &[
+            ("main.vl", ITEM_KEYS_MAIN),
+            ("model.vl", ITEM_KEYS_MODEL),
+            ("edited.vl", ITEM_KEYS_EDITED),
+            ("user.vl", ITEM_KEYS_USER),
+        ],
+        edits: &[
+            Edit {
+                label: "a key literal's field misspelt: the literal is refused, the importer's subscript is served (B711)",
+                file: "edited.vl",
+                seed: None,
+                replacements: &[("\tt[Task.title]\n", "\tt[Task.titl]\n")],
+            },
+            Edit {
+                label: "a returned key re-pointed at another field of another type: the untouched importer's write must be refused (B711)",
+                file: "edited.vl",
+                seed: None,
+                replacements: &[(
+                    "export fun title_key(): Key<Task, str> {\n\tTask.title\n}",
+                    "export fun title_key(): Key<Task, Meta> {\n\tTask.meta\n}",
+                )],
+            },
+        ],
         dependencies: &[],
     },
 ];

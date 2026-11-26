@@ -10380,3 +10380,28 @@ fn a182_a_glob_is_written_only_as_a_reexport_of_a_module() {
         "{not_a_module:?}"
     );
 }
+
+/// B711: a key's root may be written through its module (`model::Task.title`),
+/// and its step's owner is the declaring file's (`model.vl::Task`), so the
+/// same-named struct of another file makes a different step.
+#[test]
+fn keys_a_module_qualified_root_is_a_key() {
+    let stdout = run_package(
+        &[
+            (
+                "main.vl",
+                "import pkg::model;\n\
+                 struct Task { title: str }\n\
+                 fun main() {\n\
+                 \tlet t = model::Task { title = \"x\" };\n\
+                 \tprint(t[model::Task.title]);\n\
+                 \tprint(model::Task.title.path().steps()[0].owner());\n\
+                 \tprint(model::Task.title.path() == Task.title.path());\n\
+                 }\n",
+            ),
+            ("model.vl", "export struct Task { title: str }\n"),
+        ],
+        "main.vl",
+    );
+    assert_eq!(stdout, "x\nmodel.vl::Task\nfalse\n");
+}

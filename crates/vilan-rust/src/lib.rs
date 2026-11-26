@@ -6271,6 +6271,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 let field = self.field_name(subject, index, span)?;
                 format!("{subject_text}.{field}")
             }
+            Expr::Index(..) if self.program.key_subscripts.contains(&id) => {
+                return Err(unsupported(
+                    "the expression form a subscript through a struct key (`s[k]`)",
+                    span,
+                ));
+            }
             Expr::Index(subject, index) => {
                 if let Some(read) = self.shared_view_field_read(id, depth)? {
                     return Ok(read);
@@ -19159,6 +19165,8 @@ fn form_name(expr: &Expr<'_>) -> &'static str {
         Expr::Destructure(_, _) => "a destructuring binding",
         Expr::Generic(_) => "a generic type reference",
         Expr::Macro => "a macro name",
+        // B711 S1a: keys are JS-only until S1b gives a native key its access.
+        Expr::Key(_) => "a struct key (`Task.title`)",
         _ => "an unsupported form",
     }
 }
