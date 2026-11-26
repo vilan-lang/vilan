@@ -19478,3 +19478,27 @@ fn b753_a_view_return_of_a_named_place_is_its_view_on_both_backends() {
         "a view return's place leaf must hand back its view on both backends"
     );
 }
+
+/// B758: a GENERIC view return is decided at the instance — `same<T>` at each
+/// scalar pointee and at the aggregates, tail and written `&mut x`, readonly
+/// too; the result read at every value position and returned by value; a
+/// generic reaching into a generic container; a generic calling a generic; a
+/// mid-body `ret`; a generic method; a trait method through a bound; a view
+/// binding of the result; an element and a tuple position lent. JS read the
+/// result by the declared pointee `T` (never a scalar) while the callee handed
+/// back its instance's pair or value: writes were lost and `*` printed the
+/// pair. Natively it was already right.
+#[test]
+fn b758_a_generic_view_return_agrees_at_every_instance_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_generic_view_returns.vl"),
+        include_str!("native/generic_view_returns.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_generic_view_returns.vl"),
+        Verdict::Identical,
+        "a generic view return must hand back, and its caller read, the same view at every instance"
+    );
+}

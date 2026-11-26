@@ -6178,7 +6178,7 @@ impl<'src> Transformer<'src> {
                 self.program.scalar_view_calls.contains(&id)
                     || self.call_is_scalar_shared_write(id)
                     || self.call_is_scalar_option_view(id)
-                    || self.generic_view_call_is_scalar(*call_id)
+                    || self.view_call_is_scalar(*call_id)
             }
             // B514: a value `if`/`match`/block evaluates to whatever its tail
             // leaves emit, so it IS a pair when they are — `*if c { &a } else {
@@ -6580,13 +6580,23 @@ impl<'src> Transformer<'src> {
         self.is_shared_write(call_expr_id) && self.shared_write_pointee_is_scalar(call_expr_id)
     }
 
-    /// Whether `call_id` calls a `borrows` function whose return is a view of a
-    /// bare GENERIC built by `Option::some_view` (`get_or_insert`, M191) that
-    /// this call instantiates at a scalar. B506 keeps every other generic view
-    /// return on the DECLARED pointee's protocol (the instance hands the value
-    /// back); `some_view` is the one producer that pairs per instance, so its
-    /// callers read the pair it makes.
-    fn generic_view_call_is_scalar(&self, call_id: Id) -> bool {
+    /// Whether `call_id` calls a `borrows` function whose BARE view return
+    /// (`&T` / `&mut T`) has a pointee that is a scalar at THIS call — the
+    /// callee's return type under the binding the call instantiates it with,
+    /// resolved through the active substitution when the caller is itself
+    /// generic. The callee is emitted per instance and decides its return
+    /// leaves at the same instance (the analyzer's `compute_fixed_view_refs`
+    /// leaves them out), so it hands back the `(base, key)` pair exactly here,
+    /// and both sides agree for every `T` (B758).
+    ///
+    /// A concrete scalar pointee is the analyzer's `scalar_view_calls` too;
+    /// this is the per-instance half a generic `T` needs. Read by the DECLARED
+    /// pointee instead, `same(&mut n) = 2` over `fun same<T>(x: &mut T): &mut
+    /// T borrows x { x }` treated the pair it got back as an aggregate (the
+    /// write was lost, `*same(&mut n)` printed `1,0`). M191's
+    /// `get_or_insert`, whose tail is a `some_view`, was the one shape this
+    /// answered for before; it is now an instance of the rule.
+    fn view_call_is_scalar(&self, call_id: Id) -> bool {
         let Some(function_call) = self.program.function_calls.get(&call_id) else {
             return false;
         };
@@ -6597,20 +6607,8 @@ impl<'src> Transformer<'src> {
         let Some(function) = self.program.functions.get(target) else {
             return false;
         };
-        let tail_is_a_some_view = match self.program.entity_map.get(&function.body.1) {
-            Some(Expr::Call(tail_call)) => self
-                .program
-                .function_calls
-                .get(tail_call)
-                .and_then(|tail| self.program.entity_map.get(&tail.subject_id))
-                .is_some_and(|subject| {
-                    matches!(subject, Expr::Local(callee)
-                        if matches!(self.program.intrinsics.get(callee), Some(Intrinsic::OptionSomeView)))
-                }),
-            _ => false,
-        };
-        tail_is_a_some_view
-            && function.returns_mut_view
+        !function.borrows.is_empty()
+            && (function.returns_view || function.returns_mut_view)
             && self.call_result_resolves_to_scalar(call_id)
     }
 
@@ -6701,6 +6699,10 @@ impl<'src> Transformer<'src> {
                     && !self.program.return_view_reads.contains(&initial)
             }
             Some(Expr::Local(_)) => self.emits_scalar_view_pair(initial),
+            // B758: `let v = same(&mut n)` binds the view a generic call hands
+            // back, a pair exactly where its pointee is a scalar at this call
+            // (`view_call_is_scalar`); a concrete one is `primitive_views`.
+            Some(Expr::Call(call_id)) => self.view_call_is_scalar(*call_id),
             _ => false,
         }
     }
@@ -6851,9 +6853,12 @@ impl<'src> Transformer<'src> {
     /// read a pair. B505: the same for a parameter typed `T` itself (`f(&x)`),
     /// which no root rule reached, since only locals were recorded.
     ///
-    /// A view handed back through a return (a leaf, a wrapped view's payload —
-    /// `fixed_view_refs`) keeps the analyzer's verdict: the caller reading it
-    /// decides by the callee's declared pointee, never by an instance.
+    /// A view handed back through a by-value or a wrapped-view return (a
+    /// by-value seam's leaf, a wrapped view's payload — `fixed_view_refs`)
+    /// keeps the analyzer's verdict: the caller reading it decides by the
+    /// callee's declared pointee, never by an instance. A BARE view return's
+    /// leaf is decided here, at the instance, as its caller reads it (B758,
+    /// `view_call_is_scalar`).
     fn emits_scalar_view_ref(&self, ref_id: Id, operand: Id) -> bool {
         self.program.scalar_view_refs.contains(&ref_id)
             || (!self.program.fixed_view_refs.contains(&ref_id)

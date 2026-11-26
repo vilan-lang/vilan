@@ -427,6 +427,16 @@ aggregate's. It meets the same checks as the written form, so a leaf naming a
 local or a by-value parameter is refused as an escape, and a `&mut` return
 naming a place under a readonly root is refused as a writable view of it.
 
+A **generic** view return is a view at every instantiation, and which kind is
+the instantiation's: `fun same<T>(x: &mut T): &mut T borrows x { x }` at `T =
+i32` is a scalar's view, so `same(&mut n) = 2` writes `n` and `*same(&mut n)`
+reads it, and at a struct it is the struct's. A generic function has no value
+of its own (only a call instantiates it), so every caller knows the
+instantiation it reads, and the callee hands back that same view: on JS, the
+`(base, key)` pair exactly where the pointee is a scalar there, whether the
+leaf forwards a parameter, reaches into a generic container (`fun inner<T>(b:
+&mut Box<T>): &mut T borrows b { b.value }`), or is another generic call.
+
 That agreement is exact for a **forwarded parameter** and conservative for the
 other leaf shapes: a by-value return whose tail is `&self.inner`, a `borrows`
 call, or a wrapped `Some(&mut self.x)` still *projects* at the call site, even
