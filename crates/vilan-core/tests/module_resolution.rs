@@ -10825,3 +10825,18 @@ fn m211_a_file_s_own_key_does_not_load_std_key() {
         "an inline module's ambient `Key` must load `std::key`"
     );
 }
+
+/// A tuple key is std::tuple's, not std::key's: a program that indexes a
+/// tuple through its keys loads no `std::key`, and the subscript still waits
+/// for its index to be typed (the struct-key arm's deferral used to do that
+/// for it, with the module always loaded).
+#[test]
+fn m211_tuple_keys_need_no_std_key() {
+    let load = key_load_entry(
+        "import std::tuple::Tuple;\n\nfun main() {\n\tmut t = (1, \"a\");\n\tlet (a, b) = t.keys();\n\
+         \tt[a] = 5;\n\tprint(t[a]);\n\tprint(t[b]);\n}\n",
+    );
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded, "a tuple key loaded `std::key`");
+    assert_eq!(load.stdout.as_deref(), Some("5\na\n"));
+}

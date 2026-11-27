@@ -70960,7 +70960,20 @@ impl<'src> Analyzer<'src> {
         index_id: Id,
         subject_type: &Type,
     ) -> Option<Resolution> {
-        let key_struct_id = self.key_struct_id?;
+        // M211: with no `std::key` loaded the index is no struct key, but this
+        // is still the subscript's last word before the refusal, and the
+        // refusal must wait for an index not yet typed — a tuple key
+        // (`resolve_tuple_key_subscript`, which answers only a typed one)
+        // among them. The struct-key arm below defers on the same two shapes.
+        let Some(key_struct_id) = self.key_struct_id else {
+            return match self.infer_type(index_id, &Type::Unknown, &HashMap::default()) {
+                Type::Unresolved => Some(Resolution::Deferred),
+                Type::Unknown if self.is_unknown_closure_parameter(index_id) => {
+                    Some(Resolution::Deferred)
+                }
+                _ => None,
+            };
+        };
         let subject_type_id = subject_type.clone().get_type_id(self);
         let hole = Type::Unknown.get_type_id(self);
         let expected = Type::Struct(key_struct_id, vec![subject_type_id, hole]);
