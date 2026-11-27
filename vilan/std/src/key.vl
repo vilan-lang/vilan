@@ -139,7 +139,7 @@ export impl KeyPath {
 		mut at: usize = 0;
 		for step in prefix.parts {
 			let own = self.parts[at];
-			if step.index != own.index || step.owner != own.owner || !same_kind(step.kind, own.kind) {
+			if step.index != own.index || step.owner != own.owner || slot_of(step) != slot_of(own) {
 				ret false;
 			}
 			at += 1;
@@ -260,25 +260,19 @@ fun owner_name(step: KeyStep): str {
 /// `leads` the name), `::Variant` for a variant step, then `.position` when its
 /// payload has more than one slot.
 fun spelled(step: KeyStep, leads: bool): str {
-	match step.kind {
-		StepKind::Field => if leads { step.name } else { "." + step.name },
-		StepKind::Variant(let position, let width) => if width > 1 {
-			i"::{step.name}.{position}"
-		} else {
-			"::" + step.name
-		},
+	if step.kind is StepKind::Variant(let position, let width) {
+		ret if width > 1 { i"::{step.name}.{position}" } else { "::" + step.name };
 	}
+	if leads { step.name } else { "." + step.name }
 }
 
-/// Whether two steps of one declaration and position reach the same slot.
-fun same_kind(left: StepKind, right: StepKind): bool {
-	match left {
-		StepKind::Field => right is StepKind::Field,
-		StepKind::Variant(let position, _) => match right {
-			StepKind::Variant(let other, _) => position == other,
-			StepKind::Field => false,
-		},
+/// A step's payload slot plus one, 0 for a field step: two steps of one
+/// declaration and position reach the same place exactly when these agree.
+fun slot_of(step: KeyStep): usize {
+	if step.kind is StepKind::Variant(let position, _) {
+		ret position + 1;
 	}
+	0
 }
 
 // B711 S3a: keys to a place that may not be there (`proposal/struct-keys.md` §3.4,

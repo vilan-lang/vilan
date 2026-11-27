@@ -81,7 +81,7 @@ function starts_with(self, prefix) {
 	let at3 = 0;
 	for (const step of prefix[0]) {
 		const own = __at(self[0], at3, "std/src/key.vl:141:14");
-		if (step[1] !== own[1] || step[0] !== own[0] || !(same_kind(step[3], own[3]))) {
+		if (step[1] !== own[1] || step[0] !== own[0] || slot_of(step) !== slot_of(own)) {
 			return false;
 		}
 		at3 = at3 + 1;
@@ -103,47 +103,29 @@ function eq2(self, other) {
 }
 function spelled(step, leads) {
 	const $h = step[3];
-	let $i = null;
-	if ($h[0] === 0) {
-		let $j = null;
-		if (leads) {
-			$j = step[2];
+	if ($h[0] === 1) {
+		let $i = null;
+		if ($h[2] > 1) {
+			$i = "::" + step[2] + "." + $h[1];
 		} else {
-			$j = "." + step[2];
+			$i = "::" + step[2];
 		}
-		$i = $j;
-	} else {
-		const position = $h[1];
-		const width = $h[2];
-		let $k = null;
-		if (width > 1) {
-			$k = "::" + step[2] + "." + position;
-		} else {
-			$k = "::" + step[2];
-		}
-		$i = $k;
+		return $i;
 	}
-	return $i;
+	let $j = null;
+	if (leads) {
+		$j = step[2];
+	} else {
+		$j = "." + step[2];
+	}
+	return $j;
 }
-function same_kind(left, right) {
-	const $l = left;
-	let $m = null;
-	if ($l[0] === 0) {
-		const $n = right;
-		$m = $n[0] === 0;
-	} else {
-		const position = $l[1];
-		const $o = right;
-		let $p = null;
-		if ($o[0] === 1) {
-			const other = $o[1];
-			$p = position === other;
-		} else {
-			$p = false;
-		}
-		$m = $p;
+function slot_of(step) {
+	const $k = step[3];
+	if ($k[0] === 1) {
+		return $k[1] + 1;
 	}
-	return $m;
+	return 0;
 }
 const $b = [ [ [ [ "struct-keys.vl::Task", 0, "title", [ 0 ] ] ] ] ];
 function write(task2, key, value) {
@@ -188,15 +170,15 @@ function get(self, key) {
 	return __nmap_get(self[0], hash(key));
 }
 function unwrap_or(self, fallback) {
-	const $q = self;
-	let $r = null;
-	if ($q[0] === 0) {
-		const x = $q[1];
-		$r = x;
+	const $l = self;
+	let $m = null;
+	if ($l[0] === 0) {
+		const x = $l[1];
+		$m = x;
 	} else {
-		$r = __clone(fallback);
+		$m = __clone(fallback);
 	}
-	return $r;
+	return $m;
 }
 let task = [ "a", [ "ada", 1 ] ];
 task[1][0] = "bob";

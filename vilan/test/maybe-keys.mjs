@@ -179,7 +179,7 @@ function starts_with(self, prefix) {
 	let at = 0;
 	for (const step of prefix[0]) {
 		const own = __at(self[0], at, "std/src/key.vl:141:14");
-		if (step[1] !== own[1] || step[0] !== own[0] || !(same_kind(step[3], own[3]))) {
+		if (step[1] !== own[1] || step[0] !== own[0] || slot_of(step) !== slot_of(own)) {
 			return false;
 		}
 		at = at + 1;
@@ -214,48 +214,30 @@ function owner_name(step) {
 	return __at(__at(segments, segments.length - 1, "std/src/key.vl:256:2").split("#"), 0, "std/src/key.vl:256:2");
 }
 function spelled(step, leads) {
-	const $D = step[3];
-	let $E = null;
-	if ($D[0] === 0) {
-		let $F = null;
-		if (leads) {
-			$F = step[2];
+	const $z = step[3];
+	if ($z[0] === 1) {
+		let $A = null;
+		if ($z[2] > 1) {
+			$A = "::" + step[2] + "." + $z[1];
 		} else {
-			$F = "." + step[2];
+			$A = "::" + step[2];
 		}
-		$E = $F;
-	} else {
-		const position = $D[1];
-		const width = $D[2];
-		let $G = null;
-		if (width > 1) {
-			$G = "::" + step[2] + "." + position;
-		} else {
-			$G = "::" + step[2];
-		}
-		$E = $G;
+		return $A;
 	}
-	return $E;
+	let $B = null;
+	if (leads) {
+		$B = step[2];
+	} else {
+		$B = "." + step[2];
+	}
+	return $B;
 }
-function same_kind(left, right) {
-	const $y = left;
-	let $z = null;
-	if ($y[0] === 0) {
-		const $A = right;
-		$z = $A[0] === 0;
-	} else {
-		const position = $y[1];
-		const $B = right;
-		let $C = null;
-		if ($B[0] === 1) {
-			const other = $B[1];
-			$C = position === other;
-		} else {
-			$C = false;
-		}
-		$z = $C;
+function slot_of(step) {
+	const $y = step[3];
+	if ($y[0] === 1) {
+		return $y[1] + 1;
 	}
-	return $z;
+	return 0;
 }
 function eq3(self, b) {
 	const $c = self;
@@ -357,7 +339,7 @@ function name2(self) {
 function debug(self) {
 	return written(self[0]);
 }
-function $H(value, field) {
+function $C(value, field) {
 	const v1 = value[0];
 	if (v1[0] !== 0) {
 		return false;
@@ -415,7 +397,7 @@ console.log(name2($o));
 console.log(debug(age));
 d[0] = [ 1 ];
 d[2] = [ 2 ];
-assert(!($H(d, "b")), "a put never creates a place", "maybe-keys.vl:63:2");
+assert(!($C(d, "b")), "a put never creates a place", "maybe-keys.vl:63:2");
 assert(!(grow(d, $o)), "a miss lends nothing", "maybe-keys.vl:64:2");
 console.log(__dbg_flat(__show_Option_str(d[0])));
 //# sourceMappingURL=maybe-keys.mjs.map

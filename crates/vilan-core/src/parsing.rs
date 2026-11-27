@@ -3786,7 +3786,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // Every link of the chain. Each consumes at least its own leading
             // token, so the loop strictly advances; a following operator is then
             // taken by the arm above, under the refusal already pushed.
-            while matches!(self.parse_one_postfix(), Some(Some(_))) {}
+            while matches!(self.parse_one_postfix(&[]), Some(Some(_))) {}
         }
     }
 
@@ -6060,29 +6060,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut postfixes: Vec<(Postfix<'src>, Span)> = Vec::new();
         loop {
             let start = self.position;
-            // B711 S3a: `Doc.title::Some`, `Doc.shape::Rect.0` — a variant
-            // step of a key literal. `::` after a postfix is no form anything
-            // else reads (a `::` path is the BASE's, before any postfix), so
-            // the step is admitted only after a member (`.name`, `.0`) or
-            // another variant step, and name resolution decides whether the
-            // chain is a key.
-            if matches!(self.peek(), Some(Token::Op("::")))
-                && matches!(
-                    postfixes.last(),
-                    Some((
-                        Postfix::Member((
-                            Node::Accessor(_) | Node::Number(_, None, None) | Node::KeyVariant(..),
-                            _
-                        )),
-                        _
-                    ))
-                )
-            {
-                let step = self.parse_key_variant_step();
-                postfixes.push((Postfix::Member(step), self.span_from(start)));
-                continue;
-            }
-            match self.parse_one_postfix()? {
+            match self.parse_one_postfix(&postfixes)? {
                 Some(postfix) => postfixes.push((postfix, self.span_from(start))),
                 None => break,
             }
@@ -6130,7 +6108,10 @@ impl<'a, 'src> Parser<'a, 'src> {
     /// One postfix suffix, or `Some(None)` when none starts here (stop the loop).
     /// The outer `Option` is the clean-or-decline signal (a required inner element
     /// failed); the inner `Option` distinguishes "no postfix here".
-    fn parse_one_postfix(&mut self) -> Option<Option<Postfix<'src>>> {
+    fn parse_one_postfix(
+        &mut self,
+        before: &[(Postfix<'src>, Span)],
+    ) -> Option<Option<Postfix<'src>>> {
         // `.member` — with the mid-edit recovery to an `Error` member (silent at
         // parse; the receiver still analyzes, for LSP completion).
         if self.peek_is_ctrl('.') {
@@ -6189,6 +6170,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         // with a name `as` is still reported as the missing `;`.
         if self.peek_is_word("as") && self.type_can_start_at(1) {
             return Some(self.attempt(Self::parse_ascription).map(Postfix::Ascribe));
+        }
+        // B711 S3a: `Doc.title::Some`, `Doc.shape::Rect.0` — a variant step
+        // of a key literal. `::` after a postfix is no form anything else
+        // reads (a `::` path is the BASE's, before any postfix), so the step
+        // is admitted only after a member (`.name`, `.0`) or another variant
+        // step, and name resolution decides whether the chain is a key. Asked
+        // last, so a chain that ends anywhere else pays nothing for it.
+        if matches!(
+            before.last(),
+            Some((
+                Postfix::Member((
+                    Node::Accessor(_) | Node::Number(_, None, None) | Node::KeyVariant(..),
+                    _
+                )),
+                _
+            ))
+        ) && self.peek_is_op("::")
+        {
+            return Some(Some(Postfix::Member(self.parse_key_variant_step())));
         }
         Some(None)
     }

@@ -62,27 +62,22 @@ function eq2(self, other) {
 }
 function spelled(step, leads) {
 	const $g = step[3];
-	let $h = null;
-	if ($g[0] === 0) {
-		let $i = null;
-		if (leads) {
-			$i = step[2];
+	if ($g[0] === 1) {
+		let $h = null;
+		if ($g[2] > 1) {
+			$h = "::" + step[2] + "." + $g[1];
 		} else {
-			$i = "." + step[2];
+			$h = "::" + step[2];
 		}
-		$h = $i;
-	} else {
-		const position = $g[1];
-		const width = $g[2];
-		let $j = null;
-		if (width > 1) {
-			$j = "::" + step[2] + "." + position;
-		} else {
-			$j = "::" + step[2];
-		}
-		$h = $j;
+		return $h;
 	}
-	return $h;
+	let $i = null;
+	if (leads) {
+		$i = step[2];
+	} else {
+		$i = "." + step[2];
+	}
+	return $i;
 }
 function city_of(user2) {
 	return get(at2(at(user2, $b), $c));
@@ -116,9 +111,9 @@ function eq3(self, other) {
 function name2(self) {
 	return name(self[0]);
 }
-const $k = [ [ [ [ "field-syntax-keys.vl::Shelf", 0, "pair", [ 0 ] ] ] ] ];
-const $l = [ [ [ [ "field-syntax-keys.vl::Pair", 1, "right", [ 0 ] ] ] ] ];
-const $m = [ [ [ [ "field-syntax-keys.vl::Pair", 0, "left", [ 0 ] ] ] ] ];
+const $j = [ [ [ [ "field-syntax-keys.vl::Shelf", 0, "pair", [ 0 ] ] ] ] ];
+const $k = [ [ [ [ "field-syntax-keys.vl::Pair", 1, "right", [ 0 ] ] ] ] ];
+const $l = [ [ [ [ "field-syntax-keys.vl::Pair", 0, "left", [ 0 ] ] ] ] ];
 const user = [ __shared_new([ "ada", [ "london", 1 ], "verb" ]) ];
 console.log(get(at(user, $a)));
 const city = at2(at(user, $b), $c);
@@ -132,8 +127,8 @@ console.log(get(at(user, $e)));
 assert(eq3(at2(at(user, $b), $c)[1], at2(at(user, $b), $c)[1]), "one key", "field-syntax-keys.vl:88:2");
 console.log(name2(at2(at(user, $b), $c)[1]));
 const shelf = [ __shared_new([ [ "l", "r" ] ]) ];
-const right = at3(at(shelf, $k), $l);
+const right = at3(at(shelf, $j), $k);
 set(right, "R");
-const left = get(at3(at(shelf, $k), $m));
+const left = get(at3(at(shelf, $j), $l));
 console.log(left + get(right));
 //# sourceMappingURL=field-syntax-keys.mjs.map
