@@ -324,8 +324,7 @@ fn a149_s4_a_field_syntax_receiver_types_through_its_projection() {
 fn a149_s4_a_field_syntax_read_hovers_as_its_projections_handle() {
     // Hover on `city` in `store.address.city` reads the access, which IS the
     // door's call (B711 S2b; the derive's `city()` projection until then): a
-    // `Store<str>`; the call it reaches is the handle's `field`, and the
-    // declaration it names is `Address`'s field `city`.
+    // `Store<str>`, and the call it reaches is the handle's `field`.
     let text = format!(
         "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.address.city;\n}}\n"
     );
@@ -350,14 +349,8 @@ fn a149_s4_a_field_syntax_read_hovers_as_its_projections_handle() {
         Some("field"),
         "and the call is the handle's door"
     );
-    let field = analysis
-        .definition_name_span(entity)
-        .expect("the read names a declaration");
-    assert_eq!(
-        field.start,
-        text.find("city: str").expect("the field"),
-        "and the declaration it names is the field"
-    );
+    // Go to definition landing on the FIELD is pinned on the server, in
+    // `field_syntax_a_store_read_hovers_defines_and_completes_through_the_door`.
 }
 
 #[test]

@@ -479,8 +479,11 @@ impl crate::analyzer::Program<'_> {
         };
         self.type_id_to_type_map
             .iter()
-            .filter(|(_, candidate)| {
-                matches!(candidate, Type::Struct(id, _) | Type::Enum(id, _) if id == head)
+            // The declaration's own type is the pattern, never its answer (it
+            // matches itself trivially, its parameters unbound).
+            .filter(|(candidate, kind)| {
+                *candidate != declared
+                    && matches!(kind, Type::Struct(id, _) | Type::Enum(id, _) if id == head)
             })
             .find(|(candidate, _)| self.bound_matches(declared, *candidate, &bindings, 0))
             .map(|(candidate, _)| candidate)
