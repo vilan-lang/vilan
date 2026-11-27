@@ -6066,7 +6066,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // the step is admitted only after a member (`.name`, `.0`) or
             // another variant step, and name resolution decides whether the
             // chain is a key.
-            if self.peek_is_op("::")
+            if matches!(self.peek(), Some(Token::Op("::")))
                 && matches!(
                     postfixes.last(),
                     Some((

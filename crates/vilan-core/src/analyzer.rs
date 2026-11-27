@@ -6843,6 +6843,10 @@ pub struct Analyzer<'src> {
     key_struct_id: Option<Id>,
     /// B711 S3a: `std::key::MaybeKey`, when the module loaded.
     maybe_key_struct_id: Option<Id>,
+    /// B711 S3a: the total key literals over a non-generic root whose type
+    /// waits for the expectation they land in (a `Key`, or a `MaybeKey`
+    /// where one is expected); `settle_key_literal_types` types the rest.
+    unsettled_key_literals: Vec<Id>,
     /// The std `Callable` marker (B340), resolved by identity from
     /// `std::operators` after loading. `x(args)` on a receiver whose type
     /// implements it resolves as the method `call`; keyed on the real std
@@ -8864,6 +8868,7 @@ impl<'src> Analyzer<'src> {
             tuple_key_struct_id: None,
             key_struct_id: None,
             maybe_key_struct_id: None,
+            unsettled_key_literals: Vec::new(),
             lift_trait_id: None,
             callable_trait_id: None,
             hmr_stash_fn_id: None,
@@ -50742,16 +50747,6 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> Type {
-        // B711 S3a: a TOTAL key literal lands as a `MaybeKey` where one is
-        // expected — a literal takes the expected kind, as an unsuffixed
-        // number takes the expected width — and its record says so from
-        // then on.
-        if let Type::Struct(wanted, _) = constraint
-            && self.maybe_key_struct_id == Some(*wanted)
-            && let Some(adapted) = self.adapt_total_key_literal(expr_id, constraint)
-        {
-            return adapted;
-        }
         if let Some(type_id) = self.expr_id_to_type_id_map.get(&expr_id) {
             return type_id.get_type(self);
         }
@@ -51672,7 +51667,18 @@ impl<'src> Analyzer<'src> {
             // recorded its type when it resolved.
             Expr::Key(steps) => {
                 let steps = steps.clone();
-                self.key_literal_type(&steps, &constraint, substitution_context)
+                let key_type = self.key_literal_type(&steps, &constraint, substitution_context);
+                // B711 S3a: a total literal that lands where a `MaybeKey` is
+                // expected IS one from then on, so every later read agrees.
+                if let Type::Struct(kind, _) = &key_type
+                    && Some(*kind) == self.maybe_key_struct_id
+                    && !key_steps_are_partial(&steps)
+                    && !self.type_has_an_unknown_hole(&key_type)
+                {
+                    let type_id = key_type.clone().get_type_id(self);
+                    self.resolved_types.insert(expr_id, type_id);
+                }
+                key_type
             }
             Expr::Struct(struct_id) => Type::Struct(*struct_id, Vec::new()),
             Expr::Enum(enum_id) => Type::Enum(*enum_id, Vec::new()),
@@ -61291,20 +61297,6 @@ impl<'src> Analyzer<'src> {
             return Resolution::Failed;
         }
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
-        // B711 S3a: a key LITERAL as a receiver (`Doc.title::Some.get(&d)`)
-        // takes no type from where it stands, so its kind is its steps' and
-        // its type is settled here, where nothing else will record it.
-        if matches!(subject_type, Type::Struct(..))
-            && !self.type_has_an_unknown_hole(&subject_type)
-            && matches!(
-                self.expr_id_to_expr_map.get(&subject_id),
-                Some(Expr::Key(_))
-            )
-            && !self.resolved_types.contains_key(&subject_id)
-        {
-            let type_id = subject_type.clone().get_type_id(self);
-            self.resolved_types.insert(subject_id, type_id);
-        }
         // A method on a `List::new()` whose element slot is still unknown but has a
         // pending `push`/`run` to fill it must wait: resolving now would type a
         // closure parameter — and the call's own result element — against the
@@ -70880,18 +70872,25 @@ impl<'src> Analyzer<'src> {
                 ),
             );
         }
-        // A non-generic root's literal has its type now — a `MaybeKey` when a
-        // step may miss, else a `Key` that a `MaybeKey` position adapts where
-        // it lands (`infer_type_path`); a generic root's is the
-        // expectation's (R8).
+        // A non-generic root's PARTIAL literal has its type now, a
+        // `MaybeKey`. A TOTAL one is a `Key` unless it lands where a
+        // `MaybeKey` is expected (a literal takes the expected kind), so its
+        // type is decided by the first expectation that names a `MaybeKey`
+        // (`Expr::Key` in `infer_type_path`) and otherwise settled as a `Key`
+        // once the fixpoint ends ([`Self::settle_key_literal_types`]). A
+        // generic root's is the expectation's (R8).
         let root_is_generic = steps.first().is_some_and(|step| {
             self.structs
                 .get(&step.owner())
                 .is_some_and(|struct_| !struct_.generic_parameter_constraint_ids.is_empty())
         });
-        let typed = (!root_is_generic)
+        let partial = key_steps_are_partial(&steps);
+        let typed = (!root_is_generic && partial)
             .then(|| self.key_literal_type(&steps, &Type::Unknown, &HashMap::default()));
         self.expr_id_to_expr_map.insert(id, Expr::Key(steps));
+        if !root_is_generic && !partial {
+            self.unsettled_key_literals.push(id);
+        }
         if let Some(key_type) = typed.filter(|key_type| !matches!(key_type, Type::Unresolved)) {
             let key_type = key_type.get_type_id(self);
             self.expr_id_to_type_id_map.insert(id, key_type);
@@ -70900,31 +70899,27 @@ impl<'src> Analyzer<'src> {
         Resolution::Resolved
     }
 
-    /// B711 S3a: a total key LITERAL whose record is a `Key<S, F>`, landing
-    /// where `constraint` (a `MaybeKey`) is expected: re-recorded as the
-    /// `MaybeKey<S, F>` of the same path. `None` for anything else.
-    fn adapt_total_key_literal(&mut self, expr_id: Id, constraint: &Type) -> Option<Type> {
-        let Some(Expr::Key(steps)) = self.expr_id_to_expr_map.get(&expr_id) else {
-            return None;
-        };
-        if key_steps_are_partial(steps) {
-            return None;
+    /// B711 S3a: once the fixpoint ends, a total key literal no `MaybeKey`
+    /// expectation reached is the `Key` its steps spell.
+    fn settle_key_literal_types(&mut self) {
+        for id in std::mem::take(&mut self.unsettled_key_literals) {
+            if self.resolved_types.contains_key(&id)
+                || self.expr_id_to_type_id_map.contains_key(&id)
+            {
+                continue;
+            }
+            let Some(Expr::Key(steps)) = self.expr_id_to_expr_map.get(&id) else {
+                continue;
+            };
+            let steps = steps.clone();
+            let key_type = self.key_literal_type(&steps, &Type::Unknown, &HashMap::default());
+            if matches!(key_type, Type::Unresolved) {
+                continue;
+            }
+            let type_id = key_type.get_type_id(self);
+            self.expr_id_to_type_id_map.insert(id, type_id);
+            self.resolved_types.insert(id, type_id);
         }
-        let recorded = self.expr_id_to_type_id_map.get(&expr_id)?.get_type(self);
-        let Type::Struct(kind, arguments) = recorded else {
-            return None;
-        };
-        if Some(kind) != self.key_struct_id {
-            return None;
-        }
-        let Type::Struct(maybe_key, _) = constraint else {
-            return None;
-        };
-        let adapted = Type::Struct(*maybe_key, arguments);
-        let adapted_id = adapted.clone().get_type_id(self);
-        self.expr_id_to_type_id_map.insert(expr_id, adapted_id);
-        self.resolved_types.insert(expr_id, adapted_id);
-        Some(adapted)
     }
 
     /// B711: a key path as a literal spells it, root first: `Task.meta`,
@@ -94983,6 +94978,7 @@ fn analyze_over_world<'src>(
     if build_twice_forced() {
         analyzer.build();
     }
+    analyzer.settle_key_literal_types();
     analyzer.types_settled = true;
     analyzer.id_windows.phase = id_windows::Phase::Checks;
     analyzer.id_windows.clear_anchor();
