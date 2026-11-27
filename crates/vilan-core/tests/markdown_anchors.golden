@@ -490,6 +490,7 @@ std/keys.md h2 what-a-key-costs
 std/keys.md h2 identity
 std/keys.md h2 debug
 std/keys.md h2 field-syntax-on-a-handle
+std/keys.md h2 places-that-may-not-be-there-maybekey
 std/keys.md h2 what-a-key-does-not-reach
 std/lens.md h1 stdreactivelens-reference
 std/lens.md h2 at-a-glance

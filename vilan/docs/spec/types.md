@@ -1834,11 +1834,11 @@ fun main() {
   erased `KeyPath` and a path's `KeyStep` keep their insides in std-internal
   fields (§3.3's `[internal]`), so no literal outside std can write one and no
   code outside std can read one. A key therefore always names a real field.
-- **Steps reach struct fields only.** Every step but the last must reach a
-  struct the program declares: a step into an `Option` or another enum's
-  variant, a list element, a map entry, a tuple position, a type parameter, a
-  host (`external`) type or a resource is refused by name. A key TO a field of
-  any type is fine (`Doc.title` over `title: Option<str>` is a
+- **Field steps reach struct fields.** A field step must reach a struct the
+  program declares; an `Option` or another enum is stepped into by a VARIANT
+  step (below); a list element, a map entry, a tuple position, a type
+  parameter, a host (`external`) type or a resource is refused by name. A key
+  TO a field of any type is fine (`Doc.title` over `title: Option<str>` is a
   `Key<Doc, Option<str>>`). A field std marks `[internal]` has no key outside
   std, as it is no member there.
 - **Generic structs.** A key over a generic struct takes the struct's
@@ -1923,6 +1923,64 @@ The laws a program may rely on:
   places: a write through one cannot change what the other reads.
 - **K5.** `a.then(b).path() == a.path().then(b.path())`.
 
+**Places that may not be there: `MaybeKey<S, F>`** (B711 S3a; the paper's §3.4,
+R2-R4). A VARIANT STEP `::V` after a key's field reaches into the `Option`
+or enum that field holds: `Doc.title::Some` over `title: Option<str>`, and
+`Doc.shape::Rect.0` over `enum Shape { Circle(f64), Rect(f64, f64) }`. The
+step names one payload SLOT: its position follows as `.n`, and may be left
+out of a one-slot payload (`Doc.shape::Circle` is `Doc.shape::Circle.0`). A
+payload of several slots is reached one slot at a time. Steps continue past
+a variant step (a field of the payload struct, another variant step).
+
+```vilan
+enum Shape { Circle(f64), Rect(f64, f64) }
+struct Doc { title: Option<str>, shape: Shape }
+
+fun main() {
+	mut d = Doc { title = None, shape = Shape::Rect(1.0, 2.0) };
+	let width: MaybeKey<Doc, f64> = Doc.shape::Rect.0;
+	print(width.put(&mut d, 3.0));            // true
+	print(Doc.title::Some.put(&mut d, "a"));  // false: nothing is created
+	print(width.get(&d));                     // Some(3.0)
+	print(width.name());                      // shape::Rect.0
+}
+```
+
+- **The type.** A path with at least one variant step may find nothing at run
+  time, and is a `MaybeKey<S, F>` (`std::key`, in the prelude), `F` the slot's
+  type. Total then total is total; anything with a variant step is partial.
+  A total key LITERAL is a `MaybeKey` where one is expected (it takes the
+  expected kind, as it takes a generic root's arguments); a total key held in
+  a value is not, and converts with `k.maybe()`. A `MaybeKey` is never a
+  `Key`.
+- **Access is by continuation** (R3). `k.get(&s): Option<F>` copies the place
+  out; `k.view(&s, body: |&F| void): bool` and `k.change(&mut s, body:
+  |&mut F| void): bool` lend it; `k.put(&mut s, v): bool` writes it. Each
+  answers whether the place was there, and none creates a missing place (a
+  `None` stays `None`; another variant stays as it was). `s[k]` with a
+  `MaybeKey` is refused, read or written.
+- **Composition.** `k.then(next)` on a `MaybeKey` takes a `MaybeKey` (a total
+  literal is one there); `Key::then` takes a `Key`, so a held total key
+  composes with a partial one as `k.maybe().then(partial)`. `k.some()`, on a
+  key of either kind whose field is an `Option<T>`, is the `MaybeKey` of its
+  payload.
+- **Refusals.** An unknown variant; a UNIT variant (it holds no value: there is
+  no place to name); a multi-slot payload without a position, or with one
+  out of range; a variant step on a field that is no enum; a variant step on
+  a VALUE (`d.title::Some` where `d` is a binding — R9, the value's own
+  meaning stands: `::` after a member was a parse error before, and a
+  value's variant is tested with `is` or `match`). A key is rooted at a
+  struct type; an enum's name roots none (`Shape::Rect.0` stays the member
+  access on a constructor it was).
+- **Identity.** As `Key`'s: equality, the hash and `Debug` are the path's,
+  and K3-K5 hold. A variant step is the slot of one variant of one enum
+  DECLARATION, so `::Rect.0` and `::Rect.1` are disjoint, as are `::Rect.0`
+  and `::Circle`. `KeyPath::name()` writes the steps as the literal writes
+  them after its root (`shape::Rect.0`, `owner::Some.name`; the position only
+  for a payload of several slots). A `KeyStep` says its kind: `position()` is
+  a variant step's payload slot (`None` for a field step) and `may_miss()`
+  whether its place may be missing.
+
 *Implementation note: both backends emit keys, with the same output. On JS a
 key is its path, and a subscript through a key held in a value walks the
 path's steps. Natively (B711 S1b, the paper's R11) a key also carries the
@@ -1932,9 +1990,11 @@ gives it its identity. A literal's accessors are two plain functions, and
 backends a subscript through a key LITERAL is the plain field access. The
 native backend refuses one shape by name: a call handed two loans into one
 value where one goes through a key held in a value (`both(&mut s[j], &mut
-s[k])`), because Rust cannot see two run-time places apart. A key into a place
-that may be missing (`MaybeKey`) and keys parsed from run-time data are later
-stages.*
+s[k])`), because Rust cannot see two run-time places apart. A variant step on
+JS tests the enum's tag before it descends into the payload; natively a
+`MaybeKey` carries projections answering `Option`, a literal's two plain
+functions with one `match` per variant step. List and map steps and keys
+parsed from run-time data are later stages.*
 
 *`Debug`: `Key`, `KeyPath`, `KeyStep` and `TupleKey` implement it, so
 `[derive(Debug)]` takes a struct holding one. A key debugs as it is written,

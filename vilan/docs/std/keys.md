@@ -2,8 +2,11 @@
 
 Typed paths into a struct (B711; the rules are the spec's, types §5.13).
 `Task.title` is a `Key<Task, str>`, and `task[key]` is the field it names, as a
-place. `Key` is in the prelude; `KeyPath` and `KeyStep` are imported by name
-where a program writes their types:
+place. A path through a place that may not be there — an `Option`'s payload,
+`Doc.title::Some`, or a variant's payload slot, `Doc.shape::Rect.0` — is a
+`MaybeKey<Doc, F>`, reached by continuation (`get`, `view`, `change`, `put`).
+`Key` and `MaybeKey` are in the prelude; `KeyPath` and `KeyStep` are imported
+by name where a program writes their types:
 
 ```vilan,fragment
 import std::key::{ KeyPath, KeyStep };
@@ -29,8 +32,16 @@ as `both(&mut s.a, &mut s.b)` does.
 | `k.name()` | method | the field names joined with `.`: `"meta.owner"` |
 | `k.starts_with(prefix)` | method | whether `prefix`'s path starts this key's (a key starts with itself) |
 | `KeyPath` | struct | an erased path: `name()`, `steps()`, `starts_with(p)`, `then(p)`; `PartialEq`, `Hashable` |
-| `KeyStep` | struct | one step: `name()`, `index()`, `owner()` (the declaring struct, `src/model.vl::Task`, for display) |
+| `KeyStep` | struct | one step: `name()`, `index()`, `owner()` (the declaring struct or enum, `src/model.vl::Task`, for display), `position()` (a variant step's payload slot), `may_miss()` |
 | `[field_syntax]` | attribute | on a handle's `fun at<U>(self, key: Key<T, U>)`: `handle.name` reads as `handle.at(T.name)` |
+| `S.x::Some`, `S.x::V.0` | expression | a `MaybeKey<S, F>`: an `Option`'s payload, or one slot of a variant's payload |
+| `MaybeKey<S, F>` | struct | a path of `S` to a place of type `F` that may not be there; `PartialEq`, `Hashable`, `Debug`; no constructor |
+| `k.get(&s)` | method | the place copied out, `Option<F>` |
+| `k.view(&s, \|place\| ..)` | method | lends the place when it is there; answers whether it was |
+| `k.change(&mut s, \|place\| ..)` | method | lends the place for writing when it is there; answers whether it was |
+| `k.put(&mut s, v)` | method | writes the place when it is there, never creating it; answers whether it was |
+| `k.maybe()` | method | a `Key` held in a value as a `MaybeKey` (a literal needs no call) |
+| `k.some()` | method | on a key (either kind) whose field is an `Option<T>`: the key of its `Some` payload |
 
 ## Reading and writing through a key
 
@@ -215,9 +226,105 @@ std's store handles read their fields through exactly this door: `Store`,
 through refuses a struct that misses the bound at the member, quoting the
 first paragraph of the bound trait's doc comment as the steer.
 
+## Places that may not be there: `MaybeKey`
+
+A VARIANT STEP, `::Variant`, reaches into an `Option` or another enum's
+payload: `Doc.title::Some` over `title: Option<str>` is a `MaybeKey<Doc, str>`.
+A payload of several slots is reached one slot at a time, by position:
+`Doc.shape::Rect.0`. The position may be left out of a one-slot payload
+(`Doc.shape::Circle` and `Doc.shape::Circle.0` are one key). Steps continue
+past a variant step — a field of the payload struct, another variant step —
+and a path with any variant step is partial: total then total is total,
+anything with a partial step is a `MaybeKey`.
+
+```vilan
+enum Shape { Circle(f64), Rect(f64, f64), Dot }
+struct User { name: str, age: i32 }
+struct Doc { title: Option<str>, owner: Option<User>, shape: Shape }
+
+fun main() {
+	mut d = Doc {
+		title = Some("a"),
+		owner = Some(User { name = "ada", age = 3 }),
+		shape = Shape::Rect(1.0, 2.0),
+	};
+	print(Doc.title::Some.get(&d));             // Some("a")
+	print(Doc.shape::Circle.get(&d));           // None: another variant
+	print(Doc.owner::Some.age.put(&mut d, 4));  // true
+	print(Doc.shape::Rect.1.change(&mut d, |h| {
+		h = *h * 10.0;
+	}));                                         // true
+	d.title = None;
+	print(Doc.title::Some.put(&mut d, "b"));    // false: put never creates
+	print(d.title);                             // None
+}
+```
+
+A `MaybeKey` has no `s[k]`: its place is not always there, so it is reached
+by CONTINUATION, and each form answers whether the place was there.
+
+- `k.get(&s)` copies the place out as an `Option<F>`.
+- `k.view(&s, |place| ..)` lends `place: &F` to the closure when the place is
+  there.
+- `k.change(&mut s, |place| ..)` lends `place: &mut F`, to write in place.
+- `k.put(&mut s, value)` is `change` with an assignment. It never creates a
+  missing place: a `None` stays `None`, another variant stays as it was.
+
+A variant step is refused by name where it names no place: an unknown
+variant (with a near spelling), a UNIT variant (`Doc.shape::Dot` holds no
+value; test for it with `is Shape::Dot`), a multi-slot payload without its
+position or with one out of range, a field that is no enum (`Doc.n::Some`
+over an `i32`), and a variant step on a VALUE (`d.title::Some`, where `d` is
+a binding: test a value's variant with `is` or `match`). A key is rooted at a
+struct: an enum's name does not root one (`Shape::Rect.0` is no key).
+
+**Composition.** `then` composes either kind: `Key` then `Key` is a `Key`, and
+any partial half makes a `MaybeKey`. A total key LITERAL is a `MaybeKey` where
+one is expected, so `partial.then(User.age)` needs nothing more; a total key
+held in a value becomes one with `k.maybe()`, and `Key::then` takes a total
+key (`k.maybe().then(partial)` composes a held total key with a partial
+one). `k.some()`, on a key of either kind whose field is an `Option<T>`, is
+the key of its `Some` payload, for generic code:
+
+```vilan
+struct User { name: str }
+struct Doc { owner: Option<User> }
+
+fun payload<S, T>(key: Key<S, Option<T>>, subject: &S): Option<T> {
+	key.some().get(subject)
+}
+
+fun main() {
+	let d = Doc { owner = Some(User { name = "ada" }) };
+	print(payload(Doc.owner, &d).map(|user| user.name));              // Some("ada")
+	print(Doc.owner.some().then(User.name) == Doc.owner::Some.name);   // true
+}
+```
+
+**Identity.** A `MaybeKey` compares, hashes and debugs by its path as a `Key`
+does, and the laws K3 to K5 hold for it: keys with equal paths reach the
+same place, and two keys where neither path starts with the other reach
+disjoint places — the two slots of one variant (`::Rect.0`, `::Rect.1`) and
+two variants (`::Rect.0`, `::Circle`) among them. A variant step's `name()`
+is written as the literal writes it: `"shape::Rect.0"`, `"title::Some"`,
+`"owner::Some.name"` (the position only for a payload of more than one
+slot). Its `KeyStep` names the variant, `index()` is the variant's position
+in its enum, `position()` the payload slot, and `may_miss()` is true.
+
+**Cost.** A literal is one constant, as a `Key`'s is. On the JS backend each
+continuation walks the key's steps, testing a variant's tag before it
+descends. Natively a `MaybeKey` carries two projections answering `Option`;
+a literal's are plain functions, one `match` per variant step, and `then`
+shares one allocation as `Key`'s does.
+
+A `[field_syntax]` door takes a `Key`, not a `MaybeKey`: a variant step
+written through one (`handle.title::Some`) is a step on the read's VALUE, and
+refused as one.
+
 ## What a key does not reach
 
-A key's steps reach the fields of structs the program declares. A step into an
-`Option` or an enum's variant, a list element, a map entry, a tuple position, a
-type parameter, a host (`external`) type or a resource is refused by name; a
-key into a place that may be missing (`MaybeKey`) is a later stage.
+A key's FIELD steps reach the fields of structs the program declares; an
+`Option` or another enum is stepped into with a variant step. A list
+element, a map entry, a tuple position, a type parameter, a host
+(`external`) type or a resource is refused by name; list and map steps are
+a later stage.
