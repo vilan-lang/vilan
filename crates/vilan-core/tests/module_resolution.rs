@@ -10795,3 +10795,33 @@ fn m211_a_package_prelude_globbing_std_s_keeps_key_ambient() {
     assert!(!load.loaded);
     assert_eq!(load.stdout.as_deref(), Some("n\n"));
 }
+
+/// A file that declares or imports its own `Key` means its own by every bare
+/// `Key` it writes (a declaration beats the prelude), so it seeds nothing —
+/// `std::process`'s terminal `enum Key` among them; a path ending in `Key`
+/// (`Step::Key`) is a member of what it reached. An inline `mod` that does
+/// not declare one is asked afresh, and its bare `Key` is the ambient one.
+#[test]
+fn m211_a_file_s_own_key_does_not_load_std_key() {
+    let own = "enum Key {\n\tUp,\n\tDown,\n}\n\nenum Step {\n\tKey(i32),\n\tDone,\n}\n\n\
+               fun name(key: Key): str {\n\tmatch key {\n\t\tKey::Up => \"up\",\n\t\tKey::Down => \"down\",\n\t}\n}\n\n\
+               fun main() {\n\tlet step = Step::Key(1);\n\tlet n = match step {\n\t\tStep::Key(let k) => k,\n\t\tStep::Done => 0,\n\t};\n\
+               \tprint(name(Key::Up));\n\tprint(n);\n}\n";
+    let load = key_load_entry(own);
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded, "a file's own `Key` loaded `std::key`");
+    assert_eq!(load.stdout.as_deref(), Some("up\n1\n"));
+    let terminal = key_load_entry(
+        "import std::process::Key;\n\nfun f(key: Key): bool {\n\tkey == Key::Up\n}\n\nfun main() {\n\tprint(f(Key::Up));\n}\n",
+    );
+    assert!(terminal.errors.is_empty(), "{:#?}", terminal.errors);
+    assert!(!terminal.loaded, "`std::process::Key` loaded `std::key`");
+    let nested = key_load_entry(
+        "enum Key {\n\tUp,\n}\n\nmod inner {\n\tstruct Task {\n\t\ttitle: str,\n\t}\n\n\
+         \texport fun read(t: Task, k: Key<Task, str>): str {\n\t\tt[k]\n\t}\n}\n\nfun main() {\n\tprint(\"m\");\n}\n",
+    );
+    assert!(
+        nested.loaded,
+        "an inline module's ambient `Key` must load `std::key`"
+    );
+}
