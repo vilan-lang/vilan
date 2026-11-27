@@ -83762,11 +83762,15 @@ const STD_KEY_NAMES: [&str; 3] = ["Key", "KeyPath", "KeyStep"];
 ///
 /// A key value has three origins, and each is caught where it is written:
 ///
-/// 1. A NAME: `Key`, `KeyPath` or `KeyStep` as a type, a value or a pattern
-///    path — a signature `k: Key<Task, str>`, a `[field_syntax]` method's
-///    parameter, `KeyPath` in a field. (An `import` is not looked at: an
-///    import by path loads its module anyway, and a prelude's re-export must
-///    not.)
+/// 1. A NAME: `Key`, `KeyPath` or `KeyStep` written BARE — as a type, a value,
+///    a struct literal's head or a one-segment pattern: a signature
+///    `k: Key<Task, str>`, a `[field_syntax]` method's parameter, `KeyPath` in
+///    a field. Not in a body that declares or imports that name itself
+///    (`shadowed`, [`std_key_names_shadowed`]), where the bare name is the
+///    body's own and beats the prelude; not as a path's last segment
+///    (`Decoded::Key`), which names a member of what the path reached. An
+///    `import` is not looked at either: an import of `std::key` by path loads
+///    the module anyway, and a prelude's re-export must not.
 /// 2. A KEY LITERAL `Task.title` / `model::Task.title`: a field read whose
 ///    subject is a bare name or a path. Only the analyzer knows the subject is
 ///    a struct, so the seed over-approximates with the spelling: a subject
