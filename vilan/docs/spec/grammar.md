@@ -699,7 +699,8 @@ postfix = "." member                     (* span-adjacent: `.` then the member *
                                           (* direct call on the chain result *)
         | "?." member                    (* lift link, §5.10 *)
         | "?"                            (* expression lift, §5.10 *)
-        | "as" ascribed-type ;           (* ascription, §5.8 *)
+        | "as" ascribed-type             (* ascription, §5.8 *)
+        | variant-step ;                 (* a key's variant step, §3.6 below *)
 ascribed-type = type ;   (* every generic list in it span-adjacent, below *)
 
 atom    = literal | IDENT | IDENT generic-args | struct-init
@@ -777,8 +778,7 @@ enum's payload: `::` and a variant's name, then optionally its payload
 position, `Doc.title::Some`, `Doc.shape::Rect.0`:
 
 ```text
-member-postfix = "." member | variant-step ;
-variant-step   = "::" NAME [ "." INTEGER ] ;   (* only after a member or a variant step *)
+variant-step = "::" MEMBER [ "." NUMBER ] ;   (* only after a member or a variant step *)
 ```
 
 It is admitted only directly after a member (`.name`, `.0`) or another

@@ -301,11 +301,11 @@ fun main() {
 }
 ```
 
-**Identity.** A `MaybeKey` compares, hashes and debugs by its path as a `Key`
-does, and the laws K3 to K5 hold for it: keys with equal paths reach the
-same place, and two keys where neither path starts with the other reach
-disjoint places — the two slots of one variant (`::Rect.0`, `::Rect.1`) and
-two variants (`::Rect.0`, `::Circle`) among them. A variant step's `name()`
+**Identity.** A `MaybeKey` compares, hashes and debugs by its path, as a
+total key does, and the laws K3 to K5 hold for it: keys with equal paths
+reach the same place, and keys where neither path starts with the other
+reach disjoint places — the slots of one variant (`::Rect.0`, `::Rect.1`)
+among them, and different variants (`::Rect.0`, `::Circle`). A variant step's `name()`
 is written as the literal writes it: `"shape::Rect.0"`, `"title::Some"`,
 `"owner::Some.name"` (the position only for a payload of more than one
 slot). Its `KeyStep` names the variant, `index()` is the variant's position

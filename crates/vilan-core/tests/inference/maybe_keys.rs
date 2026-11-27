@@ -604,7 +604,7 @@ fn keys_std_layout() {
         declared("export struct KeyStep {"),
         ["owner", "index", "name", "kind"]
     );
-    assert_eq!(declared("enum StepKind {"), ["Field", "Variant"]);
+    assert_eq!(declared("export enum StepKind {"), ["Field", "Variant"]);
 }
 
 /// The continuations call their closure before they return and keep

@@ -51,8 +51,10 @@ export struct KeyStep {
 /// What a step reaches. The variant ORDER is the compiler's: a key literal writes
 /// it as `[0]` for a field and `[1, position, width]` for a variant's payload slot
 /// on JS, and the run-time walk reads it there. Room is left for a list position
-/// and a map entry (S3b), which will carry their value's `Hash`.
-enum StepKind {
+/// and a map entry (S3b), which will carry their value's `Hash`. Exported because
+/// `KeyStep` holds one; nothing outside std reads it (a step's kind is read through
+/// `position()` and `may_miss()`).
+export enum StepKind {
 	/// A struct's field: always there.
 	Field,
 	/// A variant's payload slot: the slot's position and the payload's width (the
