@@ -1,0 +1,44 @@
+// B711 S1c: tuple keys natively - loans into two tuples through held keys, a
+// read beside a loan, a `Shared` cell, a key held in a struct, a list of keys.
+import std::shared::Shared;
+import std::tuple::{ Tuple, TupleKey };
+
+fun both(x: &mut i32, y: &mut i32) {
+	x += 1;
+	y += 10;
+}
+
+fun take(x: &mut i32, y: i32) {
+	x += y;
+}
+
+struct Holder {
+	pair: (i32, i32),
+	at: TupleKey<(i32, i32), i32>,
+}
+
+fun main() {
+	mut t = (1, 2);
+	mut u = (1, 2);
+	let (j, k) = t.keys();
+	both(&mut t[j], &mut u[k]);
+	take(&mut t[j], t[k]);
+	print((t, u));
+	let cell = Shared::new((5, 6));
+	cell.write()[k] = 60;
+	print(cell.read()[k]);
+	print(cell.read()[j] + cell.read()[k]);
+	mut h = Holder { pair = (3, 4), at = k };
+	h.pair[h.at] = 40;
+	print(h.pair);
+	let hk = h.at;
+	h.pair[hk] += 1;
+	print(h.pair[h.at]);
+	let keys: List<TupleKey<(i32, i32), i32>> = [j, k, j];
+	mut sum = 0;
+	for key in keys {
+		sum += t[key];
+	}
+	print(sum);
+	print(j.hash() == j.hash());
+}

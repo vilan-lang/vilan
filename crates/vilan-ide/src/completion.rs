@@ -2269,6 +2269,10 @@ impl<'a, 'src> Analysis<'a, 'src> {
         tokens: &[(Token<'_>, Span)],
         receiver_end: usize,
     ) -> Vec<Completion> {
+        // B711 S1c: `Task.` and `Task.meta.` — a key literal's next step.
+        if let Some(items) = self.key_literal_completions(tokens, receiver_end) {
+            return items;
+        }
         // E249: the receiver's whole TYPE, where it can be had — the blanket
         // impls admit a type, not a nominal (`Flow<Option<T>>`'s members are
         // `MemoCell<Option<i32>>`'s and not `MemoCell<i32>`'s).
@@ -2284,6 +2288,165 @@ impl<'a, 'src> Analysis<'a, 'src> {
             self.push_field_syntax(type_id, &mut items);
         }
         items
+    }
+
+    /// B711 S1c: the candidates after a key literal's `.` — `Task.`,
+    /// `model::Task.`, `Task.meta.` — read off the LIVE tokens, the receiver
+    /// being a chain of names whose root names a struct TYPE. `None` for any
+    /// other receiver, which is then the ordinary member position: a root
+    /// that names a VALUE in scope is that value (R9: the value wins, as in
+    /// the language).
+    ///
+    /// The step the chain has reached offers the fields of the struct it
+    /// names, each with its key's type as detail (`Key<Task, str>`), under the
+    /// checker's rule for a step (`resolve_key_step`): a struct's own fields,
+    /// not std's `[internal]` ones outside std, and none of an `external` or
+    /// resource struct. Past a field whose type is no such struct there are no
+    /// steps to offer. A chain of at least one step is a key VALUE, so its
+    /// methods (`then`, `name`, `path`, `starts_with`) follow the fields.
+    fn key_literal_completions(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        receiver_end: usize,
+    ) -> Option<Vec<Completion>> {
+        let program = self.program;
+        let key_struct = program.key_struct_id?;
+        let last = self.live_receiver_index(tokens, receiver_end)?;
+        // `Ident (. Ident)*`, the root first.
+        let mut names = Vec::new();
+        let mut root = last;
+        loop {
+            let Token::Ident(name) = tokens[root].0 else {
+                return None;
+            };
+            names.push(name);
+            if root >= 2
+                && matches!(tokens[root - 1].0, Token::Ctrl('.'))
+                && matches!(tokens[root - 2].0, Token::Ident(_))
+            {
+                root -= 2;
+                continue;
+            }
+            break;
+        }
+        names.reverse();
+        let declared = |binding: Id| match program.entity_map.get(&binding) {
+            Some(Expr::Struct(id)) => Some(*id),
+            _ if program.structs.contains_key(&binding) => Some(binding),
+            _ => None,
+        };
+        let root_struct = match root.checked_sub(1).map(|before| &tokens[before].0) {
+            // A member of something else (`f().Task.`), never a root.
+            Some(Token::Ctrl('.')) => return None,
+            Some(Token::Op("::")) => {
+                let namespace = self.live_namespace_id(tokens, root.checked_sub(2)?, 0)?;
+                declared(self.namespace_entry_id(namespace, names[0])?)?
+            }
+            _ => {
+                let offset = self.to_analyzed_offset(tokens[root].1.into_range().end);
+                let binding = self.binding_in_scope(names[0], offset)?;
+                // R9: a value of the name is the value.
+                if self.same_file_variable(names[0], offset).is_some() {
+                    return None;
+                }
+                declared(binding)?
+            }
+        };
+        let key_step_struct = |struct_id: Id| {
+            program
+                .structs
+                .get(&struct_id)
+                .filter(|structure| !structure.external && !structure.resource)
+                .map(|_| struct_id)
+        };
+        let mut current = key_step_struct(root_struct);
+        for step in &names[1..] {
+            let field = current.and_then(|struct_id| {
+                program
+                    .structs
+                    .get(&struct_id)?
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *step && self.field_is_a_member(struct_id, field))
+            });
+            let Some(field) = field else {
+                // Not a step the checker accepts: nothing to continue.
+                return Some(Vec::new());
+            };
+            current = match program.type_id_to_type_map.get(&field.type_id) {
+                Some(Type::Struct(next, _)) => key_step_struct(*next),
+                _ => None,
+            };
+        }
+        let root_label = self.struct_head_label(root_struct);
+        let mut items = Vec::new();
+        if let Some(struct_id) = current
+            && let Some(structure) = program.structs.get(&struct_id)
+        {
+            let source = program.source_of(struct_id);
+            for (index, field) in structure.fields.iter().enumerate() {
+                if !self.field_is_a_member(struct_id, field) {
+                    continue;
+                }
+                let mut completion =
+                    Completion::bare(field.name.to_string(), CompletionKind::Field);
+                completion.detail = self
+                    .field_type_label(struct_id, index, field.name)
+                    .map(|field_type| format!("Key<{root_label}, {field_type}>"));
+                completion.documentation = source.and_then(|source| {
+                    self.doc_first_paragraph_at(source, field.name_span.into_range().start)
+                });
+                completion.internal = field.internal.map(str::to_string);
+                items.push(completion);
+            }
+        }
+        if names.len() > 1 {
+            let offered: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
+            items.extend(
+                self.nominal_member_completions(key_struct, None)
+                    .into_iter()
+                    .filter(|item| !offered.contains(&item.label)),
+            );
+        }
+        Some(items)
+    }
+
+    /// Whether `field` of `struct_id` is a member here: std's `[internal]`
+    /// fields are none outside std (A149 S4).
+    fn field_is_a_member(&self, struct_id: Id, field: &vilan_core::analyzer::Field<'_>) -> bool {
+        vilan_core::labels::internal_field_out_of_reach(
+            field.internal,
+            self.program.source_of(struct_id),
+            Some(self.focus),
+            &self.program.std_sources,
+        )
+        .is_none()
+    }
+
+    /// A struct's name as its declaration writes it, with its parameters
+    /// (`Pair<T>`) — line 0 of its declaration label, `struct Pair<T> {`.
+    fn struct_head_label(&self, struct_id: Id) -> String {
+        let name = self
+            .program
+            .structs
+            .get(&struct_id)
+            .map_or("", |structure| structure.name);
+        self.program
+            .declaration_labels
+            .get(&struct_id)
+            .and_then(|label| label.lines().next())
+            .and_then(|head| {
+                let at = head.find(&format!("struct {name}"))? + "struct ".len();
+                Some(
+                    head[at..]
+                        .trim_end()
+                        .trim_end_matches('{')
+                        .trim_end()
+                        .to_string(),
+                )
+            })
+            .filter(|head| !head.is_empty())
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// A149 S4: on a store handle, the fields of the struct it handles, offered

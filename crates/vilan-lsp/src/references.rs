@@ -645,6 +645,30 @@ impl ReferenceIndex {
                         false,
                     );
                 }
+                // B711 S1c: a key literal's step (`title` in `Task.title`,
+                // each step of `Task.meta.owner`) names its field, and its
+                // member span is recorded exactly, as a field read's is — so
+                // a field's references list its keys, and a rename rewrites
+                // them.
+                Expr::Key(steps) => {
+                    let Some(&(struct_id, index)) = steps.last() else {
+                        continue;
+                    };
+                    let definition = Definition::Field(struct_id, index);
+                    let Some(name) = name_of(program, definition) else {
+                        continue;
+                    };
+                    push(
+                        &mut rows,
+                        &mut dropped,
+                        source_of.of(*use_id),
+                        program.member_name_spans.get(use_id).copied(),
+                        name,
+                        Anchor::Exact,
+                        definition,
+                        false,
+                    );
+                }
                 // `x.method()` — the member span is recorded under the call's
                 // own id, and the callee is the call's wired subject.
                 Expr::Call(call_id) => {

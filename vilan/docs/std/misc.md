@@ -483,6 +483,21 @@ type — the key from `whole.keys()` reads `cells.get(key)` as a
 `keys()`/`entries()`; the type is opaque, so a key always names a position
 its family has.
 
+A key has an identity and reaches its element in place (B711):
+
+```vilan,fragment
+impl TupleKey<type T, type U> {
+	fun index(self): usize      // the position, from 0
+}
+// TupleKey<T, U> implements PartialEq, Hashable and Debug (`TupleKey(1)`):
+// equal when the positions are, and a HashMap / HashSet key.
+```
+
+`t[key]` is the element as a place: `t[key] = v`, `t[key] += 1`,
+`t[key].x = v`, `&t[key]`, `&mut t[key]`, and a `borrows` return of it. An
+element that is itself a tuple is read and written whole (`t[key] = (1, 2)`);
+a view of one, or a write into one, is refused (types.md §5.9).
+
 `map` is the comprehension spelled as a call: `t.map(|x| e)` IS `(x in t =>
 e)`. It takes a closure literal — its body is checked once, with `x` at the
 element template — and answers the tuple of the body's type per position;

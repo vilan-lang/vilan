@@ -5563,6 +5563,11 @@ pub struct Analyzer<'src> {
     // place analysis reads them as the element place they share a shape with,
     // and each emitter walks the key's steps instead of indexing a list.
     key_subscript_ids: HashSet<Id>,
+    // B711 S1c: the key subscripts whose key is a `TupleKey` (`t[k]` over a
+    // tuple family), by the INDEX expression, to the subscript. Every one is
+    // also in `key_subscript_ids`: a tuple key is always held in a value, so
+    // to the place analyses `t[k]` is "possibly any position of `t`".
+    tuple_key_subscripts: HashMap<Id, Id>,
     // Literal-element diagnostics already emitted (keyed by the offending item's
     // expr id, or the literal's own id for a count mismatch). These checks run
     // inside type INFERENCE, which the constraint fixpoint may re-run after a
@@ -8536,6 +8541,7 @@ impl<'src> Analyzer<'src> {
             compound_reread_ids: HashSet::default(),
             key_root_uses: HashSet::default(),
             key_subscript_ids: HashSet::default(),
+            tuple_key_subscripts: HashMap::default(),
             reported_literal_errors: HashSet::default(),
             binding_annotation_view: HashMap::default(),
             prepped_imports: Vec::new(),
@@ -35433,6 +35439,121 @@ impl<'src> Analyzer<'src> {
     /// (bare / `&`) parameter. Complements `check_mutable_arguments`, which only
     /// sees bare-place arguments; an *explicit* `&mut a` argument (or any other
     /// `&mut a`, e.g. `let v = &mut a`) is caught here.
+    /// B711 S1c: a tuple position reached through a `TupleKey` whose element
+    /// is ITSELF a tuple is no place a view or a member write can reach.
+    /// Tuples store flat on the JS backend (`(1, (2, 3))` is `[1, 2, 3]`), so
+    /// a nested tuple has no storage of its own to view: `&mut t[k]`, `&t[k]`,
+    /// `t[k].0 = v` and a view return of `t[k]` would copy it out and lose the
+    /// write. Reading it and writing it whole (`t[k] = (..)`) are exact, and
+    /// are accepted. An element type that is a type parameter is decided by
+    /// its instance, as `&mut t.1` is.
+    fn check_tuple_key_places(&mut self) {
+        if self.tuple_key_subscripts.is_empty() {
+            return;
+        }
+        let flat: HashSet<Id> = self
+            .tuple_key_subscripts
+            .values()
+            .copied()
+            .filter(|subscript| {
+                self.expr_id_to_type_id_map
+                    .get(subscript)
+                    .is_some_and(|type_id| matches!(type_id.get_type(self), Type::Tuple(..)))
+            })
+            .collect();
+        if flat.is_empty() {
+            return;
+        }
+        let is_flat = |this: &Self, id: Id| flat.contains(&this.peel_ascriptions(id));
+        let mut refused: Vec<(Id, Id, &'static str)> = Vec::new();
+        let entries: Vec<(Id, Expr<'src>)> = self
+            .live_entries_where(&self.expr_id_to_expr_map, |expr| {
+                matches!(expr, Expr::Reference(..) | Expr::Assignment(..))
+            })
+            .map(|(id, expr)| (*id, expr.clone()))
+            .collect();
+        for (id, expr) in entries {
+            match expr {
+                Expr::Reference(operand, mutable) if is_flat(self, operand) => {
+                    refused.push((
+                        id,
+                        operand,
+                        if mutable {
+                            "a writable view of it"
+                        } else {
+                            "a view of it"
+                        },
+                    ));
+                }
+                // A member write through it: the target's spine passes it.
+                Expr::Assignment(target, _) => {
+                    let mut current = target;
+                    while let Some(
+                        &Expr::Field(subject, _, _)
+                        | &Expr::TupleIndex(subject, _, _)
+                        | &Expr::Index(subject, _)
+                        | &Expr::Ascribe(subject),
+                    ) = self.expr_id_to_expr_map.get(&current)
+                    {
+                        if is_flat(self, subject) {
+                            refused.push((id, subject, "a write into it"));
+                            break;
+                        }
+                        current = subject;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A view return handing it back.
+        let functions: Vec<Id> = self
+            .functions
+            .iter()
+            .filter(|(_, function)| function.returns_view || function.returns_mut_view)
+            .map(|(id, _)| *id)
+            .collect();
+        for function_id in functions {
+            let mut leaves = Vec::new();
+            if let Some(function) = self.functions.get(&function_id) {
+                self.collect_tail_leaves(function.body.1, &mut leaves);
+            }
+            for (_, value) in self
+                .return_sites
+                .iter()
+                .filter(|(owner, _)| *owner == function_id)
+            {
+                self.collect_tail_leaves(*value, &mut leaves);
+            }
+            for leaf in leaves {
+                if is_flat(self, leaf) {
+                    refused.push((leaf, leaf, "a view return of it"));
+                }
+            }
+        }
+        refused.sort_unstable_by_key(|(anchor, _, _)| anchor.0);
+        refused.dedup_by_key(|(anchor, _, _)| *anchor);
+        for (anchor, place, what) in refused {
+            let element = self
+                .expr_id_to_type_id_map
+                .get(&place)
+                .map(|type_id| self.pretty_print_type(&type_id.get_type(self), &HashMap::default()))
+                .unwrap_or_default();
+            self.push_anchored(
+                Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: **self.span_map.get(&anchor).unwrap_or(&&EMPTY_SPAN),
+                    msg: format!(
+                        "this tuple key names an element that is itself a tuple, `{element}`, and \
+                         {what} is refused: tuples store flat, so a nested tuple reached through a \
+                         key is no place of its own — read it, or write it whole (`t[k] = (..)`)"
+                    ),
+                },
+                anchor,
+            );
+        }
+    }
+
     fn check_mutable_references(&mut self) {
         // S1: the reference expression is its own anchor. M110 S7b: the live
         // expressions only, walked.
@@ -69441,6 +69562,33 @@ impl<'src> Analyzer<'src> {
             }
         }
         let struct_ = self.structs.get(&struct_id).expect("checked above");
+        // B711 S1c: an `external` struct is opaque — it has no fields to write,
+        // and its values come from the host or the intrinsics that answer one
+        // (a `TupleKey` from `keys()` and `entries()` alone, so a key always
+        // names a position its family has). A literal of one built a value no
+        // operation can read.
+        if struct_.external {
+            let span = self
+                .span_map
+                .get(&constraint.initializer_id)
+                .map(|span| **span)
+                .unwrap_or(constraint.fields_span);
+            let origin = if Some(struct_id) == self.tuple_key_struct_id {
+                "a tuple key is minted only by `keys()` and `entries()`"
+            } else {
+                "a value of it comes from the functions that answer one"
+            };
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "`{}` is an `external` struct, which no literal can build: {origin}",
+                    constraint.struct_name
+                ),
+            });
+            return Resolution::Failed;
+        }
         let generic_param_ids = struct_.generic_parameter_constraint_ids.clone();
         let struct_fields = struct_.fields.clone();
         let struct_name_span = struct_.name_span;
@@ -70484,6 +70632,61 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B711 S1c (R10): `subject[key]` — a tuple position reached through a
+    /// `TupleKey<T, U>`. The subject is any tuple of the key's family: a
+    /// concrete tuple, a value of a tuple-bounded parameter, or a tuple MAPPED
+    /// from the family, which the key indexes at the mapped element type (A122
+    /// §4.3's family rule, as `get` reads it). The place has the element's type.
+    /// `None` when the index is no tuple key.
+    fn resolve_tuple_key_subscript(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        index_id: Id,
+        subject_type: &Type,
+    ) -> Option<Resolution> {
+        let tuple_key_struct_id = self.tuple_key_struct_id?;
+        let index_type = self.infer_type(index_id, &Type::Unknown, &HashMap::default());
+        let Type::Struct(key, ref arguments) = index_type else {
+            return None;
+        };
+        if key != tuple_key_struct_id || arguments.len() != 2 {
+            return None;
+        }
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let subject_type_id = subject_type.clone().get_type_id(self);
+        let hole = Type::Unknown.get_type_id(self);
+        let expected = Type::Struct(tuple_key_struct_id, vec![subject_type_id, hole]);
+        let element = match self.reconcile_type(&expected, &index_type, &HashMap::default()) {
+            Some((Type::Struct(_, reconciled), _)) if reconciled.len() == 2 => Some(reconciled[1]),
+            _ => None,
+        }
+        .filter(|element| !matches!(element.get_type(self), Type::Unknown | Type::Unresolved));
+        let Some(element) = element else {
+            let key_name = self.pretty_print_type(&index_type, &HashMap::default());
+            let subject_name = self.pretty_print_type(subject_type, &HashMap::default());
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "this key is a `{key_name}`, and the subject is a `{subject_name}`: a tuple \
+                     key indexes only a tuple of the family it was minted for, or a tuple mapped \
+                     from that family"
+                ),
+            });
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Some(Resolution::Failed);
+        };
+        self.key_subscript_ids.insert(id);
+        self.tuple_key_subscripts.insert(index_id, id);
+        self.expr_id_to_expr_map
+            .insert(id, Expr::Index(subject_id, index_id));
+        self.expr_id_to_type_id_map.insert(id, element);
+        self.resolved_types.insert(id, element);
+        Some(Resolution::Resolved)
+    }
+
     /// B568 (R-b, v0.46.0): a struct literal outside std may not write a field
     /// std marks `[internal]` — the construction half of A149 S4's read rule,
     /// under the same shared rule (`labels::internal_field_out_of_reach`) and
@@ -70828,6 +71031,11 @@ impl<'src> Analyzer<'src> {
                 Resolution::Resolved
             }
             subject_type => {
+                if let Some(resolution) =
+                    self.resolve_tuple_key_subscript(id, subject_id, index_id, &subject_type)
+                {
+                    return resolution;
+                }
                 if let Some(resolution) =
                     self.resolve_key_subscript(id, subject_id, index_id, &subject_type)
                 {
@@ -78478,6 +78686,8 @@ pub enum Intrinsic {
     // `Tuple.map(|x| e)` -> the comprehension `(x in t => e)`: the receiver's
     // `.map` where every element and every result is one slot, else unrolled.
     TupleMap,
+    // B711 S1c: `TupleKey.index()` -> the position a key names (`key[0]`).
+    TupleKeyIndex,
 }
 
 /// Identifies a source file within a compiled `Program` — an index into
@@ -79131,6 +79341,10 @@ pub struct Program<'src> {
     /// B711: the subscripts (`Expr::Index`) that reach a struct field through a
     /// key — `s[k]` — rather than a list element.
     pub key_subscripts: HashSet<Id>,
+    /// B711 S1c: the key subscripts (`t[k]`) whose key is a `TupleKey`, by the
+    /// subscript's INDEX expression, to the subscript. Each is in
+    /// `key_subscripts` too.
+    pub tuple_key_subscripts: HashMap<Id, Id>,
     /// B711: std's `Key<S, F>` declaration, when `std::key` is loaded — the
     /// struct the native backend gives a key's access to (S1b, R11).
     pub key_struct_id: Option<Id>,
@@ -93532,6 +93746,7 @@ fn analyze_over_world<'src>(
         analyzer.check_mutable_arguments();
         analyzer.check_lazy_arguments();
         analyzer.check_mutable_references();
+        analyzer.check_tuple_key_places();
         analyzer.check_view_bindings();
         analyzer.check_view_arguments();
         analyzer.check_view_value_reads();
@@ -93955,6 +94170,20 @@ fn analyze_over_world<'src>(
                 if let Some(id) = external_intrinsic_declaration(&analyzer, implementation, name) {
                     intrinsics.insert(id, intrinsic);
                 }
+            }
+        }
+    }
+    // B711 S1c: `TupleKey`'s own position.
+    if let Some(tuple_key_struct_id) = analyzer.tuple_key_struct_id {
+        for implementation in &analyzer.implementations {
+            let subject_is_the_key = matches!(
+                analyzer.type_id_to_type_map.get(&implementation.subject),
+                Some(Type::Struct(id, _)) if *id == tuple_key_struct_id
+            );
+            if subject_is_the_key
+                && let Some(id) = external_intrinsic_declaration(&analyzer, implementation, "index")
+            {
+                intrinsics.insert(id, Intrinsic::TupleKeyIndex);
             }
         }
     }
@@ -95259,6 +95488,7 @@ fn analyze_over_world<'src>(
         lift_dispatch: analyzer.lift_dispatch,
         compound_rereads: analyzer.compound_reread_ids,
         key_subscripts: analyzer.key_subscript_ids,
+        tuple_key_subscripts: analyzer.tuple_key_subscripts,
         key_struct_id: analyzer.key_struct_id,
         bitwise_u32: analyzer.bitwise_u32,
         integer_division: analyzer.integer_division,

@@ -1480,6 +1480,24 @@ t => e)` spelled as a call: it takes a closure LITERAL (a closure value has
 one type, and a tuple needs one per position) whose parameter is the binder.
 A `for` over a family binds the template and checks its body once (§3.5).
 
+A tuple key is a value with an IDENTITY and reaches its element IN PLACE (B711
+S1c, `proposal/struct-keys.md` R10). `TupleKey<T, U>` implements `PartialEq`
+and `Hashable` — two keys are equal when they name the same position, and a key
+keys a `HashMap` or a `HashSet` — and `k.index()` is its position, from 0. Two
+keys at different element types are different types, so they never compare.
+For `t` a tuple of the family (concrete, a value of `T: (2..)`, or a tuple
+mapped from the family, at the mapped element) and `k: TupleKey<T, U>`, `t[k]`
+is a **place** of type `U` under the rules of `t.0`: a read copies the element
+only, `t[k] = v`, compound assignment and `t[k].x = v` write it through a
+mutable subject, and `&t[k]`, `&mut t[k]` and a `borrows` return (`fun at<T:
+(2..), U>(t: &mut T, k: TupleKey<T, U>): &mut U borrows t { t[k] }`) are views
+of it. A key cannot miss. One shape is refused by name: where the element is
+ITSELF a tuple, `t[k]` is read and written whole only — a view of it or a write
+into it is refused, since tuples store flat and a nested tuple has no storage
+of its own to view. The laws K1–K3 of §5.13 hold for tuple keys; `get(key)` is
+`t[key]` read. A key is still minted only by `keys()` and `entries()` (no
+literal builds an `external` struct).
+
 ```vilan,fragment
 fun cells<T: (2..)>(whole: T): (U in T: SignalCell<U>) {
 	whole.map(|x| SignalCell::new(x))
@@ -1873,3 +1891,14 @@ value where one goes through a key held in a value (`both(&mut s[j], &mut
 s[k])`), because Rust cannot see two run-time places apart. A key into a place
 that may be missing (`MaybeKey`), field syntax on a handle and keys parsed
 from run-time data are later stages.*
+
+*`Debug`: `Key`, `KeyPath`, `KeyStep` and `TupleKey` implement it, so
+`[derive(Debug)]` takes a struct holding one. A key debugs as it is written,
+`Task.meta.owner` (its root struct's name and its fields'); a path as
+`KeyPath(Task.meta.owner)`, a step as `KeyStep(Meta.owner)`, a tuple key as
+`TupleKey(1)`. `dbg` and `print` still show a key's layout. A tuple key
+natively reaches its element through `Any` (`t.tuple_ref::<U>(k)` /
+`tuple_mut`): one match on the position and one type-id comparison, since a key
+minted for `T` also indexes every tuple mapped from `T` and no single typed
+accessor fits it. `[derive(Json)]` and `[derive(Wire)]` refuse a struct with a
+key field (a key's encoding is a later stage).*

@@ -382,6 +382,15 @@ later argument) count it as reaching ANY field of `s`. Natively that is also
 why a call handed two loans into one `s`, one of them `&mut` and one through a
 held key, is refused by name: nothing shows the two places apart.
 
+A TUPLE key's subscript (`t[k]`, `k: TupleKey<T, U>`, types §5.9) is the
+position `t.i` its key names, read the same way: a tuple key is always held in
+a value, so the analyses count `t[k]` as reaching ANY position of `t`, and the
+native backend refuses a call handed two loans into one tuple through one by
+name. A scalar element's `&mut t[k]` is the `(base, key)` pair of the tuple and
+the position's flat offset, as `&mut t.1` is. An element that is itself a tuple
+is no place of its own (tuples store flat), so a view of it or a write into it
+is refused by name; it is read and written whole.
+
 ## 6.4 Rule 4 — no invalidating mutation under a live view
 
 While a view of a place is live, mutations that would **invalidate** the

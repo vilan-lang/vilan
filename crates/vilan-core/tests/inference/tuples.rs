@@ -7798,7 +7798,10 @@ fn a122_a_key_has_no_constructor() {
             "\tlet _ = t.get(key);\n",
             "}\n",
         ),
-        "`TupleKey` expects 0 fields",
+        // B711 S1c: refused for what it is — no literal builds an `external`
+        // struct (the field count had refused this one, and `TupleKey { }`,
+        // with none, had built an empty key).
+        "`TupleKey` is an `external` struct, which no literal can build",
     );
 }
 

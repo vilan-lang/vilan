@@ -879,3 +879,59 @@ fn keys_a_generated_structs_step_is_its_attributes() {
         "false\ntrue\ntrue\n",
     );
 }
+
+// --- Debug (S1c) ------------------------------------------------------------
+
+/// `Key`, `KeyPath` and `KeyStep` implement `Debug`, so the derive takes a
+/// struct holding one: a key debugs as it is written, its root's name and
+/// its fields'.
+#[test]
+fn keys_debug_as_they_are_written_and_derive_through_a_struct() {
+    keys_runs(
+        r#"
+        import std::key::{ KeyPath, KeyStep };
+
+        [derive(Debug)]
+        struct Row {
+            key: Key<Task, str>,
+            path: KeyPath,
+            label: str,
+        }
+
+        fun main() {
+            let k = Task.meta.then(Meta.owner);
+            print(Row { key = k, path = k.path(), label = "x" }.debug());
+            print(Task.title.debug());
+            let step: KeyStep = k.path().steps()[1];
+            print(step.debug());
+        }
+        "#,
+        "Row { key = Task.meta.owner, path = KeyPath(Task.meta.owner), label = \"x\" }\nTask.title\nKeyStep(Meta.owner)\n",
+    );
+}
+
+/// The wire and JSON encodings of a key are a later stage: their derives
+/// refuse a struct with a key field rather than encode it.
+#[test]
+fn keys_json_and_wire_derives_refuse_a_key_field() {
+    keys_refused(
+        r#"
+        import std::json::Json;
+
+        [derive(Json)]
+        struct Row { key: Key<Task, str> }
+
+        fun main() { }
+        "#,
+        "Key<Task, str> has no method 'to_json'",
+    );
+    keys_refused(
+        r#"
+        [derive(Wire)]
+        struct Row { key: Key<Task, str> }
+
+        fun main() { }
+        "#,
+        "field `key` of `[derive(Wire)]` type `Row` is `Key<Task, str>`, which is not Wire",
+    );
+}

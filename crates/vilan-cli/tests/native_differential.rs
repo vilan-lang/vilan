@@ -19551,6 +19551,85 @@ fn keys_struct_keys_build_the_same_on_both_backends() {
     }
 }
 
+/// B711 S1c (R10): tuple keys natively — every shape the JS pins hold, built
+/// both ways and compared: `t[k]` read, assigned, compound assigned, written
+/// into at a struct element, lent `&` and `&mut`, handed back by the generic
+/// accessor at a scalar and a struct element; a tuple-bounded parameter walked
+/// by its keys and a tuple mapped from the family indexed by them; K2 through
+/// a generic; a captured `mut` tuple, a module binding, a `Shared` cell, a
+/// key held in a struct and in a list; loans into two tuples through held
+/// keys; identity (`==`, `index`, a `HashMap` and a `HashSet` key); a nested
+/// tuple element read and written whole; and `Debug` for every key type (the
+/// struct key's hidden access appears nowhere). The corpus program
+/// `tuple-keys.vl` is the first shape set.
+#[test]
+fn tuple_keys_build_the_same_on_both_backends() {
+    let staged = stage();
+    let mut programs = Vec::new();
+    for (name, program) in [
+        (
+            "native_probe_tuple_keys_generic.vl",
+            include_str!("native/tuple_keys_generic.vl"),
+        ),
+        (
+            "native_probe_tuple_keys_values.vl",
+            include_str!("native/tuple_keys_values.vl"),
+        ),
+        (
+            "native_probe_keys_debug.vl",
+            include_str!("native/keys_debug.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        programs.push(name);
+    }
+    programs.push("tuple-keys.vl");
+    let verdicts = legs_in_parallel("tuple-keys", programs.clone(), |program, target| {
+        compare_in(&staged, program, target)
+    });
+    for (program, verdict) in programs.iter().zip(verdicts) {
+        assert_eq!(
+            verdict,
+            Verdict::Identical,
+            "{program}: tuple keys must build and answer the same on both backends"
+        );
+    }
+}
+
+/// B711 S1c: a call handed two loans into one tuple, one `&mut` and one
+/// through a tuple key (always held in a value), is refused by name natively,
+/// as the struct-key form is: the position is chosen at run time.
+#[test]
+fn tuple_keys_two_loans_into_one_tuple_are_refused_by_name() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_tuple_keys_aliased.vl"),
+        concat!(
+            "import std::tuple::Tuple;\n",
+            "\n",
+            "fun both(x: &mut i32, y: &mut i32) {\n",
+            "\tx += 1;\n",
+            "\ty += 10;\n",
+            "}\n",
+            "\n",
+            "fun main() {\n",
+            "\tmut t = (1, 2);\n",
+            "\tlet (j, k) = t.keys();\n",
+            "\tboth(&mut t[j], &mut t[k]);\n",
+            "\tprint(t);\n",
+            "}\n",
+        ),
+    )
+    .expect("write the aliased probe");
+    match compare(&staged, "native_probe_tuple_keys_aliased.vl") {
+        Verdict::Refused(reason) => assert!(
+            reason.contains("through a tuple key held in a value"),
+            "refused for another reason: {reason}"
+        ),
+        other => panic!("expected a refusal by name, got {other:?}"),
+    }
+}
+
 /// B711 S1b: a key rooted through its module (`model::Task.title`) natively,
 /// its step owned by the declaring file.
 #[test]

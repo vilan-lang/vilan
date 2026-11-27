@@ -1,0 +1,57 @@
+// B711 S1c: tuple keys natively - a bounded parameter walked by key, a mapped
+// tuple indexed by its family's key, K2 through a generic, a captured `mut`
+// tuple, a module binding, a key held in a tuple.
+import std::debug::Debug;
+import std::tuple::{ Tuple, TupleKey };
+
+fun show(x: &i32): str {
+	i"<{*x}>"
+}
+
+fun reset<T: (2..: Debug)>(t: &mut T, from: T) {
+	for k in t.keys() {
+		t[k] = from[k];
+	}
+}
+
+fun copies<T: (2..: Debug)>(t: T): str {
+	let wrapped = (x in t => Some(x));
+	mut out = "";
+	for k in t.keys() {
+		out = out + wrapped[k].debug() + t[k].debug() + ";";
+	}
+	out
+}
+
+fun same<T: (2..), U>(t: &mut T, k: TupleKey<T, U>) {
+	t[k] = t[k];
+}
+
+mut module_t = (1, 2);
+
+fun main() {
+	mut t = (1, 2.5, "s");
+	let (a, b, c) = t.keys();
+	print(show(&t[a]));
+	reset(&mut t, (9, 1.5, "r"));
+	print(t);
+	print(copies((3, "x", true)));
+	same(&mut t, b);
+	print(t);
+	mut count = 0;
+	let f = || {
+		t[a] += 1;
+		count += 1;
+	};
+	f();
+	f();
+	print((t, count));
+	let (m0, m1) = module_t.keys();
+	module_t[m1] = 20;
+	module_t[m0] += 5;
+	print(module_t);
+	let pair = (a, c);
+	t[pair.0] = 0;
+	print(t[pair.1]);
+	print(t);
+}
