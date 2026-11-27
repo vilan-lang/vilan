@@ -11912,6 +11912,12 @@ impl<'a, 'src> Parser<'a, 'src> {
     }
 
     fn eat_marker_attribute(&mut self, marker: &str) -> bool {
+        // The common case, no attribute at all, answers without opening a
+        // backtrack: `expect_ctrl('[')` records nothing when it fails, so the
+        // answer and the parser's state are the attempt's.
+        if !self.peek_is_ctrl('[') {
+            return false;
+        }
         self.attempt(|parser| {
             parser.expect_ctrl('[')?;
             if parser.peek() != Some(&Token::Ident(marker)) {
