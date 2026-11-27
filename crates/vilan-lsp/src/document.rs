@@ -3881,6 +3881,11 @@ impl Document {
         // attribute of `title(..)` — is a string the desugar minted from the
         // written token, and answers for the link it lowers to.
         let id = self.markup_name_link(program, id).unwrap_or(id);
+        // B711 S2a: a field read through `[field_syntax]` hovers as the field
+        // it names, at the type the read answers (the method's result).
+        if let Some(rendered) = self.field_syntax_hover(program, id) {
+            return Some(rendered);
+        }
         // E298: a module segment in VALUE position (`model::global()`'s
         // `model`) answers as it does in an import.
         if let Some(Expr::Module(module)) = program.entity_map.get(&id)
@@ -5143,6 +5148,45 @@ impl Document {
         );
         out.push_some(Block::Doc, self.struct_field_docs(program, owner, index));
         Some(out)
+    }
+
+    /// B711 S2a: the hover of a keyed field-syntax read `user.name` — the
+    /// member at the type the read answers (`name: Optic<Profile, str>`),
+    /// the call it is (`user.at(User.name)`), then the field's declaration in
+    /// its struct and its `///`.
+    fn field_syntax_hover(&self, program: &Program, id: Id) -> Option<String> {
+        program.field_syntax_keyed.get(&id)?;
+        let &(owner, index) = program.field_syntax_fields.get(&id)?;
+        let structure = program.structs.get(&owner)?;
+        let field = structure.fields.get(index)?;
+        let type_label = self.analysis(program).hover_label(id)?;
+        let method = program
+            .function_calls
+            .get(&id)
+            .and_then(|call| self.analysis(program).function_target(call.subject_id))
+            .or_else(|| self.analysis(program).function_target(id))
+            .and_then(|target| program.functions.get(&target))
+            .map(|function| function.name);
+        let field_line = self
+            .analysis(program)
+            .field_type_label(owner, index, field.name)
+            .map(|field_type| {
+                owned_field_line(program, owner, &format!("{}: {field_type}", field.name))
+            });
+        let mut signature = format!("{}: {type_label}", field.name);
+        if let Some(method) = method {
+            signature.push_str(&format!(
+                "\n// field syntax: .{method}({}.{})",
+                structure.name, field.name
+            ));
+        }
+        if let Some(field_line) = field_line {
+            signature.push_str(&format!("\n\n{field_line}"));
+        }
+        let mut out = HoverBlocks::new();
+        out.push_code(Block::Signature, &signature);
+        out.push_some(Block::Doc, self.struct_field_docs(program, owner, index));
+        out.rendered()
     }
 
     /// The `///` block above the struct field `id` reads, or `None` when `id`
@@ -6446,6 +6490,14 @@ impl Document {
         // the same guard as `hover_label` and `function_target` (E73): the
         // chain is data a lowering can rewire, and a cycle must answer `None`
         // rather than recurse off the stack.
+        // B711 S2a: a keyed field-syntax read names its field, not the method
+        // the read calls.
+        if program.field_syntax_keyed.contains_key(&id)
+            && let Some(&(owner, index)) = program.field_syntax_fields.get(&id)
+        {
+            let field = program.structs.get(&owner)?.fields.get(index)?;
+            return Some((program.source_of(owner)?, field.name_span));
+        }
         let mut seen: Vec<Id> = Vec::new();
         let mut current = id;
         loop {
@@ -33507,3 +33559,7 @@ mod platform_reach_tests;
 #[cfg(test)]
 #[path = "struct_key_tests.rs"]
 mod struct_key_tests;
+
+#[cfg(test)]
+#[path = "field_syntax_tests.rs"]
+mod field_syntax_tests;
