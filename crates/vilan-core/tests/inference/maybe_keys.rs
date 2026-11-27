@@ -631,6 +631,56 @@ fn maybe_keys_a_continuation_takes_a_closure_capturing_a_view() {
     );
 }
 
+/// `put` is the continuation that stores: its value lands in the subject, as
+/// `s.x = value` would put it there. A closure capturing a VIEW handed as
+/// that value escapes into the subject and is refused, through a literal and
+/// through a held key, exactly as the direct store is. (Found in review: the
+/// summary first answered "keeps nothing" for all four.)
+#[test]
+fn maybe_keys_put_keeps_its_value_so_a_view_capturing_closure_is_refused() {
+    let holder = r#"
+        struct Holder { f: Option<|| i32> }
+    "#;
+    for stash in [
+        "h.f = Some(|| *n);",
+        "Holder.f::Some.put(h, || *n);",
+        "let key = Holder.f::Some; key.put(h, || *n);",
+    ] {
+        assert_fails_with(
+            &format!(
+                r#"{holder}
+                fun stash(h: &mut Holder, n: &i32) {{
+                    {stash}
+                }}
+
+                fun main() {{
+                    mut h = Holder {{ f = Some(|| 0) }};
+                    let n = 4;
+                    stash(&mut h, &n);
+                }}
+                "#
+            ),
+            "a view cannot escape its scope",
+        );
+    }
+    // A closure that captures no view is an ordinary value to put.
+    assert_compiles_and_runs(
+        &format!(
+            r#"{holder}
+            fun main() {{
+                mut h = Holder {{ f = Some(|| 0) }};
+                let n = 4;
+                print(Holder.f::Some.put(&mut h, || n + 1));
+                if h.f is Some(let f) {{
+                    print(f());
+                }}
+            }}
+            "#
+        ),
+        "true\n5\n",
+    );
+}
+
 /// A partial key folds in a `const` expression, and so does a function that
 /// reaches places through one (the const evaluator walks the key as the
 /// emitted helpers do).

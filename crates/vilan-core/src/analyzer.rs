@@ -30565,11 +30565,6 @@ impl<'src> Analyzer<'src> {
         {
             return retaining.get(&callee_id).cloned().unwrap_or_default();
         }
-        // B711 S3a: a `MaybeKey`'s continuations call their closure before
-        // they return and keep nothing — the compiler writes their bodies.
-        if self.is_maybe_key_continuation(callee_id) {
-            return BTreeSet::new();
-        }
         let arity = self
             .functions
             .get(&callee_id)
@@ -30580,23 +30575,36 @@ impl<'src> Analyzer<'src> {
                     .map(|external| external.parameters.len())
             })
             .unwrap_or(0);
+        // B711 S3a: a `MaybeKey`'s continuations call their closure before
+        // they return and keep neither it nor the subject — the compiler
+        // writes their bodies. `put` is the one that stores: its value (the
+        // last parameter) lands in the subject, exactly as `s.x = value`
+        // would put it there, so a view-capturing closure handed as the value
+        // escapes.
+        match self.maybe_key_continuation(callee_id) {
+            Some("put") => return (arity as u32).checked_sub(1).into_iter().collect(),
+            Some(_) => return BTreeSet::new(),
+            None => {}
+        }
         (0..arity as u32).collect()
     }
 
-    /// B711 S3a: whether `callee_id` is one of `MaybeKey`'s four intrinsic
-    /// continuations (`get`, `view`, `change`, `put`), whose emitted bodies
-    /// lend the place to the closure for the call and keep no argument.
-    fn is_maybe_key_continuation(&self, callee_id: Id) -> bool {
-        let Some(maybe_key) = self.maybe_key_struct_id else {
-            return false;
-        };
-        self.implementations.iter().any(|implementation| {
-            matches!(
+    /// B711 S3a: which of `MaybeKey`'s four intrinsic continuations (`get`,
+    /// `view`, `change`, `put`) `callee_id` is, if any. Their emitted bodies
+    /// lend the place to the closure for the call and keep neither the closure
+    /// nor the subject; `put` stores its value.
+    fn maybe_key_continuation(&self, callee_id: Id) -> Option<&'static str> {
+        let maybe_key = self.maybe_key_struct_id?;
+        self.implementations.iter().find_map(|implementation| {
+            if !matches!(
                 self.type_id_to_type_map.get(&implementation.subject),
                 Some(Type::Struct(id, _)) if *id == maybe_key
-            ) && ["get", "view", "change", "put"]
-                .iter()
-                .any(|name| implementation.declarations.get(*name) == Some(&callee_id))
+            ) {
+                return None;
+            }
+            ["get", "view", "change", "put"]
+                .into_iter()
+                .find(|name| implementation.declarations.get(*name) == Some(&callee_id))
         })
     }
 
