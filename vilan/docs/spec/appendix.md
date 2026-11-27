@@ -45,7 +45,7 @@ with
 Also matched by text in one position: `break`/`continue` (after `jump`), and the
 attribute names `derive` `service` `client_service` `extern` `must_use` `track_caller` `rpc` `trait_only`
 `doc` `expose` `platform` `deprecated` `internal` `resource` `hint` `reactive`
-`element`
+`element` `field_syntax`
 (`resource` was a keyword until B413 made it the `[resource]` attribute).
 
 ## A.3 Literal suffixes

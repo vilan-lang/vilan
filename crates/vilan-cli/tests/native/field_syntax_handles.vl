@@ -1,0 +1,98 @@
+// B711 S2a: field syntax through `[field_syntax]` methods, natively and on
+// JS: a value handle (`at` answers the field), a `&self` handle over a plain
+// struct, a cursor that composes keys, handles in a list and in a closure,
+// and a generic struct reached at two instantiations.
+import std::shared::Shared;
+
+struct Meta {
+	owner: str,
+	stars: i32,
+}
+
+struct Task {
+	title: str,
+	meta: Meta,
+}
+
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+/// Reads a field's value through a shared root.
+struct Reader<S> {
+	root: Shared<S>,
+}
+
+impl Reader<type S> {
+	[field_syntax]
+	fun at<U>(self, key: Key<S, U>): U {
+		self.root.read()[key]
+	}
+}
+
+/// A plain struct read through `&self`.
+struct Lens {
+	task: Task,
+}
+
+impl Lens {
+	[field_syntax]
+	fun at<U>(&self, key: Key<Task, U>): U {
+		self.task[key]
+	}
+}
+
+struct Cursor<S, T> {
+	root: Shared<S>,
+	key: Key<S, T>,
+}
+
+impl Cursor<type S, type T> {
+	fun read(self): T {
+		self.root.read()[self.key]
+	}
+
+	fun write(self, value: T) {
+		self.root.write()[self.key] = value;
+	}
+
+	[field_syntax]
+	fun at<U>(self, key: Key<T, U>): Cursor<S, U> {
+		Cursor { root = self.root, key = self.key.then(key) }
+	}
+}
+
+fun task(): Task {
+	Task { title = "t", meta = Meta { owner = "ada", stars = 1 } }
+}
+
+fun owner_of(lens: &Lens): str {
+	lens.meta.owner
+}
+
+fun main() {
+	let reader = Reader { root = Shared::new(task()) };
+	print(reader.title);
+	print(reader.meta.owner);
+	let lens = Lens { task = task() };
+	print(lens.meta.stars + 1);
+	print(lens.title);
+	print(owner_of(&lens));
+	let shared = Shared::new(task());
+	let meta = Cursor { root = shared, key = Task.meta };
+	meta.stars.write(meta.stars.read() + 9);
+	meta.owner.write("bea");
+	print(shared.read().meta.stars);
+	print(meta.owner.read());
+	let cursors = [meta, Cursor { root = Shared::new(task()), key = Task.meta }];
+	for cursor in cursors {
+		print(cursor.owner.read());
+	}
+	let read_owner = |cursor: Cursor<Task, Meta>| cursor.owner.read();
+	print(read_owner(meta));
+	let ints = Reader { root = Shared::new(Pair { left = 1, right = 2 }) };
+	let strs = Reader { root = Shared::new(Pair { left = "a", right = "b" }) };
+	print(ints.left + ints.right);
+	print(strs.left + strs.right);
+}

@@ -19596,6 +19596,36 @@ fn tuple_keys_build_the_same_on_both_backends() {
     }
 }
 
+/// B711 S2a (struct-keys.md §3.5, R6): field syntax through `[field_syntax]`
+/// methods natively — a read is the method call with a key literal argument,
+/// so it builds wherever the call does: a handle answering the field's value,
+/// a `&self` handle over a plain struct, a cursor composing keys with `then`
+/// (read and written, in a list, in a closure, behind a view), and a generic
+/// struct at two instantiations. The corpus program `field-syntax-keys.vl`
+/// is the first shape set.
+#[test]
+fn field_syntax_builds_the_same_on_both_backends() {
+    let staged = stage();
+    let probe = "native_probe_field_syntax_handles.vl";
+    std::fs::write(
+        staged.join(probe),
+        include_str!("native/field_syntax_handles.vl"),
+    )
+    .expect("write the probe program");
+    let mut programs = vec![probe];
+    programs.push("field-syntax-keys.vl");
+    let verdicts = legs_in_parallel("field-syntax", programs.clone(), |program, target| {
+        compare_in(&staged, program, target)
+    });
+    for (program, verdict) in programs.iter().zip(verdicts) {
+        assert_eq!(
+            verdict,
+            Verdict::Identical,
+            "{program}: field syntax must build and answer the same on both backends"
+        );
+    }
+}
+
 /// B711 S1c: a call handed two loans into one tuple, one `&mut` and one
 /// through a tuple key (always held in a value), is refused by name natively,
 /// as the struct-key form is: the position is chosen at run time.

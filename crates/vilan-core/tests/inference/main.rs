@@ -31,6 +31,7 @@ mod contexts;
 mod contextual_keywords;
 mod debugging;
 mod dyn_objects;
+mod field_syntax_keys;
 mod generics;
 mod hmr;
 mod index_type;

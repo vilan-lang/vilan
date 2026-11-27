@@ -2611,6 +2611,10 @@ pub const KNOWN_ATTRIBUTE_MARKERS: &[&str] = &[
     "reactive",
     // native-ui.md §12: an element constructor, `[element] fun row(): Row`.
     "element",
+    // B711 S2a (struct-keys.md §3.5, R6): the handle door, `[field_syntax] fun
+    // at<U>(self, key: Key<T, U>): ..` — `handle.name` reads as
+    // `handle.at(T.name)`.
+    "field_syntax",
 ];
 
 /// Whether `name` is one of [`KNOWN_ATTRIBUTE_MARKERS`]. Mirrors the chumsky
@@ -2632,7 +2636,7 @@ fn is_known_attribute_marker(name: &str) -> bool {
 ///   `[trait_only]` (8), and the retired `[doc(hidden)]` (9), refused where a
 ///   function's prefix reads it;
 /// - fence: `[platform]` (10);
-/// - class: `[resource]` and `[element]` (11).
+/// - class: `[resource]`, `[element]` and `[field_syntax]` (11).
 ///
 /// Ties keep the order they were written in (a `[service]` and a
 /// `[client_service]`, two `[hint]`s). The parser sorts a run into this
@@ -2650,9 +2654,10 @@ pub fn attribute_rank(name: &str) -> u8 {
         "trait_only" => 8,
         "doc" => 9,
         "platform" => 10,
-        // Both are the declaration's CLASS, and no declaration takes both:
-        // `[resource]` labels a type, `[element]` a function.
-        "resource" | "element" => 11,
+        // All three are the declaration's CLASS, and no declaration takes
+        // two: `[resource]` labels a type, `[element]` a free function and
+        // `[field_syntax]` a method.
+        "resource" | "element" | "field_syntax" => 11,
         _ => 0,
     }
 }
@@ -2760,6 +2765,25 @@ const ELEMENT_WITH_PARAMETERS: &str = "an `[element]` function is called by its 
      arguments (`<row>` is `row()`): it may declare no parameters; what varies is set through \
      the methods of what it returns, written as the tag's attributes";
 
+/// B711 S2a: `[field_syntax]` on a free function (see
+/// [`Parser::check_field_syntax_method`]).
+const FIELD_SYNTAX_ON_A_FREE_FUNCTION: &str = "`[field_syntax]` marks the method a handle's \
+     field syntax calls (`handle.name` is `handle.at(T.name)`): it may label only a method in an \
+     `impl`, and a free function has no receiver";
+
+/// `[field_syntax]` on an `external fun`.
+const FIELD_SYNTAX_ON_AN_EXTERNAL: &str = "`[field_syntax]` marks the method a handle's field \
+     syntax calls: it may label only a method with a body, and an `external fun` binds a host \
+     function, which a key cannot be handed to";
+
+/// `[field_syntax]` together with `[element]`.
+const FIELD_SYNTAX_WITH_ELEMENT: &str = "`[field_syntax]` labels a method and `[element]` a free \
+     function: no declaration takes both";
+
+/// `[field_syntax]` where no function is declared.
+const FIELD_SYNTAX_NOT_ON_A_FUNCTION: &str = "`[field_syntax]` marks the method a handle's field \
+     syntax calls (`handle.name` is `handle.at(T.name)`): it may label only a method in an `impl`";
+
 /// `[element]` where no function is declared.
 const ELEMENT_NOT_ON_A_FUNCTION: &str = "`[element]` marks the function a tag calls by name: it \
      may label only a free `fun`";
@@ -2842,7 +2866,8 @@ fn attribute_order_rule(canonical: &str) -> String {
     format!(
         "a declaration's attributes are written in one order — `[derive]` and the other \
          generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, \
-         `[trait_only]`, `[platform]`, `[resource]` or `[element]`: write `{canonical}`"
+         `[trait_only]`, `[platform]`, `[resource]`, `[element]` or `[field_syntax]`: write \
+         `{canonical}`"
     )
 }
 
@@ -4661,6 +4686,9 @@ impl<'a, 'src> Parser<'a, 'src> {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_misplaced_element) {
+            return Some(item);
+        }
+        if let Some(item) = self.attempt(Self::parse_misplaced_field_syntax) {
             return Some(item);
         }
         if let Some(item) = self.attempt(Self::parse_impl) {
@@ -9791,6 +9819,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         let element_start = self.position;
         let element = self.eat_marker_attribute("element");
         let element_span = self.span_from(element_start);
+        let field_syntax_start = self.position;
+        let field_syntax = self.eat_marker_attribute("field_syntax");
+        let field_syntax_span = self.span_from(field_syntax_start);
         let is_async = self.eat(&Token::Async);
         let external = self.eat(&Token::External);
         self.expect(&Token::Fun)?;
@@ -9847,6 +9878,9 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.reject_misplaced_spread(&parameters.0);
         if element {
             self.check_element_constructor(element_span, external, &parameters);
+        }
+        if field_syntax {
+            self.check_field_syntax_method(field_syntax_span, element, external);
         }
         // B520: `fun f() -> T` reads as `fun f(): T`, refused at the arrow.
         let mut return_type = if self.eat_op(":") || self.eat_foreign_arrow(ForeignSpelling::Arrow)
@@ -10003,6 +10037,7 @@ impl<'a, 'src> Parser<'a, 'src> {
                 rpc,
                 trait_only,
                 element,
+                field_syntax,
                 platform_fence,
                 generic_parameters,
                 parameters,
@@ -10043,6 +10078,29 @@ impl<'a, 'src> Parser<'a, 'src> {
         };
         self.errors.push(ParseError {
             span,
+            reason,
+            context: Vec::new(),
+            hint: None,
+        });
+    }
+
+    /// B711 S2a: where a `[field_syntax]` method may be declared, as far as
+    /// the parser can tell — a `fun` in an item list (an `impl` or a `trait`;
+    /// which one, and the signature, are the analyzer's to check, since a
+    /// trait's method is refused there with the reason), with a body. Each
+    /// refusal is reported and the declaration still parses.
+    fn check_field_syntax_method(&mut self, attribute: Span, element: bool, external: bool) {
+        let reason = if element {
+            ParseErrorReason::Rule(FIELD_SYNTAX_WITH_ELEMENT)
+        } else if !self.in_member_body {
+            ParseErrorReason::Rule(FIELD_SYNTAX_ON_A_FREE_FUNCTION)
+        } else if external {
+            ParseErrorReason::Rule(FIELD_SYNTAX_ON_AN_EXTERNAL)
+        } else {
+            return;
+        };
+        self.errors.push(ParseError {
+            span: attribute,
             reason,
             context: Vec::new(),
             hint: None,
@@ -12329,6 +12387,23 @@ impl<'a, 'src> Parser<'a, 'src> {
         self.errors.push(ParseError {
             span,
             reason: ParseErrorReason::Rule(ELEMENT_NOT_ON_A_FUNCTION),
+            context: Vec::new(),
+            hint: None,
+        });
+        Some((Node::Error, span))
+    }
+
+    /// B711 S2a: `[field_syntax]` NOT followed by a function — the
+    /// misplaced-attribute steer, as [`Parser::parse_misplaced_element`].
+    fn parse_misplaced_field_syntax(&mut self) -> Option<Spanned<Node<'src>>> {
+        let start = self.position;
+        if !self.eat_marker_attribute("field_syntax") {
+            return None;
+        }
+        let span = self.span_from(start);
+        self.errors.push(ParseError {
+            span,
+            reason: ParseErrorReason::Rule(FIELD_SYNTAX_NOT_ON_A_FUNCTION),
             context: Vec::new(),
             hint: None,
         });

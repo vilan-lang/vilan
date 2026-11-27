@@ -748,6 +748,17 @@ const AUTO_WHERE_NOTHING_IS_INFERRED: &str = "`auto` writes a type the toolchain
      or `mut` binding, or an ascription (`as auto T`) — nothing is inferred here, so write \
      the type";
 
+/// B711 S2a: `[field_syntax]` on a trait's method declaration.
+const FIELD_SYNTAX_IN_A_TRAIT: &str = "`[field_syntax]` marks the method a handle's field syntax \
+     calls, and field syntax reads through a concrete receiver's own surface: it may label a \
+     method of an inherent `impl`, not a trait's (a receiver known by a bound or as `dyn` has no \
+     fields to read through)";
+
+/// B711 S2a: `[field_syntax]` on a method of a trait impl.
+const FIELD_SYNTAX_IN_A_TRAIT_IMPL: &str = "`[field_syntax]` marks the method a handle's field \
+     syntax calls: it may label a method of an inherent `impl`, not one that implements a trait \
+     (declare the method in an `impl` without `with`)";
+
 /// B570 §2: a trait member's or an `external`'s return is not inferred — the
 /// trait, or the host, fixes it.
 const AUTO_WHERE_THE_RETURN_IS_FIXED: &str = "`auto` writes a return the toolchain infers, \
@@ -1519,6 +1530,9 @@ pub struct Function<'src> {
     /// reachable only through a trait bound, never on a concrete type's own
     /// surface (`proposal/transport-rpc.md` §3.2).
     pub trait_only: bool,
+    /// Declared `[field_syntax]` (B711 S2a, struct-keys.md §3.5, R6): the
+    /// method a handle's field syntax calls (`crate::field_syntax`).
+    pub field_syntax: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -5506,6 +5520,24 @@ pub struct Analyzer<'src> {
     // A149 S4: the member reads field syntax turned into projection calls
     // (`app.user`), so an assignment to one is told how a handle is written.
     field_syntax_reads: HashSet<Id>,
+    // B711 S2a: the `[field_syntax]` methods of inherent impls, each as
+    // (implementation index, member id) — what the keyed reading of
+    // `crate::field_syntax` consults. Empty for a program that declares none.
+    field_syntax_methods: Vec<(usize, Id)>,
+    // B711 S2a: the `[field_syntax]` functions an impl body's walk met, banked
+    // until the block registers (the walk knows the function, the block its
+    // member).
+    field_syntax_pending: Vec<Id>,
+    // B711 S2a: the member reads field syntax turned into a call, each with
+    // the field it reads (its struct and index) — both readings, the store
+    // projection and the keyed call — so the editor's references, rename,
+    // hover and definition treat the member as the field it names.
+    field_syntax_fields: HashMap<Id, (Id, usize)>,
+    // B711 S2a: the reads of the KEYED reading, each with the key literal the
+    // walk minted as its argument. The literal was not written, so the editor
+    // lists no reference for it; an assignment to the read is told it is a
+    // call's value.
+    field_syntax_keyed: HashMap<Id, Id>,
     // The source-defined `enum bool` (from `std/boolean.vl`), captured after the
     // module loads. `bool` literals, comparisons, and `is` tests all type as
     // this enum; the transformer lowers it to a native JS boolean.
@@ -8530,6 +8562,10 @@ impl<'src> Analyzer<'src> {
             primitive_struct_ids: HashMap::default(),
             field_syntax_handles: Vec::new(),
             field_syntax_reads: HashSet::default(),
+            field_syntax_methods: Vec::new(),
+            field_syntax_pending: Vec::new(),
+            field_syntax_fields: HashMap::default(),
+            field_syntax_keyed: HashMap::default(),
             bool_enum_id: None,
             list_element_slots: HashMap::default(),
             variant_use_holes: HashMap::default(),
@@ -34507,9 +34543,15 @@ impl<'src> Analyzer<'src> {
                 if self.call_returns_view(*call_id) {
                     return None;
                 }
+                // B711 S2a: `user.name = v` through `[field_syntax]` reads
+                // like a field and is a method call's result.
+                if self.field_syntax_keyed.contains_key(&target_id) {
+                    "a field read through `[field_syntax]`, which is a call of the handle's \
+                     method (`user.name` is `user.at(User.name)`) and answers a value, not a \
+                     place: write through what the method returns"
                 // A149 S4: `app.user.name = v` reads like a field and is a
                 // projection — a handle, which is written through, not over.
-                if self.field_syntax_reads.contains(&target_id) {
+                } else if self.field_syntax_reads.contains(&target_id) {
                     "a store handle's field, which field syntax reads as its projection (a \
                      handle, not the value): write through it with `.set(..)`"
                 } else if self.call_is_variant_constructor(*call_id) {
@@ -36277,6 +36319,75 @@ impl<'src> Analyzer<'src> {
             }
         }
         None
+    }
+
+    /// B711 S2a: each `[field_syntax]` method of an inherent impl has the
+    /// door's one shape ([`crate::field_syntax::Surface::key_parameter`]), and
+    /// a handle type has at most one: two would make `handle.name` mean two
+    /// different calls, and no rule here picks one (refused at the second, by
+    /// name). Where it is reported is where it is declared; a method refused
+    /// here is one the reading skips, so its reads fall back to the ordinary
+    /// "no field" refusal.
+    fn check_field_syntax_declarations(&mut self) {
+        if self.field_syntax_methods.is_empty() {
+            return;
+        }
+        let methods = self.field_syntax_methods.clone();
+        let mut first_on: HashMap<Id, &'src str> = HashMap::default();
+        for (implementation_index, member_id) in methods {
+            let Some(function_id) = self.field_syntax().function_of(member_id) else {
+                continue;
+            };
+            let Some((name, name_span)) = self
+                .functions
+                .get(&function_id)
+                .map(|function| (function.name, function.name_span))
+            else {
+                continue;
+            };
+            let subject = self
+                .implementations
+                .get(implementation_index)
+                .map(|implementation| implementation.subject);
+            let handle = match subject.and_then(|subject| self.type_id_to_type_map.get(&subject)) {
+                Some(Type::Struct(handle, _)) => Some(*handle),
+                _ => None,
+            };
+            let reported = !self.reusable_entity(function_id);
+            let refusal = match (handle, self.field_syntax().key_parameter(function_id)) {
+                (None, _) => Some(
+                    "`[field_syntax]` labels a method of a struct's inherent `impl`: field \
+                     syntax reads a member of a struct value, and this `impl` is not on a struct"
+                        .to_string(),
+                ),
+                (Some(_), Err(problem)) => Some(problem.message()),
+                (Some(handle), Ok(_)) => match first_on.get(&handle) {
+                    Some(first) => {
+                        let handle_name = self
+                            .structs
+                            .get(&handle)
+                            .map_or("", |structure| structure.name);
+                        Some(format!(
+                            "`{handle_name}` already has a `[field_syntax]` method, `{first}`: a \
+                             handle type has one, so that `handle.name` means one call - read \
+                             through `{name}` by calling it"
+                        ))
+                    }
+                    None => {
+                        first_on.insert(handle, name);
+                        None
+                    }
+                },
+            };
+            if let (Some(msg), true) = (refusal, reported) {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span: name_span,
+                    msg,
+                });
+            }
+        }
     }
 
     /// Element-syntax S4: `<div text("hi")>` — an undotted `text(…)` head item
@@ -45165,8 +45276,33 @@ impl<'src> Analyzer<'src> {
                         .collect(),
                     rpc: function.rpc,
                     trait_only: function.trait_only,
+                    field_syntax: function.field_syntax,
                 },
             );
+            // B711 S2a: a `[field_syntax]` method of an inherent impl is
+            // banked for the impl's registration, which pairs it with the
+            // block (`field_syntax_methods`). A trait's method and a trait
+            // impl's are refused by name: field syntax reads through a
+            // concrete receiver's own surface, and a bound or `dyn` receiver
+            // has no fields to fall back from (the ruled door is a method,
+            // R6; a trait door is open).
+            if function.field_syntax {
+                if self.walking_trait_body || self.walking_trait_impl_body {
+                    self.diagnostics.push(Error {
+                        trace: Vec::new(),
+                        note: None,
+                        span: function.name.1,
+                        msg: if self.walking_trait_body {
+                            FIELD_SYNTAX_IN_A_TRAIT
+                        } else {
+                            FIELD_SYNTAX_IN_A_TRAIT_IMPL
+                        }
+                        .to_string(),
+                    });
+                } else if self.walking_member_body {
+                    self.field_syntax_pending.push(id);
+                }
+            }
             Some(Expr::Function(id))
         }
     }
@@ -45536,7 +45672,11 @@ impl<'src> Analyzer<'src> {
         self.walking_member_body = true;
         let was_walking_trait_impl_body = self.walking_trait_impl_body;
         self.walking_trait_impl_body = !traits.is_empty();
+        let field_syntax_pending_from = self.field_syntax_pending.len();
         self.walk_expr_nodes(&body.0, body_scope_id);
+        let field_syntax_declared = self
+            .field_syntax_pending
+            .split_off(field_syntax_pending_from);
         self.walking_trait_impl_body = was_walking_trait_impl_body;
         self.current_impl_subject_name = outer_impl_subject;
         self.walking_member_body = was_walking_member_body;
@@ -45610,6 +45750,22 @@ impl<'src> Analyzer<'src> {
                     scope_id,
                     members: declared_members.clone(),
                 }));
+        }
+        // B711 S2a: the block's `[field_syntax]` methods, as members of this
+        // implementation (`crate::field_syntax` reads them; the declaration
+        // check holds their signatures). Nothing is paid by a block that
+        // declares none.
+        for function_id in field_syntax_declared {
+            if let Some(member_id) = declarations.values().copied().find(|member_id| {
+                *member_id == function_id
+                    || matches!(
+                        self.expr_id_to_expr_map.get(member_id),
+                        Some(Expr::Function(target)) if *target == function_id
+                    )
+            }) {
+                self.field_syntax_methods
+                    .push((implementation_index, member_id));
+            }
         }
         self.implementations.push(Implementation {
             subject,
@@ -70188,8 +70344,22 @@ impl<'src> Analyzer<'src> {
                         self.note_member_query(&handle_type, member_name);
                         match self.field_syntax().read(&handle_type, member_name) {
                             crate::field_syntax::Reading::Projection(_) => {
+                                self.note_store_field_syntax_field(id, &handle_type, member_name);
                                 self.read_field_through_projection(id, subject_id, member_name);
                                 return Resolution::Resolved;
+                            }
+                            // B711 S2a: the handle door — `user.name` is
+                            // `user.at(User.name)` on a receiver whose type
+                            // has a `[field_syntax]` method.
+                            crate::field_syntax::Reading::Keyed(keyed) => {
+                                return self.read_field_through_key(
+                                    id,
+                                    subject_id,
+                                    &handle_type,
+                                    struct_name,
+                                    member_name,
+                                    keyed,
+                                );
                             }
                             crate::field_syntax::Reading::Unprojected(subject) => {
                                 let subject_name = self
@@ -70343,8 +70513,46 @@ impl<'src> Analyzer<'src> {
             }
             path
         };
-        let reached_name = self.pretty_print_type(&reached, &HashMap::default());
-        let (owner, arguments) = match &reached {
+        let (owner, field_index) =
+            match self.key_step_into(id, &reached, steps.is_empty(), &path_so_far, member_name) {
+                Ok(step) => step,
+                Err(msg) => return refuse(self, msg),
+            };
+        steps.push((owner, field_index));
+        let root_is_generic = self
+            .structs
+            .get(&root)
+            .is_some_and(|struct_| !struct_.generic_parameter_constraint_ids.is_empty());
+        self.expr_id_to_expr_map
+            .insert(id, Expr::Key(steps.clone()));
+        // A generic root's arguments come from where the key lands (R8), so its
+        // type is the expectation's, asked afresh each time (`key_literal_type`).
+        if !root_is_generic {
+            let field_type = self.key_path_type(root, &steps)?.get_type_id(self);
+            let root_type = Type::Struct(root, Vec::new()).get_type_id(self);
+            let key_type =
+                Type::Struct(key_struct_id, vec![root_type, field_type]).get_type_id(self);
+            self.expr_id_to_type_id_map.insert(id, key_type);
+            self.resolved_types.insert(id, key_type);
+        }
+        Some(Resolution::Resolved)
+    }
+
+    /// B711: the step `member_name` from the type a key path has `reached` —
+    /// the field it names and its struct — or the refusal a key literal gives
+    /// there, under the rules a member access `s.x` of that struct follows.
+    /// Shared by `S.x` and by field syntax's keyed reading (S2a), whose read
+    /// `user.name` is refused with the key literal's own message.
+    fn key_step_into(
+        &mut self,
+        id: Id,
+        reached: &Type,
+        steps_is_empty: bool,
+        path_so_far: &str,
+        member_name: &str,
+    ) -> Result<(Id, usize), String> {
+        let reached_name = self.pretty_print_type(reached, &HashMap::default());
+        let (owner, arguments) = match reached {
             Type::Struct(owner, arguments)
                 if self
                     .structs
@@ -70354,18 +70562,15 @@ impl<'src> Analyzer<'src> {
                 (*owner, arguments.clone())
             }
             Type::Enum(..) => {
-                return refuse(
-                    self,
-                    format!(
-                        "a key reaches only struct fields: `{path_so_far}` has type \
+                return Err(format!(
+                    "a key reaches only struct fields: `{path_so_far}` has type \
                          `{reached_name}`, and a step into an `Option` or an enum's variant \
                          may find nothing there (a key to a place that may be missing, \
                          `MaybeKey`, is a later stage)"
-                    ),
-                );
+                ));
             }
             _ => {
-                let what = match &reached {
+                let what = match reached {
                     Type::Tuple(..) => {
                         format!(
                             "has type `{reached_name}`, and a key does not step into a tuple's positions"
@@ -70374,7 +70579,7 @@ impl<'src> Analyzer<'src> {
                     Type::Generic(_) => format!(
                         "has type `{reached_name}`, a type parameter, whose fields a key cannot name"
                     ),
-                    _ if steps.is_empty() => {
+                    _ if steps_is_empty => {
                         "is an external type, which has no fields a key can name".to_string()
                     }
                     _ => format!(
@@ -70382,14 +70587,15 @@ impl<'src> Analyzer<'src> {
                          element or a map entry, `MaybeKey`, is a later stage)"
                     ),
                 };
-                return refuse(
-                    self,
-                    format!("a key reaches only struct fields: `{path_so_far}` {what}"),
-                );
+                return Err(format!(
+                    "a key reaches only struct fields: `{path_so_far}` {what}"
+                ));
             }
         };
         let (owner_name, resource, field) = {
-            let struct_ = self.structs.get(&owner)?;
+            let Some(struct_) = self.structs.get(&owner) else {
+                return Err(format!("struct has no field '{member_name}'"));
+            };
             let field = struct_
                 .fields
                 .iter()
@@ -70400,23 +70606,17 @@ impl<'src> Analyzer<'src> {
         };
         let owner_type = Type::Struct(owner, arguments).get_type_id(self);
         if resource || self.type_is_resource(owner_type) {
-            return refuse(
-                self,
-                format!(
-                    "`{owner_name}` is a resource, and a key cannot reach into a resource's \
+            return Err(format!(
+                "`{owner_name}` is a resource, and a key cannot reach into a resource's \
                      fields: a resource is moved, never copied, and a key's place reads by copy"
-                ),
-            );
+            ));
         }
         let hidden = field.and_then(|(index, _)| self.internal_field_hidden(owner, index, id));
         if let (Some(_), Some(reason)) = (field, hidden) {
-            return refuse(
-                self,
-                format!(
-                    "`{member_name}` is an `[internal]` field of std's `{owner_name}`, and an \
+            return Err(format!(
+                "`{member_name}` is an `[internal]` field of std's `{owner_name}`, and an \
                      internal std field is not a member outside std, so it has no key: {reason}"
-                ),
-            );
+            ));
         }
         let Some((field_index, _)) = field else {
             let candidates: Vec<&str> = self
@@ -70437,29 +70637,11 @@ impl<'src> Analyzer<'src> {
             let suggestion = closest_name::closest_name(member_name, candidates.iter().copied())
                 .map(|name| format!("; did you mean `{name}`?"))
                 .unwrap_or_default();
-            return refuse(
-                self,
-                format!("struct '{owner_name}' has no field '{member_name}'{suggestion}"),
-            );
+            return Err(format!(
+                "struct '{owner_name}' has no field '{member_name}'{suggestion}"
+            ));
         };
-        steps.push((owner, field_index));
-        let root_is_generic = self
-            .structs
-            .get(&root)
-            .is_some_and(|struct_| !struct_.generic_parameter_constraint_ids.is_empty());
-        self.expr_id_to_expr_map
-            .insert(id, Expr::Key(steps.clone()));
-        // A generic root's arguments come from where the key lands (R8), so its
-        // type is the expectation's, asked afresh each time (`key_literal_type`).
-        if !root_is_generic {
-            let field_type = self.key_path_type(root, &steps)?.get_type_id(self);
-            let root_type = Type::Struct(root, Vec::new()).get_type_id(self);
-            let key_type =
-                Type::Struct(key_struct_id, vec![root_type, field_type]).get_type_id(self);
-            self.expr_id_to_type_id_map.insert(id, key_type);
-            self.resolved_types.insert(id, key_type);
-        }
-        Some(Resolution::Resolved)
+        Ok((owner, field_index))
     }
 
     /// B711: the type a key's steps reach from `root`, written in the ROOT's own
@@ -70773,6 +70955,8 @@ impl<'src> Analyzer<'src> {
             functions: &self.functions,
             parameters: &self.parameters,
             handles: &self.field_syntax_handles,
+            keyed_methods: &self.field_syntax_methods,
+            key_struct: self.key_struct_id,
         }
     }
 
@@ -70798,6 +70982,164 @@ impl<'src> Analyzer<'src> {
             argument_ids: Vec::new(),
             arguments_span: end,
         });
+    }
+
+    /// B711 S2a: the store reading's field, for the editor — the projection
+    /// `app.user` reads is the field `user` of the struct the handle is on.
+    fn note_store_field_syntax_field(&mut self, id: Id, handle_type: &Type, member_name: &str) {
+        let Some(subject) = self.field_syntax().store_subject(handle_type) else {
+            return;
+        };
+        if let Some(index) = self.structs.get(&subject).and_then(|structure| {
+            structure
+                .fields
+                .iter()
+                .position(|field| field.name == member_name)
+        }) {
+            self.field_syntax_fields.insert(id, (subject, index));
+        }
+    }
+
+    /// B711 S2a (`proposal/struct-keys.md` §3.5, R6): the member read
+    /// `subject.member` (entity `id`) on a receiver whose type has a
+    /// `[field_syntax]` method becomes the call `subject.method(T.member)` —
+    /// under the SAME entity, as the store reading's projection call does, so
+    /// the access's type, member span and hover read the call.
+    ///
+    /// Before it reads through, two things may stop it, each said at the
+    /// member:
+    ///
+    /// - the receiver's own METHOD of that name shadows the field (its own
+    ///   fields never reach here): a bare `.name` is no method reference, so
+    ///   the refusal is the one a method named without parentheses gets, and
+    ///   it names the written form that reaches the field;
+    /// - the field is one a key literal cannot name (an `[internal]` std
+    ///   field, a field of a resource or of an `external` struct): the
+    ///   refusal is the key literal's own.
+    ///
+    /// The argument is a key literal the walk mints: one step, `T`'s field,
+    /// typed as `T.member` is (a generic `T` takes its arguments from the
+    /// method's parameter, R8). It has the read's span for diagnostics and no
+    /// member span, so the editor lists no reference for it.
+    fn read_field_through_key(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        receiver: &Type,
+        receiver_name: &'src str,
+        member_name: &'src str,
+        keyed: crate::field_syntax::Keyed,
+    ) -> Resolution {
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        let (subject_name, method_name) = (
+            self.structs
+                .get(&keyed.subject)
+                .map_or("", |structure| structure.name),
+            self.functions
+                .get(&keyed.function)
+                .map_or("", |function| function.name),
+        );
+        // The call the read is, as the reader wrote the receiver
+        // (`` `h.at(User.get)` ``), or from the dot where it spans lines.
+        let call = format!("{method_name}({subject_name}.{member_name})");
+        let written = self
+            .source_of_id(id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| text.get(span.into_range()))
+            .filter(|written| written.ends_with(&format!(".{member_name}")))
+            .filter(|written| !written.contains('\n'))
+            .map(|written| written[..written.len() - member_name.len()].to_string());
+        let written = match written {
+            Some(receiver) => format!("`{receiver}{call}`"),
+            None => format!("`.{call}`"),
+        };
+        let shadowing = match self.resolve_impl_member(receiver, member_name) {
+            ImplMemberResolution::Found(member_id, _)
+            | ImplMemberResolution::FoundInheritedDefault(member_id, ..) => Some(member_id),
+            _ => None,
+        };
+        if let Some(method_id) = shadowing {
+            let call = self.written_method_call(id, span, method_id, receiver_name, member_name);
+            self.diagnostics.push(Error {
+                trace: Vec::new(),
+                note: None,
+                span,
+                msg: format!(
+                    "struct '{receiver_name}' has no field '{member_name}': `{member_name}` is a \
+                     method of `{receiver_name}`: call it, {call}; `{member_name}` is also a \
+                     field of `{subject_name}`, which the method shadows from field syntax: \
+                     reach the field with {written}"
+                ),
+            });
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        }
+        let reached = match keyed.root {
+            Some(root) => root.get_type(self),
+            None => Type::Struct(keyed.subject, Vec::new()),
+        };
+        let step = self.key_step_into(id, &reached, true, subject_name, member_name);
+        let (owner, field_index) = match step {
+            Ok(step) => step,
+            Err(reason) => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: format!(
+                        "`{member_name}` reads through `[field_syntax]` as {written}, and that \
+                         key is refused: {reason}"
+                    ),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                return Resolution::Failed;
+            }
+        };
+        let key_id = self.new_entity_id();
+        self.expr_id_to_expr_map
+            .insert(key_id, Expr::Key(vec![(owner, field_index)]));
+        if let Some(span) = self.span_map.get(&id).copied() {
+            self.span_map.insert(key_id, span);
+        }
+        if let Some(scope_id) = self.expr_id_to_scope_id_map.get(&id).copied() {
+            self.expr_id_to_scope_id_map.insert(key_id, scope_id);
+        }
+        // A non-generic `T`'s literal has its type now, as `resolve_key_step`
+        // records one; a generic `T`'s is the expectation's (R8).
+        let generic = self
+            .structs
+            .get(&owner)
+            .is_some_and(|structure| !structure.generic_parameter_constraint_ids.is_empty());
+        if !generic && let Some(key_struct_id) = self.key_struct_id {
+            let field_type = self.key_path_type(owner, &[(owner, field_index)]);
+            if let Some(field_type) = field_type {
+                let field_type = field_type.get_type_id(self);
+                let root_type = Type::Struct(owner, Vec::new()).get_type_id(self);
+                let key_type =
+                    Type::Struct(key_struct_id, vec![root_type, field_type]).get_type_id(self);
+                self.expr_id_to_type_id_map.insert(key_id, key_type);
+                self.resolved_types.insert(key_id, key_type);
+            }
+        }
+        let arguments_span = self
+            .member_name_spans
+            .get(&id)
+            .map_or(EMPTY_SPAN, |span| Span {
+                start: span.end,
+                end: span.end,
+            });
+        self.field_syntax_reads.insert(id);
+        self.field_syntax_fields.insert(id, (owner, field_index));
+        self.field_syntax_keyed.insert(id, key_id);
+        self.constraints.push(Constraint::MethodCall {
+            id,
+            subject_id,
+            member_name: method_name,
+            generic_argument_ids: Vec::new(),
+            argument_ids: vec![key_id],
+            arguments_span,
+        });
+        Resolution::Resolved
     }
 
     /// `subject is Pattern`: once the subject type is known, resolve the pattern
@@ -79510,6 +79852,15 @@ pub struct Program<'src> {
     /// A149 S4: std's store handles (`Store`, `StoreSome`) — the receivers
     /// field syntax reads through. Read with [`Program::field_syntax`].
     pub field_syntax_handles: Vec<Id>,
+    /// B711 S2a: the `[field_syntax]` methods of inherent impls, each as
+    /// (implementation index, member id). Read with [`Program::field_syntax`].
+    pub field_syntax_methods: Vec<(usize, Id)>,
+    /// B711 S2a: each member read field syntax turned into a call (either
+    /// reading), with the field it names — `(struct id, field index)`.
+    pub field_syntax_fields: HashMap<Id, (Id, usize)>,
+    /// B711 S2a: each KEYED field-syntax read, with the key literal minted as
+    /// its argument (no written source: the editor lists no reference for it).
+    pub field_syntax_keyed: HashMap<Id, Id>,
     // The `std` `panic` intrinsic (if loaded); its calls lower to a `throw`.
     pub panic_fn_id: Option<Id>,
     /// [`Divergence`]'s two resolved leaves, computed once by the analysis and
@@ -93753,6 +94104,7 @@ fn analyze_over_world<'src>(
         analyzer.check_must_use();
         analyzer.check_deprecated();
         analyzer.check_element_attribute_shadowing();
+        analyzer.check_field_syntax_declarations();
         analyzer.check_view_escape();
         analyzer.check_invalidation();
         analyzer.check_reseat_escape();
@@ -94429,6 +94781,25 @@ fn analyze_over_world<'src>(
     crate::phase_pass_mark("the stage hints and auto fills");
     let has_ascriptions = !analyzer.ascriptions.is_empty();
 
+    // B711 S2a: a keyed field-syntax read is a call of a generic method, and a
+    // call is typed on demand and records nothing; the editor hovers and
+    // completes through the read's type, so it is asked here, once per read
+    // (none in a program without a `[field_syntax]` method).
+    let field_syntax_read_types: Vec<(Id, TypeId)> = {
+        let reads: Vec<Id> = analyzer.field_syntax_keyed.keys().copied().collect();
+        let mut typed = Vec::new();
+        for read in reads {
+            if analyzer.expr_id_to_type_id_map.contains_key(&read) {
+                continue;
+            }
+            let read_type =
+                analyzer.infer_type(read, &Type::Unknown, &SubstitutionContext::default());
+            if !matches!(read_type, Type::Unknown | Type::Unresolved) {
+                typed.push((read, read_type.get_type_id(&mut analyzer)));
+            }
+        }
+        typed
+    };
     // Pre-render a type label for every typed expression (for hover). Done here
     // while the analyzer still holds the type tables; `expr_id_to_type_id_map`
     // is applied last so it wins over `resolved_types`, matching `type_of_expr`.
@@ -94458,6 +94829,13 @@ fn analyze_over_world<'src>(
             analyzer.pretty_print_type(type_, &empty_substitution),
         );
         expr_type_ids.insert(*expr_id, *type_id);
+    }
+    for (read, type_id) in field_syntax_read_types {
+        let type_ = type_id.borrow_type(&analyzer);
+        expr_types
+            .entry(read)
+            .or_insert_with(|| analyzer.pretty_print_type(type_, &empty_substitution));
+        expr_type_ids.entry(read).or_insert(type_id);
     }
     // B389: a literal's settled width, where nothing above typed it.
     for (literal_id, type_id) in &analyzer.literal_types {
@@ -95525,6 +95903,9 @@ fn analyze_over_world<'src>(
         backed_value_members,
         list_new_fn_id,
         field_syntax_handles: analyzer.field_syntax_handles,
+        field_syntax_methods: analyzer.field_syntax_methods,
+        field_syntax_fields: analyzer.field_syntax_fields,
+        field_syntax_keyed: analyzer.field_syntax_keyed,
         list_push_fn_id,
         panic_fn_id: analyzer.panic_fn_id,
         divergence_leaves: analyzer.divergence_leaves.clone(),

@@ -1032,6 +1032,7 @@ fn analyze_source_unfenced(
                     rpc: false,
                     trait_only: false,
                     element: false,
+                    field_syntax: false,
                     generic_parameters: None,
                     parameters: (Vec::new(), head),
                     return_type: Some(Box::new((Node::Accessor("Source"), head))),

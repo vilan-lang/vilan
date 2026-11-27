@@ -339,6 +339,12 @@ const ATTRIBUTE_CLASSES: &[(&str, &str, Class, &str)] = &[
         "makes a tag naming the function a typed element: lowered to a method chain on what it returns",
     ),
     (
+        "field_syntax",
+        "[field_syntax]",
+        Class::Typing,
+        "makes the method a handle's field syntax: `h.name` reads as `h.at(T.name)` on its receivers",
+    ),
+    (
         "hint",
         "[hint(Show)]",
         Class::Tooling,

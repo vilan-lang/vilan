@@ -641,7 +641,7 @@ row	flagship	key
 617	-	this pattern binds {n} {elements}, but the value is a `{type}`, not a tuple: `(a, b)` destructures a tuple
 618	-	`{member_name}` is `{trait_name}`'s, and this file does not import `{trait_name}`: a trait's methods resolve only in a file that imports the trait. Import it (`{import}`)
 619	-	`{type}` is not a trait: a selector's `with` names the trait the block implements, as its declaration does (`(impl Box with One)` selects `impl Box with One`)
-620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]` or `[element]`: write `{canonical}`
+620	-	a declaration's attributes are written in one order — `[derive]` and the other generators, `[deprecated]`, `[internal]`, `[hint]`, `[extern]`, `[must_use]`, `[rpc]`, `[trait_only]`, `[platform]`, `[resource]`, `[element]` or `[field_syntax]`: write `{canonical}`
 621	-	the left side of this assignment is not a place: it is {what} — only a place can be assigned: a binding (`x`), a field (`p.x`), an element (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a `&mut` view
 622	-	cannot reassign '{place}' while a view into it is live: the view points into the storage this write replaces (rule 4: no invalidating mutation under a live view).
 623	-	`{symbol}` computes on two numbers, but the right operand is `{rhs}`, which is not one: there are no implicit conversions, and the host would compute on its lowering (`2 * true` is `2`, typed `{lhs}`). Compute on the number you mean (`if flag { 1 } else { 0 }`, or a `parse` of the string)
@@ -815,3 +815,4 @@ NEW	-	this key reaches into a `{key}`, and the subject is a `{subject}`: a key i
 NEW	-	this tuple key names an element that is itself a tuple, `{element}`, and {what} is refused: tuples store flat, so a nested tuple reached through a key is no place of its own
 NEW	-	`{name}` is an `external` struct, which no literal can build: {origin}
 NEW	-	this key is a `{key}`, and the subject is a `{subject}`: a tuple key indexes only a tuple of the family it was minted for, or a tuple mapped from that family
+NEW	-	`{member_name}` reads through `[field_syntax]` as {written}, and that key is refused: {reason}
