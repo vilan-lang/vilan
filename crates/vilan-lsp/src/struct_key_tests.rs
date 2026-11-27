@@ -318,6 +318,42 @@ fn keys_renaming_a_field_rewrites_its_key_literals() {
     });
 }
 
+/// S1c: a path's MIDDLE step is renamed with its field, and its root with
+/// its struct, and the file checks clean after each.
+#[test]
+fn keys_renaming_a_middle_step_and_the_root_rewrites_the_path() {
+    on_big_stack(|| {
+        let document = analyzed(SOURCE);
+        let apply = |at: usize, to: &str| {
+            let edits = document
+                .rename_edits(at, to)
+                .unwrap_or_else(|refusal| panic!("{}", refusal.message()));
+            let mut spans: Vec<(usize, usize)> = edits
+                .iter()
+                .map(|(_, span, _)| (span.start, span.end))
+                .collect();
+            spans.sort_unstable();
+            let mut renamed = SOURCE.to_string();
+            for (start, end) in spans.into_iter().rev() {
+                renamed.replace_range(start..end, to);
+            }
+            renamed
+        };
+        let middle = apply(SOURCE.find("meta: Meta").expect("the field"), "info");
+        assert!(middle.contains("Task.info.owner"), "{middle}");
+        let after = analyzed(&middle);
+        assert!(after.diagnostics.is_empty(), "{:?}", messages(&after));
+        let root = apply(
+            SOURCE.find("struct Task").expect("the struct") + "struct ".len(),
+            "Job",
+        );
+        assert!(root.contains("Job.title;"), "{root}");
+        assert!(root.contains("Job.meta.owner"), "{root}");
+        let after = analyzed(&root);
+        assert!(after.diagnostics.is_empty(), "{:?}", messages(&after));
+    });
+}
+
 /// S1c: a key's steps colour as fields, its root as a type — the existing
 /// classification, read off the member spans and the root's reference.
 #[test]
