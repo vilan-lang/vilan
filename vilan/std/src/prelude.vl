@@ -28,15 +28,15 @@
 // `KeyPath` is reached through `k.path()` and imported by name from `std::key`
 // where a program writes the type.
 //
-// `Key` is listed like every other name, and it is ambient like every other
-// name, but this re-export does not LOAD `std::key` (M211): the module's impls
-// cost every program's check about 1.7 %, and only a program with keys uses
-// them. The loader loads it when some file of the program — its own, a
-// dependency's, std's, or a macro's output — may need it: one that writes
-// `Key`, `KeyPath` or `KeyStep`, a key literal (`Task.title`), or a
-// `[field_syntax]` method. Without one, nothing in the program names `Key`, so
-// nothing can tell it is absent. The web prelude's re-export is read the same
-// way.
+// `Key` is listed like every other name, and it is ambient like every other name,
+// but this re-export does not LOAD `std::key` (M211): the module's impls cost every
+// program's check about 2 %, and only a program with keys uses them. The loader
+// loads it when some file of the program — its own, a dependency's, or a macro's
+// output — may need it: one that writes `Key`, `KeyPath` or `KeyStep`, a key
+// literal (`Task.title`), or a `[field_syntax]` method; and a std module that
+// needs it imports it by path, as the store does. Without one, nothing in the
+// program names `Key`, so nothing can tell it is absent. The web prelude's
+// re-export is read the same way.
 //
 // Selected as `prelude = "std::prelude"`, which is also what omitting the key
 // means. The web set is next door in `web.vl`.

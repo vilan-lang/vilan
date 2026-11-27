@@ -83634,12 +83634,13 @@ fn collect_std_item_modules_seeding(nodes: &NodeList, want_key: bool) -> Vec<&'s
 /// The base and web preludes publish `Key` (`export import pkg::key::Key;`),
 /// but a prelude's re-export of it does not load the module
 /// ([`is_on_demand_reexport`]): the module's impls and functions cost every
-/// program about 4.5 M instructions of `vilan check` (+1.7 % on a tiny one),
+/// program about 5.8 M instructions of `vilan check` (+2.3 % on a tiny one),
 /// and only a program with keys uses them. It loads when some file of the
-/// program — the entry, a package module, a dependency's module or surface, a
-/// std module, or code a macro or derive generated — writes syntax that may
-/// need it ([`seeds_std_key`]), or when anything imports it by path (std's
-/// store does). When it is loaded the preludes bind `Key` exactly as before;
+/// program — the entry, a package module, a dependency's module or surface,
+/// or code a macro or derive generated — writes syntax that may need it
+/// ([`seeds_std_key`]), or when anything imports it by path. A std module is
+/// not asked: std writes its need as an import (the store does), and
+/// `std_modules_import_the_key_they_seed` holds every std file to that. When it is loaded the preludes bind `Key` exactly as before;
 /// when it is not, nothing in the program can tell `Key` apart from absent,
 /// since nothing names it and no key value can exist.
 const STD_KEY_MODULE: &str = "key";
