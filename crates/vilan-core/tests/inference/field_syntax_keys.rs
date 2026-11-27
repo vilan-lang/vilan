@@ -247,7 +247,8 @@ fn field_syntax_a_member_naming_no_field_is_the_plain_refusal() {
 fn field_syntax_a_read_is_no_place() {
     handles_refused(
         r#"fun main() { let r = user(); r.name = "x"; }"#,
-        "it is a field read through `[field_syntax]`, which is a call of the handle's method",
+        "`r.name` reads through `[field_syntax]` as `r.at(User.name)`, a call, which answers a \
+         `Cursor<User, str>`: a value, not a place - write through it with `.set(..)`",
     );
 }
 

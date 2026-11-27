@@ -1,0 +1,161 @@
+// B711 S2b on both backends: std's store handles read a struct's fields through
+// their one `[field_syntax]` door, `field`, which takes a key. A chain, a PATH key
+// (the same slot, the same identity and the same wakes as the chain of its single
+// steps), a `StoreSome` through an enum payload and an `Option`, a field a handle
+// member shadows (reached by the written call), a generic struct, and a remote
+// handle's door over a mirrored store (the wire path one field longer per step).
+import std::io::print;
+import std::json::json_codec;
+import std::option::Option::{ self, None, Some };
+import std::reactive::store::{ RemoteStore, RemoteStoreSome, Storable, Store, StoreSome };
+import std::reactive::{ Owner, Signal, Source, run_with_owner };
+import std::rpc::mirror::{ mint_store, read_store_reply, reply_store };
+import std::rpc::{
+	Dispatcher,
+	ReactiveClient,
+	RpcRequest,
+	call_reading,
+	duplex_pair,
+	local_rpc,
+	register_session,
+};
+import std::time::{ Duration, sleep_for };
+import std::wire::{ Deserializer, Wire };
+
+[derive(Storable, Wire)]
+struct Address {
+	city: str,
+	zip: i32,
+}
+
+[derive(Storable, Wire)]
+struct User {
+	name: str,
+	address: Address,
+	get: str,
+}
+
+[derive(Storable)]
+struct Device {
+	label: str,
+}
+
+[derive(Storable)]
+enum Presence {
+	Offline,
+	Online(Device),
+}
+
+[derive(Storable)]
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+[derive(Storable, Wire)]
+struct Global {
+	motd: str,
+	owner: User,
+}
+
+[derive(Storable)]
+struct App {
+	user: User,
+	presence: Presence,
+	home: Option<Address>,
+}
+
+fun chains_and_paths() {
+	let app = Store::new(App {
+		user = User { name = "Ann", address = Address { city = "Oslo", zip = 150 }, get = "g" },
+		presence = Presence::Online(Device { label = "phone" }),
+		home = Some(Address { city = "Bergen", zip = 5003 }),
+	});
+	let chained = app.user.address.city;
+	let path = app.field(App.user.address.city);
+	let spelled = app.field(App.user).field(User.address).field(Address.city);
+	let same = chained.identity() == path.identity() && path.identity() == spelled.identity();
+	print(i"one slot: {same}");
+	let watching = Owner::new();
+	run_with_owner(watching, || {
+		chained.effect_on_change(|city| print(i"chain woke {city}"));
+		path.effect_on_change(|city| print(i"path woke {city}"));
+		app.user.address.zip.effect_on_change(|zip| print(i"zip woke {zip}"));
+	});
+	path.set("Tromso");
+	chained.set("Tromso");
+	app.field(App.user.address).set(Address { city = "Narvik", zip = 8500 });
+	let city = app.user.address.city.get();
+	print(i"read {city}");
+	watching.dispose();
+	let shadowed = app.user.field(User.get);
+	shadowed.set("h");
+	let held = app.get();
+	print(i"shadowed {held.user.get}");
+	let label: StoreSome<str> = app.presence.online().label;
+	let first = label.get().unwrap_or("-");
+	print(i"label {first}");
+	let _landed = label.patch("tablet");
+	app.presence.set(Presence::Offline);
+	let gone = label.get().unwrap_or("-");
+	print(i"label after Offline {gone}");
+	let zip: StoreSome<i32> = app.home.some().zip;
+	let before = zip.get().unwrap_or(0);
+	app.home.set(None);
+	let after = zip.get().unwrap_or(0);
+	print(i"home zip {before} {after}");
+	let pair = Store::new(Pair { left = "a", right = "b" });
+	pair.right.set("c");
+	let left = pair.left.get();
+	let right = pair.field(Pair.right).get();
+	print(i"pair {left} {right}");
+}
+
+fun remote() {
+	let codec = json_codec();
+	let global = Store::new(Global {
+		motd = "welcome",
+		owner = User { name = "Ann", address = Address { city = "Oslo", zip = 150 }, get = "g" },
+	});
+	let (client_end, server_end) = duplex_pair();
+	register_session(7, server_end, codec);
+	let client = ReactiveClient::new(client_end, codec);
+	let dispatcher = Dispatcher::new()
+		.on("global", |request: RpcRequest| reply_store(request, global));
+	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
+	let g: RemoteStoreSome<Global> = mint_store(
+		client,
+		|| call_reading(
+			local,
+			codec,
+			"global",
+			[],
+			|reply: Deserializer| read_store_reply<Global>(reply, false),
+		),
+	);
+	let chained: RemoteStoreSome<str> = g.owner.address.city;
+	let path: RemoteStoreSome<str> = g.field(Global.owner.address.city);
+	let page = Owner::new();
+	run_with_owner(page, || {
+		chained.effect(|city| print(i"remote chain {city.unwrap_or("-")}"));
+		path.effect(|city| print(i"remote path {city.unwrap_or("-")}"));
+	});
+	sleep_for(Duration::millis(0));
+	global.owner.address.city.set("Bergen");
+	sleep_for(Duration::millis(0));
+	run_with_owner(page, || {
+		let assumed: RemoteStore<Global> = g.assume();
+		let city: RemoteStore<str> = assumed.owner.field(User.address.city);
+		city.effect(|now| print(i"remote assumed {now}"));
+	});
+	global.owner.address.city.set("Narvik");
+	sleep_for(Duration::millis(0));
+	page.dispose();
+}
+
+fun main() {
+	chains_and_paths();
+	remote();
+}
+
+main();

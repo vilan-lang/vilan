@@ -579,8 +579,10 @@ attribute names (`derive`, `service`, `client_service`, `extern`,
 
 `[reactive(..)]` is a field's store knobs, read by `[derive(Storable)]`
 (`std::reactive::store`) and by nothing else: `coarse` makes the field one slot,
-compared whole, and `name = "x"` generates its projection as `x()`. The
-`name` must be an identifier. It may stand on either side of `[expose]`.
+compared whole. `name = "x"` still parses (it must be an identifier), and the
+derive refuses it on a struct field: it renamed a field's projection until
+v0.56, and a store handle reads every field through one `[field_syntax]` door
+(B711 S2b). It may stand on either side of `[expose]`.
 
 `[service(..)]` and `[client_service]` may be written in either order
 on one struct; a struct carrying both is peer-to-peer and expands

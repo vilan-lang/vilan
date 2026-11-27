@@ -80,19 +80,9 @@ fun main() {
 	);
 	let page = Owner::new();
 	run_with_owner(page, || {
-		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
-		g
-			.messages()
-			.at(7)
-			.some()
-			.content()
-			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
-		g
-			.messages()
-			.at(8)
-			.some()
-			.content()
-			.effect(|content| print(i"eight {content.unwrap_or("-")}"));
+		g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g.messages.at(7).some().content.effect(|content| print(i"seven {content.unwrap_or("-")}"));
+		g.messages.at(8).some().content.effect(|content| print(i"eight {content.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	print("-- the connection drops: the old session goes with its channels");
@@ -100,12 +90,12 @@ fun main() {
 	drop_session(7);
 	sleep_for(Duration::millis(0));
 	print("-- written while down: the motd and seven; eight untouched");
-	global.motd().set("while down");
-	let _edited = global.messages().at(7).some().content().patch("edited");
+	global.motd.set("while down");
+	let _edited = global.messages.at(7).some().content.patch("edited");
 	print("-- a hold taken while down waits for the replay");
 	let late = Owner::new();
 	run_with_owner(late, || {
-		g.messages().at(8).some().id().effect(|id| print(i"eight's id {id.unwrap_or(0)}"));
+		g.messages.at(8).some().id.effect(|id| print(i"eight's id {id.unwrap_or(0)}"));
 	});
 	sleep_for(Duration::millis(0));
 	print("-- a fresh session on the wire, and the replay");
@@ -114,7 +104,7 @@ fun main() {
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print("-- the fresh channel follows");
-	global.motd().set("after");
+	global.motd.set("after");
 	sleep_for(Duration::millis(0));
 	late.dispose();
 	page.dispose();

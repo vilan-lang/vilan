@@ -333,7 +333,7 @@ fun main() {
 		// A DERIVATION in the body: a turn settles it ahead of the effect that
 		// tears the body down, so it runs in the turn that ends the variant.
 		let shown = device
-			.name()
+			.name
 			.derive(|name| {
 				print(i"saw {name}");
 				name
@@ -342,7 +342,7 @@ fun main() {
 		view("p").bind_text(shown)
 	})));
 	batch(|| {
-		let _renamed = presence.online().name().patch("phone");
+		let _renamed = presence.online().name.patch("phone");
 	});
 	batch(|| presence.set(Presence::Offline));
 	print("done");
@@ -393,10 +393,10 @@ fun main() {
 		print("built");
 		// The handles bind through the `Flow` arms alone (B476): a text binding
 		// and an attribute value.
-		view("p").attr("title", device.name()).bind_text(device.name())
+		view("p").attr("title", device.name).bind_text(device.name)
 	})));
 	dump("mounted");
-	let _renamed = presence.online().name().patch("phone");
+	let _renamed = presence.online().name.patch("phone");
 	presence.set(Presence::Online(Device { name = "phone", since = 2 }));
 	dump("patched");
 	presence.set(Presence::Offline);

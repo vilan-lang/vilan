@@ -71,40 +71,40 @@ fun main() {
 	// Readers: title1, by1 (from a copied handle), key1, title2, tags1 (from a copy
 	// of a copy), the root.
 	let counts: Shared<List<i32>> = Shared::new([0, 0, 0, 0, 0, 0]);
-	let first = store.rooms().at(1).some();
+	let first = store.rooms.at(1).some();
 	let copy = first;
 	let again = copy;
 	let owner = Owner::new();
 	run_with_owner(owner, || {
-		store.rooms().at(1).some().topic().title().effect_on_change(|_title| bump(counts, 0));
-		copy.topic().by().effect_on_change(|_by| bump(counts, 1));
-		store.rooms().at(1).effect_on_change(|_room| bump(counts, 2));
-		store.rooms().at(2).some().topic().title().effect_on_change(|_title| bump(counts, 3));
-		again.tags().effect_on_change(|_tags| bump(counts, 4));
+		store.rooms.at(1).some().topic.title.effect_on_change(|_title| bump(counts, 0));
+		copy.topic.by.effect_on_change(|_by| bump(counts, 1));
+		store.rooms.at(1).effect_on_change(|_room| bump(counts, 2));
+		store.rooms.at(2).some().topic.title.effect_on_change(|_title| bump(counts, 3));
+		again.tags.effect_on_change(|_tags| bump(counts, 4));
 		store.effect_on_change(|_global| bump(counts, 5));
 	});
 	print(i"subscribed: {census(store)}");
 	print(i"woke at subscribe:{woke(counts)}");
 
-	let _title = store.rooms().at(1).some().topic().title().patch("deep");
+	let _title = store.rooms.at(1).some().topic.title.patch("deep");
 	print(i"title 1 written:{woke(counts)}");
-	let _by = again.topic().by().patch("amy");
+	let _by = again.topic.by.patch("amy");
 	print(i"by 1 written through a copy:{woke(counts)}");
-	let _same = first.topic().by().patch("amy");
+	let _same = first.topic.by.patch("amy");
 	print(i"by 1 written the same:{woke(counts)}");
-	let _other = store.rooms().at(2).some().topic().title().patch("elsewhere");
+	let _other = store.rooms.at(2).some().topic.title.patch("elsewhere");
 	print(i"title 2 written:{woke(counts)}");
-	copy.tags().push("pinned");
+	copy.tags.push("pinned");
 	print(i"tags 1 pushed:{woke(counts)}");
-	store.motd().set("bye");
+	store.motd.set("bye");
 	print(i"motd written:{woke(counts)}");
-	store.rooms().at(1).some().topic().notify();
+	store.rooms.at(1).some().topic.notify();
 	print(i"topic 1 notified:{woke(counts)}");
-	store.rooms().at(1).set(Some(room("general", "reset")));
+	store.rooms.at(1).set(Some(room("general", "reset")));
 	print(i"room 1 replaced:{woke(counts)}");
 
-	print(i"values: {first.topic().title().get().unwrap_or("-")} {copy.topic().by().get().unwrap_or("-")} {store.rooms().at(2).some().topic().title().get().unwrap_or("-")} {again.tags().get().map(|tags| tags.len()).unwrap_or(0)}");
-	print(i"one path, one identity: {first.topic().title().identity() == again.topic().title().identity()} {first.topic().title().identity() == store.rooms().at(2).some().topic().title().identity()}");
+	print(i"values: {first.topic.title.get().unwrap_or("-")} {copy.topic.by.get().unwrap_or("-")} {store.rooms.at(2).some().topic.title.get().unwrap_or("-")} {again.tags.get().map(|tags| tags.len()).unwrap_or(0)}");
+	print(i"one path, one identity: {first.topic.title.identity() == again.topic.title.identity()} {first.topic.title.identity() == store.rooms.at(2).some().topic.title.identity()}");
 
 	owner.dispose();
 	print(i"disposed: {census(store)}");

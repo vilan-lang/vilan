@@ -70,8 +70,7 @@ fun main() {
 	client_end.on_frame(|frame| print(i"down {text(frame)}"));
 	let dispatcher = Dispatcher::new()
 		.on("global", |request: RpcRequest| reply_store(request, global))
-		.on("message", |request: RpcRequest| reply_store_some(request, global
-			.messages()
+		.on("message", |request: RpcRequest| reply_store_some(request, global.messages
 			.at(7)
 			.some()));
 	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
@@ -79,45 +78,45 @@ fun main() {
 	print(i"reply {text((local.handler)(encode_request(codec, "message", [])))}");
 	census("granted", global);
 	print("-- a write inside the root's boundary");
-	global.motd().set("bye");
+	global.motd.set("bye");
 	print("-- a write inside the message's boundary");
-	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	let _edited = global.messages.at(7).some().content.patch("goodbye");
 	print("-- a write under a key nobody watches");
-	let _other = global.messages().at(8).some().content().patch("ho");
+	let _other = global.messages.at(8).some().content.patch("ho");
 	print("-- two slots in one Subscribe");
 	client_end.send(Frame::Text("{\"Subscribe\":[0,[[0,-1,[0,0]],[1,-1,[1,8]]]]}"));
 	census("subscribed", global);
 	print("-- one turn, many writes");
 	batch(|| {
-		let _renamed = global.rooms().at(0).some().name().patch("lobby");
-		global.rooms().at(0).some().messages().push(9);
-		let _again = global.rooms().at(0).some().name().patch("lounge");
-		global.motd().set("one turn");
-		let _content = global.messages().at(8).some().content().patch("x");
-		let _author = global.messages().at(8).some().author().patch("zed");
+		let _renamed = global.rooms.at(0).some().name.patch("lobby");
+		global.rooms.at(0).some().messages.push(9);
+		let _again = global.rooms.at(0).some().name.patch("lounge");
+		global.motd.set("one turn");
+		let _content = global.messages.at(8).some().content.patch("x");
+		let _author = global.messages.at(8).some().author.patch("zed");
 	});
 	print("-- a write above a boundary covers the writes inside it");
 	batch(|| {
-		let _inside = global.messages().at(7).some().content().patch("inside");
-		global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+		let _inside = global.messages.at(7).some().content.patch("inside");
+		global.messages.at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
 	});
 	print("-- the same value");
-	global.motd().set("one turn");
-	global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+	global.motd.set("one turn");
+	global.messages.at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
 	print("-- a key removed, then back");
-	global.rooms().at(0).set(None);
-	global.rooms().at(0).set(Some(Room { id = 0, name = "again", messages = [] }));
+	global.rooms.at(0).set(None);
+	global.rooms.at(0).set(Some(Room { id = 0, name = "again", messages = [] }));
 	print("-- the message's payload gone");
-	global.messages().at(7).set(None);
+	global.messages.at(7).set(None);
 	print("-- a whole-root write");
 	global.set(Global { rooms = HashMap::new(), messages = HashMap::new(), motd = "reset" });
 	print("-- release the client slots, then the bases");
 	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[0,1,-2]]}"));
 	census("bases only", global);
-	global.motd().set("still the root's");
+	global.motd.set("still the root's");
 	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[-1]]}"));
 	census("released", global);
-	global.motd().set("nobody");
+	global.motd.set("nobody");
 	print("done");
 }
 

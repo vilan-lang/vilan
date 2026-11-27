@@ -9,7 +9,7 @@
 //     struct User { name: str, address: Address }
 //
 //     let user = Store::new(alice());
-//     let city: Store<str> = user.address().city();   // a handle, not a value
+//     let city: Store<str> = user.address.city;   // a handle, not a value
 //     city.set("Bergen");                              // wakes `city`, `address`, `user`
 //
 // **The handle (§2.1).** `Store<T>` is a root plus a static path. The root's value
@@ -76,6 +76,7 @@ import pkg::hash::{ Hash, Hashable };
 import pkg::hash_map::HashMap;
 import pkg::hash_set::HashSet;
 import pkg::io::panic;
+import pkg::key::Key;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::delta::{
 	CollFlow,
@@ -130,6 +131,7 @@ export import pkg::reactive::store_core::{
 	Storable,
 	Store,
 	StoreFeed,
+	StoreFields,
 	StoreFlag,
 	StoreLeaf,
 	StoreNode,
@@ -1586,8 +1588,9 @@ export impl List<type T: StoreWire> with StoreWire {
 // the boundary's typed applier as an ordinary comparing write, so what wakes is the
 // store's own diff: exactly the local slots whose value changed.
 //
-// The face is std's alone to build: its fields are internal, the derive writes its
-// projections through `narrow`, and `std::rpc::mirror` mints the base.
+// The face is std's alone to build: its fields are internal, a field is read
+// through the face's own `[field_syntax]` door, an enum's variant projections go
+// through `narrow_some` and `narrow_flag`, and `std::rpc::mirror` mints the base.
 
 /// One step of a remote handle's WIRE path from its grant's base: a field's child
 /// index, or a key — described at its own type when a `Subscribe` is written, and
@@ -1733,15 +1736,8 @@ export fun remote_store_some<P>(local: StoreSome<P>, at: MirrorAt): RemoteStoreS
 }
 
 export impl RemoteStore<type T> {
-	/// One step below this handle — what every projection the derive writes for a
-	/// remote handle calls: the replica's own projection (`step`), the wire path
-	/// one field longer.
-	[internal("the derive's remote projection step (A153 S2)")]
-	fun narrow<F>(self, index: usize, step: |Store<T>| Store<F>): RemoteStore<F> {
-		RemoteStore { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
-	}
-
-	/// A step through a variant (or `Some`).
+	/// A step through a variant (or `Some`): the replica's own projection (`step`),
+	/// the wire path one child longer.
 	[internal("the derive's remote projection step (A153 S2)")]
 	fun narrow_some<F>(self, index: usize, step: |Store<T>| StoreSome<F>): RemoteStoreSome<F> {
 		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
@@ -1755,11 +1751,6 @@ export impl RemoteStore<type T> {
 }
 
 export impl RemoteStoreSome<type P> {
-	[internal("the derive's remote projection step (A153 S2)")]
-	fun narrow<F>(self, index: usize, step: |StoreSome<P>| StoreSome<F>): RemoteStoreSome<F> {
-		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
-	}
-
 	[internal("the derive's remote projection step (A153 S2)")]
 	fun narrow_some<F>(self, index: usize, step: |StoreSome<P>| StoreSome<F>): RemoteStoreSome<F> {
 		RemoteStoreSome { local = step(self.local), at = self.at.below(MirrorStep::Field(index)) }
@@ -1782,6 +1773,37 @@ export impl RemoteStoreSome<type P> {
 	/// an owner is required, as there (B696).
 	fun assume(self): RemoteStore<P> {
 		RemoteStore { local = self.local.assume(), at = self.at }
+	}
+}
+
+/// The wire path `key`'s steps make below `at`: one `MirrorStep::Field` per field,
+/// as the replica's path takes one `StoreStep::Field` per field.
+fun mirror_below<S, F>(at: MirrorAt, key: &Key<S, F>): MirrorAt {
+	let parts = &key.erased.parts;
+	if parts.len() == 1 {
+		ret at.below(MirrorStep::Field(parts[0].index));
+	}
+	mut below = at;
+	for step in parts {
+		below = below.below(MirrorStep::Field(step.index));
+	}
+	below
+}
+
+export impl RemoteStore<type T: StoreFields> {
+	/// The remote handle on the field `key` names (`Store::field`'s face): the
+	/// replica's field, the wire path one field longer per step.
+	[field_syntax]
+	fun field<U>(self, key: Key<T, U>): RemoteStore<U> {
+		RemoteStore { at = mirror_below(self.at, &key), local = self.local.field(key) }
+	}
+}
+
+export impl RemoteStoreSome<type P: StoreFields> {
+	/// The remote handle on the field `key` names, through this handle's variant.
+	[field_syntax]
+	fun field<U>(self, key: Key<P, U>): RemoteStoreSome<U> {
+		RemoteStoreSome { at = mirror_below(self.at, &key), local = self.local.field(key) }
 	}
 }
 
@@ -2124,8 +2146,9 @@ export impl RemoteStoreFlag with Source<bool> {
 //
 //   - `impl T with Storable`: one diff line per field, in declaration order, each
 //     handed the field's child node and whether an answer is still needed;
-//   - `impl Store<T>` and `impl StoreSome<T>`: one projection per field, each one
-//     in-place step (`|held, f| f(&held.field)`) onto its parent's handle.
+//   - `impl T with StoreFields`: the marker the handles' one `[field_syntax]` door
+//     (`field`, in the core) is bounded by, which reads every field of every
+//     derived struct (B711 S2b) — so nothing per field is written on the handles.
 //
 // Per enum: the diff (the discriminant, then the live payload), and on both handle
 // types the discriminant projection per variant (`is_online()`) and, per payload
@@ -2138,8 +2161,10 @@ export impl RemoteStoreFlag with Source<bool> {
 
 /// The members of the handle surface — `Store`'s, `StoreSome`'s and every `Source`,
 /// `Signal` and `Flow` member a handle reaches. An inherent member wins over a
-/// generated projection of the same name (spec `names.md` §4.6), so a field
-/// spelled like one could never be reached; the derive refuses it (Q9).
+/// generated projection of the same name (spec `names.md` §4.6), so an enum's
+/// variant projection (`is_online()`, `online()`) spelled like one could never be
+/// reached; the derive refuses it (Q9). A struct's fields need no such list: they
+/// read through the door, and a shadowed one is reached by the written call.
 macro fun store_reserved(name: str): bool {
 	let reserved = [
 		"get",
@@ -2179,7 +2204,6 @@ macro fun store_reserved(name: str): bool {
 		"place",
 		"apply",
 		"bind_attribute",
-		"project",
 		"descend",
 		"variant",
 		"tag",
@@ -2257,37 +2281,6 @@ macro fun store_bare_binders(generics: List<GenericParameter>): str {
 	"<" + join(parts, ", ") + ">"
 }
 
-/// One field projection on a handle type (`Store` or `StoreSome`): the in-place
-/// read and write of `held.{field}`, one step below the handle's own.
-macro fun store_projection(
-	handle: str,
-	subject: str,
-	method: str,
-	field: str,
-	index: usize,
-	type_: TypeExpr,
-): str {
-	let operand = store_operand(type_);
-	let written = type_.render();
-	let read = i"|held: &{subject}, f: |&{operand}| void| f(&held.{field})";
-	let write = i"|held: &mut {subject}, f: |&mut {operand}| void| f(&mut held.{field})";
-	i"fun {method}(self): {handle}<{written}> \{\n\tself.project({index}, {read}, {write})\n" + "}"
-}
-
-/// One projection on a REMOTE handle (A153 S2): the replica's projection, through
-/// `narrow`, and the wire path one child longer.
-macro fun store_remote_projection(
-	handle: str,
-	local: str,
-	subject: str,
-	method: str,
-	index: usize,
-	written: str,
-): str {
-	let returned = if handle == "RemoteStore" { "RemoteStore" } else { "RemoteStoreSome" };
-	i"fun {method}(self): {returned}<{written}> \{\n\tself.narrow({index}, |local: {local}<{subject}>| local.{method}())\n" + "}"
-}
-
 export macro fun store_struct_impls(target: StructItem): str {
 	import macro_std::build::{ impl_of, fun_of };
 	import macro_std::panic;
@@ -2303,17 +2296,13 @@ export macro fun store_struct_impls(target: StructItem): str {
 		.line("if !need && node.is_none() {\n\tret false;\n}")
 		.line("let here = need || store_has_me(node);")
 		.line("mut changed = false;");
-	mut store_impl = impl_of(i"Store<{target.name}{store_bare_binders(target.generics)}>");
-	mut some_impl = impl_of(i"StoreSome<{target.name}{store_bare_binders(target.generics)}>");
-	mut remote_impl = impl_of(i"RemoteStore<{target.name}{store_bare_binders(target.generics)}>");
-	mut remote_some_impl = impl_of(
-		i"RemoteStoreSome<{target.name}{store_bare_binders(target.generics)}>",
-	);
 	mut index: usize = 0;
 	for field in target.fields {
-		let method = if field.reactive_name != "" { field.reactive_name } else { field.name };
-		if store_reserved(method) {
-			panic(i"`[derive(Storable)]` on `{target.name}`: the field `{field.name}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = \"..\")]` on the field");
+		// B711 S2b: a field is read through the handles' one `[field_syntax]` door,
+		// so there is no projection to rename, and a field a handle member shadows is
+		// reached by the written call.
+		if field.reactive_name != "" {
+			panic(i"`[derive(Storable)]` on `{target.name}`: `[reactive(name = \"{field.reactive_name}\")]` on the field `{field.name}` renamed its projection, and a store handle has no projections to rename any more: it reads every field through its one door, `field` - write `handle.field({target.name}.{field.name})` where a handle member is also named `{field.name}`, and `handle.{field.name}` everywhere else, and drop the attribute");
 		}
 		// A coarse field is diffed whole, through the leaf tiers. So is a
 		// closure-typed one: a blanket reaches a closure one tier deep (B508), so
@@ -2325,48 +2314,19 @@ export macro fun store_struct_impls(target: StructItem): str {
 			"store_diff"
 		};
 		diff = diff.line(i"changed = self.{field.name}.{step}(&other.{field.name}, store_kid(node, {index}), here && !changed, woken) || changed;");
-		store_impl = store_impl.member(
-			store_projection("Store", subject, method, field.name, index, field.type_),
-		);
-		some_impl = some_impl.member(
-			store_projection("StoreSome", subject, method, field.name, index, field.type_),
-		);
-		remote_impl = remote_impl.member(
-			store_remote_projection(
-				"RemoteStore",
-				"Store",
-				subject,
-				method,
-				index,
-				field.type_.render(),
-			),
-		);
-		remote_some_impl = remote_some_impl.member(
-			store_remote_projection(
-				"RemoteStoreSome",
-				"StoreSome",
-				subject,
-				method,
-				index,
-				field.type_.render(),
-			),
-		);
 		index = index + 1;
 	}
 	diff = diff.line("store_wake_me(node, changed, woken);").expr("changed");
-	mut out = impl_of(target.name)
+	// The marker the handles' `[field_syntax]` door is bounded by: it is what lets
+	// `app.user` read through a handle on this struct.
+	impl_of(target.name)
 		.generics(target.binders("Storable"))
 		.implements("Storable")
 		.method(diff)
-		.render();
-	if target.fields.len() > 0 {
-		out = out
-			+ store_impl.render()
-			+ some_impl.render()
-			+ remote_impl.render()
-			+ remote_some_impl.render();
-	}
-	out
+		.render()
+		+ impl_of(i"{target.name}{store_bare_binders(target.generics)}")
+			.implements("StoreFields")
+			.render()
 }
 
 export macro fun store_enum_impls(target: EnumItem): str {
@@ -3018,7 +2978,7 @@ export macro fun Storable(item: Item): Source {
 
 	let header = "import std::option::Option;\n"
 		+ "import std::shared::Shared;\n"
-		+ "import std::reactive::store::{ RemoteStore, RemoteStoreFlag, RemoteStoreSome, Storable, StoreFlag, StoreLeaf, StoreNode, StoreReach, StoreSlot, StoreStep, StoreWire, StoreWireLeaf, StoreWoken, Store, StoreSome, store_fresh_of, store_has_me, store_kid, store_read_path_of, store_switch, store_wake_me, store_wire_closure, store_wire_rebuild_of };\n"
+		+ "import std::reactive::store::{ RemoteStore, RemoteStoreFlag, RemoteStoreSome, Storable, StoreFields, StoreFlag, StoreLeaf, StoreNode, StoreReach, StoreSlot, StoreStep, StoreWire, StoreWireLeaf, StoreWoken, Store, StoreSome, store_fresh_of, store_has_me, store_kid, store_read_path_of, store_switch, store_wake_me, store_wire_closure, store_wire_rebuild_of };\n"
 		+ "import std::wire::{ Deserialize, Deserializer, Serialize, Serializer };\n";
 	if item.as_struct() is Some(let target) {
 		ret source(header + store_struct_impls(target) + store_struct_wire(target));

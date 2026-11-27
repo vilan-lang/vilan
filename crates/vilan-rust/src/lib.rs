@@ -544,6 +544,12 @@ struct Emitter<'a, 'src> {
     /// B711 S1b: each distinct key literal's value, to the function that
     /// copies it out of its `thread_local!` ([`Emitter::key_literal`]).
     key_literals: HashMap<String, String>,
+    /// B711 S2b: the KEY parameter of every `[field_syntax]` method — a value
+    /// in vilan that this backend receives by reference, as it does a bare
+    /// `self` ([`Emitter::receiving_form`]): the door only reads its key, and
+    /// a field-syntax read hands it a literal, which is then lent from its
+    /// `thread_local!` instead of copied ([`Emitter::key_literal`]).
+    door_keys: HashSet<Id>,
     type_instances: HashMap<(Id, Vec<String>), Reserved>,
     /// The next reserved slot. Functions and types number independently
     /// (they are two sections of the file).
@@ -886,6 +892,19 @@ struct Emitter<'a, 'src> {
     tuple_walks: usize,
 }
 
+/// B711 S2b: the key parameter of each `[field_syntax]` method
+/// ([`Emitter::door_keys`]).
+fn door_keys(program: &Program<'_>) -> HashSet<Id> {
+    let surface = program.field_syntax();
+    program
+        .field_syntax_methods
+        .iter()
+        .filter_map(|(_, member)| surface.function_of(*member))
+        .filter_map(|function| program.functions.get(&function))
+        .filter_map(|function| function.parameters.get(1).copied())
+        .collect()
+}
+
 /// One object type's Rust trait: its name and its slots, each slot's
 /// signature rendered ONCE, at the object's own arguments, so an impl written
 /// later — under another body's substitution — repeats it verbatim.
@@ -980,6 +999,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             dispatched_bindings: HashMap::default(),
             types: BTreeMap::new(),
             key_literals: HashMap::default(),
+            door_keys: door_keys(program),
             type_instances: HashMap::default(),
             next_function_slot: 0,
             next_type_slot: 0,
@@ -5949,6 +5969,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
             Convention::Ref => Receiving::Ref,
             Convention::RefMut => Receiving::RefMut,
             Convention::Bare if parameter.name == "self" && !parameter.mutable => Receiving::Ref,
+            Convention::Bare
+                if !parameter.mutable
+                    && !parameter.lazy
+                    && self.door_keys.contains(&parameter.id) =>
+            {
+                Receiving::Ref
+            }
             Convention::Bare | Convention::Own => Receiving::ByValue,
         }
     }
@@ -11649,14 +11676,33 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let name = format!("__key_literal{}", self.key_literals.len());
         let slot = self.next_type_slot;
         self.next_type_slot += 1;
+        // B711 S2b: the value lives once per thread, leaked so a door can be
+        // LENT it (`{name}_lent()`, a `&'static`): what a field-syntax read
+        // hands a `[field_syntax]` method's key, which copies nothing.
         let mut out = String::new();
+        let _ = writeln!(out, "fn {name}_lent() -> &'static {key} {{");
+        let _ = writeln!(
+            out,
+            "    thread_local! {{ static KEY: &'static {key} = Box::leak(Box::new({value})); }}"
+        );
+        let _ = writeln!(out, "    KEY.with(|key| *key)");
+        let _ = writeln!(out, "}}");
         let _ = writeln!(out, "fn {name}() -> {key} {{");
-        let _ = writeln!(out, "    thread_local! {{ static KEY: {key} = {value}; }}");
-        let _ = writeln!(out, "    KEY.with(|key| key.clone())");
+        let _ = writeln!(out, "    {name}_lent().clone()");
         let _ = writeln!(out, "}}");
         self.types.insert(slot, out);
         self.key_literals.insert(value, name.clone());
         Ok(format!("{name}()"))
+    }
+
+    /// B711 S2b: the lent form of a key literal's rendering (`__key_literal3()`
+    /// is `__key_literal3_lent()`), or `None` when `text` is no literal's.
+    fn lent_key_literal(&self, text: &str) -> Option<String> {
+        let name = text.strip_suffix("()")?;
+        self.key_literals
+            .values()
+            .any(|literal| literal == name)
+            .then(|| format!("{name}_lent()"))
     }
 
     /// The access of the one `Key` literal std writes: `then`'s `Key { erased
@@ -12280,7 +12326,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
                     || named_inside.contains(binding)
             })
             .collect();
-        let prelude = self.capture_prelude(&captures);
+        let prelude = self.capture_prelude_over(&captures, Some(closure.return_));
         // A future-answering closure answers `Boxed<R>` on every call, so its
         // body is an `async move` block behind `pin_future`. The captures are
         // cloned a SECOND time inside the closure: the block is `move` and takes
@@ -12383,14 +12429,39 @@ impl<'a, 'src> Emitter<'a, 'src> {
     /// The capture prelude for [`Self::closure_capture_handles`]' answer,
     /// counting the copies F50's census column reads.
     fn capture_prelude(&mut self, captures: &[Id]) -> String {
+        self.capture_prelude_over(captures, None)
+    }
+
+    /// [`Self::capture_prelude`] for a closure whose body is `body`: a
+    /// captured struct KEY the body reads only as a subscript's index
+    /// (`held[key]`) is captured as its ACCESS alone (B711 S2b), a
+    /// [`vilan_rt::KeyHeld`] — two function pointers or one count, where the
+    /// whole key is a copy of its path's list. Every subscript reaches a held
+    /// key through its `__access` field, which the holder keeps under the same
+    /// name, so the body is emitted unchanged. What std's store handles hand
+    /// their closures is exactly this: `|held, f| f(&held[key])`.
+    fn capture_prelude_over(&mut self, captures: &[Id], body: Option<Id>) -> String {
+        let access_only: HashSet<Id> = match body {
+            Some(body) => captures
+                .iter()
+                .copied()
+                .filter(|binding| self.captures_only_a_key_access(*binding, body))
+                .collect(),
+            None => HashSet::new(),
+        };
         self.capture_copies += captures
             .iter()
-            .filter(|binding| self.capture_is_a_copy(**binding))
+            .filter(|binding| !access_only.contains(binding) && self.capture_is_a_copy(**binding))
             .count();
         captures
             .iter()
             .map(|binding| {
                 let name = self.binding_name(*binding);
+                if access_only.contains(binding) {
+                    return format!(
+                        "let {name} = vilan_rt::KeyHeld {{ {KEY_ACCESS}: {name}.{KEY_ACCESS}.clone() }}; "
+                    );
+                }
                 // A plain `self` arrives as a `&T` natively, and a closure the
                 // counted `Rc<dyn Fn>` stores cannot hold a borrow of the
                 // caller's frame — `ListCell::set` hands `SignalCell::update` a
@@ -12411,6 +12482,65 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 format!("let {name} = {name}.clone(); ")
             })
             .collect()
+    }
+
+    /// B711 S2b: whether `binding` holds std's `Key` and every read of it
+    /// under `body` is the index of a key subscript — what lets a closure
+    /// capture the key's access alone ([`Self::capture_prelude_over`]). A
+    /// boxed binding (written after the closure is made) keeps its cell.
+    fn captures_only_a_key_access(&self, binding: Id, body: Id) -> bool {
+        let Some(key_struct) = self.program.key_struct_id else {
+            return false;
+        };
+        if self.boxed.contains(&binding) {
+            return false;
+        }
+        let type_id = self
+            .program
+            .variables
+            .get(&binding)
+            .map(|variable| variable.type_id)
+            .or_else(|| {
+                self.program
+                    .parameters
+                    .get(&binding)
+                    .map(|parameter| parameter.type_id)
+            });
+        if !type_id.is_some_and(|type_id| {
+            matches!(self.resolve(type_id), Some(Type::Struct(id, _)) if *id == key_struct)
+        }) {
+            return false;
+        }
+        let names_it = |id: &Id| matches!(self.program.entity_map.get(id), Some(Expr::Local(read)) if *read == binding);
+        let mut pending = vec![body];
+        let mut visited: HashSet<Id> = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            match self.program.entity_map.get(&id) {
+                Some(Expr::Local(read)) if *read == binding => return false,
+                Some(Expr::Index(subject, index))
+                    if self.program.key_subscripts.contains(&id) && names_it(index) =>
+                {
+                    pending.push(*subject);
+                    continue;
+                }
+                Some(Expr::Variable(declared)) => {
+                    if let Some(initial) = self
+                        .program
+                        .variables
+                        .get(declared)
+                        .and_then(|variable| variable.initial)
+                    {
+                        pending.push(initial);
+                    }
+                }
+                _ => {}
+            }
+            pending.extend(vilan_core::captures::expression_children(self.program, id));
+        }
+        true
     }
 
     /// Whether a closure's capture prelude COPIES `binding`'s value (F50's
@@ -16236,6 +16366,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             // settled in order with the by-value ones, ahead of it.
             let lent = matches!(conventions.get(index), Some(Receiving::Ref));
             let lends = lent && !already_a_reference;
+            // B711 S2b: a key literal lent to a door's key is the literal's
+            // own `thread_local!` value, never a copy of it.
+            if lends && let Some(name) = self.lent_key_literal(&text) {
+                rendered.push(name);
+                continue;
+            }
             if defers_a_copy[index]
                 || ((defers_copies || borrows_a_module_cell)
                     && lent

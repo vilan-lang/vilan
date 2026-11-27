@@ -5736,51 +5736,51 @@ fun main() {
 	client_end.on_frame(|frame| print(i"down {text(frame)}"));
 	let dispatcher = Dispatcher::new()
 		.on("global", |request: RpcRequest| reply_store(request, global))
-		.on("message", |request: RpcRequest| reply_store_some(request, global.messages().at(7).some()));
+		.on("message", |request: RpcRequest| reply_store_some(request, global.messages.at(7).some()));
 	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
 	print(i"reply {text((local.handler)(encode_request(codec, "global", [])))}");
 	print(i"reply {text((local.handler)(encode_request(codec, "message", [])))}");
 	census("granted", global);
 	print("-- a write inside the root's boundary");
-	global.motd().set("bye");
+	global.motd.set("bye");
 	print("-- a write inside the message's boundary");
-	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	let _edited = global.messages.at(7).some().content.patch("goodbye");
 	print("-- a write under a key nobody watches");
-	let _other = global.messages().at(8).some().content().patch("ho");
+	let _other = global.messages.at(8).some().content.patch("ho");
 	print("-- two slots in one Subscribe");
 	client_end.send(Frame::Text("{\"Subscribe\":[0,[[0,-1,[0,0]],[1,-1,[1,8]]]]}"));
 	census("subscribed", global);
 	print("-- one turn, many writes");
 	batch(|| {
-		let _renamed = global.rooms().at(0).some().name().patch("lobby");
-		global.rooms().at(0).some().messages().push(9);
-		let _again = global.rooms().at(0).some().name().patch("lounge");
-		global.motd().set("one turn");
-		let _content = global.messages().at(8).some().content().patch("x");
-		let _author = global.messages().at(8).some().author().patch("zed");
+		let _renamed = global.rooms.at(0).some().name.patch("lobby");
+		global.rooms.at(0).some().messages.push(9);
+		let _again = global.rooms.at(0).some().name.patch("lounge");
+		global.motd.set("one turn");
+		let _content = global.messages.at(8).some().content.patch("x");
+		let _author = global.messages.at(8).some().author.patch("zed");
 	});
 	print("-- a write above a boundary covers the writes inside it");
 	batch(|| {
-		let _inside = global.messages().at(7).some().content().patch("inside");
-		global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+		let _inside = global.messages.at(7).some().content.patch("inside");
+		global.messages.at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
 	});
 	print("-- the same value");
-	global.motd().set("one turn");
-	global.messages().at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
+	global.motd.set("one turn");
+	global.messages.at(7).set(Some(Message { id = 7, author = "bob", content = "whole" }));
 	print("-- a key removed, then back");
-	global.rooms().at(0).set(None);
-	global.rooms().at(0).set(Some(Room { id = 0, name = "again", messages = [] }));
+	global.rooms.at(0).set(None);
+	global.rooms.at(0).set(Some(Room { id = 0, name = "again", messages = [] }));
 	print("-- the message's payload gone");
-	global.messages().at(7).set(None);
+	global.messages.at(7).set(None);
 	print("-- a whole-root write");
 	global.set(Global { rooms = HashMap::new(), messages = HashMap::new(), motd = "reset" });
 	print("-- release the client slots, then the bases");
 	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[0,1,-2]]}"));
 	census("bases only", global);
-	global.motd().set("still the root's");
+	global.motd.set("still the root's");
 	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[-1]]}"));
 	census("released", global);
-	global.motd().set("nobody");
+	global.motd.set("nobody");
 	print("done");
 }
 "##;
@@ -5893,9 +5893,9 @@ fun main() {
 	register_session(7, server_end, codec);
 	client_end.on_frame(|frame| print(i"down {text(frame)}"));
 	let dispatcher = Dispatcher::new()
-		.on("message", |request: RpcRequest| reply_store(request, global.messages().at(7)))
+		.on("message", |request: RpcRequest| reply_store(request, global.messages.at(7)))
 		.on("other", |request: RpcRequest| reply_store(request, other))
-		.on("online", |request: RpcRequest| reply_store_some(request, global.presence().online()));
+		.on("online", |request: RpcRequest| reply_store_some(request, global.presence.online()));
 	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
 	print(i"reply {text((local.handler)(encode_request(codec, "message", [])))}");
 	print(i"reply again {text((local.handler)(encode_request(codec, "message", [])))}");
@@ -5911,22 +5911,22 @@ fun main() {
 	print("-- a grant can only reach below itself: the message's payload");
 	client_end.send(Frame::Text("{\"Subscribe\":[0,[[7,-1,[1]]]]}"));
 	census("probed", global);
-	let _landed = global.messages().at(7).some().content().patch("edited");
+	let _landed = global.messages.at(7).some().content.patch("edited");
 	print("-- the variant ends: the through-variant grant is gone");
-	global.presence().set(Presence::Offline);
+	global.presence.set(Presence::Offline);
 	print("-- and comes back");
-	global.presence().set(Presence::Online("phone"));
+	global.presence.set(Presence::Online("phone"));
 	print("-- the deduped grant needs both releases");
 	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[7,-1]]}"));
-	let _landed = global.messages().at(7).some().content().patch("once");
+	let _landed = global.messages.at(7).some().content.patch("once");
 	client_end.send(Frame::Text("{\"Unsubscribe\":[0,[-1]]}"));
-	let _landed = global.messages().at(7).some().content().patch("twice");
+	let _landed = global.messages.at(7).some().content.patch("twice");
 	census("one grant left", global);
 	print("-- the session ends: every mirror torn down");
 	drop_session(7);
 	census("dropped", global);
 	census("other dropped", other);
-	global.presence().set(Presence::Online("gone"));
+	global.presence.set(Presence::Online("gone"));
 	print("done");
 }
 "##;
@@ -6010,12 +6010,12 @@ fun main() {
 	batch(|| {
 		mut n = 0;
 		for n < 1100 {
-			board.count().set(n);
+			board.count.set(n);
 			n += 1;
 		}
 	});
 	print("-- the next turn is told by path again");
-	board.motd().set("caught up");
+	board.motd.set("caught up");
 	print("done");
 }
 "##;
@@ -6108,27 +6108,27 @@ fun main() {
 	print(i"unleased: {g.get().is_some()}");
 	let page = Owner::new();
 	run_with_owner(page, || {
-		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
-		g.presence().online().effect(|place| print(i"online {place.unwrap_or("-")}"));
-		g.presence().is_online().effect(|on| print(i"is online {on}"));
-		g.messages().at(7).some().content().effect(|content| print(i"seven {content.unwrap_or("-")}"));
-		g.messages().at(7).some().id().effect(|id| print(i"seven's id {id.unwrap_or(0)}"));
+		g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g.presence.online().effect(|place| print(i"online {place.unwrap_or("-")}"));
+		g.presence.is_online().effect(|on| print(i"is online {on}"));
+		g.messages.at(7).some().content.effect(|content| print(i"seven {content.unwrap_or("-")}"));
+		g.messages.at(7).some().id.effect(|id| print(i"seven's id {id.unwrap_or(0)}"));
 	});
 	sleep_for(Duration::millis(0));
 	print("-- server writes");
-	global.motd().set("bye");
-	global.presence().set(Presence::Offline);
-	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	global.motd.set("bye");
+	global.presence.set(Presence::Offline);
+	let _edited = global.messages.at(7).some().content.patch("goodbye");
 	print("-- the page goes: the grant is let go");
 	page.dispose();
 	sleep_for(Duration::millis(0));
-	global.motd().set("unwatched");
+	global.motd.set("unwatched");
 	print(i"held: {g.get().map(|value: Global| value.motd).unwrap_or("-")}");
-	print(i"the released key left the replica: {g.messages().at(7).get().flatten().is_none()}");
+	print(i"the released key left the replica: {g.messages.at(7).get().flatten().is_none()}");
 	print("-- a new lease mints again");
 	let again = Owner::new();
 	run_with_owner(again, || {
-		g.motd().effect(|motd| print(i"again {motd.unwrap_or("-")}"));
+		g.motd.effect(|motd| print(i"again {motd.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	again.dispose();
@@ -6241,12 +6241,12 @@ impl Board {
 
 	[rpc]
 	fun message(self, id: u53): StoreSome<Message> {
-		shared.messages().at(id).some()
+		shared.messages.at(id).some()
 	}
 
 	[rpc]
 	fun edit(self, id: u53, content: str): bool {
-		shared.messages().at(id).some().content().patch(content)
+		shared.messages.at(id).some().content.patch(content)
 	}
 }
 
@@ -6281,12 +6281,12 @@ fun main() {
 	print(i"one origin, one mirror: {client.global().identity() == g.identity()}");
 	let page = Owner::new();
 	run_with_owner(page, || {
-		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
-		m.content().effect(|content| print(i"message {content.unwrap_or("-")}"));
+		g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		m.content.effect(|content| print(i"message {content.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	print(i"edit: {client.edit(7, "goodbye").unwrap_or(false)}");
-	shared.motd().set("bye");
+	shared.motd.set("bye");
 	page.dispose();
 	sleep_for(Duration::millis(0));
 	print("done");
@@ -6427,20 +6427,20 @@ fun main() {
 	run_with_owner(again, || {
 		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
 		g
-			.messages()
+			.messages
 			.at(7)
 			.some()
 			.states()
 			.effect(|state| print(i"seven {shown(state, |value: Message| value.content)}"));
 		g
-			.messages()
+			.messages
 			.at(9)
 			.some()
 			.states()
 			.effect(|state| print(i"nine {shown(state, |value: Message| value.content)}"));
-		g.messages().at(7).some().is_pending().effect(|pending| print(i"seven pending {pending}"));
-		let content: dyn Source<Option<str>> = g.messages().at(7).some().content();
-		let id: dyn Source<Option<u53>> = g.messages().at(7).some().id();
+		g.messages.at(7).some().is_pending().effect(|pending| print(i"seven pending {pending}"));
+		let content: dyn Source<Option<str>> = g.messages.at(7).some().content;
+		let id: dyn Source<Option<u53>> = g.messages.at(7).some().id;
 		combine((content, id)).effect(|both| {
 			let (text, number) = both;
 			print(i"seven's pair {number.unwrap_or(0)}:{text.unwrap_or("-")}");
@@ -6449,14 +6449,14 @@ fun main() {
 	sleep_for(Duration::millis(0));
 	print("-- two fields in one patch: one turn on the client");
 	batch(|| {
-		let _content = global.messages().at(7).some().content().patch("both");
-		let _id = global.messages().at(7).some().id().patch(70);
+		let _content = global.messages.at(7).some().content.patch("both");
+		let _id = global.messages.at(7).some().id.patch(70);
 	});
 	sleep_for(Duration::millis(0));
 	print("-- the key goes, then comes back");
-	global.messages().at(7).set(None);
+	global.messages.at(7).set(None);
 	sleep_for(Duration::millis(0));
-	global.messages().at(7).set(Some(Message { id = 7, content = "back" }));
+	global.messages.at(7).set(Some(Message { id = 7, content = "back" }));
 	sleep_for(Duration::millis(0));
 	again.dispose();
 	sleep_for(Duration::millis(0));
@@ -6615,22 +6615,22 @@ fun main() {
 	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
 	let page = Owner::new();
 	run_with_owner(page, || {
-		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
 		g
-			.messages()
+			.messages
 			.at(7)
 			.some()
-			.content()
+			.content
 			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
 		g
-			.messages()
+			.messages
 			.at(8)
 			.some()
-			.content()
+			.content
 			.effect(|content| print(i"eight {content.unwrap_or("-")}"));
 		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
 		g
-			.messages()
+			.messages
 			.at(7)
 			.some()
 			.states()
@@ -6642,12 +6642,12 @@ fun main() {
 	drop_session(7);
 	sleep_for(Duration::millis(0));
 	print("-- written while down: the motd and seven; eight untouched");
-	global.motd().set("while down");
-	let _edited = global.messages().at(7).some().content().patch("edited");
+	global.motd.set("while down");
+	let _edited = global.messages.at(7).some().content.patch("edited");
 	print("-- a hold taken while down waits for the replay");
 	let late = Owner::new();
 	run_with_owner(late, || {
-		g.messages().at(8).some().id().effect(|id| print(i"eight's id {id.unwrap_or(0)}"));
+		g.messages.at(8).some().id.effect(|id| print(i"eight's id {id.unwrap_or(0)}"));
 	});
 	sleep_for(Duration::millis(0));
 	print("-- a fresh session on the wire, and the replay");
@@ -6656,7 +6656,7 @@ fun main() {
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print("-- the fresh channel follows");
-	global.motd().set("after");
+	global.motd.set("after");
 	sleep_for(Duration::millis(0));
 	late.dispose();
 	page.dispose();
@@ -6811,30 +6811,30 @@ fun main() {
 	let page = Owner::new();
 	let watching = Owner::new();
 	run_with_owner(page, || {
-		g.rooms().at(1).some().name().effect(|name| print(i"name {name.unwrap_or("-")}"));
+		g.rooms.at(1).some().name.effect(|name| print(i"name {name.unwrap_or("-")}"));
 	});
 	run_with_owner(watching, || {
-		let lounge = g.rooms().at(1).some();
-		lounge.members().contains("amy").effect(|present| print(i"amy {present.unwrap_or(false)}"));
-		lounge.members().contains("zed").effect(|present| print(i"zed {present.unwrap_or(false)}"));
+		let lounge = g.rooms.at(1).some();
+		lounge.members.contains("amy").effect(|present| print(i"amy {present.unwrap_or(false)}"));
+		lounge.members.contains("zed").effect(|present| print(i"zed {present.unwrap_or(false)}"));
 	});
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print("-- zed joins, amy leaves, bob stays: only the watched members cross");
-	let _zed = global.rooms().at(1).some().members().insert("zed");
-	let _amy = global.rooms().at(1).some().members().remove("amy");
-	let _cat = global.rooms().at(1).some().members().insert("cat");
+	let _zed = global.rooms.at(1).some().members.insert("zed");
+	let _amy = global.rooms.at(1).some().members.remove("amy");
+	let _cat = global.rooms.at(1).some().members.insert("cat");
 	sleep_for(Duration::millis(0));
 	print("-- the room's own hold goes; the members watched inside it keep it");
 	page.dispose();
 	sleep_for(Duration::millis(0));
-	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
-	let _back = global.rooms().at(1).some().members().insert("amy");
+	print(i"room held: {g.rooms.at(1).get().flatten().is_some()}");
+	let _back = global.rooms.at(1).some().members.insert("amy");
 	sleep_for(Duration::millis(0));
 	print("-- the last hold inside it goes: the room leaves the replica");
 	watching.dispose();
 	sleep_for(Duration::millis(0));
-	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	print(i"room held: {g.rooms.at(1).get().flatten().is_some()}");
 	print("done");
 }
 "##;
@@ -6982,15 +6982,15 @@ fun main() {
 	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
 	let page = Owner::new();
 	run_with_owner(page, || {
-		g.rooms().at(0).some().messages().effect(|list| print(i"general {ids(list)}"));
-		g.rooms().keys().effect(|keys| {
+		g.rooms.at(0).some().messages.effect(|list| print(i"general {ids(list)}"));
+		g.rooms.keys().effect(|keys| {
 			mut out = "";
 			for key in keys {
 				out = out + i" {key}";
 			}
 			print(i"rooms:{out}");
 		});
-		g.tags().keys().effect(|members| {
+		g.tags.keys().effect(|members| {
 			mut out = "";
 			for member in members {
 				out = out + i" {member}";
@@ -7000,7 +7000,7 @@ fun main() {
 	});
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
-	let general = global.rooms().at(0).some().messages();
+	let general = global.rooms.at(0).some().messages;
 	print("-- a push is a splice at the end");
 	general.push(4);
 	sleep_for(Duration::millis(0));
@@ -7015,14 +7015,14 @@ fun main() {
 	let _whole = general.patch([7, 8]);
 	sleep_for(Duration::millis(0));
 	print("-- a room's name is not a key change");
-	let _named = global.rooms().at(5).some().name().patch("chat");
+	let _named = global.rooms.at(5).some().name.patch("chat");
 	sleep_for(Duration::millis(0));
 	print("-- a room created and one deleted");
-	global.rooms().at(9).set(Some(Room { id = 9, name = "new", messages = [] }));
-	global.rooms().at(5).set(None);
+	global.rooms.at(9).set(Some(Room { id = 9, name = "new", messages = [] }));
+	global.rooms.at(5).set(None);
 	sleep_for(Duration::millis(0));
 	print("-- a set's members are its key set");
-	global.tags().insert("urgent");
+	global.tags.insert("urgent");
 	sleep_for(Duration::millis(0));
 	page.dispose();
 	sleep_for(Duration::millis(0));
@@ -7151,30 +7151,30 @@ fun main() {
 	let row = Owner::new();
 	run_with_owner(page, || {
 		g
-			.messages()
+			.messages
 			.at(7)
 			.some()
-			.content()
+			.content
 			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
 	});
 	run_with_owner(row, || {
 		g
-			.messages()
+			.messages
 			.at(8)
 			.some()
-			.content()
+			.content
 			.effect(|content| print(i"eight {content.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print("-- eight's row goes; a write to eight is already on its way");
-	let _late = global.messages().at(8).some().content().patch("late");
+	let _late = global.messages.at(8).some().content.patch("late");
 	row.dispose();
 	print(i"retired readers while the acknowledgement is on its way: {mirror_retired_census()}");
 	sleep_for(Duration::millis(0));
 	print(i"after it lands: {mirror_retired_census()}");
 	print("-- eight is written again: nothing names its slot");
-	let _again = global.messages().at(8).some().content().patch("unwatched");
+	let _again = global.messages.at(8).some().content.patch("unwatched");
 	sleep_for(Duration::millis(0));
 	page.dispose();
 	sleep_for(Duration::millis(0));
@@ -7267,15 +7267,15 @@ fun main() {
 	client_end.on_frame(|frame| print(i"down {text(frame)}"));
 	let dispatcher = Dispatcher::new()
 		.on("global", |request: RpcRequest| reply_store(request, global))
-		.on("topic", |request: RpcRequest| reply_store_some(request, global.rooms().at(0).some().topic()));
+		.on("topic", |request: RpcRequest| reply_store_some(request, global.rooms.at(0).some().topic));
 	let local = local_rpc(dispatcher.into_protocol(codec).for_connection(7));
 	print(i"reply {text((local.handler)(encode_request(codec, "global", [])))}");
 	client_end.send(Frame::Text("{\"Subscribe\":[0,[[0,-1,[0,0]]]]}"));
 	print("-- five steps down, under the key's slot");
-	let _title = global.rooms().at(0).some().topic().title().patch("first");
+	let _title = global.rooms.at(0).some().topic.title.patch("first");
 	print(i"reply {text((local.handler)(encode_request(codec, "topic", [])))}");
 	print("-- five steps down, under the key's slot and the topic's grant");
-	let _by = global.rooms().at(0).some().topic().by().patch("amy");
+	let _by = global.rooms.at(0).some().topic.by.patch("amy");
 	print("done");
 }
 "##;

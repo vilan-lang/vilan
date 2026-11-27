@@ -2499,14 +2499,23 @@ impl<'a> Interpreter<'a> {
             }
             // B711: a key's place, matching the emitted helpers: the key's
             // parts are `key[0][0]`, each `[owner, index, name]`.
-            "__key_at" => {
+            // B711 S2b: the door's entry-resolved forms; the step is a cache
+            // of what the key says, so the walk reads the key itself.
+            "__key_step" => {
+                let positions = key_positions(&take(0))?;
+                Ok(Value::Number(match positions.as_slice() {
+                    [only] => *only as f64,
+                    _ => -1.0,
+                }))
+            }
+            "__key_at" | "__key_at_step" => {
                 let mut value = take(0);
                 for index in key_positions(&take(1))? {
                     value = array_slot(&value, index)?;
                 }
                 Ok(value)
             }
-            "__key_put" | "__key_view" => {
+            "__key_put" | "__key_view" | "__key_view_at" => {
                 let mut value = take(0);
                 let positions = key_positions(&take(1))?;
                 let Some((last, parents)) = positions.split_last() else {
@@ -2516,7 +2525,7 @@ impl<'a> Interpreter<'a> {
                     value = array_slot(&value, *index)?;
                 }
                 let holder = expect_array(&value)?;
-                if name == "__key_view" {
+                if name == "__key_view" || name == "__key_view_at" {
                     return Ok(Value::Array(Rc::new(RefCell::new(vec![
                         Value::Array(holder),
                         Value::Number(*last as f64),

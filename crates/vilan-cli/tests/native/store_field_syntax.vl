@@ -38,7 +38,7 @@ fun main() {
 	print(i"{app.name.get()} {app.address.city.get()} {app.address.root.get()} {app.path.get().len()}");
 	let watching = Owner::new();
 	run_with_owner(watching, || {
-		app.address().city().effect_on_change(|city| print(i"woke city={city}"));
+		app.address.city.effect_on_change(|city| print(i"woke city={city}"));
 	});
 	app.address.city.set("Tromso");
 	watching.dispose();

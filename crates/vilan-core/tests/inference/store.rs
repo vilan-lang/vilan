@@ -1,7 +1,7 @@
 //! A142 S7 — the `Store` (`proposal/store.md`, RULED 2026-10-01).
 //!
 //! A `Store<T>` is a root plus a static path: the root's value lives in one
-//! `Shared`, in place, and a projection (`user.address().city()`) is another
+//! `Shared`, in place, and a projection (`user.address.city`) is another
 //! handle cut from its parent whose `set` writes back through the root.
 //! `[derive(Storable)]` emits the per-type diff and the projections. A slot
 //! (one path's subscriber list) is made by the first subscription at its path
@@ -102,12 +102,12 @@ fn a142_s7_a_read_allocates_nothing_and_a_slot_lives_as_long_as_its_subscription
         &program(
             r#"
             let user = Store::new(alice());
-            let _city = user.address().city().get();
+            let _city = user.address.city.get();
             print(i"new + one read: {census(user)}");
-            let first = user.address().city().on_change(|c| mark(c));
-            let second = user.address().city().on_change(|c| mark(c));
+            let first = user.address.city.on_change(|c| mark(c));
+            let second = user.address.city.on_change(|c| mark(c));
             print(i"two on city: {census(user)}");
-            let third = user.name().on_change(|n| mark(n));
+            let third = user.name.on_change(|n| mark(n));
             print(i"and one on name: {census(user)}");
             first.dispose();
             print(i"one on city left: {census(user)}");
@@ -137,11 +137,11 @@ fn a142_s7_a_whole_write_wakes_exactly_the_changed_slots_and_their_ancestors() {
             let user = Store::new(alice());
             let watching = Owner::new();
             run_with_owner(watching, || {
-                user.name().effect_on_change(|_n| mark("name"));
-                user.age().effect_on_change(|_a| mark("age"));
-                user.address().city().effect_on_change(|_c| mark("address.city"));
-                user.address().zip().effect_on_change(|_z| mark("address.zip"));
-                user.address().effect_on_change(|_a| mark("address"));
+                user.name.effect_on_change(|_n| mark("name"));
+                user.age.effect_on_change(|_a| mark("age"));
+                user.address.city.effect_on_change(|_c| mark("address.city"));
+                user.address.zip.effect_on_change(|_z| mark("address.zip"));
+                user.address.effect_on_change(|_a| mark("address"));
                 user.effect_on_change(|_u| mark("user"));
             });
             mut next = alice();
@@ -179,7 +179,7 @@ fn a142_s7_a_whole_write_with_no_live_slot_compares_nothing() {
                 user.set(next);
                 i += 1;
             }
-            print(i"five whole writes, nothing watched: {drained()} age={user.age().get().value}");
+            print(i"five whole writes, nothing watched: {drained()} age={user.age.get().value}");
             "#,
         ),
         "five whole writes, nothing watched: [-] compares=0 age=4\n",
@@ -198,13 +198,13 @@ fn a142_s7_a_handle_write_commits_along_the_spine_and_never_looks_at_a_sibling()
             let user = Store::new(alice());
             let watching = Owner::new();
             run_with_owner(watching, || {
-                user.age().effect_on_change(|_a| mark("age"));
-                user.address().city().effect_on_change(|_c| mark("address.city"));
-                user.address().zip().effect_on_change(|_z| mark("address.zip"));
-                user.address().effect_on_change(|_a| mark("address"));
+                user.age.effect_on_change(|_a| mark("age"));
+                user.address.city.effect_on_change(|_c| mark("address.city"));
+                user.address.zip.effect_on_change(|_z| mark("address.zip"));
+                user.address.effect_on_change(|_a| mark("address"));
                 user.effect_on_change(|_u| mark("user"));
             });
-            let city = user.address().city();
+            let city = user.address.city;
             city.set("Bergen");
             let now: User = user.get();
             print(i"city set: {drained()} root.city={now.address.city}");
@@ -213,7 +213,7 @@ fn a142_s7_a_handle_write_commits_along_the_spine_and_never_looks_at_a_sibling()
             let copy = city;
             copy.set("Trondheim");
             print(i"through a copy of the handle: {drained()} city={city.get()}");
-            user.age().set(Counted { value = 31 });
+            user.age.set(Counted { value = 31 });
             print(i"age set: {drained()}");
             watching.dispose();
             "#,
@@ -235,14 +235,14 @@ fn a142_s7_notify_wakes_the_slot_and_its_ancestors_without_comparing() {
             let user = Store::new(alice());
             let watching = Owner::new();
             run_with_owner(watching, || {
-                user.name().effect_on_change(|_n| mark("name"));
-                user.address().city().effect_on_change(|_c| mark("address.city"));
-                user.address().effect_on_change(|_a| mark("address"));
+                user.name.effect_on_change(|_n| mark("name"));
+                user.address.city.effect_on_change(|_c| mark("address.city"));
+                user.address.effect_on_change(|_a| mark("address"));
                 user.effect_on_change(|_u| mark("user"));
             });
-            user.address().city().notify();
+            user.address.city.notify();
             print(i"city notified: {drained()}");
-            user.age().notify();
+            user.age.notify();
             print(i"age notified (no slot of its own): {drained()}");
             watching.dispose();
             "#,
@@ -263,8 +263,8 @@ fn a142_s7_a_store_handle_is_a_source_and_a_signal_to_the_whole_reactive_layer()
         &program(
             r#"
             let user = Store::new(alice());
-            let city = user.address().city();
-            let zip = user.address().zip();
+            let city = user.address.city;
+            let zip = user.address.zip;
             let runs = Shared::new(0);
             let watching = Owner::new();
             run_with_owner(watching, || {
@@ -345,8 +345,8 @@ fn a142_s7_a_coarse_field_is_one_slot_compared_whole() {
             let user = Store::new(User { name = "a", address = Address { city = "Oslo", zip = "0150" } });
             let watching = Owner::new();
             run_with_owner(watching, || {
-                user.address().effect_on_change(|_a| print("address woke"));
-                user.address().city().effect_on_change(|_c| print("address.city woke"));
+                user.address.effect_on_change(|_a| print("address woke"));
+                user.address.city.effect_on_change(|_c| print("address.city woke"));
             });
             user.set(User { name = "a", address = Address { city = "Oslo", zip = "0151" } });
             print(i"zip changed: compares={compares.read()}");
@@ -364,8 +364,10 @@ fn a142_s7_a_coarse_field_is_one_slot_compared_whole() {
 
 #[test]
 fn a142_s7_a_renamed_projection_takes_the_name_the_attribute_gives() {
-    // Q9's way out: `[reactive(name = "..")]` generates the projection under
-    // another name, so a field may be called `get`.
+    // Q9's way out was `[reactive(name = "..")]`, which generated the
+    // projection under another name so a field could be called `get`. B711
+    // S2b: there are no projections; a field called `get` is reached through
+    // the door by name, and `[reactive(coarse)]` still makes a field one slot.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -374,17 +376,16 @@ fn a142_s7_a_renamed_projection_takes_the_name_the_attribute_gives() {
 
         [derive(Storable)]
         struct Request {
-            [reactive(name = "verb")]
             get: str,
-            [reactive(coarse, name = "headers_all")]
+            [reactive(coarse)]
             headers: List<str>,
         }
 
         fun main() {
             let request = Store::new(Request { get = "/", headers = ["a"] });
-            request.verb().set("/index");
-            print(request.verb().get());
-            print(request.headers_all().get().len());
+            request.field(Request.get).set("/index");
+            print(request.field(Request.get).get());
+            print(request.headers.get().len());
         }
 
         main();
@@ -395,24 +396,42 @@ fn a142_s7_a_renamed_projection_takes_the_name_the_attribute_gives() {
 
 #[test]
 fn a142_s7_the_derive_refuses_a_field_named_like_a_handle_member() {
-    // Q9: an inherent member wins over a generated projection, so a field called
-    // `get`, `set`, `derive`, `patch`, ... could never be reached as a projection;
-    // the derive refuses it and steers to `[reactive(name = "..")]`.
-    for member in ["get", "set", "derive", "effect", "patch", "some", "live"] {
+    // Q9 refused a field named like a handle member, since a projection of
+    // that name could never be reached. B711 S2b: a field is read through the
+    // door, so the derive ACCEPTS it, and the field is reached by the written
+    // call while the bare read is refused with both spellings.
+    // `patch`, `some` and `live` are members of OTHER handles (`StoreSome`,
+    // `Store<Option<P>>`), and `effect` of no handle in a file that imports
+    // none of its traits: they shadow nothing on a `Store<Clash>` and read
+    // through as fields.
+    for member in ["patch", "some", "live", "effect"] {
+        assert_compiles(&format!(
+            "import std::reactive::store::{{ Storable, Store }};\n\n[derive(Storable)]\nstruct Clash {{\n    {member}: i32,\n}}\n\nfun main() {{\n    let clash = Store::new(Clash {{ {member} = 1 }});\n    let _read = clash.{member};\n}}\n"
+        ));
+    }
+    for member in ["get", "set", "derive"] {
+        let source = format!(
+            r#"
+            import std::reactive::store::{{ Storable, Store }};
+
+            [derive(Storable)]
+            struct Clash {{
+                {member}: i32,
+            }}
+
+            fun main() {{
+                let clash = Store::new(Clash {{ {member} = 1 }});
+                let _reached = clash.field(Clash.{member});
+            }}
+            "#
+        );
+        assert_compiles(&source);
         assert_fails_with(
-            &format!(
-                r#"
-                import std::reactive::store::Storable;
-
-                [derive(Storable)]
-                struct Clash {{
-                    {member}: i32,
-                }}
-
-                fun main() {{}}
-                "#
+            &source.replace(
+                &format!("clash.field(Clash.{member})"),
+                &format!("clash.{member}"),
             ),
-            &format!("would project as `{member}()`"),
+            &format!("reach the field with `clash.field(Clash.{member})`"),
         );
     }
 }
@@ -461,8 +480,8 @@ fn a142_s7_a_leaf_with_no_equality_changes_on_every_covering_write() {
             let button = Store::new(Button { label = "ok", on_press = nothing });
             let watching = Owner::new();
             run_with_owner(watching, || {
-                button.on_press().effect_on_change(|_f| print("on_press woke"));
-                button.label().effect_on_change(|_l| print("label woke"));
+                button.on_press.effect_on_change(|_f| print("on_press woke"));
+                button.label.effect_on_change(|_l| print("label woke"));
             });
             button.set(Button { label = "ok", on_press = nothing });
             button.set(Button { label = "ok", on_press = nothing });
@@ -484,17 +503,17 @@ fn a142_s7_an_option_field_is_reached_through_its_some() {
         &program(
             r#"
             let user = Store::new(alice());
-            let nick = user.nick().some();
+            let nick = user.nick.some();
             let watching = Owner::new();
             run_with_owner(watching, || {
                 nick.effect_on_change(|n| mark(i"nick={n.unwrap_or("-")}"));
-                user.nick().is_some().effect_on_change(|s| mark(i"is_some={s}"));
+                user.nick.is_some().effect_on_change(|s| mark(i"is_some={s}"));
             });
             print(i"patch while None: landed={nick.patch("al")} {drained()}");
-            user.nick().set(Some("ally"));
+            user.nick.set(Some("ally"));
             print(i"None -> Some: {drained()}");
             print(i"patch while Some: landed={nick.patch("al")} {drained()}");
-            user.nick().set(None);
+            user.nick.set(None);
             print(i"Some -> None: {drained()} read={nick.get().unwrap_or("-")}");
             watching.dispose();
             "#,
@@ -526,11 +545,11 @@ fn a142_s7_a_generic_struct_derives_and_projects_its_parameters() {
             let pair = Store::new(Pair { left = 1, right = 2 });
             let watching = Owner::new();
             run_with_owner(watching, || {
-                pair.left().effect_on_change(|l| print(i"left={l}"));
-                pair.right().effect_on_change(|r| print(i"right={r}"));
+                pair.left.effect_on_change(|l| print(i"left={l}"));
+                pair.right.effect_on_change(|r| print(i"right={r}"));
             });
             pair.set(Pair { left = 1, right = 3 });
-            pair.left().set(5);
+            pair.left.set(5);
             watching.dispose();
         }
 
@@ -569,7 +588,7 @@ fn a142_s7_a_handle_reads_one_leaf_without_copying_the_root() {
                 i += 1;
             }
             let root = Store::new(Root { label = "hi", scores });
-            let label = root.label();
+            let label = root.label;
             mut total = 0;
             i = 0;
             for i < 2000 {
@@ -630,8 +649,8 @@ fn a142_s7_a_same_variant_write_patches_the_payload_and_rebuilds_nothing() {
             let watching = Owner::new();
             run_with_owner(watching, || {
                 presence.is_online().effect_on_change(|_t| tags.write() += 1);
-                presence.online().name().effect_on_change(|_n| names.write() += 1);
-                presence.online().since().effect_on_change(|_s| sinces.write() += 1);
+                presence.online().name.effect_on_change(|_n| names.write() += 1);
+                presence.online().since.effect_on_change(|_s| sinces.write() += 1);
                 presence.effect_on_change(|_p| mark("presence"));
             });
             mut i = 1;
@@ -661,12 +680,12 @@ fn a142_s7_a_variant_switch_wakes_the_discriminant_and_every_live_payload_slot()
         &variant_program(
             r#"
             let presence = Store::new(online("laptop", 1));
-            let name = presence.online().name();
+            let name = presence.online().name;
             let watching = Owner::new();
             run_with_owner(watching, || {
                 presence.is_online().effect_on_change(|t| mark(i"tag={t}"));
                 name.effect_on_change(|n| mark(i"name={n.unwrap_or("-")}"));
-                presence.online().since().effect_on_change(|s| mark(i"since={s.is_some()}"));
+                presence.online().since.effect_on_change(|s| mark(i"since={s.is_some()}"));
                 presence.is_away().effect_on_change(|a| mark(i"away={a}"));
                 presence.effect_on_change(|_p| mark("presence"));
             });
@@ -693,17 +712,17 @@ fn a142_s7_a_variant_switch_wakes_the_discriminant_and_every_live_payload_slot()
 fn a142_s7_a_handle_into_a_payload_is_a_source_of_an_option_with_patch() {
     // Q6: a through-variant handle reads `None` while the variant is not live
     // and `Some` while it is; `live()` is its variant's discriminant; it projects
-    // further (`online().name()`), and a multi-payload variant's handle reads the
+    // further (`online().name`), and a multi-payload variant's handle reads the
     // payload as a tuple.
     assert_compiles_and_runs(
         &variant_program(
             r#"
             let presence = Store::new(Presence::Offline);
             let device = presence.online();
-            print(i"offline: device={device.get().is_some()} live={device.live().get()} name={device.name().get().unwrap_or("-")}");
+            print(i"offline: device={device.get().is_some()} live={device.live().get()} name={device.name.get().unwrap_or("-")}");
             presence.set(online("laptop", 7));
             let now: Device = device.get().unwrap();
-            print(i"online: name={now.name} since={device.since().get().unwrap().value} live={device.live().get()}");
+            print(i"online: name={now.name} since={device.since.get().unwrap().value} live={device.live().get()}");
             presence.set(Presence::Away("lunch", 30));
             let (why, minutes) = presence.away().get().unwrap();
             print(i"away: {why} {minutes} online={presence.is_online().get()} offline={presence.is_offline().get()}");
@@ -735,16 +754,16 @@ fn a142_s7_a_payload_store_assumed_reads_the_last_payload_once_the_variant_ends(
             let body = Owner::new();
             run_with_owner(body, || {
                 let device: Store<Device> = presence.online().assume();
-                device.name().set("phone");
+                device.name.set("phone");
                 let held: Presence = presence.get();
                 let now = match held {
                     Presence::Online(let d) => d.name,
                     _ => "-",
                 };
-                print(i"live: {device.name().get()} root={now}");
+                print(i"live: {device.name.get()} root={now}");
                 presence.set(Presence::Offline);
-                device.name().set("ghost");
-                print(i"ended: {device.name().get()} online={presence.is_online().get()}");
+                device.name.set("ghost");
+                print(i"ended: {device.name.get()} online={presence.is_online().get()}");
             });
             body.dispose();
             "#,
@@ -780,11 +799,11 @@ fn b526_an_assumed_handle_holds_the_last_value_its_subscribers_read() {
             let owner = Owner::new();
             run_with_owner(owner, || {
                 let held: Store<Message> = slot.some().assume();
-                held.content().effect_on_change(|content| seen.push(content));
-                let _patched = slot.some().content().patch("edited");
+                held.content.effect_on_change(|content| seen.push(content));
+                let _patched = slot.some().content.patch("edited");
                 slot.set(None);
                 print(seen.join(" "));
-                print(held.content().get());
+                print(held.content.get());
             });
             owner.dispose();
         }
@@ -890,7 +909,7 @@ fn a142_s7_when_live_compiles_on_both_ui_layers() {
         }
 
         fun panel(presence: Store<Presence>): View {
-            view("aside").child(when_live(presence.online(), |device| view("p").bind_text(device.name())))
+            view("aside").child(when_live(presence.online(), |device| view("p").bind_text(device.name)))
         }
     "#;
     assert_compiles_browser(&format!("{component}\nfun main() {{}}\n"));
@@ -929,8 +948,8 @@ fn b526_the_server_twins_when_live_serves_the_payload_as_it_stands() {
 
         fun main() {
             let presence = Store::new(Presence::Online(Device { name = "laptop" }));
-            let _renamed = presence.online().name().patch("phone");
-            print(render(view("aside").child(when_live(presence.online(), |device| view("p").bind_text(device.name())))));
+            let _renamed = presence.online().name.patch("phone");
+            print(render(view("aside").child(when_live(presence.online(), |device| view("p").bind_text(device.name)))));
         }
 
         main();
@@ -974,7 +993,7 @@ fn b694_the_server_twin_disposes_each_bodys_owner_once_it_is_placed() {
             let page = view("main")
                 .child(when_live(presence.online(), |device| {
                     on_cleanup(|| print("when_live released"));
-                    view("p").bind_text(device.name())
+                    view("p").bind_text(device.name)
                 }))
                 .child(when(shown, || {
                     on_cleanup(|| print("when released"));
@@ -1028,13 +1047,13 @@ fn a142_s7_every_handle_to_one_path_of_one_store_shares_an_identity() {
             r#"
             let user = Store::new(alice());
             let other = Store::new(alice());
-            let city = user.address().city();
+            let city = user.address.city;
             let copy = city;
-            print(user.address().city().identity() == copy.identity());
-            print(city.identity() == user.address().zip().identity());
-            print(city.identity() == other.address().city().identity());
+            print(user.address.city.identity() == copy.identity());
+            print(city.identity() == user.address.zip.identity());
+            print(city.identity() == other.address.city.identity());
             print(user.identity() == user.identity());
-            print(user.nick().is_some().identity() == user.nick().is_some().identity());
+            print(user.nick.is_some().identity() == user.nick.is_some().identity());
             let presence = Store::new(online("laptop", 1));
             let body = Owner::new();
             run_with_owner(body, || {
@@ -1057,7 +1076,7 @@ fn a142_s7_a_tracked_read_of_a_store_handle_attaches_once_across_runs() {
         &program(
             r#"
             let user = Store::new(alice());
-            let watched = Watched { inner = user.address().city(), attaches = Shared::new(0) };
+            let watched = Watched { inner = user.address.city, attaches = Shared::new(0) };
             let trigger: SignalCell<i32> = Signal::new(0);
             let owner = Owner::new();
             run_with_owner(owner, || {
@@ -1068,7 +1087,7 @@ fn a142_s7_a_tracked_read_of_a_store_handle_attaches_once_across_runs() {
                 trigger.set(step);
                 step += 1;
             }
-            user.address().city().set("Bergen");
+            user.address.city.set("Bergen");
             print(i"attaches={watched.attaches.read()}");
             owner.dispose();
             "#,
@@ -1301,40 +1320,40 @@ fn a149_s3_a_write_to_one_key_wakes_that_keys_readers_and_nobody_elses() {
                 mut id = 1;
                 for id <= 6 {
                     let name = i"k{id}";
-                    store.channels().at(id).effect_on_change(|_held| bump(name));
+                    store.channels.at(id).effect_on_change(|_held| bump(name));
                     id += 1;
                 }
-                store.channels().effect_on_change(|_map| bump("map"));
-                store.channels().at(3).some().name().effect_on_change(|_name| bump("name3"));
-                store.tags().effect_on_change(|_tags| bump("tags"));
+                store.channels.effect_on_change(|_map| bump("map"));
+                store.channels.at(3).some().name.effect_on_change(|_name| bump("name3"));
+                store.tags.effect_on_change(|_tags| bump("tags"));
             });
             print(i"subscribed:{tally()}");
-            let _renamed = store.channels().at(3).some().name().patch("three");
+            let _renamed = store.channels.at(3).some().name.patch("three");
             print(i"key 3's name patched:{tally()}");
-            let _pushed = store.channels().at(3).some().messages().push(30);
+            let _pushed = store.channels.at(3).some().messages.push(30);
             print(i"key 3's list pushed:{tally()}");
-            store.channels().at(3).set(store.channels().at(3).get());
+            store.channels.at(3).set(store.channels.at(3).get());
             print(i"key 3 set to what it holds:{tally()}");
-            store.channels().insert(4, channel(4, "four"));
+            store.channels.insert(4, channel(4, "four"));
             print(i"key 4 replaced:{tally()}");
-            store.channels().insert(9, channel(9, "nine"));
+            store.channels.insert(9, channel(9, "nine"));
             print(i"key 9 arrived:{tally()}");
-            store.channels().remove(5);
+            store.channels.remove(5);
             print(i"key 5 removed:{tally()}");
-            store.channels().remove(5);
+            store.channels.remove(5);
             print(i"key 5 removed again:{tally()}");
-            mut whole = store.channels().get();
+            mut whole = store.channels.get();
             whole.insert(2, channel(2, "two"));
-            store.channels().set(whole);
+            store.channels.set(whole);
             print(i"whole map, key 2 changed:{tally()}");
-            store.channels().set(store.channels().get());
+            store.channels.set(store.channels.get());
             print(i"whole map unchanged:{tally()}");
             mut root = store.get();
             root.tags.insert("new");
             store.set(root);
             print(i"root written, only the set changed:{tally()}");
-            print(store.channels().at(3).get().map(|held| held.name).unwrap_or("-"));
-            print(store.channels().at(5).get().is_none());
+            print(store.channels.at(3).get().map(|held| held.name).unwrap_or("-"));
+            print(store.channels.at(5).get().is_none());
             owner.dispose();
             print(census(store));
             "#,
@@ -1366,12 +1385,12 @@ fn a149_s3_a_keyed_slot_lives_as_long_as_its_subscriptions() {
         &collections_program(
             r#"
             let store = Store::new(global());
-            let _read = store.channels().at(2).get();
+            let _read = store.channels.at(2).get();
             print(i"one read: {census(store)}");
-            let first = store.channels().at(2).on_change(|_held| bump("a"));
-            let second = store.channels().at(2).on_change(|_held| bump("b"));
+            let first = store.channels.at(2).on_change(|_held| bump("a"));
+            let second = store.channels.at(2).on_change(|_held| bump("b"));
             print(i"two on key 2: {census(store)}");
-            let third = store.channels().at(4).some().name().on_change(|_name| bump("c"));
+            let third = store.channels.at(4).some().name.on_change(|_name| bump("c"));
             print(i"and key 4's name: {census(store)}");
             first.dispose();
             second.dispose();
@@ -1400,32 +1419,32 @@ fn a149_s3_a_map_field_is_a_map_flow_told_one_op_per_changed_key() {
         &collections_program(
             r#"
             let store = Store::new(global());
-            let flow = store.channels().open();
+            let flow = store.channels.open();
             print(i"open: {census(store)}");
-            store.channels().insert(7, channel(7, "seven"));
-            store.channels().at(1).set(Some(channel(1, "one")));
-            let _renamed = store.channels().at(2).some().name().patch("two");
-            store.channels().remove(3);
-            store.channels().remove(3);
-            store.channels().at(4).set(store.channels().at(4).get());
+            store.channels.insert(7, channel(7, "seven"));
+            store.channels.at(1).set(Some(channel(1, "one")));
+            let _renamed = store.channels.at(2).some().name.patch("two");
+            store.channels.remove(3);
+            store.channels.remove(3);
+            store.channels.at(4).set(store.channels.at(4).get());
             print(i"handle writes:{map_ops((flow.drain)())}");
-            mut whole = store.channels().get();
+            mut whole = store.channels.get();
             whole.remove(4);
             whole.insert(5, channel(5, "five"));
             whole.insert(8, channel(8, "eight"));
-            store.channels().set(whole);
+            store.channels.set(whole);
             print(i"whole write:{map_ops((flow.drain)())}");
             mut root = store.get();
             root.channels.remove(8);
             store.set(root);
             print(i"root write:{map_ops((flow.drain)())}");
-            store.channels().set(store.channels().get());
+            store.channels.set(store.channels.get());
             print(i"unchanged:{map_ops((flow.drain)())}");
             (flow.release)();
             print(i"released: {census(store)}");
-            let keys = store.channels().keys().memo_global();
-            store.channels().insert(10, channel(10, "ten"));
-            store.channels().remove(1);
+            let keys = store.channels.keys().memo_global();
+            store.channels.insert(10, channel(10, "ten"));
+            store.channels.remove(1);
             print(i"keys: {keys.len()} {keys.contains(10).get()} {keys.contains(1).get()}");
             "#,
         ),
@@ -1448,25 +1467,25 @@ fn a149_s3_a_set_field_wakes_one_member_and_is_told_set_ops() {
         &collections_program(
             r#"
             let store = Store::new(global());
-            let flow = store.tags().open();
+            let flow = store.tags.open();
             let owner = Owner::new();
             run_with_owner(owner, || {
-                store.tags().contains("red").effect_on_change(|held| bump(i"red:{held}"));
-                store.tags().contains("blue").effect_on_change(|held| bump(i"blue:{held}"));
+                store.tags.contains("red").effect_on_change(|held| bump(i"red:{held}"));
+                store.tags.contains("blue").effect_on_change(|held| bump(i"blue:{held}"));
             });
-            store.tags().insert("red");
+            store.tags.insert("red");
             print(i"red added:{tally()}");
-            store.tags().insert("green");
+            store.tags.insert("green");
             print(i"green added:{tally()}");
-            store.tags().contains("red").set(true);
+            store.tags.contains("red").set(true);
             print(i"red added again:{tally()}");
-            store.tags().remove("red");
-            store.tags().contains("blue").set(true);
+            store.tags.remove("red");
+            store.tags.contains("blue").set(true);
             print(i"red removed, blue added:{tally()}");
             mut whole: HashSet<str> = HashSet::new();
             whole.insert("blue");
             whole.insert("pink");
-            store.tags().set(whole);
+            store.tags.set(whole);
             print(i"whole write:{tally()}");
             print(i"ops:{set_ops((flow.drain)())}");
             owner.dispose();
@@ -1494,28 +1513,28 @@ fn a149_s3_a_keyed_list_reads_by_key_and_wakes_only_the_element_that_moved() {
         &collections_program(
             r#"
             let store = Store::new(global());
-            store.log().push(Message { id = 1, text = "hi" });
-            store.log().push(Message { id = 2, text = "yo" });
+            store.log.push(Message { id = 1, text = "hi" });
+            store.log.push(Message { id = 2, text = "yo" });
             let owner = Owner::new();
             run_with_owner(owner, || {
-                store.log().by_key(1).effect_on_change(|_held| bump("m1"));
-                store.log().by_key(2).effect_on_change(|_held| bump("m2"));
-                store.log().by_key(2).some().text().effect_on_change(|_text| bump("text2"));
-                store.log().effect_on_change(|_list| bump("log"));
+                store.log.by_key(1).effect_on_change(|_held| bump("m1"));
+                store.log.by_key(2).effect_on_change(|_held| bump("m2"));
+                store.log.by_key(2).some().text.effect_on_change(|_text| bump("text2"));
+                store.log.effect_on_change(|_list| bump("log"));
             });
-            store.log().push(Message { id = 3, text = "hey" });
+            store.log.push(Message { id = 3, text = "hey" });
             print(i"another pushed:{tally()}");
-            let _edited = store.log().by_key(1).some().text().patch("HI");
+            let _edited = store.log.by_key(1).some().text.patch("HI");
             print(i"1 edited by key:{tally()}");
-            store.log().set([Message { id = 1, text = "HI" }, Message { id = 2, text = "YO" }, Message { id = 3, text = "hey" }]);
+            store.log.set([Message { id = 1, text = "HI" }, Message { id = 2, text = "YO" }, Message { id = 3, text = "hey" }]);
             print(i"whole list, 2 changed:{tally()}");
-            store.log().remove_at(0);
+            store.log.remove_at(0);
             print(i"1 spliced out:{tally()}");
-            store.log().splice(0, 1, [Message { id = 2, text = "YO" }]);
+            store.log.splice(0, 1, [Message { id = 2, text = "YO" }]);
             print(i"the same element spliced back:{tally()}");
-            store.log().by_key(4).set(Some(Message { id = 4, text = "four" }));
-            store.log().by_key(3).set(None);
-            print(i"4 appended, 3 removed by key:{tally()} {texts(store.log().get())}");
+            store.log.by_key(4).set(Some(Message { id = 4, text = "four" }));
+            store.log.by_key(3).set(None);
+            print(i"4 appended, 3 removed by key:{tally()} {texts(store.log.get())}");
             owner.dispose();
             print(census(store));
             "#,
@@ -1541,24 +1560,24 @@ fn a149_s3_a_list_field_is_a_collection_flow_told_splices() {
         &collections_program(
             r#"
             let store = Store::new(global());
-            let flow = store.log().open();
-            store.log().push(Message { id = 1, text = "hi" });
-            store.log().push(Message { id = 2, text = "yo" });
-            let _edited = store.log().by_key(1).some().text().patch("HI");
-            store.log().by_key(2).set(None);
+            let flow = store.log.open();
+            store.log.push(Message { id = 1, text = "hi" });
+            store.log.push(Message { id = 2, text = "yo" });
+            let _edited = store.log.by_key(1).some().text.patch("HI");
+            store.log.by_key(2).set(None);
             print(i"writes:{seq_ops((flow.drain)())}");
-            store.log().set([Message { id = 0, text = "zero" }, Message { id = 1, text = "HI" }]);
+            store.log.set([Message { id = 0, text = "zero" }, Message { id = 1, text = "HI" }]);
             print(i"whole write:{seq_ops((flow.drain)())}");
-            store.log().set(store.log().get());
+            store.log.set(store.log.get());
             print(i"unchanged:{seq_ops((flow.drain)())}");
             (flow.release)();
             let mapped = Shared::new(0);
-            let lengths = store.log().map(|message: Message| {
+            let lengths = store.log.map(|message: Message| {
                 mapped.write() = mapped.read() + 1;
                 message.text.len()
             }).memo_global();
             print(i"sealed: mapped={mapped.read()} {lengths.get().len()}");
-            store.log().push(Message { id = 6, text = "six" });
+            store.log.push(Message { id = 6, text = "six" });
             print(i"one pushed: mapped={mapped.read()} {lengths.get().len()}");
             "#,
         ),
@@ -1578,7 +1597,7 @@ fn a149_s3_a_list_field_offers_no_index_handle() {
         &collections_program(
             r#"
             let store = Store::new(global());
-            let _first = store.log().at(0);
+            let _first = store.log.at(0);
             "#,
         ),
         "has no method 'at'",
@@ -1595,25 +1614,25 @@ fn a149_s3_a_collection_through_an_option_reads_and_patches_by_key() {
         &collections_program(
             r#"
             let store = Store::new(Holder { index = None, members = None, log = None });
-            print(store.index().some().at(1).patch(Some("one")));
-            store.index().set(Some(HashMap::new()));
-            store.members().set(Some(HashSet::new()));
-            store.log().set(Some([]));
+            print(store.index.some().at(1).patch(Some("one")));
+            store.index.set(Some(HashMap::new()));
+            store.members.set(Some(HashSet::new()));
+            store.log.set(Some([]));
             let owner = Owner::new();
             run_with_owner(owner, || {
-                store.index().some().at(1).effect_on_change(|_held| bump("i1"));
-                store.members().some().contains("x").effect_on_change(|_held| bump("x"));
-                store.log().some().by_key(4).effect_on_change(|_held| bump("m4"));
+                store.index.some().at(1).effect_on_change(|_held| bump("i1"));
+                store.members.some().contains("x").effect_on_change(|_held| bump("x"));
+                store.log.some().by_key(4).effect_on_change(|_held| bump("m4"));
             });
-            print(store.index().some().at(1).patch(Some("one")));
-            print(store.index().some().at(2).patch(Some("two")));
-            print(i"index:{tally()} {store.index().some().at(1).some().get().unwrap_or("-")}");
-            print(store.members().some().contains("x").patch(true));
-            print(store.members().some().contains("y").patch(true));
+            print(store.index.some().at(1).patch(Some("one")));
+            print(store.index.some().at(2).patch(Some("two")));
+            print(i"index:{tally()} {store.index.some().at(1).some().get().unwrap_or("-")}");
+            print(store.members.some().contains("x").patch(true));
+            print(store.members.some().contains("y").patch(true));
             print(i"members:{tally()}");
-            store.log().some().push(Message { id = 3, text = "three" });
-            store.log().some().push(Message { id = 4, text = "four" });
-            print(i"log:{tally()} {store.log().some().size()}");
+            store.log.some().push(Message { id = 3, text = "three" });
+            store.log.some().push(Message { id = 4, text = "four" });
+            print(i"log:{tally()} {store.log.some().size()}");
             owner.dispose();
             "#,
         )
@@ -1637,7 +1656,7 @@ fun main() {"#,
 // The ruled door: std's `[internal]` fields stop resolving as members outside
 // std (the cause), and then, on a `Store<T>` or `StoreSome<T>`, a member that
 // names a field of `T` resolves to the projection of that name —
-// `app.user.name` for `app.user().name()`. It sits after the handle's own
+// `app.user.name` for `app.user().name`. It sits after the handle's own
 // (now visible) fields, so it shadows nothing.
 
 /// A root whose fields are named like the handle's own machinery (`root`,
@@ -1686,9 +1705,10 @@ fn s4_program(body: &str) -> String {
 
 #[test]
 fn a149_s4_a_field_of_the_handled_struct_reads_through_its_projection() {
-    // The read, the write and the subscription each go through the projection:
-    // `app.address.city` is the same handle `app.address().city()` is, so a
-    // write through one wakes a subscription on the other. Red on the base:
+    // The read, the write and the subscription each go through the door
+    // (B711 S2b; a projection method until then): `app.address.city` is the
+    // same handle `app.field(App.address).field(Address.city)` is, so a write
+    // through one wakes a subscription on the other. Red on the base:
     // "struct 'Store' has no field 'address'".
     assert_compiles_and_runs(
         &s4_program(
@@ -1698,10 +1718,10 @@ fn a149_s4_a_field_of_the_handled_struct_reads_through_its_projection() {
             print(store.address.city.get());
             let watching = Owner::new();
             run_with_owner(watching, || {
-                store.address().city().effect_on_change(|city| print(i"woke city={city}"));
+                store.field(App.address).field(Address.city).effect_on_change(|city| print(i"woke city={city}"));
             });
             store.address.city.set("Tromso");
-            print(store.address().city().get());
+            print(store.field(App.address).field(Address.city).get());
             watching.dispose();
             "#,
         ),
@@ -1733,9 +1753,9 @@ fn a149_s4_a_field_named_like_a_handle_internal_reaches_the_projection() {
 
 #[test]
 fn a149_s4_field_syntax_reads_through_a_store_some() {
-    // `StoreSome<Address>` carries projections too (the derive writes both
-    // handle types), so `home.some().city` is field syntax on the through-Option
-    // handle: `None` while the option is `None`.
+    // `StoreSome<Address>` has the door too (B711 S2b: one `[field_syntax]`
+    // method per handle type), so `home.some().city` is field syntax on the
+    // through-Option handle: `None` while the option is `None`.
     assert_compiles_and_runs(
         &s4_program(
             r#"
@@ -1753,8 +1773,9 @@ fn a149_s4_field_syntax_reads_through_a_store_some() {
 
 #[test]
 fn a149_s4_field_syntax_reads_a_generic_structs_projection() {
-    // The derive's `impl Store<Pair<type T>>` is a projection on the handle at
-    // `Pair`'s own type, whatever its arguments: `pair.left` is `Store<i32>`.
+    // The door reads a generic struct's field at the handle's arguments: the
+    // key literal `Pair.left` takes them from the door's parameter (R8), so
+    // `pair.left` is `Store<i32>`.
     assert_compiles_and_runs(
         r#"
         import std::io::print;
@@ -1781,9 +1802,11 @@ fn a149_s4_field_syntax_reads_a_generic_structs_projection() {
 
 #[test]
 fn a149_s4_a_renamed_projection_is_not_read_under_the_fields_name() {
-    // Q9's rename: field `get` projects as `verb()`. `request.get` names the
-    // FIELD, whose projection is not called `get` — and reaching the handle's
-    // own `get()` there would hand back the whole `Request`. Refused, saying so.
+    // Q9's rename (`[reactive(name = "verb")]` on a field `get`) renamed a
+    // projection, and B711 S2b removed the projections: the derive refuses the
+    // attribute on a struct field, by name, with the written call that reaches
+    // the field. What the pin guarded stands: `request.get` never reaches the
+    // handle's own `get()` (see the shadowing pin below).
     assert_fails_with(
         r#"
         import std::reactive::Source;
@@ -1800,16 +1823,20 @@ fn a149_s4_a_renamed_projection_is_not_read_under_the_fields_name() {
             let _verb = request.get;
         }
         "#,
-        "has no projection named `get` to read it through",
+        "`[reactive(name = \"verb\")]` on the field `get` renamed its projection, and a store \
+         handle has no projections to rename any more: it reads every field through its one \
+         door, `field` - write `handle.field(Request.get)` where a handle member is also named \
+         `get`, and `handle.get` everywhere else, and drop the attribute",
     );
 }
 
 #[test]
 fn a149_s4_a_struct_that_does_not_derive_storable_has_no_field_syntax() {
-    // A type that does not derive `Storable` is a LEAF (Q3): its store has no
-    // projections, so its fields are not members of the handle.
-    assert_fails_with(
-        r#"
+    // A type that does not derive `Storable` is a LEAF (Q3): its store reads no
+    // fields. B711 S2b: the door's impl is bounded by `StoreFields`, which the
+    // derive implements, and the refusal is said at the member with the
+    // trait's own steer to the derive.
+    let source = r#"
         import std::reactive::store::Store;
 
         struct Plain {
@@ -1820,9 +1847,15 @@ fn a149_s4_a_struct_that_does_not_derive_storable_has_no_field_syntax() {
             let plain = Store::new(Plain { label = "x" });
             let _label = plain.label;
         }
-        "#,
-        "`Plain` does not `[derive(Storable)]`",
+        "#;
+    assert_fails_once_with(
+        source,
+        "`label` is a field of `Plain`, and field syntax reads it through a method whose impl \
+         needs `Plain: StoreFields`, which `Plain` does not implement. `StoreFields`: \
+         `[derive(Storable)]` implements it on a struct: add the derive to read the struct's \
+         fields through a store handle.",
     );
+    assert_fails_without(source, "required by a generic bound of this call");
 }
 
 #[test]
@@ -1833,8 +1866,8 @@ fn a149_s4_an_internal_std_field_is_no_member_outside_std() {
     for (read, field, owner) in [
         ("store.path", "path", "Store"),
         ("store.lend", "lend", "Store"),
-        ("store.address().city().root", "root", "Store"),
-        ("store.home().is_some().read", "read", "StoreFlag"),
+        ("store.address.city.root", "root", "Store"),
+        ("store.home.is_some().read", "read", "StoreFlag"),
     ] {
         assert_fails_with(
             &format!(
@@ -1851,7 +1884,7 @@ fn a149_s4_a_call_named_like_an_internal_field_is_not_steered_to_it() {
     // send the reader to a member that no longer resolves.
     assert_fails_without(
         &format!(
-            "{S4_TYPES}\nfun main() {{\n    let store = Store::new(app());\n    store.address().lend(|_held| {{}});\n}}\n"
+            "{S4_TYPES}\nfun main() {{\n    let store = Store::new(app());\n    store.address.lend(|_held| {{}});\n}}\n"
         ),
         "parenthesize",
     );
@@ -1870,6 +1903,221 @@ fn a149_s4_an_assignment_through_field_syntax_steers_to_set() {
     );
     assert_fails_once_with(&source, "write through it with `.set(..)`");
     assert_fails_without(&source, "Expected Store<str>");
+}
+
+// --- B711 S2b: the store handles' `[field_syntax]` door ----------------------
+//
+// `Store`, `StoreSome`, `RemoteStore` and `RemoteStoreSome` each declare ONE
+// `[field_syntax] fun field<U>(self, key: Key<T, U>)`; the derive writes the
+// diff and the `StoreFields` marker the door is bounded by, and no projection.
+
+#[test]
+fn b711_s2b_a_store_reads_through_its_door_and_a_path_key_is_the_chain() {
+    // The door by its written call, a path key, and the chain of single steps
+    // are one handle: one identity, and a write through any wakes the others.
+    assert_compiles_and_runs(
+        &s4_program(
+            r#"
+            let store = Store::new(app());
+            let chained = store.address.city;
+            let path = store.field(App.address.city);
+            let spelled = store.field(App.address).field(Address.city);
+            print(chained.identity() == path.identity());
+            print(path.identity() == spelled.identity());
+            let watching = Owner::new();
+            run_with_owner(watching, || {
+                chained.effect_on_change(|city| print(i"chain={city}"));
+                path.effect_on_change(|city| print(i"path={city}"));
+            });
+            path.set("Tromso");
+            spelled.set("Tromso");
+            store.field(App.address).set(Address { city = "Narvik", root = "r" });
+            print(chained.get());
+            watching.dispose();
+            "#,
+        ),
+        "true\ntrue\nchain=Tromso\npath=Tromso\nchain=Narvik\npath=Narvik\nNarvik\n",
+    );
+}
+
+#[test]
+fn b711_s2b_a_store_some_reads_through_an_enum_payload() {
+    // `presence.online()` is the enum half's through-variant handle (still
+    // generated per variant); its payload's fields read through `StoreSome`'s
+    // door, `None` while the variant is not live.
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::{ Signal, Source };
+        import std::reactive::store::{ Storable, Store, StoreSome };
+
+        [derive(Storable)]
+        struct Device {
+            label: str,
+        }
+
+        [derive(Storable)]
+        enum Presence {
+            Offline,
+            Online(Device),
+        }
+
+        fun main() {
+            let presence = Store::new(Presence::Online(Device { label = "phone" }));
+            let label: StoreSome<str> = presence.online().label;
+            print(label.get().unwrap_or("-"));
+            print(label.patch("tablet"));
+            print(presence.online().field(Device.label).get().unwrap_or("-"));
+            presence.set(Presence::Offline);
+            print(label.get().unwrap_or("-"));
+        }
+
+        main();
+        "#,
+        "phone\ntrue\ntablet\n-\n",
+    );
+}
+
+#[test]
+fn b711_s2b_the_remote_handles_read_through_their_doors() {
+    // `RemoteStore` and `RemoteStoreSome` type their field reads through their
+    // own doors, chained and by a path key, at the remote handle types.
+    assert_compiles(
+        r#"
+        import std::reactive::store::{ RemoteStore, RemoteStoreSome, Storable };
+        import std::wire::Wire;
+
+        [derive(Storable, Wire)]
+        struct Address {
+            city: str,
+        }
+
+        [derive(Storable, Wire)]
+        struct User {
+            name: str,
+            address: Address,
+        }
+
+        fun cities(root: RemoteStore<User>, some: RemoteStoreSome<User>) {
+            let _a: RemoteStore<str> = root.address.city;
+            let _b: RemoteStore<str> = root.field(User.address.city);
+            let _c: RemoteStoreSome<str> = some.address.city;
+            let _d: RemoteStoreSome<Address> = some.field(User.address);
+        }
+
+        fun main() {}
+        "#,
+    );
+}
+
+#[test]
+fn b711_s2b_the_paren_form_is_refused_with_the_field_syntax_that_reads_it() {
+    // `store.address` was the derived projection until S2b. It is no method
+    // now, and the refusal is the one every migrating program meets: it names
+    // the field read at this receiver and the call it stands for. A chain is
+    // refused once, at its first paren call.
+    let source = s4_program(
+        r#"
+        let store = Store::new(app());
+        print(store.address().city().get());
+        "#,
+    );
+    assert_fails_once_with(
+        &source,
+        "Store<App> has no method 'address'; `address` is a field of `App`, which this handle \
+         reads with field syntax, not as a method: write `store.address` (the call \
+         `store.field(App.address)`)",
+    );
+}
+
+#[test]
+fn b711_s2b_a_field_a_handle_member_shadows_is_reached_by_the_written_call() {
+    // A field named like a handle member (`get`, and the door's own name,
+    // `field`) is shadowed from field syntax: refused with both written forms,
+    // and reached through the door by name. The derive no longer refuses the
+    // field (its reserved-name list is the enum half's alone).
+    let types = r#"
+        import std::io::print;
+        import std::reactive::{ Signal, Source };
+        import std::reactive::store::{ Storable, Store };
+
+        [derive(Storable)]
+        struct Request {
+            get: str,
+            field: i32,
+        }
+    "#;
+    assert_compiles_and_runs(
+        &format!(
+            "{types}\nfun main() {{\n    let request = Store::new(Request {{ get = \"/\", field = 1 }});\n    request.field(Request.get).set(\"/index\");\n    request.field(Request.field).set(2);\n    let held = request.get();\n    print(i\"{{held.get}} {{held.field}}\");\n}}\n\nmain();\n"
+        ),
+        "/index 2\n",
+    );
+    assert_fails_with(
+        &format!(
+            "{types}\nfun main() {{\n    let request = Store::new(Request {{ get = \"/\", field = 1 }});\n    let _get = request.get;\n}}\n"
+        ),
+        "`get` is a method of `Store`: call it, `request.get()`; `get` is also a field of \
+         `Request`, which the method shadows from field syntax: reach the field with \
+         `request.field(Request.get)`",
+    );
+    assert_fails_with(
+        &format!(
+            "{types}\nfun main() {{\n    let request = Store::new(Request {{ get = \"/\", field = 1 }});\n    let _field = request.field;\n}}\n"
+        ),
+        "reach the field with `request.field(Request.field)`",
+    );
+}
+
+#[test]
+fn b711_s2b_an_assignment_through_the_door_names_the_call_and_its_type() {
+    // The store's own wording survives the move to the door, keyed on what
+    // the call answers (a type with a `set`), never on a std type's name.
+    let source = s4_program(
+        r#"
+        let store = Store::new(app());
+        store.address.city = "Bergen";
+        "#,
+    );
+    assert_fails_once_with(
+        &source,
+        "the left side of this assignment is not a place: `store.address.city` reads through \
+         `[field_syntax]` as `store.address.field(Address.city)`, a call, which answers a \
+         `Store<str>`: a value, not a place - write through it with `.set(..)`",
+    );
+}
+
+#[test]
+fn b711_s2b_an_enum_variant_named_like_the_door_keeps_its_projection() {
+    // The enum half still generates its projections; a variant `Field(..)`
+    // projects as `field()`, beside the door, which an enum never reaches
+    // (its impl is bounded by `StoreFields`, a struct's).
+    assert_compiles_and_runs(
+        r#"
+        import std::io::print;
+        import std::reactive::Source;
+        import std::reactive::store::{ Storable, Store };
+
+        [derive(Storable)]
+        struct Device {
+            label: str,
+        }
+
+        [derive(Storable)]
+        enum Slot {
+            Empty,
+            Field(Device),
+        }
+
+        fun main() {
+            let slot = Store::new(Slot::Field(Device { label = "d" }));
+            print(slot.field().label.get().unwrap_or("-"));
+        }
+
+        main();
+        "#,
+        "d\n",
+    );
 }
 
 // --- B568: a struct literal outside std writes no std-`[internal]` field ------
@@ -2423,7 +2671,7 @@ impl Board {
 fun hold_every_key(g: RemoteStoreSome<Global>, count: u53) {
     mut id: u53 = 0;
     for id < count {
-        g.messages().at(id).some().content().effect(|_content| {});
+        g.messages.at(id).some().content.effect(|_content| {});
         id += 1;
     }
 }
@@ -2576,15 +2824,15 @@ fun main() {
         print("assumed");
         mut read = 0;
         for read < 100 {
-            let _title = live.records().at(1).some().title().get();
+            let _title = live.records.at(1).some().title.get();
             read += 1;
         }
         print("read");
-        let _renamed = live.records().at(1).some().title().patch("renamed");
+        let _renamed = live.records.at(1).some().title.patch("renamed");
         print("written inside");
         store.set(None);
         print("ended");
-        print(live.records().at(1).some().title().get().unwrap_or("?"));
+        print(live.records.at(1).some().title.get().unwrap_or("?"));
     });
 }
 
@@ -2699,11 +2947,11 @@ fn b693_the_keeper_stands_while_its_owner_does() {
             print(i"disposed: {census(presence)}");
             let runs = Owner::new();
             run_with_owner(runs, || {
-                presence.online().name().effect(|_name| {
+                presence.online().name.effect(|_name| {
                     let _device = presence.online().assume();
                 });
             });
-            let _renamed = presence.online().name().patch("phone");
+            let _renamed = presence.online().name.patch("phone");
             presence.set(Presence::Online(Device { name = "tablet" }));
             print(i"effect: {store_feed_census(presence)}");
             runs.dispose();
@@ -2781,9 +3029,9 @@ fn b693_the_enums_own_handle_ending_its_variant_leaves_the_payload_as_it_stood()
         r#"
         let presence = Store::new(Presence::Online(Device { name = "laptop" }));
         let device = presence.online().assume();
-        let _renamed = presence.online().name().patch("phone");
+        let _renamed = presence.online().name.patch("phone");
         presence.set(Presence::Offline);
-        print(device.name().get());
+        print(device.name.get());
         "#,
         "phone\n",
     );
@@ -2795,9 +3043,9 @@ fn b693_an_option_set_to_none_leaves_the_payload_as_it_stood() {
         r#"
         let slot: Store<Option<Record>> = Store::new(Some(Record { title = "draft", notes = [] }));
         let record = slot.some().assume();
-        let _edited = slot.some().title().patch("edited");
+        let _edited = slot.some().title.patch("edited");
         slot.set(None);
-        print(record.title().get());
+        print(record.title.get());
         "#,
         "edited\n",
     );
@@ -2808,10 +3056,10 @@ fn b693_a_key_set_to_none_under_the_handle_leaves_its_value_as_it_stood() {
     assert_ends(
         r#"
         let keyed = Store::new(state("laptop"));
-        let first = keyed.records().at(1).some().assume();
-        let _edited = keyed.records().at(1).some().title().patch("first, edited");
-        keyed.records().at(1).set(None);
-        print(i"{first.title().get()} / {keyed.records().len()}");
+        let first = keyed.records.at(1).some().assume();
+        let _edited = keyed.records.at(1).some().title.patch("first, edited");
+        keyed.records.at(1).set(None);
+        print(i"{first.title.get()} / {keyed.records.len()}");
         "#,
         "first, edited / 1\n",
     );
@@ -2822,10 +3070,10 @@ fn b693_a_key_removed_under_the_handle_leaves_its_value_as_it_stood() {
     assert_ends(
         r#"
         let keyed = Store::new(state("laptop"));
-        let second = keyed.records().at(2).some().assume();
-        let _edited = keyed.records().at(2).some().title().patch("second, edited");
-        keyed.records().remove(2);
-        print(i"{second.title().get()} / {keyed.records().len()}");
+        let second = keyed.records.at(2).some().assume();
+        let _edited = keyed.records.at(2).some().title.patch("second, edited");
+        keyed.records.remove(2);
+        print(i"{second.title.get()} / {keyed.records.len()}");
         "#,
         "second, edited / 1\n",
     );
@@ -2836,10 +3084,10 @@ fn b693_a_whole_state_write_replacing_the_enum_leaves_the_payload_as_it_stood() 
     assert_ends(
         r#"
         let whole = Store::new(state("laptop"));
-        let inner = whole.presence().online().assume();
-        let _tablet = whole.presence().online().name().patch("tablet");
+        let inner = whole.presence.online().assume();
+        let _tablet = whole.presence.online().name.patch("tablet");
         whole.set(State { presence = Presence::Offline, records = HashMap::new() });
-        print(inner.name().get());
+        print(inner.name.get());
         "#,
         "tablet\n",
     );
@@ -2852,12 +3100,12 @@ fn b693_an_outer_variant_ending_leaves_every_inner_payload_as_it_stood() {
     assert_ends(
         r#"
         let outer: Store<Option<State>> = Store::new(Some(state("laptop")));
-        let deep = outer.some().presence().online().assume();
-        let deep_record = outer.some().records().at(1).some().assume();
-        let _desktop = outer.some().presence().online().name().patch("desktop");
-        let _noted = outer.some().records().at(1).some().title().patch("first, noted");
+        let deep = outer.some().presence.online().assume();
+        let deep_record = outer.some().records.at(1).some().assume();
+        let _desktop = outer.some().presence.online().name.patch("desktop");
+        let _noted = outer.some().records.at(1).some().title.patch("first, noted");
         outer.set(None);
-        print(i"{deep.name().get()} / {deep_record.title().get()}");
+        print(i"{deep.name.get()} / {deep_record.title.get()}");
         "#,
         "desktop / first, noted\n",
     );
@@ -2873,12 +3121,12 @@ fn b693_after_the_end_a_write_lands_nowhere_and_a_new_payload_is_read_live() {
         let again: Store<Option<Record>> = Store::new(Some(Record { title = "one", notes = [] }));
         let held = again.some().assume();
         again.set(None);
-        held.title().set("ghost");
-        print(i"dead: {held.title().get()} none={again.get().is_none()}");
+        held.title.set("ghost");
+        print(i"dead: {held.title.get()} none={again.get().is_none()}");
         again.set(Some(Record { title = "two", notes = [] }));
-        print(i"again: {held.title().get()}");
-        let _three = again.some().title().patch("three");
-        print(i"live: {held.title().get()}");
+        print(i"again: {held.title.get()}");
+        let _three = again.some().title.patch("three");
+        print(i"live: {held.title.get()}");
         "#,
         "dead: one none=true\nagain: two\nlive: three\n",
     );
@@ -3026,19 +3274,19 @@ fun main() {
     mut total = 0;
     mut read = 0;
     for read < 100 {
-        total += store.next().next().n().get();
+        total += store.next.next.n.get();
         read += 1;
     }
     print(i"depth 3: {total}");
     read = 0;
     for read < 100 {
-        total += store.next().next().next().n().get();
+        total += store.next.next.next.n.get();
         read += 1;
     }
     print(i"depth 4: {total}");
     read = 0;
     for read < 100 {
-        total += store.next().next().next().next().n().get();
+        total += store.next.next.next.next.n.get();
         read += 1;
     }
     print(i"depth 5: {total}");
@@ -3098,19 +3346,19 @@ fn m186_a_shared_paths_identity_is_the_identity_of_its_steps() {
             records.insert(1, Record { title = "one", notes = [] });
             records.insert(2, Record { title = "two", notes = [] });
             let store: Store<Option<State>> = Store::new(Some(State { records }));
-            let title = store.some().records().at(1).some().title();
-            let keyed = store.some().records().at(1);
+            let title = store.some().records.at(1).some().title;
+            let keyed = store.some().records.at(1);
             let copy = keyed;
-            print(title.identity() == store.some().records().at(1).some().title().identity());
-            print(title.identity() == copy.some().title().identity());
+            print(title.identity() == store.some().records.at(1).some().title.identity());
+            print(title.identity() == copy.some().title.identity());
             run_with_owner(Owner::new(), || {
-                print(title.identity() == store.some().assume().records().at(1).some().title().identity());
+                print(title.identity() == store.some().assume().records.at(1).some().title.identity());
             });
-            print(title.identity() == store.some().records().at(2).some().title().identity());
-            print(title.identity() == store.some().records().at(1).some().notes().identity());
+            print(title.identity() == store.some().records.at(2).some().title.identity());
+            print(title.identity() == store.some().records.at(1).some().notes.identity());
             print(copy.identity() == keyed.identity());
             print(copy.is_some().identity() == keyed.identity());
-            print(copy.is_some().identity() == store.some().records().at(1).is_some().identity());
+            print(copy.is_some().identity() == store.some().records.at(1).is_some().identity());
         }
 
         main();
@@ -3202,23 +3450,23 @@ fun main() {
     );
     let page = Owner::new();
     run_with_owner(page, || {
-        let notice = g.notices().at(1).some();
-        notice.kind().effect(|kind| print(i"kind {kind.map(|kind| kind.value()).unwrap_or("-")}"));
-        notice.level().effect(|level| print(i"level {level.map(|level| level.value()).unwrap_or(0)}"));
-        notice.text().effect(|text| print(i"text {text.unwrap_or("-")}"));
-        g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+        let notice = g.notices.at(1).some();
+        notice.kind.effect(|kind| print(i"kind {kind.map(|kind| kind.value()).unwrap_or("-")}"));
+        notice.level.effect(|level| print(i"level {level.map(|level| level.value()).unwrap_or(0)}"));
+        notice.text.effect(|text| print(i"text {text.unwrap_or("-")}"));
+        g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
     });
     sleep_for(Duration::millis(0));
     sleep_for(Duration::millis(0));
     print("-- a whole record set over the held one");
-    global.notices().at(1).set(Some(Notice { kind = Kind::Direct, level = Level::High, text = "dm" }));
+    global.notices.at(1).set(Some(Notice { kind = Kind::Direct, level = Level::High, text = "dm" }));
     sleep_for(Duration::millis(0));
     print("-- frames after it still land");
-    global.motd().set("after");
-    let _text = global.notices().at(1).some().text().patch("dm 2");
+    global.motd.set("after");
+    let _text = global.notices.at(1).some().text.patch("dm 2");
     sleep_for(Duration::millis(0));
     print("-- and a second whole set");
-    global.notices().at(1).set(Some(Notice { kind = Kind::Mention, level = Level::Low, text = "back" }));
+    global.notices.at(1).set(Some(Notice { kind = Kind::Mention, level = Level::Low, text = "back" }));
     sleep_for(Duration::millis(0));
     page.dispose();
     print("done");

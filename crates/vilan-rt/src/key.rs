@@ -48,6 +48,24 @@ pub enum KeyAccess<S: 'static, F: 'static> {
     Composed(Rc<dyn Reach<S, F>>),
 }
 
+/// A key's ACCESS held without its path (B711 S2b): what a closure that
+/// reads a captured key only as a subscript's index (`|held| f(&held[key])`,
+/// std's store handles) captures in place of the whole key, whose copy would
+/// copy the path's list. The field has the key's own name for its access, so
+/// a subscript through either is written the same.
+pub struct KeyHeld<S: 'static, F: 'static> {
+    /// The two projections, as the key held them.
+    pub __access: KeyAccess<S, F>,
+}
+
+impl<S: 'static, F: 'static> Clone for KeyHeld<S, F> {
+    fn clone(&self) -> Self {
+        KeyHeld {
+            __access: self.__access.clone(),
+        }
+    }
+}
+
 /// A projection from `S` to `F`, both ways. [`KeyAccess`] implements it, and
 /// so does a composition of two of them, which is what lets a composition
 /// erase the type in the middle (`Key<S, M>` then `Key<M, F>`).

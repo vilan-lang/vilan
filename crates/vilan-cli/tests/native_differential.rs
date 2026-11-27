@@ -13939,8 +13939,9 @@ fn a_deref_of_a_conditional_view_is_identical_on_both_backends() {
 /// A142 S7 S1 (`proposal/store.md`): a derived struct's store builds and wakes
 /// the same on both backends — a nested struct, a whole write that wakes only the
 /// changed spine, a handle write committed along the spine, a write of the value
-/// held, `notify`, a `[reactive(coarse)]` field, a `[reactive(name = "..")]`
-/// projection, an `Option` field through its `Some` (observed, read and patched), a generic
+/// held, `notify`, a `[reactive(coarse)]` field, a field a handle member shadows
+/// (`get`, reached as `user.field(User.get)` since B711 S2b), an `Option` field
+/// through its `Some` (observed, read and patched), a generic
 /// struct, and the slot census through subscribe and dispose.
 #[test]
 fn a142_s7_a_struct_store_builds_and_wakes_the_same_on_both_backends() {
@@ -13958,10 +13959,10 @@ fn a142_s7_a_struct_store_builds_and_wakes_the_same_on_both_backends() {
 }
 
 /// A149 S4: field syntax on store handles reads, writes and subscribes the same
-/// on both backends — `app.address.city` is the projection call, a field named
-/// like a handle internal (`root`, `path`) reads the struct's field, a
-/// `StoreSome` reads through its projections, and a generic struct's
-/// projection is reached by its field name.
+/// on both backends — `app.address.city` is the door's call (B711 S2b:
+/// `app.field(App.address).field(Address.city)`), a field named like a handle
+/// internal (`root`, `path`) reads the struct's field, a `StoreSome` reads
+/// through its door, and a generic struct's field is reached by its name.
 #[test]
 fn a149_s4_field_syntax_reads_and_writes_the_same_on_both_backends() {
     let staged = stage();
@@ -13974,6 +13975,27 @@ fn a149_s4_field_syntax_reads_and_writes_the_same_on_both_backends() {
         compare(&staged, "native_probe_store_field_syntax.vl"),
         Verdict::Identical,
         "field syntax must read and write the same on both backends"
+    );
+}
+
+/// B711 S2b: the store handles' `[field_syntax]` door on both backends — a
+/// chain, a PATH key (one slot, one identity and the same wakes as the chain of
+/// its steps), a `StoreSome` through an enum payload and through an `Option`, a
+/// field a handle member shadows reached by the written call, a generic struct,
+/// and a remote handle's door over a mirrored store, chained, by a path key and
+/// through `assume()` (the wire path one field longer per step).
+#[test]
+fn b711_s2b_the_store_door_reads_the_same_on_both_backends() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_store_door.vl"),
+        include_str!("native/store_door.vl"),
+    )
+    .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, "native_probe_store_door.vl"),
+        Verdict::Identical,
+        "the store door must read, write and wake the same on both backends"
     );
 }
 

@@ -71,29 +71,25 @@ fun main() {
 	);
 	let page = Owner::new();
 	run_with_owner(page, || {
-		let notice = g.notices().at(1).some();
-		notice.kind().effect(|kind| print(i"kind {kind.map(|kind| kind.value()).unwrap_or("-")}"));
-		notice
-			.level()
-			.effect(|level| print(i"level {level.map(|level| level.value()).unwrap_or(0)}"));
-		notice.text().effect(|text| print(i"text {text.unwrap_or("-")}"));
-		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		let notice = g.notices.at(1).some();
+		notice.kind.effect(|kind| print(i"kind {kind.map(|kind| kind.value()).unwrap_or("-")}"));
+		notice.level.effect(|level| print(i"level {level.map(|level| level.value()).unwrap_or(0)}"));
+		notice.text.effect(|text| print(i"text {text.unwrap_or("-")}"));
+		g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print("-- a whole record set over the held one");
-	global
-		.notices()
+	global.notices
 		.at(1)
 		.set(Some(Notice { kind = Kind::Direct, level = Level::High, text = "dm" }));
 	sleep_for(Duration::millis(0));
 	print("-- frames after it still land");
-	global.motd().set("after");
-	let _text = global.notices().at(1).some().text().patch("dm 2");
+	global.motd.set("after");
+	let _text = global.notices.at(1).some().text.patch("dm 2");
 	sleep_for(Duration::millis(0));
 	print("-- and a second whole set");
-	global
-		.notices()
+	global.notices
 		.at(1)
 		.set(Some(Notice { kind = Kind::Mention, level = Level::Low, text = "back" }));
 	sleep_for(Duration::millis(0));

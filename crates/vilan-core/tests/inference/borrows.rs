@@ -13551,9 +13551,9 @@ fn b509_a_through_variant_write_copies_nothing() {
                 i += 1;
             }}
             let presence = Store::new(Presence::Online(Device {{ since = 0, big }}));
-            let since = presence.online().since();
+            let since = presence.online().since;
             let maybe = Store::new(Some(Device {{ since = 0, big = [1, 2, 3] }}));
-            let other = maybe.some().since();
+            let other = maybe.some().since;
             mut n = 0;
             for n < {writes} {{
                 let _variant = since.patch(n);

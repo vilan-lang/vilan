@@ -15,13 +15,13 @@ import std::reactive::store::{ Storable, Store, StoreSome, StoreFlag };
 
 | Item | Kind | One line |
 |---|---|---|
-| `[derive(Storable)]` | derive | a struct's or an enum's store surface: its diff and one projection per field |
-| `Store<T>` | struct | a root plus a path: a `Source<T>` and a `Signal<T>`, the root and every projection alike |
+| `[derive(Storable)]` | derive | a struct's or an enum's store surface: its diff, and for a struct the opt-in to field syntax |
+| `Store<T>` | struct | a root plus a path: a `Source<T>` and a `Signal<T>`, the root and every handle below it alike |
 | `Store::new(value)` | constructor | a root holding `value` |
 | `StoreSome<P>` | struct | a handle *through* an `Option` (or an enum variant): a `Source<Option<P>>` plus `patch` |
 | `StoreFlag` | struct | a discriminant as a read-only `Source<bool>` (`is_some()`, `is_online()`) |
+| `app.user`, `.field(key)` | on a struct handle | the handle on a field (or a path of fields), through the handle's one `[field_syntax]` door |
 | `[reactive(coarse)]` | field attribute | the field is one slot, compared whole |
-| `[reactive(name = "..")]` | field attribute | the name the field's projection is generated under |
 | `when_live(handle, body)` | `std::web::ui` | a variant as content: rebuilt only when the variant changes, the payload's `Store<P>` in hand |
 | `when_remote_live(handle, body)` | `std::web::remote` | `when_live` for a mirrored store's handle (`RemoteStoreSome<P>`), the payload's `RemoteStore<P>` in hand |
 | `.at(key)` | on a `HashMap` field | one key's value as a `Store<Option<V>>` that wakes for that key only |
@@ -50,32 +50,33 @@ struct User {
 
 fun main() {
 	let user = Store::new(User { name = "Alice", address = Address { city = "Oslo", zip = "0150" } });
-	let city: Store<str> = user.address().city();   // a handle, not a value
+	let city: Store<str> = user.address.city;   // a handle, not a value
 	let page = Owner::new();
 	run_with_owner(page, || {
-		user.name().effect(|name| print(i"name: {name}"));
+		user.name.effect(|name| print(i"name: {name}"));
 		city.effect(|now| print(i"city: {now}"));
 	});
-	city.set("Bergen");                               // prints "city: Bergen" — and not the name
-	print(user.address().zip().get());                // 0150
+	city.set("Bergen");                           // prints "city: Bergen" — and not the name
+	print(user.address.zip.get());                // 0150
 	page.dispose();
 }
 ```
 
 `Store::new(value)` makes a ROOT and hands back the handle to it. Every field
-of a derived type is a projection — another `Store`, cut from its parent:
-`user.address().city()` is a `Store<str>`. A projection reads, writes,
-subscribes and projects further exactly as the root does, so there is one type
-for both.
+of a derived struct is reached the way the value spells it: `user.address.city`
+is a `Store<str>`, another handle cut from its parent. A handle below the root
+reads, writes, subscribes and reaches further exactly as the root does, so there
+is one type for both.
 
 The value lives in the root, in place. `get()` copies out only the value at the
 handle's path — a read of `city` copies the city, never the whole user — and
 `set(v)` assigns in place through the root.
 
-**Field syntax.** A field reads the way the value spells it: on a `Store<T>`
-(and on a `StoreSome<T>`, below) a member that names a field of `T` is that
-field's projection, so `user.address.city` is `user.address().city()` — the
-same handle, written without the calls:
+**Field syntax.** Each handle type has one door, the `[field_syntax]` method
+`field`, which takes a [key](key.md): `user.address` is `user.field(User.address)`,
+and `user.address.city` is `user.field(User.address).field(Address.city)`. A
+PATH key reaches the same handle in one call — `user.field(User.address.city)` is
+the same slot, wakes the same subscribers and reads the same place as the chain:
 
 ```vilan
 import std::reactive::{ Signal, Source };
@@ -94,23 +95,30 @@ struct User {
 
 fun main() {
 	let user = Store::new(User { name = "Alice", address = Address { city = "Oslo" } });
-	user.address.city.set("Bergen");     // the handle `user.address().city()` is
-	print(user.address.city.get());      // Bergen
+	user.address.city.set("Bergen");
+	print(user.field(User.address.city).get());      // Bergen: the same handle
+	print(user.address.city.identity() == user.field(User.address.city).identity());   // true
 }
 ```
 
 A field read is a handle, so it is written through, never over:
-`user.name = "Bob"` is refused with the `.set(..)` that writes it. A field whose
-projection is renamed (`[reactive(name = "..")]`, below) is read by the
-projection's name, as a call; a type that does not derive `Storable` has no
-projections, so its store reads no fields this way. The handle's own fields
-are std's `[internal]` machinery and are not members outside std, so a field
-of `T` named `path` or `root` reads `T`'s field. A library handle opens the
-same door with one `[field_syntax]` method taking a key (std::key §"Field
-syntax on a handle"); the store's own rule is unchanged by it.
+`user.name = "Bob"` is refused with the `.set(..)` that writes it. A field is
+not a method, so `user.name()` is refused with the field syntax that reads it
+(v0.56 and earlier generated one projection METHOD per field; `vilan check --fix`
+rewrites every such call). A struct that does not derive `Storable` is a leaf of
+the store, read and written whole: `app.settings.theme` through a non-deriving
+`Settings` is refused with the derive that opens it.
 
-A handle is data: copying it allocates nothing, a projection allocates one step
-of its path, and it has no owner. It is a `Source<T>`, so every pipe, effect
+The handle's own members win: a field named like one — `get`, `set`, `derive`,
+`patch`, … — is reached by the written call, `request.field(Request.get)`, and
+the plain `request.get` is refused with both spellings. The handle's own fields
+are std's `[internal]` machinery and are not members outside std, so a field of
+`T` named `path` or `root` reads `T`'s field. The door is the same one a library
+handle opens (std::key §"Field syntax on a handle"): the compiler knows no store
+type by name.
+
+A handle is data: copying it allocates nothing, a step below it allocates one
+step of its path (a path key one per field), and it has no owner. It is a `Source<T>`, so every pipe, effect
 and binding takes one (`city.derive(..)`, `<p>{city}</p>`), and a `Signal<T>`,
 so anything that writes a signal writes it (`set_with`, `optimistic`,
 `bind_value`). Every handle to one path of one store has one `identity()`, so
@@ -145,15 +153,16 @@ fully landed.
 ## [derive(Storable)]
 
 The derive is the opt-in, and it is also the boundary: vilan has no private
-fields, so a type projects its fields only if its author derived `Storable`.
-Every other type is a **leaf**: one slot holding the whole value, compared with
-`==` when it has `PartialEq`, and counted as changed on every write that covers
-it when it has not (a closure, an opaque handle). `Option` needs no derive (see
-below).
+fields, so a struct's store reads its fields one by one only if its author
+derived `Storable`. Per struct the derive writes the diff, one line per field,
+and `StoreFields`, the marker the handles' door is bounded by; the handles' field
+reads are the door's, one generic method per handle type, so the derive writes
+nothing per field on the handles. Every other type is a **leaf**: one slot holding
+the whole value, compared with `==` when it has `PartialEq`, and counted as
+changed on every write that covers it when it has not (a closure, an opaque
+handle). `Option` needs no derive (see below).
 
-A field named like a member of the handle — `get`, `set`, `derive`, `effect`,
-`patch`, … — could never be reached as a projection, because a handle's own
-member wins. The derive refuses it; rename the projection:
+A field named like a member of the handle is reached through the door by name:
 
 ```vilan
 import std::reactive::{ Signal, Source };
@@ -161,16 +170,19 @@ import std::reactive::store::{ Storable, Store };
 
 [derive(Storable)]
 struct Request {
-	[reactive(name = "verb")]
 	get: str,
 }
 
 fun main() {
 	let request = Store::new(Request { get = "/" });
-	request.verb().set("/index");
-	print(request.verb().get());
+	request.field(Request.get).set("/index");
+	print(request.field(Request.get).get());
 }
 ```
+
+`[reactive(name = "..")]` renamed a field's projection until v0.56; there are no
+projections to rename, and the derive refuses it on a struct field with the
+written call that replaces it.
 
 `[reactive(coarse)]` makes a field ONE slot, compared whole with `==`, even when
 its type derives `Storable` — an `Address` that is always edited as a whole:
@@ -199,12 +211,12 @@ struct Profile {
 
 fun main() {
 	let profile = Store::new(Profile { nick = None });
-	let nick: StoreSome<str> = profile.nick().some();
+	let nick: StoreSome<str> = profile.nick.some();
 	print(nick.patch("al"));                 // false: the option is None, nothing lands
-	profile.nick().set(Some("ally"));
+	profile.nick.set(Some("ally"));
 	print(nick.patch("al"));                 // true
 	print(nick.get().unwrap_or("-"));        // al
-	print(profile.nick().is_some().get());   // true
+	print(profile.nick.is_some().get());   // true
 }
 ```
 
@@ -243,7 +255,7 @@ enum Presence {
 
 fun main() {
 	let presence = Store::new(Presence::Online(Device { name = "laptop", since = 1 }));
-	let name: StoreSome<str> = presence.online().name();
+	let name: StoreSome<str> = presence.online().name;
 	let page = Owner::new();
 	run_with_owner(page, || {
 		presence.is_online().effect(|live| print(i"online: {live}"));
@@ -308,7 +320,7 @@ A collection field takes its declared shape — no derive to write:
   a present value. `insert(key, value)` and `remove(key)` are the same two
   writes. The step lends the map's slot IN PLACE on both backends
   (`HashMap::peek` / `slot`): a read of one field through
-  `at(key).some().title()` copies only that field, however large the value it
+  `at(key).some().title` copies only that field, however large the value it
   sits in, and a write through `at(key)` lands where the value is — no copy out
   and back in.
 - a **`HashSet<T>`** likewise: `contains(x)` is a `Store<bool>`, and
@@ -338,16 +350,16 @@ struct Global {
 
 fun main() {
 	let global = Store::new(Global { channels = HashMap::new() });
-	global.channels().insert(1, Channel { name = "general", messages = [] });
-	global.channels().insert(2, Channel { name = "random", messages = [] });
+	global.channels.insert(1, Channel { name = "general", messages = [] });
+	global.channels.insert(2, Channel { name = "random", messages = [] });
 	let page = Owner::new();
 	run_with_owner(page, || {
-		global.channels().at(1).some().name().effect(|name| print(i"1 is {name.unwrap_or("-")}"));
-		global.channels().at(2).effect(|channel| print(i"2 has {channel.map(|held| held.messages.len()).unwrap_or(0)}"));
+		global.channels.at(1).some().name.effect(|name| print(i"1 is {name.unwrap_or("-")}"));
+		global.channels.at(2).effect(|channel| print(i"2 has {channel.map(|held| held.messages.len()).unwrap_or(0)}"));
 	});
-	global.channels().at(2).some().messages().push(40);   // "2 has 1" — channel 1 does not wake
-	let _renamed = global.channels().at(1).some().name().patch("lobby");   // "1 is lobby"
-	global.channels().remove(2);                          // "2 has 0"
+	global.channels.at(2).some().messages.push(40);   // "2 has 1" — channel 1 does not wake
+	let _renamed = global.channels.at(1).some().name.patch("lobby");   // "1 is lobby"
+	global.channels.remove(2);                          // "2 has 0"
 	page.dispose();
 }
 ```
@@ -356,7 +368,7 @@ A whole write of a collection diffs by key — a list by its common prefix and
 suffix, as `ListCell::reconcile_to` does — and wakes only the keys whose value
 changed. A map is never compared with `==`.
 
-A collection handle is also the shape's FLOW. `global.channels().keys()`,
+A collection handle is also the shape's FLOW. `global.channels.keys()`,
 `.values()`, `log.map(..)`, `each_by(log, ..)` start from it and are told OPS —
 a `MapOp` per changed key, a `SetOp` per member, a `SeqOp` per splice (`SetAt`
 for an element changed in place) — never handed a copy to diff. A push builds
@@ -457,7 +469,7 @@ impl Board {
 
 // at the client
 let global: RemoteStoreSome<Global> = client.global();
-global.messages().at(7).some().content().effect(|content| print(content.unwrap_or("")));
+global.messages.at(7).some().content.effect(|content| print(content.unwrap_or("")));
 ```
 
 A list field crosses by its splices — a push is the one element and a count,
@@ -467,8 +479,8 @@ told its keys when one comes or goes. `each` over it, each row on its own key,
 is the map leased as a collection:
 
 ```vilan,fragment
-<ul>{each(global.channels().keys(), |id| id, |id| {
-	<li>{when_remote_live(global.channels().at(id).some(), |channel| <b>{channel.name()}</b>)}</li>
+<ul>{each(global.channels.keys(), |id| id, |id| {
+	<li>{when_remote_live(global.channels.at(id).some(), |channel| <b>{channel.name}</b>)}</li>
 })}</ul>
 ```
 
@@ -491,7 +503,7 @@ whose body gets the payload's `RemoteStore<P>`, its fields plain and seeded:
 ```vilan,fragment
 import std::web::remote::when_remote_live;
 
-<li>{when_remote_live(global.messages().at(id).some(), |message| <span>{message.content()}</span>)}</li>
+<li>{when_remote_live(global.messages.at(id).some(), |message| <span>{message.content}</span>)}</li>
 ```
 
 ## What it costs
@@ -501,8 +513,11 @@ import std::web::remote::when_remote_live;
   read and write — and it allocates nothing until something subscribes.
 - **A whole write costs one comparison per live slot.** A handle write costs
   the comparisons under the handle.
-- **Projections are methods**: `user.address().city()`, and field syntax
-  (`user.address.city`) is the same call written without the parentheses.
+- **A field read is one call of the handle's door**: `user.address.city` is
+  `user.field(User.address).field(Address.city)`, each step one path node and
+  two closures over the key's place (natively the key's two accessors; on JS
+  its field position, resolved once per handle). A path key is one call that
+  makes one path node per field.
 - **A write through a variant lands in place** for a single payload and an
   `Option`'s `Some` (a `match &mut` capture is a writable view); a variant
   with several payloads copies its tuple out and back. A write under a map key
