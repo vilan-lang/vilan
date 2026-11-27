@@ -875,6 +875,14 @@ enum ScaleClock {
     /// measurement, and the one M15 exists to stop relying on. Unreachable on
     /// unix and windows; kept so the gate degrades rather than disappears.
     Wall,
+    /// The host has a thread CPU clock, but one too COARSE for the small
+    /// subject's window ([`THREAD_CPU_TICK`]), so the cost is wall clock. This
+    /// is windows: `GetThreadTimes` advances in scheduler ticks of 15.6 ms, and
+    /// the 20-site window is about 20 ms, so the CPU pair reads a handful of
+    /// ticks at best and `0 ms` against `15.62 ms` at worst (N212: the pin went
+    /// red on exactly that, "the 20-site measurement read zero", the day a
+    /// change made the small subject a little cheaper).
+    WallForACoarseCpuClock,
 }
 
 impl ScaleClock {
@@ -882,9 +890,24 @@ impl ScaleClock {
         match self {
             ScaleClock::ThreadCpu => "thread-cpu",
             ScaleClock::Wall => "wall",
+            ScaleClock::WallForACoarseCpuClock => "wall (thread-cpu too coarse)",
         }
     }
 }
+
+/// The step the thread CPU clock advances in. `GetThreadTimes` counts whole
+/// scheduler ticks (15.625 ms by default); the unix thread clock resolves
+/// nanoseconds, and a microsecond is a safe floor for it.
+#[cfg(windows)]
+const THREAD_CPU_TICK: Duration = Duration::from_micros(15_625);
+#[cfg(not(windows))]
+const THREAD_CPU_TICK: Duration = Duration::from_micros(1);
+
+/// How many ticks the SMALL subject's CPU reading must span before a ratio of
+/// two CPU readings means anything: one tick of error on a reading of
+/// sixteen is about 6 %, far inside the distance between a linear pass (about
+/// 3×) and the 6× bound.
+const THREAD_CPU_TICKS_FOR_A_RATIO: u32 = 16;
 
 /// The `post_analysis_passes` COST of TWO style-heavy entries, measured warm,
 /// ALTERNATELY — small, large, small, large… — and each taken as the MINIMUM
@@ -962,7 +985,7 @@ fn const_pass_costs(
     };
     let cost = |sample: &PhaseSample| match clock {
         ScaleClock::ThreadCpu => sample.post_cpu.unwrap_or(sample.post),
-        ScaleClock::Wall => sample.post,
+        ScaleClock::Wall | ScaleClock::WallForACoarseCpuClock => sample.post,
     };
     let mut measured = ConstPassCost {
         small: Duration::MAX,
@@ -978,6 +1001,17 @@ fn const_pass_costs(
         let large_sample = measure_phases(&large, std, platform, false);
         measured.large = measured.large.min(cost(&large_sample));
         measured.large_wall = measured.large_wall.min(large_sample.post);
+    }
+    // N212: a CPU reading of a few ticks cannot carry a ratio (see
+    // [`ScaleClock::WallForACoarseCpuClock`]). The wall pair was measured in
+    // the same rounds, so the gate degrades to it and says so, rather than
+    // dividing by a reading of zero ticks.
+    if measured.clock == ScaleClock::ThreadCpu
+        && measured.small < THREAD_CPU_TICK * THREAD_CPU_TICKS_FOR_A_RATIO
+    {
+        measured.small = measured.small_wall;
+        measured.large = measured.large_wall;
+        measured.clock = ScaleClock::WallForACoarseCpuClock;
     }
     measured
 }
