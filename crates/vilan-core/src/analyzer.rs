@@ -89437,7 +89437,9 @@ fn std_import_index(std: &PackageSpec, platform: Platform) -> std::sync::Arc<Std
                             .map(|seed| seed.to_string()),
                     )
                     .chain(
-                        collect_std_item_modules(&loaded.ast.0)
+                        // M211: without the key seed, as the drain reads a std
+                        // module.
+                        collect_std_item_modules_seeding(&loaded.ast.0, false)
                             .into_iter()
                             .map(str::to_string),
                     )
@@ -92166,13 +92168,16 @@ fn analyze_inner<'src>(
                     }
                     // B270, the entry's twin: a loaded module's own `css` blocks and
                     // elements seed their std modules, whatever package it belongs to.
+                    // M211's key seed is not asked of a std module (std writes its
+                    // dependency on `std::key` as an import — `std_modules_import_
+                    // the_key_they_seed` holds every file to it), nor once the module
+                    // is loading.
+                    let want_key = !(origin == Origin::Std && !compiling_std)
+                        && !loaded_keys.contains(&(Origin::Std, STD_KEY_MODULE));
                     to_load.extend(
-                        collect_std_item_modules_seeding(
-                            &ast.0,
-                            !loaded_keys.contains(&(Origin::Std, STD_KEY_MODULE)),
-                        )
-                        .into_iter()
-                        .map(|module| (Origin::Std, module)),
+                        collect_std_item_modules_seeding(&ast.0, want_key)
+                            .into_iter()
+                            .map(|module| (Origin::Std, module)),
                     );
                     // Seed the module's `std::` and `<dep>::` references. Only the *building*
                     // package's own code (`Pkg`) is cross-target-gated — a dependency's modules
@@ -98716,6 +98721,56 @@ pub fn check_unlowered_externals(program: &mut Program) {
                 msg,
             },
             source,
+        );
+    }
+}
+
+#[cfg(test)]
+mod std_key_seed_tests {
+    //! M211: the loader does not ask a std module for the `std::key` seed —
+    //! the drain and the std import index both skip it — so every std file
+    //! whose syntax would seed the module must import it by path instead (or
+    //! be `std::key` itself). This holds every file of every std layer to it.
+
+    use super::*;
+
+    #[test]
+    fn std_modules_import_the_key_they_seed() {
+        let std_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std");
+        let spec = crate::manifest::resolve_std(&std_dir);
+        let roots: Vec<&Path> = std::iter::once(spec.base_root.as_path())
+            .chain(spec.layers.iter().map(|layer| layer.root.as_path()))
+            .collect();
+        let mut checked = 0;
+        let mut offenders = Vec::new();
+        for root in &roots {
+            for (_, path) in modules_under_root(root, &roots) {
+                let Some(loaded) = load_package_module(&path) else {
+                    continue;
+                };
+                checked += 1;
+                if path == std_module_path(&spec.base_root, "key.vl")
+                    || !collect_std_item_modules(&loaded.ast.0).contains(&STD_KEY_MODULE)
+                {
+                    continue;
+                }
+                let imports_key =
+                    collect_module_paths(&loaded.ast.0, "pkg")
+                        .iter()
+                        .any(|(request, _)| {
+                            *request == STD_KEY_MODULE
+                                || request.starts_with(&format!("{STD_KEY_MODULE}::"))
+                        });
+                if !imports_key {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(checked > 50, "only {checked} std files were found");
+        assert!(
+            offenders.is_empty(),
+            "these std files write syntax that needs `std::key` without importing it \
+             (add `import pkg::key::Key;` or whatever they use): {offenders:#?}"
         );
     }
 }
