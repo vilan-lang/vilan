@@ -30560,6 +30560,11 @@ impl<'src> Analyzer<'src> {
         {
             return retaining.get(&callee_id).cloned().unwrap_or_default();
         }
+        // B711 S3a: a `MaybeKey`'s continuations call their closure before
+        // they return and keep nothing — the compiler writes their bodies.
+        if self.is_maybe_key_continuation(callee_id) {
+            return BTreeSet::new();
+        }
         let arity = self
             .functions
             .get(&callee_id)
@@ -30571,6 +30576,23 @@ impl<'src> Analyzer<'src> {
             })
             .unwrap_or(0);
         (0..arity as u32).collect()
+    }
+
+    /// B711 S3a: whether `callee_id` is one of `MaybeKey`'s four intrinsic
+    /// continuations (`get`, `view`, `change`, `put`), whose emitted bodies
+    /// lend the place to the closure for the call and keep no argument.
+    fn is_maybe_key_continuation(&self, callee_id: Id) -> bool {
+        let Some(maybe_key) = self.maybe_key_struct_id else {
+            return false;
+        };
+        self.implementations.iter().any(|implementation| {
+            matches!(
+                self.type_id_to_type_map.get(&implementation.subject),
+                Some(Type::Struct(id, _)) if *id == maybe_key
+            ) && ["get", "view", "change", "put"]
+                .iter()
+                .any(|name| implementation.declarations.get(*name) == Some(&callee_id))
+        })
     }
 
     /// C16's interprocedural summary over the WHOLE program, by rounds: per

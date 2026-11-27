@@ -588,3 +588,27 @@ fn keys_std_layout() {
     );
     assert_eq!(declared("enum StepKind {"), ["Field", "Variant"]);
 }
+
+/// The continuations call their closure before they return and keep
+/// nothing, so a closure capturing a VIEW may be handed to one (an external
+/// with no readable body is otherwise assumed to keep what it is handed).
+#[test]
+fn maybe_keys_a_continuation_takes_a_closure_capturing_a_view() {
+    maybe_runs(
+        r#"
+        fun total(d: &Doc, acc: &mut i32): bool {
+            Doc.owner::Some.age.view(d, |age| {
+                acc = *acc + *age;
+            })
+        }
+
+        fun main() {
+            let d = doc();
+            mut sum = 10;
+            print(total(&d, &mut sum));
+            print(sum);
+        }
+        "#,
+        "true\n13\n",
+    );
+}
