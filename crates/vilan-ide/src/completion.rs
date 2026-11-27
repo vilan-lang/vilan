@@ -2449,14 +2449,8 @@ impl<'a, 'src> Analysis<'a, 'src> {
             .unwrap_or_else(|| name.to_string())
     }
 
-    /// A149 S4: on a store handle, the fields of the struct it handles, offered
-    /// the way field syntax reads them (`app.user`). Each REPLACES its
-    /// projection's method candidate of the same name: the two are one member,
-    /// and the field spelling is the one a reader writes. The answer is
-    /// `vilan_core::field_syntax`'s, the analyzer's own reader, so the list
-    /// cannot offer a field the analysis would refuse.
-    ///
-    /// B711 S2a: on a receiver whose type has a `[field_syntax]` method, the
+    /// B711: on a receiver whose type has a `[field_syntax]` method (std's
+    /// store handles among them, S2b), the
     /// fields of the struct its key is over, AFTER the receiver's own members
     /// and never in place of one (a member of the receiver shadows the field,
     /// as the analysis reads it). Each carries the read's RESULT type, the
@@ -2497,15 +2491,6 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 self.doc_first_paragraph_at(source, field.name_span.into_range().start)
             });
             completion.internal = field.internal.map(str::to_string);
-            items.push(completion);
-        }
-        for (name, projection) in program.field_syntax().projected_fields(receiver) {
-            items.retain(|item| !(item.label == name && item.kind == CompletionKind::Method));
-            let mut completion = Completion::bare(name.to_string(), CompletionKind::Field);
-            if let Some(target) = self.function_target(projection) {
-                completion.detail = signature_label(program, target);
-                completion.documentation = self.doc_first_paragraph(target);
-            }
             items.push(completion);
         }
     }
@@ -2701,8 +2686,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// (`Store<App>`), and the methods offered are those of the impls that
     /// APPLY to it — the solver's selection
     /// ([`vilan_core::impl_select::applying_implementations`]), so an inherent
-    /// impl at other type arguments (`impl Store<Address>`'s projections on a
-    /// `Store<App>`) is not offered, where every impl of the nominal was.
+    /// impl at other type arguments (`impl Store<Presence>`'s variant
+    /// projections on a `Store<App>`) is not offered, where every impl of the
+    /// nominal was.
     fn nominal_member_completions(&self, type_id: Id, receiver: Option<TypeId>) -> Vec<Completion> {
         let program = self.program;
         let mut items = Vec::new();
@@ -2977,8 +2963,8 @@ impl<'a, 'src> Analysis<'a, 'src> {
             return None;
         };
         match index.checked_sub(1).map(|before| &tokens[before].0) {
-            // `x.f` — a field read; on a store handle, field syntax (A149 S4):
-            // the projection's result, grounded through the handle's type.
+            // `x.f` — a field read; on a handle, field syntax (B711): the door
+            // method's result at the field, grounded through the handle's type.
             Some(Token::Ctrl('.')) => {
                 let receiver = self.live_receiver_type_id(tokens, index - 2, depth + 1)?;
                 let nominal = nominal_type_id(program, receiver)?;
@@ -3000,9 +2986,6 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 field.or_else(|| {
                     let receiver_type = program.type_id_to_type_map.get(&receiver)?;
                     match program.field_syntax().read(receiver_type, name) {
-                        vilan_core::field_syntax::Reading::Projection(member) => self
-                            .receiver_grounded_result_type_id(member, receiver)
-                            .or_else(|| self.declared_result_type_id(member)),
                         // B711 S2a: a keyed read is the method's result at
                         // the field — unless a member of the receiver shadows
                         // it, which the analysis reads instead (and refuses).

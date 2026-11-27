@@ -3994,12 +3994,12 @@ fun main() {
 	let g: RemoteStoreSome<Global> = mint_store(client, || call_reading(local, codec, "global", [], |reply: Deserializer| read_store_reply<Global>(reply, false)));
 	let root = mount_root("app", || {
 		view("div")
-			.child(when_remote_live(g.messages().at(7).some(), |message: RemoteStore<Message>| {
+			.child(when_remote_live(g.messages.at(7).some(), |message: RemoteStore<Message>| {
 				print("build seven");
 				on_cleanup(|| print("released seven"));
-				view("p").bind_text(message.content())
+				view("p").bind_text(message.content)
 			}))
-			.child(when_all_some((g.motd(), g.messages().at(7).some().author()), |(motd, author)| {
+			.child(when_all_some((g.motd, g.messages.at(7).some().author), |(motd, author)| {
 				print("build both");
 				on_cleanup(|| print("released both"));
 				view("b")
@@ -4009,14 +4009,14 @@ fun main() {
 	});
 	sleep_for(Duration::millis(0));
 	print(i"seeded={tree()}");
-	let _edited = global.messages().at(7).some().content().patch("goodbye");
-	global.motd().set("bye");
+	let _edited = global.messages.at(7).some().content.patch("goodbye");
+	global.motd.set("bye");
 	sleep_for(Duration::millis(0));
 	print(i"patched={tree()}");
-	global.messages().at(7).set(None);
+	global.messages.at(7).set(None);
 	sleep_for(Duration::millis(0));
 	print(i"gone={tree()}");
-	global.messages().at(7).set(Some(Message { id = 7, author = "amy", content = "back" }));
+	global.messages.at(7).set(Some(Message { id = 7, author = "amy", content = "back" }));
 	sleep_for(Duration::millis(0));
 	print(i"back={tree()}");
 	root.dispose();
@@ -4119,12 +4119,12 @@ fun main() {
 	// sequence inside it (each push one splice).
 	let app = mount_root("app", || {
 		view("div").child(when_remote_live(root, |g: RemoteStore<Global>| {
-			view("ul").child(each(g.rooms().keys(), |id| id, |id| {
+			view("ul").child(each(g.rooms.keys(), |id| id, |id| {
 				print(i"build room {id}");
-				view("li").child(when_remote_live(g.rooms().at(id).some(), |room: RemoteStore<Room>| {
+				view("li").child(when_remote_live(g.rooms.at(id).some(), |room: RemoteStore<Room>| {
 					view("p")
-						.child(view("b").bind_text(room.name()))
-						.child(each(room.messages(), |message| message, |message| view("i").text(i"{message}")))
+						.child(view("b").bind_text(room.name))
+						.child(each(room.messages, |message| message, |message| view("i").text(i"{message}")))
 				}))
 			}))
 		}))
@@ -4133,12 +4133,12 @@ fun main() {
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print(i"seeded={tree()}");
-	global.rooms().at(1).some().messages().push(12);
-	let _renamed = global.rooms().at(2).some().name().patch("chat");
+	global.rooms.at(1).some().messages.push(12);
+	let _renamed = global.rooms.at(2).some().name.patch("chat");
 	sleep_for(Duration::millis(0));
 	print(i"patched={tree()}");
-	global.rooms().at(3).set(Some(Room { id = 3, name = "new", messages = [] }));
-	global.rooms().at(2).set(None);
+	global.rooms.at(3).set(Some(Room { id = 3, name = "new", messages = [] }));
+	global.rooms.at(2).set(None);
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));

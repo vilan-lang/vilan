@@ -198,40 +198,40 @@ fun a_write_to_one_key_wakes_that_keys_readers_and_nobody_elses() {
 		mut id = 1;
 		for id <= 6 {
 			let name = i"k{id}";
-			store.channels().at(id).effect_on_change(|_held| bump(name));
+			store.channels.at(id).effect_on_change(|_held| bump(name));
 			id += 1;
 		}
-		store.channels().effect_on_change(|_map| bump("map"));
-		store.channels().at(3).some().name().effect_on_change(|_name| bump("name3"));
-		store.tags().effect_on_change(|_tags| bump("tags"));
+		store.channels.effect_on_change(|_map| bump("map"));
+		store.channels.at(3).some().name.effect_on_change(|_name| bump("name3"));
+		store.tags.effect_on_change(|_tags| bump("tags"));
 	});
 	print(i"subscribed:{tally()}");
-	let _renamed = store.channels().at(3).some().name().patch("three");
+	let _renamed = store.channels.at(3).some().name.patch("three");
 	print(i"key 3's name patched:{tally()}");
-	let _pushed = store.channels().at(3).some().messages().push(30);
+	let _pushed = store.channels.at(3).some().messages.push(30);
 	print(i"key 3's list pushed:{tally()}");
-	store.channels().at(3).set(store.channels().at(3).get());
+	store.channels.at(3).set(store.channels.at(3).get());
 	print(i"key 3 set to what it holds:{tally()}");
-	store.channels().insert(4, channel(4, "four"));
+	store.channels.insert(4, channel(4, "four"));
 	print(i"key 4 replaced:{tally()}");
-	store.channels().insert(9, channel(9, "nine"));
+	store.channels.insert(9, channel(9, "nine"));
 	print(i"key 9 arrived:{tally()}");
-	store.channels().remove(5);
+	store.channels.remove(5);
 	print(i"key 5 removed:{tally()}");
-	store.channels().remove(5);
+	store.channels.remove(5);
 	print(i"key 5 removed again:{tally()}");
-	mut whole = store.channels().get();
+	mut whole = store.channels.get();
 	whole.insert(2, channel(2, "two"));
-	store.channels().set(whole);
+	store.channels.set(whole);
 	print(i"whole map, key 2 changed:{tally()}");
-	store.channels().set(store.channels().get());
+	store.channels.set(store.channels.get());
 	print(i"whole map unchanged:{tally()}");
 	mut root = store.get();
 	root.tags.insert("new");
 	store.set(root);
 	print(i"root written, only the set changed:{tally()}");
-	print(store.channels().at(3).get().map(|held| held.name).unwrap_or("-"));
-	print(store.channels().at(5).get().is_none());
+	print(store.channels.at(3).get().map(|held| held.name).unwrap_or("-"));
+	print(store.channels.at(5).get().is_none());
 	owner.dispose();
 	print(census(store));
 }
@@ -240,12 +240,12 @@ fun a_keyed_slot_lives_as_long_as_its_subscriptions() {
 	print("-- a keyed slot lives as long as its subscriptions");
 
 	let store = Store::new(global());
-	let _read = store.channels().at(2).get();
+	let _read = store.channels.at(2).get();
 	print(i"one read: {census(store)}");
-	let first = store.channels().at(2).on_change(|_held| bump("a"));
-	let second = store.channels().at(2).on_change(|_held| bump("b"));
+	let first = store.channels.at(2).on_change(|_held| bump("a"));
+	let second = store.channels.at(2).on_change(|_held| bump("b"));
 	print(i"two on key 2: {census(store)}");
-	let third = store.channels().at(4).some().name().on_change(|_name| bump("c"));
+	let third = store.channels.at(4).some().name.on_change(|_name| bump("c"));
 	print(i"and key 4's name: {census(store)}");
 	first.dispose();
 	second.dispose();
@@ -258,32 +258,32 @@ fun a_map_field_is_a_map_flow_told_one_op_per_changed_key() {
 	print("-- a map field is a map flow told one op per changed key");
 
 	let store = Store::new(global());
-	let flow = store.channels().open();
+	let flow = store.channels.open();
 	print(i"open: {census(store)}");
-	store.channels().insert(7, channel(7, "seven"));
-	store.channels().at(1).set(Some(channel(1, "one")));
-	let _renamed = store.channels().at(2).some().name().patch("two");
-	store.channels().remove(3);
-	store.channels().remove(3);
-	store.channels().at(4).set(store.channels().at(4).get());
+	store.channels.insert(7, channel(7, "seven"));
+	store.channels.at(1).set(Some(channel(1, "one")));
+	let _renamed = store.channels.at(2).some().name.patch("two");
+	store.channels.remove(3);
+	store.channels.remove(3);
+	store.channels.at(4).set(store.channels.at(4).get());
 	print(i"handle writes:{map_ops((flow.drain)())}");
-	mut whole = store.channels().get();
+	mut whole = store.channels.get();
 	whole.remove(4);
 	whole.insert(5, channel(5, "five"));
 	whole.insert(8, channel(8, "eight"));
-	store.channels().set(whole);
+	store.channels.set(whole);
 	print(i"whole write:{map_ops((flow.drain)())}");
 	mut root = store.get();
 	root.channels.remove(8);
 	store.set(root);
 	print(i"root write:{map_ops((flow.drain)())}");
-	store.channels().set(store.channels().get());
+	store.channels.set(store.channels.get());
 	print(i"unchanged:{map_ops((flow.drain)())}");
 	(flow.release)();
 	print(i"released: {census(store)}");
-	let keys = store.channels().keys().memo_global();
-	store.channels().insert(10, channel(10, "ten"));
-	store.channels().remove(1);
+	let keys = store.channels.keys().memo_global();
+	store.channels.insert(10, channel(10, "ten"));
+	store.channels.remove(1);
 	print(i"keys: {keys.len()} {keys.contains(10).get()} {keys.contains(1).get()}");
 }
 
@@ -291,25 +291,25 @@ fun a_set_field_wakes_one_member_and_is_told_set_ops() {
 	print("-- a set field wakes one member and is told set ops");
 
 	let store = Store::new(global());
-	let flow = store.tags().open();
+	let flow = store.tags.open();
 	let owner = Owner::new();
 	run_with_owner(owner, || {
-		store.tags().contains("red").effect_on_change(|held| bump(i"red:{held}"));
-		store.tags().contains("blue").effect_on_change(|held| bump(i"blue:{held}"));
+		store.tags.contains("red").effect_on_change(|held| bump(i"red:{held}"));
+		store.tags.contains("blue").effect_on_change(|held| bump(i"blue:{held}"));
 	});
-	store.tags().insert("red");
+	store.tags.insert("red");
 	print(i"red added:{tally()}");
-	store.tags().insert("green");
+	store.tags.insert("green");
 	print(i"green added:{tally()}");
-	store.tags().contains("red").set(true);
+	store.tags.contains("red").set(true);
 	print(i"red added again:{tally()}");
-	store.tags().remove("red");
-	store.tags().contains("blue").set(true);
+	store.tags.remove("red");
+	store.tags.contains("blue").set(true);
 	print(i"red removed, blue added:{tally()}");
 	mut whole: HashSet<str> = HashSet::new();
 	whole.insert("blue");
 	whole.insert("pink");
-	store.tags().set(whole);
+	store.tags.set(whole);
 	print(i"whole write:{tally()}");
 	print(i"ops:{set_ops((flow.drain)())}");
 	owner.dispose();
@@ -321,34 +321,32 @@ fun a_keyed_list_reads_by_key_and_wakes_only_the_element_that_moved() {
 	print("-- a keyed list reads by key and wakes only the element that moved");
 
 	let store = Store::new(global());
-	store.log().push(Message { id = 1, text = "hi" });
-	store.log().push(Message { id = 2, text = "yo" });
+	store.log.push(Message { id = 1, text = "hi" });
+	store.log.push(Message { id = 2, text = "yo" });
 	let owner = Owner::new();
 	run_with_owner(owner, || {
-		store.log().by_key(1).effect_on_change(|_held| bump("m1"));
-		store.log().by_key(2).effect_on_change(|_held| bump("m2"));
-		store.log().by_key(2).some().text().effect_on_change(|_text| bump("text2"));
-		store.log().effect_on_change(|_list| bump("log"));
+		store.log.by_key(1).effect_on_change(|_held| bump("m1"));
+		store.log.by_key(2).effect_on_change(|_held| bump("m2"));
+		store.log.by_key(2).some().text.effect_on_change(|_text| bump("text2"));
+		store.log.effect_on_change(|_list| bump("log"));
 	});
-	store.log().push(Message { id = 3, text = "hey" });
+	store.log.push(Message { id = 3, text = "hey" });
 	print(i"another pushed:{tally()}");
-	let _edited = store.log().by_key(1).some().text().patch("HI");
+	let _edited = store.log.by_key(1).some().text.patch("HI");
 	print(i"1 edited by key:{tally()}");
-	store
-		.log()
-		.set([
-			Message { id = 1, text = "HI" },
-			Message { id = 2, text = "YO" },
-			Message { id = 3, text = "hey" },
-		]);
+	store.log.set([
+		Message { id = 1, text = "HI" },
+		Message { id = 2, text = "YO" },
+		Message { id = 3, text = "hey" },
+	]);
 	print(i"whole list, 2 changed:{tally()}");
-	store.log().remove_at(0);
+	store.log.remove_at(0);
 	print(i"1 spliced out:{tally()}");
-	store.log().splice(0, 1, [Message { id = 2, text = "YO" }]);
+	store.log.splice(0, 1, [Message { id = 2, text = "YO" }]);
 	print(i"the same element spliced back:{tally()}");
-	store.log().by_key(4).set(Some(Message { id = 4, text = "four" }));
-	store.log().by_key(3).set(None);
-	print(i"4 appended, 3 removed by key:{tally()} {texts(store.log().get())}");
+	store.log.by_key(4).set(Some(Message { id = 4, text = "four" }));
+	store.log.by_key(3).set(None);
+	print(i"4 appended, 3 removed by key:{tally()} {texts(store.log.get())}");
 	owner.dispose();
 	print(census(store));
 }
@@ -357,27 +355,26 @@ fun a_list_field_is_a_collection_flow_told_splices() {
 	print("-- a list field is a collection flow told splices");
 
 	let store = Store::new(global());
-	let flow = store.log().open();
-	store.log().push(Message { id = 1, text = "hi" });
-	store.log().push(Message { id = 2, text = "yo" });
-	let _edited = store.log().by_key(1).some().text().patch("HI");
-	store.log().by_key(2).set(None);
+	let flow = store.log.open();
+	store.log.push(Message { id = 1, text = "hi" });
+	store.log.push(Message { id = 2, text = "yo" });
+	let _edited = store.log.by_key(1).some().text.patch("HI");
+	store.log.by_key(2).set(None);
 	print(i"writes:{seq_ops((flow.drain)())}");
-	store.log().set([Message { id = 0, text = "zero" }, Message { id = 1, text = "HI" }]);
+	store.log.set([Message { id = 0, text = "zero" }, Message { id = 1, text = "HI" }]);
 	print(i"whole write:{seq_ops((flow.drain)())}");
-	store.log().set(store.log().get());
+	store.log.set(store.log.get());
 	print(i"unchanged:{seq_ops((flow.drain)())}");
 	(flow.release)();
 	let mapped = Shared::new(0);
-	let lengths = store
-		.log()
+	let lengths = store.log
 		.map(|message: Message| {
 			mapped.write() = mapped.read() + 1;
 			message.text.len()
 		})
 		.memo_global();
 	print(i"sealed: mapped={mapped.read()} {lengths.get().len()}");
-	store.log().push(Message { id = 6, text = "six" });
+	store.log.push(Message { id = 6, text = "six" });
 	print(i"one pushed: mapped={mapped.read()} {lengths.get().len()}");
 }
 

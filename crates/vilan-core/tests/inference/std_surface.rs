@@ -965,7 +965,7 @@ fn b689_insert_keeps_copies_of_what_it_is_given() {
 /// map's slot — `at`'s two closures call `peek`/`slot` (M191), which reach the
 /// slot through `__nmap_lend`/`__nmap_slot`, and NONE of the four clones the
 /// value. A
-/// read through `at(1).some().title().get()` copies only the leaf (the
+/// read through `at(1).some().title.get()` copies only the leaf (the
 /// timings are the lane report's: a timing is not a gate).
 #[test]
 fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
@@ -990,9 +990,9 @@ fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
             mut records: HashMap<i32, Record> = HashMap::new();
             records.insert(1, Record { title = "first", notes = ["a", "b"] });
             let store = Store::new(State { records });
-            print(store.records().at(1).some().title().get().unwrap_or("?"));
-            let _changed = store.records().at(1).some().title().patch("renamed");
-            print(store.records().at(1).some().title().get().unwrap_or("?"));
+            print(store.records.at(1).some().title.get().unwrap_or("?"));
+            let _changed = store.records.at(1).some().title.patch("renamed");
+            print(store.records.at(1).some().title.get().unwrap_or("?"));
         }
         "#,
     )
@@ -1037,7 +1037,7 @@ fn b689_the_store_keyed_step_lends_the_slot_without_a_copy() {
 }
 
 /// §4.5 run, and §4.6: the same reads and writes through `at(key)` answer the
-/// values they did when the step copied — a write through `some().title()`
+/// values they did when the step copied — a write through `some().title`
 /// lands in the map, `at(2).set(Some(..))` inserts, `at(1).set(None)` removes.
 #[test]
 fn b689_a_store_write_through_the_keyed_step_lands_in_place() {
@@ -1062,16 +1062,16 @@ fn b689_a_store_write_through_the_keyed_step_lands_in_place() {
             mut records: HashMap<i32, Record> = HashMap::new();
             records.insert(1, Record { title = "first", notes = ["a"] });
             let store = Store::new(State { records });
-            let title = store.records().at(1).some().title();
+            let title = store.records.at(1).some().title;
             print(title.get().unwrap_or("?"));
             let _changed = title.patch("renamed");
             print(title.get().unwrap_or("?"));
-            store.records().at(2).set(Some(Record { title = "second", notes = [] }));
-            print(store.records().len());
-            store.records().at(1).set(None);
-            print(store.records().len());
-            print(store.records().at(1).get().is_none());
-            print(store.records().at(2).some().title().get().unwrap_or("?"));
+            store.records.at(2).set(Some(Record { title = "second", notes = [] }));
+            print(store.records.len());
+            store.records.at(1).set(None);
+            print(store.records.len());
+            print(store.records.at(1).get().is_none());
+            print(store.records.at(2).some().title.get().unwrap_or("?"));
         }
         "#,
         "first\nrenamed\n2\n1\ntrue\nsecond\n",

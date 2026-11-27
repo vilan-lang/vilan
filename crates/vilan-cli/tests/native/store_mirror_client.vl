@@ -89,32 +89,27 @@ fun main() {
 	print(i"unleased: {g.get().is_some()}");
 	let page = Owner::new();
 	run_with_owner(page, || {
-		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
-		g.presence().online().effect(|place| print(i"online {place.unwrap_or("-")}"));
-		g.presence().is_online().effect(|on| print(i"is online {on}"));
-		g
-			.messages()
-			.at(7)
-			.some()
-			.content()
-			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
-		g.messages().at(7).some().id().effect(|id| print(i"seven's id {id.unwrap_or(0)}"));
+		g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g.presence.online().effect(|place| print(i"online {place.unwrap_or("-")}"));
+		g.presence.is_online().effect(|on| print(i"is online {on}"));
+		g.messages.at(7).some().content.effect(|content| print(i"seven {content.unwrap_or("-")}"));
+		g.messages.at(7).some().id.effect(|id| print(i"seven's id {id.unwrap_or(0)}"));
 	});
 	sleep_for(Duration::millis(0));
 	print("-- server writes");
-	global.motd().set("bye");
-	global.presence().set(Presence::Offline);
-	let _edited = global.messages().at(7).some().content().patch("goodbye");
+	global.motd.set("bye");
+	global.presence.set(Presence::Offline);
+	let _edited = global.messages.at(7).some().content.patch("goodbye");
 	print("-- the page goes: the grant is let go");
 	page.dispose();
 	sleep_for(Duration::millis(0));
-	global.motd().set("unwatched");
+	global.motd.set("unwatched");
 	print(i"held: {g.get().map(|value: Global| value.motd).unwrap_or("-")}");
-	print(i"the released key left the replica: {g.messages().at(7).get().flatten().is_none()}");
+	print(i"the released key left the replica: {g.messages.at(7).get().flatten().is_none()}");
 	print("-- a new lease mints again");
 	let again = Owner::new();
 	run_with_owner(again, || {
-		g.motd().effect(|motd| print(i"again {motd.unwrap_or("-")}"));
+		g.motd.effect(|motd| print(i"again {motd.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	again.dispose();

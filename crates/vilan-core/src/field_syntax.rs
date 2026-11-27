@@ -1,38 +1,15 @@
-//! Field syntax on store handles (A149 S4, `proposal/store.md` §3.2, ruled R-e).
+//! Field syntax on a handle (B711, `proposal/struct-keys.md` §3.5, R6).
 //!
-//! `[derive(Storable)]` puts one PROJECTION per field on `Store<T>` and
-//! `StoreSome<T>`: `app.user()` is the handle on `app`'s `user` field. This tier
-//! lets a reader write the field the way the value spells it, `app.user.name`
-//! for `app.user().name()`:
-//!
-//! > on a `Store<T>` (or `StoreSome<T>`) value, a member that names a field of
-//! > `T` resolves to the projection of that name.
-//!
-//! It sits AFTER the handle's own fields, so it can shadow nothing a handle
-//! has: the handles' fields are `[internal]`, and an internal std field is not
-//! a member outside std (the ruled door, the cause), so a field of `T` named
-//! `path` or `root` reaches its projection rather than the handle's slot tree.
-//! A method is never in the way: a bare `.name` is no method reference in
-//! vilan, and the derive refuses a field named like a handle member (Q9).
-//!
-//! A PROJECTION is a self-only method declared in an inherent impl whose
-//! subject is the handle AT `T`'s own type (`impl Store<User>`) — exactly what
-//! the derive writes, and never what std's `impl Store<type T>` is. That is
-//! what keeps a renamed projection honest: a field `get` renamed `verb` with
-//! `[reactive(name = "verb")]` has no projection called `get`, and `request.get`
-//! is refused with that said, rather than reaching the handle's own `get()`.
-//!
-//! ONE reader for both questions — the analyzer asking what `.name` means
-//! while it solves, and the editor asking what to offer after `app.` — so the
-//! two cannot disagree about which fields read through.
-//!
-//! ## The keyed reading (B711 S2a, `proposal/struct-keys.md` §3.5, R6)
-//!
-//! The handle door opened to library types: one attribute on one method.
+//! The handle door is one attribute on one method:
 //!
 //! > on a receiver whose type has a `[field_syntax]` method taking a
 //! > `Key<T, _>`, a member that is no member of the receiver and names a field
-//! > of the struct `T` reads as `receiver.method(T.name)`.
+//! > of the struct `T` reads as `receiver.method(T.member)`.
+//!
+//! std's store handles read their struct's fields through it (S2b: `Store`,
+//! `StoreSome`, `RemoteStore` and `RemoteStoreSome` each declare one
+//! `[field_syntax] fun field`), exactly as a library's handle does: the
+//! compiler knows no store type by name.
 //!
 //! It is consulted only where a member read has already failed to find a
 //! field (the analyzer's), and only for a struct that an inherent impl
@@ -43,10 +20,9 @@
 //! method it refuses, so a malformed declaration is one diagnostic, never a
 //! cascade at every read.
 //!
-//! The store reading above is keyed on std's two handles and stays as it is
-//! until std's store moves to the attribute (S2b), which deletes
-//! [`Surface::handles`] and the projection lookup and leaves this half
-//! untouched.
+//! ONE reader for both questions — the analyzer asking what `.name` means
+//! while it solves, and the editor asking what to offer after `app.` — so the
+//! two cannot disagree about which fields read through.
 
 use crate::analyzer::{Expr, Function, Implementation, Parameter, Struct};
 use crate::fx::{FxHashMap as HashMap, FxIndexMap as IndexMap};
@@ -63,9 +39,6 @@ pub struct Surface<'a, 'src> {
     pub entities: &'a HashMap<Id, Expr<'src>>,
     pub functions: &'a IndexMap<Id, Function<'src>>,
     pub parameters: &'a IndexMap<Id, Parameter<'src>>,
-    /// The handle structs the tier applies to — std's `Store` and `StoreSome`,
-    /// when `std::reactive::store_core` is loaded.
-    pub handles: &'a [Id],
     /// B711 S2a: the `[field_syntax]` methods of inherent impls, each as
     /// (implementation index, member id).
     pub keyed_methods: &'a [(usize, Id)],
@@ -172,138 +145,35 @@ impl ShapeProblem {
 /// What `receiver.member` means under the tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reading {
-    /// The receiver is no store handle over a struct, or `member` names no
-    /// field of that struct: the tier has nothing to say.
+    /// The receiver's type has no `[field_syntax]` method over a struct, or
+    /// `member` names no field of that struct: the tier has nothing to say.
     Inapplicable,
-    /// `member` names a field of `T`, and this is its projection's
-    /// declaration: the read is the call `receiver.member()`.
-    Projection(Id),
-    /// `member` names a field of `T` and the handle has no projection of that
-    /// name — `T` does not derive `Storable`, or the field's projection is
-    /// renamed. Carries `T`'s struct id, for the message.
-    Unprojected(Id),
-    /// B711 S2a: the receiver's type has a `[field_syntax]` method over a
-    /// struct `T` and `member` names a field of `T`: the read is the call
+    /// The receiver's type has a `[field_syntax]` method over a struct `T` and
+    /// `member` names a field of `T`: the read is the call
     /// `receiver.method(T.member)`.
     Keyed(Keyed),
 }
 
-impl<'src> Surface<'_, 'src> {
-    /// The struct a handle type is a handle ON — `User` for `Store<User>` —
-    /// with the handle's own struct id, or `None` when `receiver` is not one.
-    fn subject_of(&self, receiver: &Type) -> Option<(Id, Id)> {
-        let Type::Struct(handle, arguments) = receiver else {
-            return None;
-        };
-        if !self.handles.contains(handle) {
-            return None;
-        }
-        match self.types.get(arguments.first()?)? {
-            Type::Struct(subject, _) => Some((*handle, *subject)),
-            _ => None,
-        }
-    }
-
-    /// The struct a store handle type is on (`User` for `Store<User>`), or
-    /// `None` when `receiver` is no store handle — the store reading's `T`.
-    pub fn store_subject(&self, receiver: &Type) -> Option<Id> {
-        self.subject_of(receiver).map(|(_, subject)| subject)
-    }
-
-    /// Whether `member_id` is a method taking `self` and nothing else.
-    fn is_self_only(&self, member_id: Id) -> bool {
-        let Some(Expr::Function(function_id)) = self.entities.get(&member_id) else {
-            return false;
-        };
-        let Some(function) = self.functions.get(function_id) else {
-            return false;
-        };
-        match function.parameters.as_slice() {
-            [only] => self
-                .parameters
-                .get(only)
-                .is_some_and(|parameter| parameter.name == "self"),
-            _ => false,
-        }
-    }
-
-    /// The projection named `name` on the handle `handle` at the subject
-    /// struct `subject`: a self-only member of an inherent impl on exactly
-    /// `handle<subject<..>>`.
-    fn projection(&self, handle: Id, subject: Id, name: &str) -> Option<Id> {
-        self.implementations.iter().find_map(|implementation| {
-            if !implementation.trait_ids.is_empty() {
-                return None;
-            }
-            let Some(Type::Struct(subject_handle, arguments)) =
-                self.types.get(&implementation.subject)
-            else {
-                return None;
-            };
-            if *subject_handle != handle {
-                return None;
-            }
-            let at_subject = arguments
-                .first()
-                .and_then(|argument| self.types.get(argument));
-            if !matches!(at_subject, Some(Type::Struct(id, _)) if *id == subject) {
-                return None;
-            }
-            let member_id = *implementation.declarations.get(name)?;
-            self.is_self_only(member_id).then_some(member_id)
-        })
-    }
-
+impl Surface<'_, '_> {
     /// What `receiver.member` reads, under the tier.
     pub fn read(&self, receiver: &Type, member: &str) -> Reading {
-        let Some((handle, subject)) = self.subject_of(receiver) else {
-            return self
-                .keyed_method(receiver)
-                .and_then(|(method, subject)| {
-                    let field = self
-                        .structs
-                        .get(&subject.0)?
-                        .fields
-                        .iter()
-                        .position(|field| field.name == member)?;
-                    Some(Reading::Keyed(Keyed {
-                        method: method.0,
-                        function: method.1,
-                        subject: subject.0,
-                        root: subject.1,
-                        field,
-                    }))
-                })
-                .unwrap_or(Reading::Inapplicable);
-        };
-        let names_a_field = self
-            .structs
-            .get(&subject)
-            .is_some_and(|structure| structure.fields.iter().any(|field| field.name == member));
-        if !names_a_field {
-            return Reading::Inapplicable;
-        }
-        match self.projection(handle, subject, member) {
-            Some(member_id) => Reading::Projection(member_id),
-            None => Reading::Unprojected(subject),
-        }
-    }
-
-    /// Every field the tier reads through on `receiver`, in declaration
-    /// order, each with its projection — the editor's member list after
-    /// `app.`. Empty when `receiver` is no handle.
-    pub fn projected_fields(&self, receiver: &Type) -> Vec<(&'src str, Id)> {
-        let Some((handle, subject)) = self.subject_of(receiver) else {
-            return Vec::new();
-        };
-        let Some(structure) = self.structs.get(&subject) else {
-            return Vec::new();
-        };
-        structure
-            .fields
-            .iter()
-            .filter_map(|field| Some((field.name, self.projection(handle, subject, field.name)?)))
-            .collect()
+        self.keyed_method(receiver)
+            .and_then(|(method, subject)| {
+                let field = self
+                    .structs
+                    .get(&subject.0)?
+                    .fields
+                    .iter()
+                    .position(|field| field.name == member)?;
+                Some(Reading::Keyed(Keyed {
+                    method: method.0,
+                    function: method.1,
+                    subject: subject.0,
+                    root: subject.1,
+                    field,
+                }))
+            })
+            .unwrap_or(Reading::Inapplicable)
     }
 }
 
@@ -525,7 +395,7 @@ impl<'src> Surface<'_, 'src> {
 
 impl<'src> crate::analyzer::Program<'src> {
     /// The field-syntax tier's reader over a finished analysis — what the
-    /// editor asks after a `.` on a store handle.
+    /// editor asks after a `.` on a handle.
     pub fn field_syntax(&self) -> Surface<'_, 'src> {
         Surface {
             structs: &self.structs,
@@ -534,7 +404,6 @@ impl<'src> crate::analyzer::Program<'src> {
             entities: &self.entity_map,
             functions: &self.functions,
             parameters: &self.parameters,
-            handles: &self.field_syntax_handles,
             keyed_methods: &self.field_syntax_methods,
             key_struct: self.key_struct_id,
         }
@@ -610,8 +479,11 @@ impl crate::analyzer::Program<'_> {
         };
         self.type_id_to_type_map
             .iter()
-            .filter(|(_, candidate)| {
-                matches!(candidate, Type::Struct(id, _) | Type::Enum(id, _) if id == head)
+            // The declaration's own type is the pattern, never its answer (it
+            // matches itself trivially, its parameters unbound).
+            .filter(|(candidate, kind)| {
+                *candidate != declared
+                    && matches!(kind, Type::Struct(id, _) | Type::Enum(id, _) if id == head)
             })
             .find(|(candidate, _)| self.bound_matches(declared, *candidate, &bindings, 0))
             .map(|(candidate, _)| candidate)
@@ -707,5 +579,98 @@ impl crate::analyzer::Program<'_> {
             Type::Void => Some("void".to_string()),
             _ => None,
         }
+    }
+}
+
+/// B711 S2b: the clause the refusal of a handle's field called as a method
+/// carries (`app.user()`, the paren form a store's derived projections had):
+/// what [`field_syntax_call_fix`] reads a diagnostic by.
+pub const FIELD_SYNTAX_CALL_MARK: &str =
+    "which this handle reads with field syntax, not as a method";
+
+/// B711 S2b: the edit for the paren form `app.user()` that a refusal carrying
+/// [`FIELD_SYNTAX_CALL_MARK`] reports at the member `user` (`span`): the call
+/// `user()` becomes the read `user`. `None` when the message is another's, or
+/// the member is not followed by an empty argument list (a call with
+/// arguments is no field read to rewrite). What `vilan check --fix` applies.
+pub fn field_syntax_call_fix(
+    text: &str,
+    span: crate::span::Span,
+    message: &str,
+) -> Option<(crate::span::Span, String)> {
+    if !message.contains(FIELD_SYNTAX_CALL_MARK) {
+        return None;
+    }
+    let name = text.get(span.into_range())?;
+    if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+        return None;
+    }
+    let after = text.get(span.end..)?;
+    after.starts_with("()").then(|| {
+        (
+            crate::span::Span {
+                start: span.start,
+                end: span.end + 2,
+            },
+            name.to_string(),
+        )
+    })
+}
+
+/// B711 S2b: the first paragraph of the `///` doc comment above the
+/// declaration whose name starts at `name_start` in `text`, joined into one
+/// line — the steer a field-syntax refusal quotes from the trait a door's
+/// impl bounds by. Attribute lines between the comment and the declaration
+/// are skipped. `None` when the declaration has no doc comment.
+pub fn doc_summary(text: &str, name_start: usize) -> Option<String> {
+    let before = text.get(..name_start)?;
+    let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+    let mut lines: Vec<&str> = Vec::new();
+    for line in before[..line_start].lines().rev() {
+        let line = line.trim();
+        if line.starts_with('[') && lines.is_empty() {
+            continue;
+        }
+        match line.strip_prefix("///") {
+            Some(doc) => lines.push(doc.trim()),
+            None => break,
+        }
+    }
+    lines.reverse();
+    let paragraph: Vec<&str> = lines
+        .into_iter()
+        .skip_while(|line| line.is_empty())
+        .take_while(|line| !line.is_empty())
+        .collect();
+    (!paragraph.is_empty()).then(|| paragraph.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FIELD_SYNTAX_CALL_MARK, doc_summary, field_syntax_call_fix};
+    use crate::span::Span;
+
+    #[test]
+    fn the_paren_form_fix_drops_an_empty_argument_list_only() {
+        let message = format!(
+            "Store<App> has no method 'user'; `user` is a field of `App`, {FIELD_SYNTAX_CALL_MARK}"
+        );
+        let text = "app.user().name()";
+        let at = Span { start: 4, end: 8 };
+        assert_eq!(
+            field_syntax_call_fix(text, at, &message),
+            Some((Span { start: 4, end: 10 }, "user".to_string()))
+        );
+        assert_eq!(field_syntax_call_fix("app.user(1)", at, &message), None);
+        assert_eq!(field_syntax_call_fix(text, at, "another message"), None);
+    }
+
+    #[test]
+    fn a_doc_summary_is_the_first_paragraph_above_the_attributes() {
+        let text = "/// One line\n/// two.\n///\n/// Later.\n[hint(x)]\nexport trait Marker {}\n";
+        let start = text.find("Marker").unwrap();
+        assert_eq!(doc_summary(text, start).as_deref(), Some("One line two."));
+        let bare = "fun f() {}\ntrait Bare {}\n";
+        assert_eq!(doc_summary(bare, bare.find("Bare").unwrap()), None);
     }
 }

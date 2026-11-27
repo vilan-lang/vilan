@@ -54,7 +54,7 @@ fun drained(): str {
 
 fun main() {
 	let presence = Store::new(Presence::Online(Device { name = "laptop", since = 1 }));
-	let name: StoreSome<str> = presence.online().name();
+	let name: StoreSome<str> = presence.online().name;
 	let watching = Owner::new();
 	run_with_owner(watching, || {
 		presence.is_online().effect_on_change(|t| mark(i"tag={t}"));
@@ -63,9 +63,7 @@ fun main() {
 		presence.effect_on_change(|_p| mark("presence"));
 	});
 	presence.set(Presence::Online(Device { name = "laptop", since = 2 }));
-	print(
-		i"same-variant write: [{drained()}] since={presence.online().since().get().unwrap_or(0)}",
-	);
+	print(i"same-variant write: [{drained()}] since={presence.online().since.get().unwrap_or(0)}");
 	presence.set(Presence::Offline);
 	print(i"to Offline: [{drained()}] name={name.get().unwrap_or("-")}");
 	print(i"patch through the dead variant: {name.patch("ghost")} [{drained()}]");
@@ -77,7 +75,7 @@ fun main() {
 	run_with_owner(assumed, || {
 		let device: Store<Device> = presence.online().assume();
 		presence.set(Presence::Away("lunch", 30));
-		print(i"to Away: [{drained()}] assumed={device.name().get()}");
+		print(i"to Away: [{drained()}] assumed={device.name.get()}");
 	});
 	assumed.dispose();
 	let (why, minutes) = presence.away().get().unwrap_or(("-", 0));

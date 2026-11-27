@@ -25,8 +25,8 @@ fun main() {
 	let action = Store::new(Action::Run(|x| x + 1));
 	let watching = Owner::new();
 	run_with_owner(watching, || {
-		button.on_press().effect_on_change(|_f| print("on_press woke"));
-		button.label().effect_on_change(|_l| print("label woke"));
+		button.on_press.effect_on_change(|_f| print("on_press woke"));
+		button.label.effect_on_change(|_l| print("label woke"));
 		action.run().effect_on_change(|_r| print("run woke"));
 		action.keyed().effect_on_change(|_k| print("keyed woke"));
 	});

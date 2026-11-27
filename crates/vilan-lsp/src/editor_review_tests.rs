@@ -1224,7 +1224,7 @@ fn e312_a_derive_answers_what_it_writes() {
         };
         let storable = hover("Storable, PartialEq");
         assert!(
-            storable.starts_with("```vilan\nmod std::reactive::store\nimpl Account with Storable\nimpl Store<Account>\n"),
+            storable.starts_with("```vilan\nmod std::reactive::store\nimpl Account with Storable\nimpl Account with StoreFields\n"),
             "{storable}"
         );
         assert!(

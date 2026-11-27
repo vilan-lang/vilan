@@ -629,7 +629,7 @@ row	flagship	key
 605	-	unused pipe: a pipe runs nothing until it is consumed — seal it (`.memo()`), consume it (`.effect(..)`, a binding), or `let _ = …` to discard.
 606	-	`[reactive(name = "..")]` names the field's PROJECTION — a method on the store handle — so it must be an identifier: letters, digits and `_`, not starting with a digit
 607	-	`[reactive(..)]` on a field takes `coarse` (one slot, compared whole, even when the field's type derives `Storable`) and `name = ".."` (the name its store projection is generated under), comma-separated: `[reactive(coarse)]`, `[reactive(name = "nick")]`
-608	-	`[derive(Storable)]` on `{name}`: the field `{field}` would project as `{method}()`, which a store handle already has (`{method}` is a handle member, and an inherent member wins over a projection) — rename the projection with `[reactive(name = "..")]` on the field
+608	-	`[derive(Storable)]` on `{name}`: `[reactive(name = \"{name}\")]` on the field `{field}` renamed its projection, and a store handle has no projections to rename any more: it reads every field through its one door, `field` - write `handle.field({struct}.{field})` where a handle member is also named `{field}`, and `handle.{field}` everywhere else, and drop the attribute
 609	-	`[derive(Storable)]` on `{name}`: the variant `{variant}` would project as `{snake}()`/`{flag}()`, which a store handle already has — rename the variant
 610	-	`[derive(Storable)]` on `{name}`: two variants project as `{snake}()`
 611	-	`return` is not a vilan keyword: vilan spells this `ret` — `ret value;` returns a value, and a bare `ret;` leaves a function that returns nothing
@@ -682,7 +682,7 @@ row	flagship	key
 658	-	`mut {name}` would bind a COPY of a sub-tuple, and its write would not reach `{place}`: a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a copy even under a view subject, since tuples store flat — bind the tuple whole (`let pair`), which is a view, and write `pair.0`
 659	-	cannot mutate '{name}': a capture of a sub-tuple (or of an element still generic) inside a tuple pattern is a COPY even under a view subject, since tuples store flat and it spans several slots, so a write to it would not reach `{place}` — bind the tuple whole (`let pair`), which is a view, and write `pair.0`
 660	-	`{member_name}` is an `[internal]` field of std's `{struct_name}`, and an internal std field is not a member outside std: {reason}
-661	-	`{member_name}` is a field of `{subject_name}`, and this `{struct_name}<{subject_name}>` has no projection named `{member_name}` to read it through: `{subject_name}` does not `[derive(Storable)]`, or the field's projection is renamed
+661	-	`{field}` is a field of `{subject}`, and field syntax reads it through a method whose impl needs `{type}: {trait}`, which `{type}` does not implement{steer}
 663	-	`{name}` is `[track_caller]`: it takes its caller's location as a hidden argument, and a call through a value cannot pass one
 664	-	`dbg` left in a release build: a release build refuses it, so a debugging line cannot ship by accident
 665	-	`dbg` takes no type arguments: it prints each argument at the type it already has
@@ -816,3 +816,5 @@ NEW	-	this tuple key names an element that is itself a tuple, `{element}`, and {
 NEW	-	`{name}` is an `external` struct, which no literal can build: {origin}
 NEW	-	this key is a `{key}`, and the subject is a `{subject}`: a tuple key indexes only a tuple of the family it was minted for, or a tuple mapped from that family
 NEW	-	`{member_name}` reads through `[field_syntax]` as {written}, and that key is refused: {reason}
+NEW	-	; `{member_name}` is a field of `{subject}`, {mark}: write `{receiver}.{member_name}` (the call `{receiver}.{method}({subject}.{member_name})`)
+NEW	-	the left side of this assignment is not a place: {read}, {answers} - {how}

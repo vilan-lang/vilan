@@ -1871,8 +1871,10 @@ key literal — `user.address.city` is `user.at(User.address).at(Address.city)`
 call's result type.
 
 - **Resolution order.** A member access resolves to the receiver's own field
-  first; then to std's store projection (A149 S4, on `Store`/`StoreSome`,
-  std::store); then to the `[field_syntax]` reading. A member that names one
+  first, then to the `[field_syntax]` reading. std's store handles (`Store`,
+  `StoreSome`, `RemoteStore`, `RemoteStoreSome`) read their struct's fields
+  through this door like any library handle (B711 S2b: one `field` method
+  each; the compiler names no store type). A member that names one
   of the receiver's METHODS (its own, a trait's, a blanket impl's) does not
   read through: it is refused as a method named without parentheses, and the
   refusal names the written call that reaches the field
@@ -1887,7 +1889,15 @@ call's result type.
   of a resource or of an `external` struct) is refused at the member with the
   key literal's own reason.
 - **A value.** The read is the call's result, never a place: an assignment to
-  it is refused.
+  it is refused, and the refusal names the call and the type it answers (and
+  `.set(..)` when that type has a `set` method).
+- **Not a method.** A call `h.name()` where `name` is no method of the
+  receiver and names a field of `T` is refused with the field syntax that
+  reads it, `h.name`.
+- **A bounded door.** When the door's impl bounds the struct `T` it reads
+  through (`impl Store<type T: StoreFields>`) and `T` misses the bound, the
+  read is refused at the member as a field-syntax read, quoting the first
+  paragraph of the bound trait's doc comment.
 - **The declaration.** `fun m<U>(self, key: Key<T, U>): R` with `self` or
   `&self`, exactly one further parameter, a plain value (no `lazy`, `own`,
   `mut`, view or spread) of type `Key<T, U>`, `U` the method's only type

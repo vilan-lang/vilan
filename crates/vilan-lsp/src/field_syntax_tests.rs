@@ -3,8 +3,8 @@
 //! as `h.at(User.address).at(Address.city)`; the editor reads the same reader
 //! (`vilan_core::field_syntax`), so completion offers the fields the analysis
 //! reads through, hover and go to definition answer for the FIELD, and a
-//! field's references and rename reach its field-syntax reads — the store
-//! rule's reads (`app.user`) included.
+//! field's references and rename reach its field-syntax reads — std's store
+//! handles' reads (`app.user`, through their own door since S2b) included.
 
 use std::path::Path;
 
@@ -241,6 +241,31 @@ fn field_syntax_a_storable_fields_references_list_its_store_reads() {
             "{}",
             refusal.message()
         );
+    });
+}
+
+/// B711 S2b: a store read is the door's call like any other: hover shows the
+/// handle type and `.field(Address.city)`, definition lands on the FIELD, and
+/// completion after a store receiver offers the struct's fields with the
+/// handle type as detail.
+#[test]
+fn field_syntax_a_store_read_hovers_defines_and_completes_through_the_door() {
+    on_big_stack(|| {
+        let text = "import std::reactive::{ Signal, Source };\n\
+             import std::reactive::store::{ Storable, Store };\n\n\
+             [derive(Storable)]\nstruct Address {\n\t/// The town.\n\tcity: str,\n}\n\n\
+             [derive(Storable)]\nstruct App {\n\tname: str,\n\taddress: Address,\n}\n\n\
+             fun main() {\n\tlet store = Store::new(App { name = \"a\", address = Address { city = \"c\" } });\n\
+             \tprint(store.address.city.get());\n}\n";
+        let document = analyzed(text);
+        assert!(document.diagnostics.is_empty(), "{:?}", messages(&document));
+        let member = text.find(".city.get()").expect("the read") + ".ci".len();
+        let hover = document.hover(member).expect("a hover on the member");
+        assert!(hover.contains("Store<str>"), "{hover}");
+        assert!(hover.contains(".field(Address.city)"), "{hover}");
+        assert!(hover.contains("The town."), "{hover}");
+        let (_, field) = document.definition(member).expect("the field");
+        assert_eq!(field.start, text.find("city: str").expect("the field"));
     });
 }
 

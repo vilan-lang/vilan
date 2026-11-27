@@ -65,6 +65,11 @@ pub(crate) struct Fixed {
     /// files they were in.
     pub(crate) autos: usize,
     pub(crate) auto_files: BTreeSet<PathBuf>,
+    /// B711 S2b: handle fields called as methods (`app.user()`, the paren
+    /// form of v0.56's store projections) rewritten as field syntax
+    /// (`app.user`), and the files they were in.
+    pub(crate) field_reads: usize,
+    pub(crate) field_read_files: BTreeSet<PathBuf>,
 }
 
 /// A moved std path `--fix` leaves to a person, and why.
@@ -156,6 +161,8 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
         let mut by_file: BTreeMap<PathBuf, Vec<NumericFix>> = BTreeMap::new();
         // B570: each stale or unfilled `auto`'s rewrite, over its span.
         let mut autos: BTreeMap<PathBuf, Vec<(Span, String)>> = BTreeMap::new();
+        // B711 S2b: each `app.user()` read back as `app.user`.
+        let mut field_reads: BTreeMap<PathBuf, Vec<(Span, String)>> = BTreeMap::new();
         let mut moved: BTreeMap<PathBuf, BTreeMap<Span, StdPathFix>> = BTreeMap::new();
         let mut for_a_hand: BTreeMap<PathBuf, BTreeMap<usize, ForAHand>> = BTreeMap::new();
         let mut texts: BTreeMap<PathBuf, String> = BTreeMap::new();
@@ -213,6 +220,14 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
                     }
                     None => {}
                 }
+                continue;
+            }
+            if let Some(edit) = vilan_core::field_syntax::field_syntax_call_fix(
+                text,
+                diagnostic.span,
+                &diagnostic.msg,
+            ) {
+                field_reads.entry(path).or_default().push(edit);
                 continue;
             }
             if let Some(rewrite) = vilan_core::analyzer::auto_annotation_rewrite(&diagnostic.msg) {
@@ -308,10 +323,31 @@ pub(crate) fn fix_unit(unit: &Unit, platform: Platform, fixed: &mut Fixed) -> Re
             std::fs::write(&path, rewritten)
                 .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
             autos_this_round += applied;
+            converted.insert(path.clone());
             fixed.auto_files.insert(path);
         }
         fixed.autos += autos_this_round;
-        if applied_this_round == 0 && autos_this_round == 0 {
+        // B711 S2b: the paren form, in the same round; a chain's next call
+        // (`app.user().name()`) is refused only once its receiver types, so
+        // the next round finds it.
+        let mut field_reads_this_round = 0;
+        for (path, fixes) in field_reads {
+            // A file an earlier edit of this round rewrote has moved under
+            // these spans; the next round reads it as it now stands.
+            if converted.contains(&path) {
+                continue;
+            }
+            let (rewritten, applied) = apply_spans(&texts[&path], fixes);
+            if applied == 0 {
+                continue;
+            }
+            std::fs::write(&path, rewritten)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            field_reads_this_round += applied;
+            fixed.field_read_files.insert(path);
+        }
+        fixed.field_reads += field_reads_this_round;
+        if applied_this_round == 0 && autos_this_round == 0 && field_reads_this_round == 0 {
             return Ok(());
         }
     }
@@ -497,6 +533,15 @@ pub(crate) fn report(fixed: &Fixed) {
             "{fixed_word} {} `auto` annotation{} in {files} file{}",
             fixed.autos,
             plural(fixed.autos, "", "s"),
+            plural(files, "", "s"),
+        );
+    }
+    if fixed.field_reads > 0 {
+        let files = fixed.field_read_files.len();
+        println!(
+            "{fixed_word} {} handle field{} called as a method in {files} file{}",
+            fixed.field_reads,
+            plural(fixed.field_reads, "", "s"),
             plural(files, "", "s"),
         );
     }

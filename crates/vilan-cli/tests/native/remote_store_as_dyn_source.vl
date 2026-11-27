@@ -50,11 +50,11 @@ fun main() {
 	);
 	let page = Owner::new();
 	run_with_owner(page, || {
-		let motd: dyn Source<Option<str>> = g.motd();
+		let motd: dyn Source<Option<str>> = g.motd;
 		motd.effect(|text| print(i"motd {text.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
-	global.motd().set("bye");
+	global.motd.set("bye");
 	sleep_for(Duration::millis(0));
 	print("done");
 }

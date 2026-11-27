@@ -3153,6 +3153,25 @@ fn helper_source(name: &str) -> &'static str {
              \treturn value[parts[last][1]] = field;\n\
              }"
         }
+        // B711 S2b: a `[field_syntax]` door's key, resolved once at the
+        // door's entry: its field's position for a one-step key, `-1` for a
+        // path; the two `_at` forms take that step and walk only a path.
+        "__key_step" => {
+            "function __key_step(key) {\n\
+             \tconst parts = key[0][0];\n\
+             \treturn parts.length === 1 ? parts[0][1] : -1;\n\
+             }"
+        }
+        "__key_at_step" => {
+            "function __key_at_step(value, key, step) {\n\
+             \treturn step >= 0 ? value[step] : __key_at(value, key);\n\
+             }"
+        }
+        "__key_view_at" => {
+            "function __key_view_at(value, key, step) {\n\
+             \treturn step >= 0 ? [ value, step ] : __key_view(value, key);\n\
+             }"
+        }
         "__key_view" => {
             "function __key_view(value, key) {\n\
              \tconst parts = key[0][0];\n\
@@ -5544,6 +5563,18 @@ impl<'src> Transformer<'src> {
                             vec![js::Node::Local(name)],
                         )),
                     ))
+                } else if self.is_door_key(*parameter_id) && self.subscripts_through(*parameter_id)
+                {
+                    // B711 S2b: a door's key, resolved once
+                    // ([`Self::door_key_step`]).
+                    self.used_helpers.insert("__key_step");
+                    Some(js::Node::ConstVariable(js::Variable {
+                        name: format!("{name}$step"),
+                        value: Box::new(js::Node::Call(
+                            Box::new(js::Node::Local("__key_step".to_string())),
+                            vec![js::Node::Local(name)],
+                        )),
+                    }))
                 } else {
                     None
                 }
@@ -7745,6 +7776,14 @@ impl<'src> Transformer<'src> {
                 }
             };
         }
+        if let Some(step) = self.door_key_step(index_id) {
+            self.used_helpers.insert("__key_at");
+            self.used_helpers.insert("__key_at_step");
+            return js::Node::Call(
+                Box::new(js::Node::Local("__key_at_step".to_string())),
+                vec![subject, key, step],
+            );
+        }
         self.used_helpers.insert("__key_at");
         js::Node::Call(
             Box::new(js::Node::Local("__key_at".to_string())),
@@ -7839,11 +7878,72 @@ impl<'src> Transformer<'src> {
         if let Some((offset, _)) = self.tuple_key_slot(subject_id, index_id, key.clone()) {
             return js::Node::Array(vec![subject, offset]);
         }
+        if let Some(step) = self.door_key_step(index_id) {
+            self.used_helpers.insert("__key_view");
+            self.used_helpers.insert("__key_view_at");
+            return js::Node::Call(
+                Box::new(js::Node::Local("__key_view_at".to_string())),
+                vec![subject, key, step],
+            );
+        }
         self.used_helpers.insert("__key_view");
         js::Node::Call(
             Box::new(js::Node::Local("__key_view".to_string())),
             vec![subject, key],
         )
+    }
+
+    /// B711 S2b: whether `parameter_id` is the key of a `[field_syntax]`
+    /// method — the door every field-syntax read calls, std's store handles'
+    /// among them. Its body reads the key through subscripts inside the
+    /// closures it hands back, at every read of the handle, so the key's one
+    /// step is resolved once at entry ([`Self::parameter_entry_preludes`]).
+    fn is_door_key(&self, parameter_id: Id) -> bool {
+        if self.program.field_syntax_methods.is_empty() {
+            return false;
+        }
+        let surface = self.program.field_syntax();
+        let Some(parameter) = self.program.parameters.get(&parameter_id) else {
+            return false;
+        };
+        self.program.field_syntax_methods.iter().any(|(_, member)| {
+            surface.function_of(*member) == Some(parameter.function_id)
+                && self
+                    .program
+                    .functions
+                    .get(&parameter.function_id)
+                    .and_then(|function| function.parameters.get(1))
+                    == Some(&parameter_id)
+        })
+    }
+
+    /// B711 S2b: whether some key subscript's index is `binding` read as
+    /// itself — a door that only stores or composes its key (a cursor's
+    /// `then`) resolves no step.
+    fn subscripts_through(&self, binding: Id) -> bool {
+        self.program.key_subscripts.iter().any(|subscript| {
+            matches!(
+                self.program.entity_map.get(subscript),
+                Some(Expr::Index(_, index))
+                    if matches!(self.program.entity_map.get(index), Some(Expr::Local(read)) if *read == binding)
+            )
+        })
+    }
+
+    /// B711 S2b: the entry-resolved step of a door's key, when a subscript's
+    /// index is that key read as itself: `{key}$step`, the field's position
+    /// for a one-step key and `-1` for a path, which the helpers walk.
+    fn door_key_step(&mut self, index_id: Id) -> Option<js::Node<'src>> {
+        let Some(&Expr::Local(binding)) = self.program.entity_map.get(&index_id) else {
+            return None;
+        };
+        if !self.is_door_key(binding) {
+            return None;
+        }
+        Some(js::Node::Local(format!(
+            "{}$step",
+            self.ng.name_for(binding)
+        )))
     }
 
     fn walk_entity(&mut self, id: Id, block: &mut Vec<js::Node<'src>>) -> Option<js::Node<'src>> {

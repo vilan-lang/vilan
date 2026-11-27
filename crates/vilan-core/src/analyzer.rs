@@ -5513,13 +5513,6 @@ pub struct Analyzer<'src> {
     // The built-in `std` structs that back scalar primitives, keyed by name
     // (`i32`, `str`, ...). Used to type literals and resolve primitive names.
     primitive_struct_ids: HashMap<&'static str, Id>,
-    // A149 S4: std's store handles (`Store`, `StoreSome`), when
-    // `std::reactive::store_core` loaded — the receivers field syntax reads
-    // through (`crate::field_syntax`).
-    field_syntax_handles: Vec<Id>,
-    // A149 S4: the member reads field syntax turned into projection calls
-    // (`app.user`), so an assignment to one is told how a handle is written.
-    field_syntax_reads: HashSet<Id>,
     // B711 S2a: the `[field_syntax]` methods of inherent impls, each as
     // (implementation index, member id) — what the keyed reading of
     // `crate::field_syntax` consults. Empty for a program that declares none.
@@ -8560,8 +8553,6 @@ impl<'src> Analyzer<'src> {
             modules: IndexMap::default(),
             parameters: IndexMap::default(),
             primitive_struct_ids: HashMap::default(),
-            field_syntax_handles: Vec::new(),
-            field_syntax_reads: HashSet::default(),
             field_syntax_methods: Vec::new(),
             field_syntax_pending: Vec::new(),
             field_syntax_fields: HashMap::default(),
@@ -10073,6 +10064,21 @@ impl<'src> Analyzer<'src> {
                     {
                         hole_refusals.insert((call_id, hole_span));
                         errors.push((call_id, hole_span, msg, constraint_id));
+                        continue;
+                    }
+                    // B711 S2b: a field-syntax read whose door's impl bounds
+                    // the struct it reads through (std's store: `T:
+                    // StoreFields`, which `[derive(Storable)]` implements) is
+                    // said about the field, with the trait's own steer.
+                    if let Some(msg) =
+                        self.field_syntax_bound_refusal(call_id, &type_label, *required_trait_id)
+                    {
+                        errors.push((
+                            call_id,
+                            **self.span_map.get(&call_id).unwrap_or(&&EMPTY_SPAN),
+                            msg,
+                            constraint_id,
+                        ));
                         continue;
                     }
                     // A generic argument fails by MISSING the bound on its own
@@ -25660,6 +25666,32 @@ impl<'src> Analyzer<'src> {
         }
     }
 
+    /// B711 S2b: `app.user()` on a receiver whose type has a `[field_syntax]`
+    /// method over a struct with a field `user` — the paren form a store
+    /// handle's derived projection had until S2b, and the one every migrating
+    /// program meets. The field is read with field syntax, and the steer
+    /// spells it at this receiver, with the call it stands for.
+    fn field_syntax_call_steer(
+        &self,
+        subject_id: Id,
+        subject_type: &Type,
+        member_name: &str,
+    ) -> Option<String> {
+        let crate::field_syntax::Reading::Keyed(keyed) =
+            self.field_syntax().read(subject_type, member_name)
+        else {
+            return None;
+        };
+        let subject = self.structs.get(&keyed.subject)?.name;
+        let method = self.functions.get(&keyed.function)?.name;
+        let receiver = self.receiver_spelling(subject_id).unwrap_or("x");
+        Some(format!(
+            "; `{member_name}` is a field of `{subject}`, {}: write `{receiver}.{member_name}` \
+             (the call `{receiver}.{method}({subject}.{member_name})`)",
+            crate::field_syntax::FIELD_SYNTAX_CALL_MARK
+        ))
+    }
+
     /// The A99 steer: one of the six `View` methods the order RETIRED was
     /// written, and the fix is the free slot value of the same idea.
     ///
@@ -33825,17 +33857,21 @@ impl<'src> Analyzer<'src> {
                 }
                 continue;
             };
+            let msg = match self.field_syntax_keyed.contains_key(&non_place_id) {
+                true => self.field_syntax_place_refusal(non_place_id),
+                false => format!(
+                    "the left side of this assignment is not a place: it is {what} — only a \
+                     place can be assigned: a binding (`x`), a field (`p.x`), an element \
+                     (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a \
+                     `&mut` view"
+                ),
+            };
             self.push_anchored(
                 Error {
                     trace: Vec::new(),
                     note: None,
                     span: **self.span_map.get(&non_place_id).unwrap_or(&&EMPTY_SPAN),
-                    msg: format!(
-                        "the left side of this assignment is not a place: it is {what} — only a \
-                         place can be assigned: a binding (`x`), a field (`p.x`), an element \
-                         (`list[i]`), a tuple of places (`(a, b)`), or a call that returns a \
-                         `&mut` view"
-                    ),
+                    msg,
                 },
                 target_id,
             );
@@ -34517,6 +34553,121 @@ impl<'src> Analyzer<'src> {
         );
     }
 
+    /// B711 S2b: the refusal of a field-syntax read (`app.user`) whose
+    /// `[field_syntax]` method sits in an impl that bounds the struct the
+    /// read goes through, at a struct that misses the bound — std's store
+    /// handles read only a struct that `[derive(Storable)]`, through the
+    /// marker trait `StoreFields` the derive implements. Said at the member,
+    /// as the read the author wrote, the call it stands for and the trait it
+    /// lacks; the steer is the trait's own first doc paragraph, so a library
+    /// door says what its marker asks without the compiler naming it.
+    fn field_syntax_bound_refusal(
+        &self,
+        read_id: Id,
+        type_label: &str,
+        trait_id: Id,
+    ) -> Option<String> {
+        self.field_syntax_keyed.get(&read_id)?;
+        let (struct_id, index) = *self.field_syntax_fields.get(&read_id)?;
+        let structure = self.structs.get(&struct_id)?;
+        let field = structure.fields.get(index)?.name;
+        let subject = structure.name;
+        let trait_ = self.traits.get(&trait_id)?;
+        let trait_name = trait_.name;
+        let steer = self
+            .source_of_id(trait_id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| crate::field_syntax::doc_summary(text, trait_.name_span.start))
+            .map(|doc| format!(". `{trait_name}`: {doc}"))
+            .unwrap_or_default();
+        Some(format!(
+            "`{field}` is a field of `{subject}`, and field syntax reads it through a method \
+             whose impl needs `{type_label}: {trait_name}`, which `{type_label}` does not \
+             implement{steer}"
+        ))
+    }
+
+    /// B711: the refusal of `app.user.name = v`, where `app.user.name` is a
+    /// field-syntax read: the call it stands for, what that call answers, and
+    /// how to write through it. The last part is keyed on the answer's own
+    /// surface, never on a std type: a result with a `set` method is told to
+    /// write with `.set(..)` (every store handle has one), any other is told
+    /// to write through what the method returns.
+    fn field_syntax_place_refusal(&mut self, read_id: Id) -> String {
+        let span = **self.span_map.get(&read_id).unwrap_or(&&EMPTY_SPAN);
+        let written = self
+            .source_of_id(read_id)
+            .and_then(|source| self.source_text(source))
+            .and_then(|text| text.get(span.into_range()))
+            .filter(|written| !written.contains('\n'));
+        let (subject, field) = self
+            .field_syntax_fields
+            .get(&read_id)
+            .and_then(|(struct_id, index)| {
+                let structure = self.structs.get(struct_id)?;
+                Some((structure.name, structure.fields.get(*index)?.name))
+            })
+            .unwrap_or(("", ""));
+        let method = match self.expr_id_to_expr_map.get(&read_id) {
+            Some(Expr::Call(call_id)) => self
+                .function_calls
+                .get(call_id)
+                .and_then(
+                    |call| match self.expr_id_to_expr_map.get(&call.subject_id) {
+                        Some(Expr::Local(function_id)) => self.functions.get(function_id),
+                        _ => None,
+                    },
+                )
+                .map_or("", |function| function.name),
+            _ => "",
+        };
+        let call = format!("{method}({subject}.{field})");
+        let read = match written {
+            Some(written) => {
+                let receiver = written
+                    .strip_suffix(field)
+                    .and_then(|receiver| receiver.strip_suffix('.'))
+                    .unwrap_or(written);
+                format!("`{written}` reads through `[field_syntax]` as `{receiver}.{call}`")
+            }
+            None => format!("this read goes through `[field_syntax]` as `.{call}`"),
+        };
+        let call_id = match self.expr_id_to_expr_map.get(&read_id) {
+            Some(Expr::Call(call_id)) => Some(*call_id),
+            _ => None,
+        };
+        let result = [Some(read_id), call_id]
+            .into_iter()
+            .flatten()
+            .find_map(|id| {
+                self.expr_id_to_type_id_map
+                    .get(&id)
+                    .or_else(|| self.resolved_types.get(&id))
+                    .copied()
+            })
+            .map(|type_id| type_id.get_type(self))
+            .or_else(|| Some(self.infer_type(read_id, &Type::Unknown, &HashMap::default())))
+            .filter(|result| !matches!(result, Type::Unknown | Type::Unresolved));
+        let label = result
+            .as_ref()
+            .map(|result| self.pretty_print_type(result, &HashMap::default()));
+        let writes_with_set = result.as_ref().is_some_and(|result| {
+            matches!(
+                self.resolve_impl_member(result, "set"),
+                ImplMemberResolution::Found(..) | ImplMemberResolution::FoundInheritedDefault(..)
+            )
+        });
+        let answers = match label {
+            Some(label) => format!("a call, which answers a `{label}`: a value, not a place"),
+            None => "a call, which answers a value, not a place".to_string(),
+        };
+        let how = match writes_with_set {
+            true => "write through it with `.set(..)`",
+            false => "write through what the method returns",
+        };
+        format!("the left side of this assignment is not a place: {read}, {answers} - {how}")
+    }
+
     /// The first sub-expression of an assignment target that is not a place,
     /// with the words that name its kind — `None` when the whole target is a
     /// place (or carries its own refusal elsewhere). B522.
@@ -34544,16 +34695,10 @@ impl<'src> Analyzer<'src> {
                     return None;
                 }
                 // B711 S2a: `user.name = v` through `[field_syntax]` reads
-                // like a field and is a method call's result.
+                // like a field and is a method call's result; the assignment
+                // check words it itself ([`Self::field_syntax_place_refusal`]).
                 if self.field_syntax_keyed.contains_key(&target_id) {
-                    "a field read through `[field_syntax]`, which is a call of the handle's \
-                     method (`user.name` is `user.at(User.name)`) and answers a value, not a \
-                     place: write through what the method returns"
-                // A149 S4: `app.user.name = v` reads like a field and is a
-                // projection — a handle, which is written through, not over.
-                } else if self.field_syntax_reads.contains(&target_id) {
-                    "a store handle's field, which field syntax reads as its projection (a \
-                     handle, not the value): write through it with `.set(..)`"
+                    "a field read through `[field_syntax]`"
                 } else if self.call_is_variant_constructor(*call_id) {
                     "a variant constructor (a pattern is matched with `let` or `is`, not assigned)"
                 } else {
@@ -61939,9 +62084,13 @@ impl<'src> Analyzer<'src> {
                 // If a FIELD of that name exists, the fix is syntax, not a
                 // missing method — method lookup does not fall back to fields
                 // (B4: steer to the one edit that resolves it).
-                let field_steer = self
-                    .same_named_field_steer(id, &subject_type, member_name)
-                    .unwrap_or_default();
+                let field_steer = match self.same_named_field_steer(id, &subject_type, member_name)
+                {
+                    Some(steer) => steer,
+                    None => self
+                        .field_syntax_call_steer(subject_id, &subject_type, member_name)
+                        .unwrap_or_default(),
+                };
                 // If an UNLOADED std module implements it for this type, the fix
                 // is an import, not a definition (std-surface.md §5 — the
                 // `42.to_string()` complaint that opened I4).
@@ -69534,10 +69683,10 @@ impl<'src> Analyzer<'src> {
         value_span: Span,
     ) -> Resolution {
         match self.expr_id_to_expr_map.get(&target_id) {
-            // A149 S4: a field-syntax read is never a place, and the place
-            // check says so with the steer; its handle type is no slot type to
-            // check the value against.
-            Some(Expr::Call(_)) if self.field_syntax_reads.contains(&target_id) => {
+            // A149 S4, B711: a field-syntax read is never a place, and the
+            // place check says so with the steer; its handle type is no slot
+            // type to check the value against.
+            Some(Expr::Call(_)) if self.field_syntax_keyed.contains_key(&target_id) => {
                 return Resolution::Resolved;
             }
             Some(Expr::Field(..) | Expr::TupleIndex(..) | Expr::Index(..) | Expr::Call(_)) => {}
@@ -70337,20 +70486,13 @@ impl<'src> Analyzer<'src> {
                         Resolution::Resolved
                     }
                     None => {
-                        // A149 S4: on a store handle, a field of the struct it
-                        // handles reads through its projection —
-                        // `app.user.name` is `app.user().name()`.
+                        // B711 S2a: the handle door — `user.name` is
+                        // `user.at(User.name)` on a receiver whose type has a
+                        // `[field_syntax]` method (std's store handles among
+                        // them, S2b: `app.user` is `app.field(App.user)`).
                         let handle_type = Type::Struct(struct_id, arguments.clone());
                         self.note_member_query(&handle_type, member_name);
                         match self.field_syntax().read(&handle_type, member_name) {
-                            crate::field_syntax::Reading::Projection(_) => {
-                                self.note_store_field_syntax_field(id, &handle_type, member_name);
-                                self.read_field_through_projection(id, subject_id, member_name);
-                                return Resolution::Resolved;
-                            }
-                            // B711 S2a: the handle door — `user.name` is
-                            // `user.at(User.name)` on a receiver whose type
-                            // has a `[field_syntax]` method.
                             crate::field_syntax::Reading::Keyed(keyed) => {
                                 return self.read_field_through_key(
                                     id,
@@ -70360,27 +70502,6 @@ impl<'src> Analyzer<'src> {
                                     member_name,
                                     keyed,
                                 );
-                            }
-                            crate::field_syntax::Reading::Unprojected(subject) => {
-                                let subject_name = self
-                                    .structs
-                                    .get(&subject)
-                                    .map_or("", |subject| subject.name);
-                                self.diagnostics.push(Error {
-                                    trace: Vec::new(),
-                                    note: None,
-                                    span: **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN),
-                                    msg: format!(
-                                        "`{member_name}` is a field of `{subject_name}`, and this \
-                                         `{struct_name}<{subject_name}>` has no projection named \
-                                         `{member_name}` to read it through: `{subject_name}` does \
-                                         not `[derive(Storable)]`, or the field's projection is \
-                                         renamed with `[reactive(name = \"..\")]` — call the \
-                                         projection by its own name"
-                                    ),
-                                });
-                                self.expr_id_to_expr_map.insert(id, Expr::Error);
-                                return Resolution::Failed;
                             }
                             crate::field_syntax::Reading::Inapplicable => {}
                         }
@@ -70954,57 +71075,16 @@ impl<'src> Analyzer<'src> {
             entities: &self.expr_id_to_expr_map,
             functions: &self.functions,
             parameters: &self.parameters,
-            handles: &self.field_syntax_handles,
             keyed_methods: &self.field_syntax_methods,
             key_struct: self.key_struct_id,
-        }
-    }
-
-    /// A149 S4: the member read `subject.member` (entity `id`) becomes the call
-    /// `subject.member()` — the method call the walk would have queued had the
-    /// parentheses been written, under the SAME entity, so everything keyed by
-    /// the access (its type, its member span, the editor's hover) reads the
-    /// call. Its argument list is empty and sits just past the member's name.
-    fn read_field_through_projection(&mut self, id: Id, subject_id: Id, member_name: &'src str) {
-        let end = self
-            .member_name_spans
-            .get(&id)
-            .map_or(EMPTY_SPAN, |span| Span {
-                start: span.end,
-                end: span.end,
-            });
-        self.field_syntax_reads.insert(id);
-        self.constraints.push(Constraint::MethodCall {
-            id,
-            subject_id,
-            member_name,
-            generic_argument_ids: Vec::new(),
-            argument_ids: Vec::new(),
-            arguments_span: end,
-        });
-    }
-
-    /// B711 S2a: the store reading's field, for the editor — the projection
-    /// `app.user` reads is the field `user` of the struct the handle is on.
-    fn note_store_field_syntax_field(&mut self, id: Id, handle_type: &Type, member_name: &str) {
-        let Some(subject) = self.field_syntax().store_subject(handle_type) else {
-            return;
-        };
-        if let Some(index) = self.structs.get(&subject).and_then(|structure| {
-            structure
-                .fields
-                .iter()
-                .position(|field| field.name == member_name)
-        }) {
-            self.field_syntax_fields.insert(id, (subject, index));
         }
     }
 
     /// B711 S2a (`proposal/struct-keys.md` §3.5, R6): the member read
     /// `subject.member` (entity `id`) on a receiver whose type has a
     /// `[field_syntax]` method becomes the call `subject.method(T.member)` —
-    /// under the SAME entity, as the store reading's projection call does, so
-    /// the access's type, member span and hover read the call.
+    /// under the SAME entity, so the access's type, member span and hover
+    /// read the call. std's store handles read through here (B711 S2b).
     ///
     /// Before it reads through, two things may stop it, each said at the
     /// member:
@@ -71128,7 +71208,6 @@ impl<'src> Analyzer<'src> {
                 start: span.end,
                 end: span.end,
             });
-        self.field_syntax_reads.insert(id);
         self.field_syntax_fields.insert(id, (owner, field_index));
         self.field_syntax_keyed.insert(id, key_id);
         self.constraints.push(Constraint::MethodCall {
@@ -79849,9 +79928,6 @@ pub struct Program<'src> {
     /// Nothing new may be keyed this way: a compiler-lowered external is a row.
     pub list_new_fn_id: Option<Id>,
     pub list_push_fn_id: Option<Id>,
-    /// A149 S4: std's store handles (`Store`, `StoreSome`) — the receivers
-    /// field syntax reads through. Read with [`Program::field_syntax`].
-    pub field_syntax_handles: Vec<Id>,
     /// B711 S2a: the `[field_syntax]` methods of inherent impls, each as
     /// (implementation index, member id). Read with [`Program::field_syntax`].
     pub field_syntax_methods: Vec<(usize, Id)>,
@@ -93053,19 +93129,6 @@ fn analyze_inner<'src>(
             .insert("Context", context_struct_id);
     }
 
-    // A149 S4: std's store handles, out of the module that DECLARES them — the
-    // receivers `app.user.name` reads through (`crate::field_syntax`). Keyed on
-    // std's own structs, so a user type named `Store` is never one.
-    if let Some(store_core) = module_scopes
-        .get("reactive::store_core")
-        .and_then(|scope_id| analyzer.scopes.get(scope_id))
-    {
-        analyzer.field_syntax_handles = ["Store", "StoreSome"]
-            .iter()
-            .filter_map(|name| store_core.name_to_id_map.get(name).copied())
-            .collect();
-    }
-
     // The `std::js::promise` `Promise<T>` struct, so `async`/`await` type precisely.
     analyzer.promise_struct_id = module_scopes
         .get("js::promise")
@@ -95902,7 +95965,6 @@ fn analyze_over_world<'src>(
             .collect(),
         backed_value_members,
         list_new_fn_id,
-        field_syntax_handles: analyzer.field_syntax_handles,
         field_syntax_methods: analyzer.field_syntax_methods,
         field_syntax_fields: analyzer.field_syntax_fields,
         field_syntax_keyed: analyzer.field_syntax_keyed,

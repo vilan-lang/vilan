@@ -264,7 +264,8 @@ const STORE_PRELUDE: &str = "import std::reactive::{ Signal, Source };\nimport s
 #[test]
 fn a149_s4_a_store_handle_offers_its_structs_fields_as_fields() {
     // After `store.` the handled struct's fields are offered as FIELDS (field
-    // syntax), each replacing its projection's method candidate, and the
+    // syntax, through the door since B711 S2b: there is no projection method
+    // to replace any more, and each is offered once), and the
     // handle's own `[internal]` fields (`root`, `path`, `lend`, `modify`) are
     // not offered at all outside std — the analysis refuses them.
     let source = format!(
@@ -322,8 +323,8 @@ fn a149_s4_a_field_syntax_receiver_types_through_its_projection() {
 #[test]
 fn a149_s4_a_field_syntax_read_hovers_as_its_projections_handle() {
     // Hover on `city` in `store.address.city` reads the access, which IS the
-    // projection call: a `Store<str>`, and the declaration it reaches is the
-    // derive's `city()`.
+    // door's call (B711 S2b; the derive's `city()` projection until then): a
+    // `Store<str>`, and the call it reaches is the handle's `field`.
     let text = format!(
         "{STORE_PRELUDE}fun main() {{\n\tlet store = Store::new(App {{ name = \"a\", address = Address {{ city = \"c\", path = \"p\" }} }});\n\tlet _x = store.address.city;\n}}\n"
     );
@@ -345,9 +346,11 @@ fn a149_s4_a_field_syntax_read_hovers_as_its_projections_handle() {
             .functions
             .get(&target)
             .map(|function| function.name),
-        Some("city"),
-        "and the declaration is the projection"
+        Some("field"),
+        "and the call is the handle's door"
     );
+    // Go to definition landing on the FIELD is pinned on the server, in
+    // `field_syntax_a_store_read_hovers_defines_and_completes_through_the_door`.
 }
 
 #[test]

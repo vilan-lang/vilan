@@ -12,6 +12,7 @@ import pkg::compare::PartialEq;
 import pkg::hash::{ Hash, canonical_hash };
 import pkg::io::panic;
 import pkg::js::hash_table::HashTable;
+import pkg::key::Key;
 import pkg::option::Option::{ self, None, Some };
 import pkg::reactive::{
 	DeltaCursor,
@@ -892,9 +893,9 @@ export impl Option<type P: Storable> with Storable {
 // === The handles (§2.1, Q6, Q8) ===============================================
 
 /// A store: a root plus a static path, read in place and written back through the
-/// root. The root and every projection are this one type (Q8). `Store::new` makes a
-/// root (Q5); a derived type's fields are its projections — `user.address().city()`
-/// is a `Store<str>`.
+/// root. The root and every handle below it are this one type (Q8). `Store::new`
+/// makes a root (Q5); a derived struct's fields read through the handle's
+/// `[field_syntax]` door — `user.address.city` is a `Store<str>`.
 ///
 /// It is a `Source<T>`: `get` copies out only the value at the path, never the
 /// root's, and a subscription allocates the path's slot. It is a `Signal<T>`: `set`
@@ -945,21 +946,9 @@ export impl Store<type T> {
 		}
 	}
 
-	/// One field step below this handle — what every projection the derive writes
-	/// calls. `read` and `write` hand the field's place to their consumer in place,
-	/// so a read through ten levels copies only the leaf.
-	[internal("the derive's projection step (A142 S7)")]
-	fun project<F>(
-		self,
-		index: usize,
-		read: |&T, (|&F| void)| void,
-		write: |&mut T, (|&mut F| void)| void,
-	): Store<F> {
-		self.descend(StoreStep::Field(index), read, write)
-	}
-
-	/// One step below this handle, a field's or a key's (`at`, `contains`,
-	/// `by_key`).
+	/// One step below this handle, a key's (`at`, `contains`, `by_key`). `read` and
+	/// `write` hand the place to their consumer in place, so a read through ten
+	/// levels copies only the leaf.
 	[internal("a store's step down (A149 S3)")]
 	fun descend<F>(
 		self,
@@ -1018,18 +1007,7 @@ export impl Store<type T> {
 }
 
 export impl StoreSome<type P> {
-	/// One field step below this handle (`Store::project`'s twin).
-	[internal("the derive's projection step (A142 S7)")]
-	fun project<F>(
-		self,
-		index: usize,
-		read: |&P, (|&F| void)| void,
-		write: |&mut P, (|&mut F| void)| void,
-	): StoreSome<F> {
-		self.descend(StoreStep::Field(index), read, write)
-	}
-
-	/// One step below this handle, a field's or a key's (`Store::step`'s twin).
+	/// One step below this handle, a key's (`Store::descend`'s twin).
 	[internal("a store's step down (A149 S3)")]
 	fun descend<F>(
 		self,
@@ -1168,6 +1146,75 @@ export impl StoreSome<type P> {
 				}
 			},
 			modify = self.modify,
+		}
+	}
+}
+
+// === Field syntax (B711 S2b, `proposal/struct-keys.md` §3.5, R6) ==============
+//
+// A handle reads its struct's fields through ONE door per handle type: the
+// `[field_syntax]` method `field`, which takes a key. `app.user.name` is
+// `app.field(App.user).field(User.name)`; a path key reaches the same handle in one
+// call (`app.field(App.user.name)`): the same slot, the same wakes. The node tree
+// is keyed one `StoreStep::Field` per struct level, so a path's steps are walked
+// into the handle's path, and its read and write go through the key's own place
+// (`held[key]`), which a literal makes the plain field chain.
+
+/// `[derive(Storable)]` implements it on a struct: add the derive to read the
+/// struct's fields through a store handle.
+///
+/// A struct whose fields a store handle reads one by one (`app.user` on a
+/// `Store<App>`), the bound of the handles' `[field_syntax]` door. A struct that
+/// does not derive it is a leaf of the store, read and written whole (`get`,
+/// `set`).
+export trait StoreFields {}
+
+/// The path `key`'s steps make below `path`: one `StoreStep::Field` per field, so a
+/// path key and the chain of its single steps reach one node.
+fun key_path<S, F>(path: Shared<StorePathStep>, key: &Key<S, F>): Shared<StorePathStep> {
+	let parts = &key.erased.parts;
+	if parts.len() == 1 {
+		ret path_child(path, StoreStep::Field(parts[0].index));
+	}
+	mut at = path;
+	for step in parts {
+		at = path_child(at, StoreStep::Field(step.index));
+	}
+	at
+}
+
+export impl Store<type T: StoreFields> {
+	/// The handle on the field (or the path of fields) `key` names — what field
+	/// syntax reads: `app.user` is `app.field(App.user)`. In place, like every step
+	/// below a handle: a read through ten levels copies only the leaf.
+	[field_syntax]
+	fun field<U>(self, key: Key<T, U>): Store<U> {
+		let lend = self.lend;
+		let modify = self.modify;
+		// The closures read the key only as a subscript's index, so natively each
+		// holds the key's access alone, never a copy of its path.
+		Store<U> {
+			root = self.root,
+			path = key_path(self.path, &key),
+			lend = |f: |&U| void| lend(|held: &T| f(&held[key])),
+			modify = |f: |&mut U| void| modify(|held: &mut T| f(&mut held[key])),
+		}
+	}
+}
+
+export impl StoreSome<type P: StoreFields> {
+	/// The handle on the field `key` names, through this handle's variant
+	/// (`Store::field`'s twin): `presence.online().name` is a `StoreSome<str>`.
+	[field_syntax]
+	fun field<U>(self, key: Key<P, U>): StoreSome<U> {
+		let lend = self.lend;
+		let modify = self.modify;
+		StoreSome<U> {
+			root = self.root,
+			path = key_path(self.path, &key),
+			lend = |f: |&U| void| lend(|held: &P| f(&held[key])),
+			modify = |f: |&mut U| void| modify(|held: &mut P| f(&mut held[key])),
+			gate = self.gate,
 		}
 	}
 }

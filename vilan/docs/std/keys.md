@@ -183,7 +183,12 @@ The rule, for a receiver whose type has a `[field_syntax]` method taking a
   — std's `[internal]` one, a field of a resource or of an `external` struct —
   is refused at the member with the key literal's own reason.
 - **A value, not a place.** The read is the method's result: `user.name = v`
-  is refused (write through what the method returns, `user.name.set(v)`).
+  is refused with the call it stands for and the type it answers (write through
+  what the method returns; when that type has a `set` method, the message says
+  `.set(..)`).
+- **A field is not a method.** `user.name()`, where `name` is a field of `T`
+  and no method of the receiver, is refused with the field syntax that reads it
+  (`vilan check --fix` rewrites it).
 
 The declaration has one shape, checked where it is written: `fun at<U>(self,
 key: Key<T, U>): R`, the receiver taken as `self` or `&self` (not `&mut self`:
@@ -201,10 +206,14 @@ state is its own type, whose `[field_syntax]` method starts a cursor:
 `fun at<U>(self, key: Key<S, U>): Cursor<S, U> { Cursor { root = self.state,
 key } }` on a `Root<S>`.
 
-std's store handles read their fields the same way (`app.user.name`, the
-**Field syntax** paragraph of std::store), through the projections
-`[derive(Storable)]` writes; that rule is keyed on `Store` and `StoreSome` and
-stands beside this one until the store moves to the attribute.
+std's store handles read their fields through exactly this door: `Store`,
+`StoreSome`, `RemoteStore` and `RemoteStoreSome` each declare one
+`[field_syntax] fun field<U>(self, key: Key<T, U>)`, so `app.user.name` is
+`app.field(App.user).field(User.name)` (the **Field syntax** paragraph of
+[std::store](store.md)). Their impls bound `T` by `StoreFields`, which
+`[derive(Storable)]` implements: a door whose impl bounds the struct it reads
+through refuses a struct that misses the bound at the member, quoting the
+first paragraph of the bound trait's doc comment as the steer.
 
 ## What a key does not reach
 

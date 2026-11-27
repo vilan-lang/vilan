@@ -49,7 +49,7 @@ pub mod time;
 pub mod url;
 pub mod ws;
 
-pub use key::{KeyAccess, key_mut, key_ref};
+pub use key::{KeyAccess, KeyHeld, key_mut, key_ref};
 
 // ---------------------------------------------------------------- strings ---
 

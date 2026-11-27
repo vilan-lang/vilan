@@ -73,31 +73,21 @@ fun main() {
 	let page = Owner::new();
 	let row = Owner::new();
 	run_with_owner(page, || {
-		g
-			.messages()
-			.at(7)
-			.some()
-			.content()
-			.effect(|content| print(i"seven {content.unwrap_or("-")}"));
+		g.messages.at(7).some().content.effect(|content| print(i"seven {content.unwrap_or("-")}"));
 	});
 	run_with_owner(row, || {
-		g
-			.messages()
-			.at(8)
-			.some()
-			.content()
-			.effect(|content| print(i"eight {content.unwrap_or("-")}"));
+		g.messages.at(8).some().content.effect(|content| print(i"eight {content.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print("-- eight's row goes; a write to eight is already on its way");
-	let _late = global.messages().at(8).some().content().patch("late");
+	let _late = global.messages.at(8).some().content.patch("late");
 	row.dispose();
 	print(i"retired readers while the acknowledgement is on its way: {mirror_retired_census()}");
 	sleep_for(Duration::millis(0));
 	print(i"after it lands: {mirror_retired_census()}");
 	print("-- eight is written again: nothing names its slot");
-	let _again = global.messages().at(8).some().content().patch("unwatched");
+	let _again = global.messages.at(8).some().content.patch("unwatched");
 	sleep_for(Duration::millis(0));
 	page.dispose();
 	sleep_for(Duration::millis(0));

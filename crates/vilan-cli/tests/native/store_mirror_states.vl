@@ -99,21 +99,19 @@ fun main() {
 	let again = Owner::new();
 	run_with_owner(again, || {
 		g.states().effect(|state| print(i"root {shown(state, |value: Global| value.motd)}"));
-		g
-			.messages()
+		g.messages
 			.at(7)
 			.some()
 			.states()
 			.effect(|state| print(i"seven {shown(state, |value: Message| value.content)}"));
-		g
-			.messages()
+		g.messages
 			.at(9)
 			.some()
 			.states()
 			.effect(|state| print(i"nine {shown(state, |value: Message| value.content)}"));
-		g.messages().at(7).some().is_pending().effect(|pending| print(i"seven pending {pending}"));
-		let content: dyn Source<Option<str>> = g.messages().at(7).some().content();
-		let id: dyn Source<Option<u53>> = g.messages().at(7).some().id();
+		g.messages.at(7).some().is_pending().effect(|pending| print(i"seven pending {pending}"));
+		let content: dyn Source<Option<str>> = g.messages.at(7).some().content;
+		let id: dyn Source<Option<u53>> = g.messages.at(7).some().id;
 		combine((content, id)).effect(|both| {
 			let (text, number) = both;
 			print(i"seven's pair {number.unwrap_or(0)}:{text.unwrap_or("-")}");
@@ -122,14 +120,14 @@ fun main() {
 	sleep_for(Duration::millis(0));
 	print("-- two fields in one patch: one turn on the client");
 	batch(|| {
-		let _content = global.messages().at(7).some().content().patch("both");
-		let _id = global.messages().at(7).some().id().patch(70);
+		let _content = global.messages.at(7).some().content.patch("both");
+		let _id = global.messages.at(7).some().id.patch(70);
 	});
 	sleep_for(Duration::millis(0));
 	print("-- the key goes, then comes back");
-	global.messages().at(7).set(None);
+	global.messages.at(7).set(None);
 	sleep_for(Duration::millis(0));
-	global.messages().at(7).set(Some(Message { id = 7, content = "back" }));
+	global.messages.at(7).set(Some(Message { id = 7, content = "back" }));
 	sleep_for(Duration::millis(0));
 	again.dispose();
 	sleep_for(Duration::millis(0));

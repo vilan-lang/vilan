@@ -87,29 +87,29 @@ fun main() {
 	let page = Owner::new();
 	let watching = Owner::new();
 	run_with_owner(page, || {
-		g.rooms().at(1).some().name().effect(|name| print(i"name {name.unwrap_or("-")}"));
+		g.rooms.at(1).some().name.effect(|name| print(i"name {name.unwrap_or("-")}"));
 	});
 	run_with_owner(watching, || {
-		let lounge = g.rooms().at(1).some();
-		lounge.members().contains("amy").effect(|present| print(i"amy {present.unwrap_or(false)}"));
-		lounge.members().contains("zed").effect(|present| print(i"zed {present.unwrap_or(false)}"));
+		let lounge = g.rooms.at(1).some();
+		lounge.members.contains("amy").effect(|present| print(i"amy {present.unwrap_or(false)}"));
+		lounge.members.contains("zed").effect(|present| print(i"zed {present.unwrap_or(false)}"));
 	});
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
 	print("-- zed joins, amy leaves, bob stays: only the watched members cross");
-	let _zed = global.rooms().at(1).some().members().insert("zed");
-	let _amy = global.rooms().at(1).some().members().remove("amy");
-	let _cat = global.rooms().at(1).some().members().insert("cat");
+	let _zed = global.rooms.at(1).some().members.insert("zed");
+	let _amy = global.rooms.at(1).some().members.remove("amy");
+	let _cat = global.rooms.at(1).some().members.insert("cat");
 	sleep_for(Duration::millis(0));
 	print("-- the room's own hold goes; the members watched inside it keep it");
 	page.dispose();
 	sleep_for(Duration::millis(0));
-	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
-	let _back = global.rooms().at(1).some().members().insert("amy");
+	print(i"room held: {g.rooms.at(1).get().flatten().is_some()}");
+	let _back = global.rooms.at(1).some().members.insert("amy");
 	sleep_for(Duration::millis(0));
 	print("-- the last hold inside it goes: the room leaves the replica");
 	watching.dispose();
 	sleep_for(Duration::millis(0));
-	print(i"room held: {g.rooms().at(1).get().flatten().is_some()}");
+	print(i"room held: {g.rooms.at(1).get().flatten().is_some()}");
 	print("done");
 }

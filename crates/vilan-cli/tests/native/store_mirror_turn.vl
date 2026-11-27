@@ -76,31 +76,25 @@ fun main() {
 	);
 	let again = Owner::new();
 	run_with_owner(again, || {
-		g.motd().effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
-		g
-			.messages()
-			.at(9)
-			.some()
-			.content()
-			.effect(|content| print(i"nine {content.unwrap_or("-")}"));
+		g.motd.effect(|motd| print(i"motd {motd.unwrap_or("-")}"));
+		g.messages.at(9).some().content.effect(|content| print(i"nine {content.unwrap_or("-")}"));
 		// The id is read PASSIVELY when the content wakes: a patch whose two ops
 		// landed in two turns would show the content beside the old id.
-		let seven = g.messages().at(7).some();
-		seven
-			.content()
-			.effect(|text| print(i"seven's pair {seven.id().get().unwrap_or(0)}:{text.unwrap_or("-")}"));
+		let seven = g.messages.at(7).some();
+		seven.content
+			.effect(|text| print(i"seven's pair {seven.id.get().unwrap_or(0)}:{text.unwrap_or("-")}"));
 	});
 	sleep_for(Duration::millis(0));
 	print("-- two fields in one patch: one turn on the client");
 	batch(|| {
-		let _content = global.messages().at(7).some().content().patch("both");
-		let _id = global.messages().at(7).some().id().patch(70);
+		let _content = global.messages.at(7).some().content.patch("both");
+		let _id = global.messages.at(7).some().id.patch(70);
 	});
 	sleep_for(Duration::millis(0));
 	print("-- the key goes, then comes back");
-	global.messages().at(7).set(None);
+	global.messages.at(7).set(None);
 	sleep_for(Duration::millis(0));
-	global.messages().at(7).set(Some(Message { id = 7, content = "back" }));
+	global.messages.at(7).set(Some(Message { id = 7, content = "back" }));
 	sleep_for(Duration::millis(0));
 	again.dispose();
 	sleep_for(Duration::millis(0));

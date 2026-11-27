@@ -22,7 +22,7 @@ struct User {
 	age: i32,
 	address: Address,
 	[reactive(coarse)] billing: Address,
-	[reactive(name = "nickname")] get: Option<str>,
+	get: Option<str>,
 }
 
 [derive(Storable)]
@@ -70,19 +70,19 @@ fun alice(): User {
 
 fun main() {
 	let user = Store::new(alice());
-	let city = user.address().city();
+	let city = user.address.city;
 	print(i"read {city.get()}: {census(user)}");
 	let watching = Owner::new();
 	run_with_owner(watching, || {
-		user.name().effect_on_change(|_n| mark("name"));
-		user.age().effect_on_change(|_a| mark("age"));
+		user.name.effect_on_change(|_n| mark("name"));
+		user.age.effect_on_change(|_a| mark("age"));
 		city.effect_on_change(|_c| mark("address.city"));
-		user.address().zip().effect_on_change(|_z| mark("address.zip"));
-		user.address().effect_on_change(|_a| mark("address"));
-		user.billing().effect_on_change(|_b| mark("billing"));
-		user.billing().zip().effect_on_change(|_z| mark("billing.zip"));
-		user.nickname().is_some().effect_on_change(|s| mark(i"nickname.is_some={s}"));
-		user.nickname().some().effect_on_change(|n| mark(i"nick={n.unwrap_or("-")}"));
+		user.address.zip.effect_on_change(|_z| mark("address.zip"));
+		user.address.effect_on_change(|_a| mark("address"));
+		user.billing.effect_on_change(|_b| mark("billing"));
+		user.billing.zip.effect_on_change(|_z| mark("billing.zip"));
+		user.field(User.get).is_some().effect_on_change(|s| mark(i"nickname.is_some={s}"));
+		user.field(User.get).some().effect_on_change(|n| mark(i"nick={n.unwrap_or("-")}"));
 		user.effect_on_change(|_u| mark("user"));
 	});
 	print(i"subscribed: {census(user)}");
@@ -100,17 +100,17 @@ fun main() {
 	print(i"handle set address.city: [{drained()}] root.city={now.address.city}");
 	city.set("Bergen");
 	print(i"handle set, same value: [{drained()}]");
-	user.age().notify();
+	user.age.notify();
 	print(i"notify age: [{drained()}]");
-	let nick: StoreSome<str> = user.nickname().some();
+	let nick: StoreSome<str> = user.field(User.get).some();
 	print(i"patch while None: {nick.patch("al")} [{drained()}]");
-	user.nickname().set(Some("ally"));
+	user.field(User.get).set(Some("ally"));
 	print(i"None -> Some: [{drained()}] nick={nick.get().unwrap_or("-")}");
 	print(i"patch while Some: {nick.patch("al")} [{drained()}] nick={nick.get().unwrap_or("-")}");
 	watching.dispose();
 	print(i"released: {census(user)}");
 	let pair = Store::new(Pair { left = 1, right = 2 });
-	pair.left().set(5);
+	pair.left.set(5);
 	let both: Pair<i32> = pair.get();
-	print(i"pair: {both.left} {both.right} {pair.right().get()}");
+	print(i"pair: {both.left} {both.right} {pair.right.get()}");
 }

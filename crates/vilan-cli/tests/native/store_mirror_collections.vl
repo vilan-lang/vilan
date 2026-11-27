@@ -98,15 +98,15 @@ fun main() {
 	);
 	let page = Owner::new();
 	run_with_owner(page, || {
-		g.rooms().at(0).some().messages().effect(|list| print(i"general {ids(list)}"));
-		g.rooms().keys().effect(|keys| {
+		g.rooms.at(0).some().messages.effect(|list| print(i"general {ids(list)}"));
+		g.rooms.keys().effect(|keys| {
 			mut out = "";
 			for key in keys {
 				out = out + i" {key}";
 			}
 			print(i"rooms:{out}");
 		});
-		g.tags().keys().effect(|members| {
+		g.tags.keys().effect(|members| {
 			mut out = "";
 			for member in members {
 				out = out + i" {member}";
@@ -116,7 +116,7 @@ fun main() {
 	});
 	sleep_for(Duration::millis(0));
 	sleep_for(Duration::millis(0));
-	let general = global.rooms().at(0).some().messages();
+	let general = global.rooms.at(0).some().messages;
 	print("-- a push is a splice at the end");
 	general.push(4);
 	sleep_for(Duration::millis(0));
@@ -131,14 +131,14 @@ fun main() {
 	let _whole = general.patch([7, 8]);
 	sleep_for(Duration::millis(0));
 	print("-- a room's name is not a key change");
-	let _named = global.rooms().at(5).some().name().patch("chat");
+	let _named = global.rooms.at(5).some().name.patch("chat");
 	sleep_for(Duration::millis(0));
 	print("-- a room created and one deleted");
-	global.rooms().at(9).set(Some(Room { id = 9, name = "new", messages = [] }));
-	global.rooms().at(5).set(None);
+	global.rooms.at(9).set(Some(Room { id = 9, name = "new", messages = [] }));
+	global.rooms.at(5).set(None);
 	sleep_for(Duration::millis(0));
 	print("-- a set's members are its key set");
-	global.tags().insert("urgent");
+	global.tags.insert("urgent");
 	sleep_for(Duration::millis(0));
 	page.dispose();
 	sleep_for(Duration::millis(0));
