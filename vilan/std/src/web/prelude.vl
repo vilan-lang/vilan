@@ -15,6 +15,7 @@ export import pkg::iterator::Iterator;
 // prelude's, this re-export does not load `std::key`; a program that may need it
 // does (M211, `prelude.vl`).
 export import pkg::key::Key;
+export import pkg::key::MaybeKey;
 export import pkg::option::Option::{ self, None, Some };
 export import pkg::result::Result::{ self, Err, Ok };
 

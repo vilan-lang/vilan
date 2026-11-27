@@ -616,8 +616,8 @@ fn keys_an_unknown_field_is_refused_with_a_suggestion() {
     );
 }
 
-/// S3's places are refused: a key reaches only struct fields, never into an
-/// `Option`, a list, a map, a tuple or a scalar.
+/// A FIELD step reaches only struct fields, never into an `Option` (that is a
+/// variant step, S3a), a list, a map, a tuple or a scalar.
 #[test]
 fn keys_a_step_past_a_struct_field_is_refused() {
     let shapes = r#"
@@ -634,7 +634,9 @@ fn keys_a_step_past_a_struct_field_is_refused() {
     "#;
     assert_fails_with(
         &format!("{shapes} fun main() {{ let k = Doc.cover.v; }}"),
-        "a key reaches only struct fields: `Doc.cover` has type `Option<Inner>`, and a step into an `Option` or an enum's variant may find nothing there",
+        // S3a: an enum is stepped into through a variant, and the refusal
+        // says how.
+        "a field step reaches only struct fields: `Doc.cover` has type `Option<Inner>`, an enum: a key reaches a variant's payload with a variant step, `Doc.cover::Some.v`",
     );
     assert_fails_with(
         &format!("{shapes} fun main() {{ let k = Doc.tags.len; }}"),
@@ -705,7 +707,7 @@ fn keys_a_literal_is_one_hoisted_constant_and_a_field_chain() {
     );
     let js = compile(&source).expect("compiles");
     assert_eq!(
-        js.matches("2, \"meta\" ], [").count(),
+        js.matches("2, \"meta\", [ 0 ] ], [").count(),
         1,
         "one constant for the literal:\n{js}"
     );

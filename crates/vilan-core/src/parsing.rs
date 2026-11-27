@@ -6060,12 +6060,71 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut postfixes: Vec<(Postfix<'src>, Span)> = Vec::new();
         loop {
             let start = self.position;
+            // B711 S3a: `Doc.title::Some`, `Doc.shape::Rect.0` — a variant
+            // step of a key literal. `::` after a postfix is no form anything
+            // else reads (a `::` path is the BASE's, before any postfix), so
+            // the step is admitted only after a member (`.name`, `.0`) or
+            // another variant step, and name resolution decides whether the
+            // chain is a key.
+            if self.peek_is_op("::")
+                && matches!(
+                    postfixes.last(),
+                    Some((
+                        Postfix::Member((
+                            Node::Accessor(_) | Node::Number(_, None, None) | Node::KeyVariant(..),
+                            _
+                        )),
+                        _
+                    ))
+                )
+            {
+                let step = self.parse_key_variant_step();
+                postfixes.push((Postfix::Member(step), self.span_from(start)));
+                continue;
+            }
             match self.parse_one_postfix()? {
                 Some(postfix) => postfixes.push((postfix, self.span_from(start))),
                 None => break,
             }
         }
         Some(group_postfixes(base, postfixes))
+    }
+
+    /// B711 S3a: `::Variant` and its optional payload position (`.0`) after a
+    /// member — the cursor on the `::`. The name must start on the `::`'s
+    /// line (E142's rule); a missing one is the half-typed `Doc.title::`, kept
+    /// as an empty name so the subject still analyzes (completion offers the
+    /// variants there) and the analysis says what is missing.
+    fn parse_key_variant_step(&mut self) -> Spanned<Node<'src>> {
+        let start = self.position;
+        self.bump(); // `::`
+        let name_start = self.position;
+        let name = if self.separator_crosses_a_line() {
+            None
+        } else {
+            self.eat_member_name()
+        };
+        let Some(name) = name else {
+            let at = self.span_from(start);
+            let end = Span::from(at.end..at.end);
+            return (Node::KeyVariant(("", end), None), at);
+        };
+        let name = (name, self.span_from(name_start));
+        // `.0` straight after the variant is its payload position, folded into
+        // the step: one number, against its dot, no fraction and no suffix.
+        let mut position = None;
+        if self.peek_is_ctrl('.')
+            && let Some((Token::Number(whole, None, None), number_span)) =
+                self.tokens.get(self.position + 1)
+            && self.tokens[self.position].1.end == number_span.start
+        {
+            let whole = *whole;
+            let number_span = *number_span;
+            self.bump();
+            self.bump();
+            position = Some((whole, number_span));
+        }
+        (Node::KeyVariant(name, position), self.span_from(start))
     }
 
     /// One postfix suffix, or `Some(None)` when none starts here (stop the loop).

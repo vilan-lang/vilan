@@ -832,6 +832,44 @@ fn primed_binder_name(name: &str) -> &'static str {
     leaked
 }
 
+/// One step of a key literal ([`Expr::Key`], B711).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum KeyLiteralStep {
+    /// A struct's field: the struct that DECLARES it, and its position there.
+    Field(Id, usize),
+    /// A variant's payload slot (S3a, `::Rect.0`): the enum that declares the
+    /// variant, the variant's position, and the slot's. It may miss at run
+    /// time, so a path holding one is a `MaybeKey`.
+    Variant(Id, usize, usize),
+}
+
+impl KeyLiteralStep {
+    /// The declaration the step belongs to: a struct, or an enum.
+    pub fn owner(self) -> Id {
+        match self {
+            KeyLiteralStep::Field(owner, _) | KeyLiteralStep::Variant(owner, ..) => owner,
+        }
+    }
+
+    /// The field's position for a field step.
+    pub fn field(self) -> Option<(Id, usize)> {
+        match self {
+            KeyLiteralStep::Field(owner, index) => Some((owner, index)),
+            KeyLiteralStep::Variant(..) => None,
+        }
+    }
+
+    /// Whether the place may be missing at run time.
+    pub fn is_partial(self) -> bool {
+        matches!(self, KeyLiteralStep::Variant(..))
+    }
+}
+
+/// Whether a key literal's steps make a `MaybeKey` (any step may miss).
+pub fn key_steps_are_partial(steps: &[KeyLiteralStep]) -> bool {
+    steps.iter().any(|step| step.is_partial())
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub enum Expr<'src> {
@@ -877,10 +915,11 @@ pub enum Expr<'src> {
     // rooted at the subject, told apart by `Program::key_subscripts`.
     Index(Id, Id),
     /// A key literal (B711, `proposal/struct-keys.md`): `Task.meta.owner` as a
-    /// `Key<Task, str>`. Its steps, root first, each the struct that DECLARES
-    /// the field and the field's position in it. A constant: it has no operand
-    /// to evaluate, and every emitter builds `std::key`'s layout from the steps.
-    Key(Vec<(Id, usize)>),
+    /// `Key<Task, str>`, `Doc.shape::Rect.0` as a `MaybeKey<Doc, f64>` (S3a).
+    /// Its steps, root first ([`KeyLiteralStep`]). A constant: it has no
+    /// operand to evaluate, and every emitter builds `std::key`'s layout from
+    /// the steps.
+    Key(Vec<KeyLiteralStep>),
     // A loop: the optional condition and the body (statements, trailing expr).
     For(Option<Id>, (Vec<Id>, Id)),
     // `for item in iterable` — the iterable, the optional element binding (None
@@ -3642,6 +3681,17 @@ pub struct FieldAccessorConstraint<'src> {
     pub id: Id,
     pub subject_id: Id,
     pub member_name: &'src str,
+    /// B711 S3a: `Some` when the member is a key's VARIANT step
+    /// (`::Some`, `::Rect.0`) — `member_name` is then the variant's name.
+    pub variant: Option<KeyVariantWritten<'src>>,
+}
+
+/// B711 S3a: a variant step as written after its `::` name: its payload
+/// position, when one was written (`.0`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound(deserialize = "'de: 'static"))]
+pub struct KeyVariantWritten<'src> {
+    pub position: Option<(&'src str, Span)>,
 }
 
 /// A deferred type-inference task, resolved by `Analyzer::try_resolve`. This is
@@ -6791,6 +6841,8 @@ pub struct Analyzer<'src> {
     // B711: `std::key`'s `Key<S, F>`, by identity — the type of a key literal
     // and of the index a struct subscript takes.
     key_struct_id: Option<Id>,
+    /// B711 S3a: `std::key::MaybeKey`, when the module loaded.
+    maybe_key_struct_id: Option<Id>,
     /// The std `Callable` marker (B340), resolved by identity from
     /// `std::operators` after loading. `x(args)` on a receiver whose type
     /// implements it resolves as the method `call`; keyed on the real std
@@ -8811,6 +8863,7 @@ impl<'src> Analyzer<'src> {
             tuple_trait_id: None,
             tuple_key_struct_id: None,
             key_struct_id: None,
+            maybe_key_struct_id: None,
             lift_trait_id: None,
             callable_trait_id: None,
             hmr_stash_fn_id: None,
@@ -31121,7 +31174,12 @@ impl<'src> Analyzer<'src> {
             Expr::Index(subject_id, index_id) if self.key_subscript_ids.contains(&expr_id) => {
                 let (root, mut path) = self.place_path(*subject_id)?;
                 if let Some(Expr::Key(steps)) = self.expr_id_to_expr_map.get(index_id) {
-                    path.extend(steps.iter().map(|(_, index)| PlaceStep::Field(*index)));
+                    path.extend(
+                        steps
+                            .iter()
+                            .filter_map(|step| step.field())
+                            .map(|(_, index)| PlaceStep::Field(index)),
+                    );
                 }
                 Some((root, path))
             }
@@ -42755,6 +42813,9 @@ impl<'src> Analyzer<'src> {
             // B620's head-link mark is only ever a member, unwrapped by the
             // member walk; one in expression position is a pass bug.
             Node::ElementHeadLink(..) => Some(Expr::Error),
+            // B711 S3a: a variant step is only ever a member, walked by the
+            // member walk; anywhere else the parser never builds one.
+            Node::KeyVariant(..) => Some(Expr::Error),
             // Likewise: `..e` forwards to its operand and marks it, so a
             // `Spread` node never reaches the entity match.
             Node::Spread(..) => unreachable!("`..` forwards to its operand expression"),
@@ -43173,6 +43234,7 @@ impl<'src> Analyzer<'src> {
                         id,
                         subject_id,
                         member_name: name,
+                        variant: None,
                     }));
             }
             // A number member (`pair.0`) is a tuple's positional
@@ -43208,6 +43270,7 @@ impl<'src> Analyzer<'src> {
                                 id: inner_id,
                                 subject_id,
                                 member_name: name,
+                                variant: None,
                             }));
                         (inner_id, *fraction_part)
                     }
@@ -43218,6 +43281,21 @@ impl<'src> Analyzer<'src> {
                         id,
                         subject_id: final_subject,
                         member_name: final_member,
+                        variant: None,
+                    }));
+            }
+            // B711 S3a: `Doc.title::Some`, `Doc.shape::Rect.0` — a key's
+            // variant step, resolved like a field step once its subject is.
+            Node::KeyVariant((name, name_span), position) => {
+                self.member_name_spans.insert(id, *name_span);
+                self.constraints
+                    .push(Constraint::FieldAccessor(FieldAccessorConstraint {
+                        id,
+                        subject_id,
+                        member_name: name,
+                        variant: Some(KeyVariantWritten {
+                            position: *position,
+                        }),
                     }));
             }
             Node::Call(call_subject, call_generic_arguments, call_arguments) => {
@@ -55872,7 +55950,7 @@ impl<'src> Analyzer<'src> {
         source_id: SourceId,
     ) -> bool {
         // The leaf first: it rejects almost every import in one comparison.
-        if name != STD_KEY_AMBIENT {
+        if !STD_KEY_AMBIENT.contains(&name) {
             return false;
         }
         let [("pkg", _), (STD_KEY_MODULE, _)] = path else {
@@ -58393,6 +58471,27 @@ impl<'src> Analyzer<'src> {
                 "Expected {expected}, but got {got} instead: the label `{label}` names slot \
                  {from} of the value and slot {to} here, {LABEL_CONTRADICTION_STEER}"
             );
+        }
+        // B711 S3a: the two key kinds. A total key widens with `.maybe()`;
+        // a partial one has no total form.
+        if let (Type::Struct(wanted, _), Type::Struct(given, _)) = (expected_type, got_type)
+            && self.key_struct_id.is_some()
+            && self.maybe_key_struct_id.is_some()
+        {
+            if Some(*wanted) == self.key_struct_id && Some(*given) == self.maybe_key_struct_id {
+                return format!(
+                    "Expected {expected}, but got {got} instead: this key's path has a step that \
+                     may find nothing (a variant step), so it is a `MaybeKey`, which reaches its \
+                     place with `get`, `view`, `change` or `put`; a `Key` names a place that is \
+                     always there"
+                );
+            }
+            if Some(*wanted) == self.maybe_key_struct_id && Some(*given) == self.key_struct_id {
+                return format!(
+                    "Expected {expected}, but got {got} instead: a total key held in a value \
+                     becomes a `MaybeKey` with `.maybe()` (a key literal needs no call)"
+                );
+            }
         }
         match self.numeric_conversion_target(expected_type, got_type) {
             Some("usize") => format!(
@@ -61160,6 +61259,20 @@ impl<'src> Analyzer<'src> {
             return Resolution::Failed;
         }
         let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+        // B711 S3a: a key LITERAL as a receiver (`Doc.title::Some.get(&d)`)
+        // takes no type from where it stands, so its kind is its steps' and
+        // its type is settled here, where nothing else will record it.
+        if matches!(subject_type, Type::Struct(..))
+            && !self.type_has_an_unknown_hole(&subject_type)
+            && matches!(
+                self.expr_id_to_expr_map.get(&subject_id),
+                Some(Expr::Key(_))
+            )
+            && !self.resolved_types.contains_key(&subject_id)
+        {
+            let type_id = subject_type.clone().get_type_id(self);
+            self.resolved_types.insert(subject_id, type_id);
+        }
         // A method on a `List::new()` whose element slot is still unknown but has a
         // pending `push`/`run` to fill it must wait: resolving now would type a
         // closure parameter — and the call's own result element — against the
@@ -70400,6 +70513,9 @@ impl<'src> Analyzer<'src> {
         if !self.expr_id_to_expr_map.contains_key(&subject_id) {
             return Resolution::Deferred;
         }
+        if let Some(written) = &constraint.variant {
+            return self.resolve_key_variant_step(id, subject_id, member_name, written);
+        }
         if let Some(resolution) = self.resolve_key_step(id, subject_id, member_name) {
             return resolution;
         }
@@ -70643,15 +70759,17 @@ impl<'src> Analyzer<'src> {
     ///
     /// `subject` is either a struct TYPE written as a bare name (the root,
     /// admitted by `resolve_prepped_local` from `key_root_uses`) or a key
-    /// literal already resolved (a path continues: `Task.meta` then `.owner`).
-    /// Answers `None` for every other subject, which is then the ordinary member
-    /// access — a value named like a type never gets here (R9).
+    /// literal already resolved (a path continues: `Task.meta` then `.owner`,
+    /// or past a variant step, `Doc.owner::Some.name`). Answers `None` for
+    /// every other subject, which is then the ordinary member access — a value
+    /// named like a type never gets here (R9).
     ///
     /// The step names a field of the struct the path has reached so far, under
     /// the rules a member access `s.x` of that struct follows: an `[internal]`
-    /// std field is no member outside std. A key reaches ONLY a struct's own
-    /// fields: a step into an `Option`, an enum, a list, a map, a tuple or a
-    /// type parameter is refused (a partial place is `MaybeKey`, a later stage).
+    /// std field is no member outside std. A field step reaches ONLY a
+    /// struct's own fields: a step into an `Option` or an enum is a variant
+    /// step (`::Some`, [`Self::resolve_key_variant_step`]); one into a list, a
+    /// map, a tuple or a type parameter is refused.
     fn resolve_key_step(
         &mut self,
         id: Id,
@@ -70662,78 +70780,321 @@ impl<'src> Analyzer<'src> {
         // said whether it loaded or not — `i32.max` is refused with the same
         // words in a program the module is never seeded for. Only a key that
         // IS built needs `Key`; see the end.
-        let (root, mut steps) = match self.expr_id_to_expr_map.get(&subject_id) {
-            Some(Expr::Local(target)) if self.key_root_uses.contains(&subject_id) => {
-                match self.expr_id_to_expr_map.get(target) {
-                    Some(Expr::Struct(struct_id)) => (*struct_id, Vec::new()),
-                    _ => return None,
-                }
-            }
-            Some(Expr::Key(steps)) => (steps.first()?.0, steps.clone()),
-            _ => return None,
-        };
+        let (root, mut steps) = self.key_literal_subject(subject_id)?;
         let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
         let reached = self.key_path_type(root, &steps)?;
-        let refuse = |this: &mut Self, msg: String| {
-            this.diagnostics.push(Error {
-                trace: Vec::new(),
-                note: None,
-                span,
-                msg,
-            });
-            this.expr_id_to_expr_map.insert(id, Expr::Error);
-            Some(Resolution::Failed)
-        };
-        let root_name = self.structs.get(&root).map_or("", |struct_| struct_.name);
-        let path_so_far = {
-            let mut path = root_name.to_string();
-            for (owner, index) in &steps {
-                if let Some(field) = self
-                    .structs
-                    .get(owner)
-                    .and_then(|struct_| struct_.fields.get(*index))
-                {
-                    path.push('.');
-                    path.push_str(field.name);
-                }
-            }
-            path
-        };
+        let path_so_far = self.key_path_spelling(root, &steps);
         let (owner, field_index) =
             match self.key_step_into(id, &reached, steps.is_empty(), &path_so_far, member_name) {
                 Ok(step) => step,
-                Err(msg) => return refuse(self, msg),
+                Err(msg) => return Some(self.refuse_key_step(id, span, msg)),
             };
-        steps.push((owner, field_index));
+        steps.push(KeyLiteralStep::Field(owner, field_index));
+        Some(self.record_key_literal(id, steps, &path_so_far, member_name))
+    }
+
+    /// B711: the root and the steps so far of a key literal's SUBJECT — a
+    /// struct type written as a bare name or path (no steps yet), or a key
+    /// literal (its steps) — or `None` when the subject is a value.
+    fn key_literal_subject(&self, subject_id: Id) -> Option<(Id, Vec<KeyLiteralStep>)> {
+        match self.expr_id_to_expr_map.get(&subject_id) {
+            Some(Expr::Local(target)) if self.key_root_uses.contains(&subject_id) => {
+                match self.expr_id_to_expr_map.get(target) {
+                    Some(Expr::Struct(struct_id)) => Some((*struct_id, Vec::new())),
+                    _ => None,
+                }
+            }
+            Some(Expr::Key(steps)) => Some((steps.first()?.owner(), steps.clone())),
+            _ => None,
+        }
+    }
+
+    /// A key step's refusal at `span`: the message, and the step an error.
+    fn refuse_key_step(&mut self, id: Id, span: Span, msg: String) -> Resolution {
+        self.diagnostics.push(Error {
+            trace: Vec::new(),
+            note: None,
+            span,
+            msg,
+        });
+        self.expr_id_to_expr_map.insert(id, Expr::Error);
+        Resolution::Failed
+    }
+
+    /// B711: entity `id` is the key literal `steps` (its last step just
+    /// resolved, written `{path_so_far}` then `{step_written}`). Its type is
+    /// the expectation's, asked afresh each time ([`Self::key_literal_type`]):
+    /// a generic root takes its arguments from where the key lands (R8), and a
+    /// TOTAL literal is a `MaybeKey` where one is expected (S3a) — a literal
+    /// takes its type from its position, as an unsuffixed number does.
+    fn record_key_literal(
+        &mut self,
+        id: Id,
+        steps: Vec<KeyLiteralStep>,
+        path_so_far: &str,
+        step_written: &str,
+    ) -> Resolution {
         // M211: a key literal stands here, so the loader's seed
         // (`seeds_std_key`) must have loaded `std::key`. A miss is a defect in
         // the seed, said as one rather than compiled as a member access.
-        let Some(key_struct_id) = self.key_struct_id else {
-            return refuse(
-                self,
+        if self.key_struct_id.is_none() || self.maybe_key_struct_id.is_none() {
+            let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+            return self.refuse_key_step(
+                id,
+                span,
                 format!(
-                    "internal error: `{path_so_far}.{member_name}` is a key literal, and \
+                    "internal error: `{path_so_far}{step_written}` is a key literal, and \
                      `std::key` was not loaded for it (M211: the loader's key seed missed it)"
                 ),
             );
-        };
-        let root_is_generic = self
+        }
+        self.expr_id_to_expr_map.insert(id, Expr::Key(steps));
+        Resolution::Resolved
+    }
+
+    /// B711: a key path as a literal spells it, root first: `Task.meta`,
+    /// `Doc.shape::Rect.0`, for diagnostics.
+    fn key_path_spelling(&self, root: Id, steps: &[KeyLiteralStep]) -> String {
+        let mut path = self
             .structs
             .get(&root)
-            .is_some_and(|struct_| !struct_.generic_parameter_constraint_ids.is_empty());
-        self.expr_id_to_expr_map
-            .insert(id, Expr::Key(steps.clone()));
-        // A generic root's arguments come from where the key lands (R8), so its
-        // type is the expectation's, asked afresh each time (`key_literal_type`).
-        if !root_is_generic {
-            let field_type = self.key_path_type(root, &steps)?.get_type_id(self);
-            let root_type = Type::Struct(root, Vec::new()).get_type_id(self);
-            let key_type =
-                Type::Struct(key_struct_id, vec![root_type, field_type]).get_type_id(self);
-            self.expr_id_to_type_id_map.insert(id, key_type);
-            self.resolved_types.insert(id, key_type);
+            .map_or("", |struct_| struct_.name)
+            .to_string();
+        for step in steps {
+            match *step {
+                KeyLiteralStep::Field(owner, index) => {
+                    if let Some(field) = self
+                        .structs
+                        .get(&owner)
+                        .and_then(|struct_| struct_.fields.get(index))
+                    {
+                        path.push('.');
+                        path.push_str(field.name);
+                    }
+                }
+                KeyLiteralStep::Variant(owner, variant, slot) => {
+                    if let Some(declared) = self
+                        .enums
+                        .get(&owner)
+                        .and_then(|enum_| enum_.variants.get(variant))
+                    {
+                        path.push_str("::");
+                        path.push_str(declared.name);
+                        if declared.data_type_ids.len() > 1 {
+                            path.push('.');
+                            path.push_str(&slot.to_string());
+                        }
+                    }
+                }
+            }
         }
-        Some(Resolution::Resolved)
+        path
+    }
+
+    /// B711 S3a (`proposal/struct-keys.md` §3.4, R4): `::Variant` and its
+    /// optional payload position after a key literal — `Doc.title::Some`,
+    /// `Doc.shape::Rect.0`. The step reaches one slot of the variant's payload
+    /// and may miss, so the literal is a `MaybeKey`. The position may be left
+    /// out of a one-slot payload; a payload of several slots is reached one
+    /// slot at a time, and a unit variant has no place to name.
+    ///
+    /// Only a key's path takes a variant step: on a VALUE (`doc.title::Some`,
+    /// a store handle's `app.title::Some`) it is refused with the forms that
+    /// test a value's variant.
+    fn resolve_key_variant_step(
+        &mut self,
+        id: Id,
+        subject_id: Id,
+        variant_name: &'src str,
+        written: &KeyVariantWritten<'src>,
+    ) -> Resolution {
+        let span = **self.span_map.get(&id).unwrap_or(&&EMPTY_SPAN);
+        if matches!(self.expr_id_to_expr_map.get(&subject_id), Some(Expr::Error)) {
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        }
+        let Some((root, mut steps)) = self.key_literal_subject(subject_id) else {
+            // A value: say so once its type is known (or it never will be).
+            let subject_type = self.infer_type(subject_id, &Type::Unknown, &HashMap::default());
+            if matches!(subject_type, Type::Unresolved) {
+                return Resolution::Deferred;
+            }
+            let subject_written = self
+                .source_of_id(subject_id)
+                .and_then(|source| self.source_text(source))
+                .and_then(|text| {
+                    let subject_span = **self.span_map.get(&subject_id)?;
+                    text.get(subject_span.into_range())
+                })
+                .filter(|text| !text.contains('\n'))
+                .map_or_else(|| "this".to_string(), |text| format!("`{text}`"));
+            let shown = if variant_name.is_empty() {
+                "Variant"
+            } else {
+                variant_name
+            };
+            return self.refuse_key_step(
+                id,
+                span,
+                format!(
+                    "a variant step (`::{shown}`) stands only in a key literal's path, rooted at \
+                     a struct type (`Doc.title::Some`), and {subject_written} is a value: to \
+                     test a value's variant write `{} is {shown}(..)` or `match`",
+                    subject_written.trim_matches('`')
+                ),
+            );
+        };
+        let path_so_far = self.key_path_spelling(root, &steps);
+        let Some(reached) = self.key_path_type(root, &steps) else {
+            self.expr_id_to_expr_map.insert(id, Expr::Error);
+            return Resolution::Failed;
+        };
+        let reached_name = self.pretty_print_type(&reached, &HashMap::default());
+        let (enum_id, arguments) = match &reached {
+            Type::Enum(enum_id, arguments) => (*enum_id, arguments.clone()),
+            _ => {
+                return self.refuse_key_step(
+                    id,
+                    span,
+                    format!(
+                        "a variant step reaches into an `Option` or an enum's payload: \
+                         `{path_so_far}` has type `{reached_name}`, which has no variants"
+                    ),
+                );
+            }
+        };
+        let (enum_name, resource, variants): (&str, bool, Vec<(&str, usize, bool)>) = {
+            let Some(enum_) = self.enums.get(&enum_id) else {
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                return Resolution::Failed;
+            };
+            (
+                enum_.name,
+                enum_.resource,
+                enum_
+                    .variants
+                    .iter()
+                    .map(|variant| {
+                        (
+                            variant.name,
+                            variant.data_type_ids.len(),
+                            variant.internal.is_some(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let enum_type = Type::Enum(enum_id, arguments).get_type_id(self);
+        if resource || self.type_is_resource(enum_type) {
+            return self.refuse_key_step(
+                id,
+                span,
+                format!(
+                    "`{enum_name}` is a resource, and a key cannot reach into a resource's \
+                     payload: a resource is moved, never copied, and a key's place reads by copy"
+                ),
+            );
+        }
+        let reachable = |this: &Self, index: usize| {
+            !variants[index].2
+                || crate::labels::internal_field_out_of_reach(
+                    this.enums
+                        .get(&enum_id)
+                        .and_then(|enum_| enum_.variants.get(index))
+                        .and_then(|variant| variant.internal),
+                    this.source_of_id(enum_id),
+                    this.source_of_id(id),
+                    &this.std_sources,
+                )
+                .is_none()
+        };
+        let payload_variants: Vec<&str> = variants
+            .iter()
+            .enumerate()
+            .filter(|(index, (_, slots, _))| *slots > 0 && reachable(self, *index))
+            .map(|(_, (name, ..))| *name)
+            .collect();
+        let listed = || {
+            payload_variants
+                .iter()
+                .map(|name| format!("`::{name}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if variant_name.is_empty() {
+            return self.refuse_key_step(
+                id,
+                span,
+                format!(
+                    "expected a variant name after `::`: `{path_so_far}` is a `{reached_name}`, \
+                     whose payload variants are {}",
+                    listed()
+                ),
+            );
+        }
+        let Some(variant_index) = variants
+            .iter()
+            .position(|(name, ..)| *name == variant_name)
+            .filter(|index| reachable(self, *index))
+        else {
+            let suggestion =
+                closest_name::closest_name(variant_name, payload_variants.iter().copied())
+                    .map(|name| format!("; did you mean `{name}`?"))
+                    .unwrap_or_default();
+            return self.refuse_key_step(
+                id,
+                span,
+                format!("enum '{enum_name}' has no variant '{variant_name}'{suggestion}"),
+            );
+        };
+        let slots = variants[variant_index].1;
+        if slots == 0 {
+            return self.refuse_key_step(
+                id,
+                span,
+                format!(
+                    "`{enum_name}::{variant_name}` is a unit variant: it holds no value, so \
+                     there is no place for a key to reach; to test for it, read \
+                     `{path_so_far}` and write `is {enum_name}::{variant_name}`"
+                ),
+            );
+        }
+        let slot = match written.position {
+            Some((digits, _)) => match digits.parse::<usize>() {
+                Ok(slot) if slot < slots => slot,
+                _ => {
+                    let positions = if slots == 1 {
+                        "one slot, at position 0".to_string()
+                    } else {
+                        format!("{slots} slots, at positions 0 to {}", slots - 1)
+                    };
+                    return self.refuse_key_step(
+                        id,
+                        span,
+                        format!(
+                            "`{enum_name}::{variant_name}`'s payload has {positions}: \
+                             `.{digits}` is out of range"
+                        ),
+                    );
+                }
+            },
+            None if slots > 1 => {
+                return self.refuse_key_step(
+                    id,
+                    span,
+                    format!(
+                        "`{enum_name}::{variant_name}` holds {slots} values, and a key reaches \
+                         one slot at a time: name it by its position, `{path_so_far}::{variant_name}.0` \
+                         to `{path_so_far}::{variant_name}.{}`",
+                        slots - 1
+                    ),
+                );
+            }
+            None => 0,
+        };
+        steps.push(KeyLiteralStep::Variant(enum_id, variant_index, slot));
+        let written_step = format!("::{variant_name}");
+        self.record_key_literal(id, steps, &path_so_far, &written_step)
     }
 
     /// B711: the step `member_name` from the type a key path has `reached` —
@@ -70759,12 +71120,32 @@ impl<'src> Analyzer<'src> {
             {
                 (*owner, arguments.clone())
             }
-            Type::Enum(..) => {
+            Type::Enum(enum_id, _) => {
+                // S3a: an enum is stepped into through one of its variants.
+                let variant = self
+                    .enums
+                    .get(enum_id)
+                    .and_then(|enum_| {
+                        enum_
+                            .variants
+                            .iter()
+                            .find(|variant| !variant.data_type_ids.is_empty())
+                    })
+                    .map(|variant| (variant.name, variant.data_type_ids.len()));
+                let steer = match variant {
+                    Some((name, 1)) => format!(
+                        ": a key reaches a variant's payload with a variant step, \
+                         `{path_so_far}::{name}.{member_name}`"
+                    ),
+                    Some((name, _)) => format!(
+                        ": a key reaches a variant's payload with a variant step and its \
+                         position, `{path_so_far}::{name}.0`"
+                    ),
+                    None => ", whose variants hold no values".to_string(),
+                };
                 return Err(format!(
-                    "a key reaches only struct fields: `{path_so_far}` has type \
-                         `{reached_name}`, and a step into an `Option` or an enum's variant \
-                         may find nothing there (a key to a place that may be missing, \
-                         `MaybeKey`, is a later stage)"
+                    "a field step reaches only struct fields: `{path_so_far}` has type \
+                     `{reached_name}`, an enum{steer}"
                 ));
             }
             _ => {
@@ -70782,7 +71163,7 @@ impl<'src> Analyzer<'src> {
                     }
                     _ => format!(
                         "has type `{reached_name}`, which has no fields a key can name (a list \
-                         element or a map entry, `MaybeKey`, is a later stage)"
+                         element or a map entry is a later stage)"
                     ),
                 };
                 return Err(format!(
@@ -70844,37 +71225,54 @@ impl<'src> Analyzer<'src> {
 
     /// B711: the type a key's steps reach from `root`, written in the ROOT's own
     /// terms — a generic root's parameters stay its `Generic`s, and each step's
-    /// field type is substituted with the arguments of the struct it is a field
-    /// of. `None` when a step does not name a field of the struct reached (which
-    /// `resolve_key_step` never builds).
-    fn key_path_type(&mut self, root: Id, steps: &[(Id, usize)]) -> Option<Type> {
-        let root_generics = self
-            .structs
-            .get(&root)?
-            .generic_parameter_constraint_ids
-            .clone();
-        let mut reached = Type::Struct(
-            root,
-            root_generics
-                .iter()
-                .map(|constraint| Type::Generic(*constraint).get_type_id(self))
-                .collect(),
-        );
-        for (owner, index) in steps {
-            let Type::Struct(reached_owner, arguments) = &reached else {
-                return None;
-            };
-            if reached_owner != owner {
-                return None;
-            }
-            let (generics, field_type) = {
-                let struct_ = self.structs.get(owner)?;
+    /// type is substituted with the arguments of the struct (or enum) it
+    /// belongs to. `None` when a step does not belong to the type reached
+    /// (which the resolvers never build).
+    fn key_path_type(&mut self, root: Id, steps: &[KeyLiteralStep]) -> Option<Type> {
+        let root_generics = match self.structs.get(&root) {
+            Some(struct_) => struct_.generic_parameter_constraint_ids.clone(),
+            // `option_some`'s step is rooted at an enum.
+            None => self
+                .enums
+                .get(&root)?
+                .generic_parameter_constraint_ids
+                .clone(),
+        };
+        let root_arguments: Vec<TypeId> = root_generics
+            .iter()
+            .map(|constraint| Type::Generic(*constraint).get_type_id(self))
+            .collect();
+        let mut reached = if self.structs.contains_key(&root) {
+            Type::Struct(root, root_arguments)
+        } else {
+            Type::Enum(root, root_arguments)
+        };
+        for step in steps {
+            let (generics, arguments, declared) = match (*step, &reached) {
+                (KeyLiteralStep::Field(owner, index), Type::Struct(reached_owner, arguments))
+                    if *reached_owner == owner =>
+                {
+                    let struct_ = self.structs.get(&owner)?;
+                    (
+                        struct_.generic_parameter_constraint_ids.clone(),
+                        arguments.clone(),
+                        struct_.fields.get(index)?.type_id,
+                    )
+                }
                 (
-                    struct_.generic_parameter_constraint_ids.clone(),
-                    struct_.fields.get(*index)?.type_id,
-                )
+                    KeyLiteralStep::Variant(owner, variant, slot),
+                    Type::Enum(reached_owner, arguments),
+                ) if *reached_owner == owner => {
+                    let enum_ = self.enums.get(&owner)?;
+                    (
+                        enum_.generic_parameter_constraint_ids.clone(),
+                        arguments.clone(),
+                        *enum_.variants.get(variant)?.data_type_ids.get(slot)?,
+                    )
+                }
+                _ => return None,
             };
-            let declared = field_type.get_type(self);
+            let declared = declared.get_type(self);
             reached = if generics.is_empty() || arguments.is_empty() {
                 declared
             } else {
@@ -70889,62 +71287,89 @@ impl<'src> Analyzer<'src> {
         Some(reached)
     }
 
-    /// B711 (R8): the type of a key literal whose root is GENERIC — `Pair.left`
-    /// is a `Key<Pair<A>, A>` at the arguments the expectation gives `Pair`
-    /// (`let k: Key<Pair<i32>, i32> = Pair.left`, a parameter, the subject of
-    /// `p[Pair.left]`), as a struct literal's are. Without one the arguments are
-    /// holes, as a bare `None`'s are; a subscript through such a key is refused.
+    /// B711: the type of a key literal — `Key<S, F>`, or `MaybeKey<S, F>` when
+    /// a step may miss, or when the literal is TOTAL and the expectation is a
+    /// `MaybeKey` (S3a: a literal takes the expected kind, as it takes a
+    /// generic root's arguments). A generic root (R8) — `Pair.left` is a
+    /// `Key<Pair<A>, A>` at the arguments the expectation gives `Pair` (`let k:
+    /// Key<Pair<i32>, i32> = Pair.left`, a parameter, the subject of
+    /// `p[Pair.left]`), as a struct literal's are. Without one the arguments
+    /// are holes, as a bare `None`'s are; a subscript through such a key is
+    /// refused.
     fn key_literal_type(
         &mut self,
-        steps: &[(Id, usize)],
+        steps: &[KeyLiteralStep],
         constraint: &Type,
         substitution_context: &SubstitutionContext,
     ) -> Type {
-        let (Some(key_struct_id), Some(&(root, _))) = (self.key_struct_id, steps.first()) else {
+        let (Some(key_struct_id), Some(maybe_key_struct_id), Some(root)) = (
+            self.key_struct_id,
+            self.maybe_key_struct_id,
+            steps.first().map(|step| step.owner()),
+        ) else {
             return Type::Unresolved;
         };
-        let generics = self
-            .structs
-            .get(&root)
-            .map(|struct_| struct_.generic_parameter_constraint_ids.clone())
-            .unwrap_or_default();
+        let generics = match self.structs.get(&root) {
+            Some(struct_) => struct_.generic_parameter_constraint_ids.clone(),
+            None => self
+                .enums
+                .get(&root)
+                .map(|enum_| enum_.generic_parameter_constraint_ids.clone())
+                .unwrap_or_default(),
+        };
         let Some(field_type) = self.key_path_type(root, steps) else {
             return Type::Unresolved;
         };
-        let expected_arguments = match constraint {
+        let partial = key_steps_are_partial(steps);
+        let (kind, expected_arguments) = match constraint {
             Type::Struct(wanted_key, wanted)
-                if *wanted_key == key_struct_id && wanted.len() == 2 =>
+                if (*wanted_key == key_struct_id || *wanted_key == maybe_key_struct_id)
+                    && wanted.len() == 2 =>
             {
                 // The expected ROOT is what decides, written in the terms of
                 // the call it lands in: `then`'s `next: Key<F, G>` expects a
                 // root `F` its receiver binds, and the field type `G` is what
                 // this literal answers for the call to bind.
                 let wanted_root = wanted[0].get_type(self);
-                match self.substitute_type(&wanted_root, substitution_context) {
-                    Type::Struct(wanted_root, arguments)
+                let arguments = match self.substitute_type(&wanted_root, substitution_context) {
+                    Type::Struct(wanted_root, arguments) | Type::Enum(wanted_root, arguments)
                         if wanted_root == root && arguments.len() == generics.len() =>
                     {
                         Some(arguments)
                     }
                     _ => None,
-                }
+                };
+                (*wanted_key, arguments)
             }
-            _ => None,
+            _ => (key_struct_id, None),
         };
-        let arguments = expected_arguments.unwrap_or_else(|| {
-            let hole = Type::Unknown.get_type_id(self);
-            vec![hole; generics.len()]
-        });
-        let substitution: SubstitutionContext = generics
-            .iter()
-            .copied()
-            .zip(arguments.iter().copied())
-            .collect();
-        let field_type = self
-            .substitute_type(&field_type, &substitution)
-            .get_type_id(self);
-        let root_type = Type::Struct(root, arguments).get_type_id(self);
-        Type::Struct(key_struct_id, vec![root_type, field_type])
+        let kind = if partial { maybe_key_struct_id } else { kind };
+        let arguments = match expected_arguments {
+            Some(arguments) => arguments,
+            None if generics.is_empty() => Vec::new(),
+            None => {
+                let hole = Type::Unknown.get_type_id(self);
+                vec![hole; generics.len()]
+            }
+        };
+        let field_type = if generics.is_empty() {
+            field_type.get_type_id(self)
+        } else {
+            let substitution: SubstitutionContext = generics
+                .iter()
+                .copied()
+                .zip(arguments.iter().copied())
+                .collect();
+            self.substitute_type(&field_type, &substitution)
+                .get_type_id(self)
+        };
+        let root_type = if self.structs.contains_key(&root) {
+            Type::Struct(root, arguments)
+        } else {
+            Type::Enum(root, arguments)
+        }
+        .get_type_id(self);
+        Type::Struct(kind, vec![root_type, field_type])
     }
 
     /// B711: `subject[key]` — a struct field reached through a `Key<S, F>`
@@ -71020,6 +71445,22 @@ impl<'src> Analyzer<'src> {
                 self.expr_id_to_type_id_map.insert(id, field_type);
                 self.resolved_types.insert(id, field_type);
                 Some(Resolution::Resolved)
+            }
+            // S3a (R3): a place that may not be there is no place
+            // expression; it is reached by continuation.
+            Type::Struct(key, _) if Some(key) == self.maybe_key_struct_id => {
+                self.diagnostics.push(Error {
+                    trace: Vec::new(),
+                    note: None,
+                    span,
+                    msg: "this key is a `MaybeKey`: its place may not be there, so `s[k]` \
+                          cannot name it; read it with `k.get(&s)` (an `Option`), lend it with \
+                          `k.view(&s, |place| ..)` or `k.change(&mut s, |place| ..)`, or write it \
+                          with `k.put(&mut s, value)` (each answers whether it was there)"
+                        .to_string(),
+                });
+                self.expr_id_to_expr_map.insert(id, Expr::Error);
+                Some(Resolution::Failed)
             }
             _ => None,
         }
@@ -71266,8 +71707,10 @@ impl<'src> Analyzer<'src> {
             }
         };
         let key_id = self.new_entity_id();
-        self.expr_id_to_expr_map
-            .insert(key_id, Expr::Key(vec![(owner, field_index)]));
+        self.expr_id_to_expr_map.insert(
+            key_id,
+            Expr::Key(vec![KeyLiteralStep::Field(owner, field_index)]),
+        );
         if let Some(span) = self.span_map.get(&id).copied() {
             self.span_map.insert(key_id, span);
         }
@@ -71281,7 +71724,8 @@ impl<'src> Analyzer<'src> {
             .get(&owner)
             .is_some_and(|structure| !structure.generic_parameter_constraint_ids.is_empty());
         if !generic && let Some(key_struct_id) = self.key_struct_id {
-            let field_type = self.key_path_type(owner, &[(owner, field_index)]);
+            let field_type =
+                self.key_path_type(owner, &[KeyLiteralStep::Field(owner, field_index)]);
             if let Some(field_type) = field_type {
                 let field_type = field_type.get_type_id(self);
                 let root_type = Type::Struct(owner, Vec::new()).get_type_id(self);
@@ -79199,6 +79643,15 @@ pub enum Intrinsic {
     TupleMap,
     // B711 S1c: `TupleKey.index()` -> the position a key names (`key[0]`).
     TupleKeyIndex,
+    // B711 S3a: a `MaybeKey`'s four continuations — the place walked with a
+    // test before each partial step, and handed on only when it is there.
+    MaybeKeyGet,
+    MaybeKeyView,
+    MaybeKeyChange,
+    MaybeKeyPut,
+    // B711 S3a: `std::key::option_some<T>()` -> the key `::Some` rooted at an
+    // `Option<T>` (what `k.some()` composes with).
+    OptionSomeKey,
 }
 
 /// Identifies a source file within a compiled `Program` — an index into
@@ -79859,6 +80312,10 @@ pub struct Program<'src> {
     /// B711: std's `Key<S, F>` declaration, when `std::key` is loaded — the
     /// struct the native backend gives a key's access to (S1b, R11).
     pub key_struct_id: Option<Id>,
+    /// B711 S3a: std's `MaybeKey<S, F>`, when `std::key` is loaded.
+    pub maybe_key_struct_id: Option<Id>,
+    /// B711 S3a: std's `Option`, the root of `option_some`'s key.
+    pub option_enum_id: Option<Id>,
     pub bitwise_u32: HashSet<Id>,
     pub bitwise_generic_lhs: HashMap<Id, TypeId>,
     pub integer_division: HashSet<Id>,
@@ -81065,31 +81522,29 @@ impl<'src> Program<'src> {
     /// moves only when that file's declarations do; it is a name for display,
     /// not a storage format (stored data writes a key by `name()`).
     pub fn key_step_owner(&self, struct_id: Id) -> String {
+        let name = self.key_step_owner_name(struct_id).unwrap_or("");
         let Some((spelling, source)) = self.key_step_spelling(struct_id) else {
-            return self
-                .structs
-                .get(&struct_id)
-                .map_or(String::new(), |struct_| struct_.name.to_string());
+            return name.to_string();
         };
-        let name = self
-            .structs
-            .get(&struct_id)
-            .map_or("", |struct_| struct_.name);
-        let mut twins: Vec<(usize, Id)> = self
+        // S3a: a variant step's owner is an enum, spelled the same way.
+        let declarations = self
             .structs
             .values()
-            .filter(|other| {
-                other.name == name
-                    && self.key_step_site(other.id).map(|(site, _)| site) == Some(source)
+            .map(|struct_| (struct_.id, struct_.name))
+            .chain(self.enums.values().map(|enum_| (enum_.id, enum_.name)));
+        let mut twins: Vec<(usize, Id)> = declarations
+            .filter(|(other_id, other_name)| {
+                *other_name == name
+                    && self.key_step_site(*other_id).map(|(site, _)| site) == Some(source)
                     && self
-                        .key_step_spelling(other.id)
+                        .key_step_spelling(*other_id)
                         .is_some_and(|(other_spelling, _)| other_spelling == spelling)
             })
-            .map(|other| {
+            .map(|(other_id, _)| {
                 let start = self
-                    .key_step_site(other.id)
+                    .key_step_site(other_id)
                     .map_or(0, |(_, span)| span.start);
-                (start, other.id)
+                (start, other_id)
             })
             .collect();
         if twins.len() < 2 {
@@ -81101,6 +81556,28 @@ impl<'src> Program<'src> {
             .position(|(_, other)| *other == struct_id)
             .map_or(1, |position| position + 1);
         format!("{spelling}#{ordinal}")
+    }
+
+    /// B711 S3a: the DECLARATION entity of variant `index` of `enum_id` —
+    /// what a use `Shape::Rect` resolves to, so a key's variant step is a
+    /// reference to the same definition.
+    pub fn variant_entity(&self, enum_id: Id, index: usize) -> Option<Id> {
+        let enum_ = self.enums.get(&enum_id)?;
+        let name = enum_.variants.get(index)?.name;
+        self.scopes
+            .get(&enum_.variants_scope_id)?
+            .name_to_id_map
+            .get(name)
+            .copied()
+    }
+
+    /// The name of a key step's owner: a struct's, or (a variant step's) an
+    /// enum's.
+    fn key_step_owner_name(&self, owner: Id) -> Option<&'src str> {
+        self.structs
+            .get(&owner)
+            .map(|struct_| struct_.name)
+            .or_else(|| self.enums.get(&owner).map(|enum_| enum_.name))
     }
 
     /// Where a struct is declared for its key steps: its file and span — for a
@@ -81120,7 +81597,7 @@ impl<'src> Program<'src> {
 
     /// [`Self::key_step_owner`] before the ordinal, and the declaring file.
     fn key_step_spelling(&self, struct_id: Id) -> Option<(String, SourceId)> {
-        let name = self.structs.get(&struct_id)?.name;
+        let name = self.key_step_owner_name(struct_id)?;
         let (source, span) = self.key_step_site(struct_id)?;
         let mut spelling = self.source_display_path(source);
         if span.start == span.end {
@@ -83756,35 +84233,40 @@ impl<'a, 'src> StdKeyScope<'a, 'src> {
     }
 }
 
-/// M211: the ambient name the preludes publish from `std::key`.
-const STD_KEY_AMBIENT: &str = "Key";
+/// M211: the ambient names the preludes publish from `std::key` (`MaybeKey`
+/// since B711 S3a).
+const STD_KEY_AMBIENT: [&str; 2] = ["Key", "MaybeKey"];
 
-/// M211: the request a std prelude's `export import pkg::key::Key;` makes, as
-/// [`collect_module_paths`] spells it (the module path joined with the leaf).
-const STD_KEY_REEXPORT_REQUEST: &str = "key::Key";
+/// M211: the request a std prelude's `export import pkg::key::Key;` (and
+/// `MaybeKey`'s) makes, as [`collect_module_paths`] spells it (the module
+/// path joined with the leaf).
+const STD_KEY_REEXPORT_REQUESTS: [&str; 2] = ["key::Key", "key::MaybeKey"];
 
-/// M211: whether `node` is `export import pkg::key::Key;` — the one re-export
-/// that publishes an on-demand module's name WITHOUT loading the module. The
-/// base and web preludes write it, and keep `Key` listed beside every other
+/// M211: which of [`STD_KEY_AMBIENT`] `node` re-exports when it is `export
+/// import pkg::key::Key;` (or `MaybeKey`'s twin) — the re-exports that
+/// publish an on-demand module's names WITHOUT loading the module. The base
+/// and web preludes write them, and keep `Key` and `MaybeKey` listed beside every other
 /// ambient name, so the prelude file still answers what is in scope; the
 /// laziness is the loader's ([`drop_on_demand_reexports`]) and the resolver's
 /// (`Analyzer::is_deferred_on_demand_import`), not the file's.
-fn is_on_demand_reexport(node: &Node) -> bool {
+fn is_on_demand_reexport(node: &Node) -> Option<usize> {
     use crate::node::{ImportBranch, ImportTail};
     let Node::Export(None, inner, _) = node else {
-        return false;
+        return None;
     };
     let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(module)), _) = &inner.0
     else {
-        return false;
+        return None;
     };
     let ImportBranch::Path(STD_KEY_MODULE, _, ImportTail::Continue(leaf)) = module.as_ref() else {
-        return false;
+        return None;
     };
-    matches!(
-        leaf.as_ref(),
-        ImportBranch::Path(STD_KEY_AMBIENT, _, ImportTail::Leaf)
-    )
+    match leaf.as_ref() {
+        ImportBranch::Path(name, _, ImportTail::Leaf) => {
+            STD_KEY_AMBIENT.iter().position(|ambient| ambient == name)
+        }
+        _ => None,
+    }
 }
 
 /// M211: takes the requests a std module's on-demand re-exports made out of
@@ -83793,10 +84275,13 @@ fn is_on_demand_reexport(node: &Node) -> bool {
 /// by the drain and by the std import index, which must agree (the std
 /// prefix's closure is the index's).
 fn drop_on_demand_reexports(nodes: &NodeList, requests: &mut Vec<(&str, Span)>) {
-    for _ in nodes.iter().filter(|node| is_on_demand_reexport(&node.0)) {
+    for which in nodes
+        .iter()
+        .filter_map(|node| is_on_demand_reexport(&node.0))
+    {
         if let Some(index) = requests
             .iter()
-            .position(|(request, _)| *request == STD_KEY_REEXPORT_REQUEST)
+            .position(|(request, _)| *request == STD_KEY_REEXPORT_REQUESTS[which])
         {
             requests.remove(index);
         }
@@ -83806,7 +84291,7 @@ fn drop_on_demand_reexports(nodes: &NodeList, requests: &mut Vec<(&str, Span)>) 
 /// M211: the names `std::key` publishes. Writing any of them, anywhere, loads
 /// the module — so `Key` resolves as the ambient name, and `KeyPath` written
 /// without its import is the same miss (with the same import steer) it was.
-const STD_KEY_NAMES: [&str; 3] = ["Key", "KeyPath", "KeyStep"];
+const STD_KEY_NAMES: [&str; 4] = ["Key", "KeyPath", "KeyStep", "MaybeKey"];
 
 /// M211: whether this ONE node (its children are the caller's walk) is syntax
 /// that may need `std::key`. Decided syntactically, before any name resolves,
@@ -83820,7 +84305,7 @@ const STD_KEY_NAMES: [&str; 3] = ["Key", "KeyPath", "KeyStep"];
 ///
 /// A key value has three origins, and each is caught where it is written:
 ///
-/// 1. A NAME: `Key`, `KeyPath` or `KeyStep` written BARE — as a type, a value,
+/// 1. A NAME: `Key`, `KeyPath`, `KeyStep` or `MaybeKey` written BARE — as a type, a value,
 ///    a struct literal's head or a one-segment pattern: a signature
 ///    `k: Key<Task, str>`, a `[field_syntax]` method's parameter, `KeyPath` in
 ///    a field. Not in a body that declares or imports that name itself
@@ -83844,6 +84329,8 @@ const STD_KEY_NAMES: [&str; 3] = ["Key", "KeyPath", "KeyStep"];
 ///    import that binds a lower-case alias to a name that is not lower-case
 ///    (`import model::Task as task;`), the one other way a lower-case name
 ///    can come to stand for a struct. Vilan has no type aliases.
+///    A VARIANT STEP (`Doc.title::Some`, B711 S3a) seeds it whatever its
+///    root is spelled like: `::` after a member stands nowhere else.
 /// 3. A `[field_syntax]` method, whose reads (`app.user`) become key literals
 ///    in files that write no key at all; its declaration seeds the module
 ///    (its `Key<T, U>` parameter would too, by rule 1).
@@ -83917,6 +84404,11 @@ fn seeds_std_key(node: &Node) -> StdKeySeed {
             // An `Error` member is the editor's half-typed `Task.`, whose
             // completion offers the fields as keys (`Key<Task, str>`).
             let (member, _) = crate::node::unmark_head_link(member);
+            // B711 S3a: a variant step (`Doc.title::Some`) stands only in a
+            // key's path, whatever its root is spelled like.
+            if matches!(member.0, Node::KeyVariant(..)) {
+                return StdKeySeed::Yes;
+            }
             yes(matches!(member.0, Node::Accessor(_) | Node::Error)
                 && matches!(
                     &subject.0,
@@ -93429,6 +93921,12 @@ fn analyze_inner<'src>(
             .get(scope_id)
             .and_then(|scope| scope.name_to_id_map.get("Key").copied())
     });
+    analyzer.maybe_key_struct_id = module_scopes.get("key").and_then(|scope_id| {
+        analyzer
+            .scopes
+            .get(scope_id)
+            .and_then(|scope| scope.name_to_id_map.get("MaybeKey").copied())
+    });
     analyzer.try_trait_id = module_scopes.get("operators").and_then(|scope_id| {
         analyzer
             .scopes
@@ -95156,6 +95654,28 @@ fn analyze_over_world<'src>(
             }
         }
     }
+    // B711 S3a: `MaybeKey`'s continuations.
+    if let Some(maybe_key_struct_id) = analyzer.maybe_key_struct_id {
+        for implementation in &analyzer.implementations {
+            let subject_is_the_key = matches!(
+                analyzer.type_id_to_type_map.get(&implementation.subject),
+                Some(Type::Struct(id, _)) if *id == maybe_key_struct_id
+            );
+            if !subject_is_the_key {
+                continue;
+            }
+            for (name, intrinsic) in [
+                ("get", Intrinsic::MaybeKeyGet),
+                ("view", Intrinsic::MaybeKeyView),
+                ("change", Intrinsic::MaybeKeyChange),
+                ("put", Intrinsic::MaybeKeyPut),
+            ] {
+                if let Some(id) = external_intrinsic_declaration(&analyzer, implementation, name) {
+                    intrinsics.insert(id, intrinsic);
+                }
+            }
+        }
+    }
     if let Some(json_value_struct_id) = analyzer.primitive_struct_ids.get("JsonValue").copied() {
         for implementation in &analyzer.implementations {
             let subject_is_json_value = matches!(
@@ -95271,6 +95791,9 @@ fn analyze_over_world<'src>(
         if let Some(id) = module_member("random", name) {
             intrinsics.insert(id, intrinsic);
         }
+    }
+    if let Some(id) = module_member("key", "option_some") {
+        intrinsics.insert(id, Intrinsic::OptionSomeKey);
     }
     if let Some(args_id) = module_member("process", "args") {
         intrinsics.insert(args_id, Intrinsic::Args);
@@ -96485,6 +97008,8 @@ fn analyze_over_world<'src>(
         key_subscripts: analyzer.key_subscript_ids,
         tuple_key_subscripts: analyzer.tuple_key_subscripts,
         key_struct_id: analyzer.key_struct_id,
+        maybe_key_struct_id: analyzer.maybe_key_struct_id,
+        option_enum_id: analyzer.option_enum_id,
         bitwise_u32: analyzer.bitwise_u32,
         integer_division: analyzer.integer_division,
         division_generic_lhs: analyzer.division_generic_lhs,

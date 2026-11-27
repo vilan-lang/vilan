@@ -8593,7 +8593,9 @@ impl<'src> Printer<'src> {
     fn print_postfix_suffix(&mut self, step: &Spanned<Node<'src>>) {
         match &step.0 {
             Node::MemberAccessor(_, member) => {
-                self.out.push('.');
+                if !matches!(member.0, Node::KeyVariant(..)) {
+                    self.out.push('.');
+                }
                 self.print_expr(member);
             }
             Node::Index(_, index) => {
@@ -9167,6 +9169,16 @@ impl<'src> Printer<'src> {
             return;
         }
         match &expr.0 {
+            // B711 S3a: a key's variant step, the member of its access —
+            // `::Rect.0` (the access prints no dot before it).
+            Node::KeyVariant((name, _), position) => {
+                self.out.push_str("::");
+                self.out.push_str(name);
+                if let Some((digits, _)) = position {
+                    self.out.push('.');
+                    self.out.push_str(digits);
+                }
+            }
             Node::Number(whole, fraction, suffix) => {
                 self.out.push_str(whole);
                 if let Some(fraction) = fraction {
@@ -9231,7 +9243,9 @@ impl<'src> Printer<'src> {
                 };
                 self.print_postfix_subject(subject);
                 self.leave_postfix_subject(entered);
-                self.out.push('.');
+                if !matches!(member.0, Node::KeyVariant(..)) {
+                    self.out.push('.');
+                }
                 // The callee of `list.push(…)` IS the member, so a permission
                 // dropped here never reaches the call's arguments — which made
                 // a method call's tail unreachable from statement level however

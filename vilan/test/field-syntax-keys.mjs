@@ -43,10 +43,7 @@ function assert(condition, message, caller) {
 function name(self) {
 	let name3 = "";
 	for (const step of self[0]) {
-		if (name3 !== "") {
-			name3 = name3 + ".";
-		}
-		name3 = name3 + step[2];
+		name3 = name3 + spelled(step, name3 === "");
 	}
 	return name3;
 }
@@ -63,18 +60,42 @@ function then(self, next) {
 function eq2(self, other) {
 	return eq(__hash(self[0]), __hash(other[0]));
 }
+function spelled(step, leads) {
+	const $g = step[3];
+	let $h = null;
+	if ($g[0] === 0) {
+		let $i = null;
+		if (leads) {
+			$i = step[2];
+		} else {
+			$i = "." + step[2];
+		}
+		$h = $i;
+	} else {
+		const position = $g[1];
+		const width = $g[2];
+		let $j = null;
+		if (width > 1) {
+			$j = "::" + step[2] + "." + position;
+		} else {
+			$j = "::" + step[2];
+		}
+		$h = $j;
+	}
+	return $h;
+}
 function city_of(user2) {
 	return get(at2(at(user2, $b), $c));
 }
-const $a = [ [ [ [ "field-syntax-keys.vl::User", 0, "name" ] ] ] ];
+const $a = [ [ [ [ "field-syntax-keys.vl::User", 0, "name", [ 0 ] ] ] ] ];
 function at(self, key) {
 	return [ self[0], __clone(key) ];
 }
 function get(self) {
 	return __key_at(self[0].v, self[1]);
 }
-const $b = [ [ [ [ "field-syntax-keys.vl::User", 1, "address" ] ] ] ];
-const $c = [ [ [ [ "field-syntax-keys.vl::Address", 0, "city" ] ] ] ];
+const $b = [ [ [ [ "field-syntax-keys.vl::User", 1, "address", [ 0 ] ] ] ] ];
+const $c = [ [ [ [ "field-syntax-keys.vl::Address", 0, "city", [ 0 ] ] ] ] ];
 function then2(self, next) {
 	return [ then(self[0], next[0]) ];
 }
@@ -84,20 +105,20 @@ function at2(self, key) {
 function set(self, value) {
 	__key_put(self[0].v, self[1], __clone(value));
 }
-const $d = [ [ [ [ "field-syntax-keys.vl::Address", 1, "zip" ] ] ] ];
+const $d = [ [ [ [ "field-syntax-keys.vl::Address", 1, "zip", [ 0 ] ] ] ] ];
 function at3(self, key) {
 	return [ self[0], then2(self[1], key) ];
 }
-const $e = [ [ [ [ "field-syntax-keys.vl::User", 2, "get" ] ] ] ];
+const $e = [ [ [ [ "field-syntax-keys.vl::User", 2, "get", [ 0 ] ] ] ] ];
 function eq3(self, other) {
 	return eq2(self[0], other[0]);
 }
 function name2(self) {
 	return name(self[0]);
 }
-const $g = [ [ [ [ "field-syntax-keys.vl::Shelf", 0, "pair" ] ] ] ];
-const $h = [ [ [ [ "field-syntax-keys.vl::Pair", 1, "right" ] ] ] ];
-const $i = [ [ [ [ "field-syntax-keys.vl::Pair", 0, "left" ] ] ] ];
+const $k = [ [ [ [ "field-syntax-keys.vl::Shelf", 0, "pair", [ 0 ] ] ] ] ];
+const $l = [ [ [ [ "field-syntax-keys.vl::Pair", 1, "right", [ 0 ] ] ] ] ];
+const $m = [ [ [ [ "field-syntax-keys.vl::Pair", 0, "left", [ 0 ] ] ] ] ];
 const user = [ __shared_new([ "ada", [ "london", 1 ], "verb" ]) ];
 console.log(get(at(user, $a)));
 const city = at2(at(user, $b), $c);
@@ -111,8 +132,8 @@ console.log(get(at(user, $e)));
 assert(eq3(at2(at(user, $b), $c)[1], at2(at(user, $b), $c)[1]), "one key", "field-syntax-keys.vl:88:2");
 console.log(name2(at2(at(user, $b), $c)[1]));
 const shelf = [ __shared_new([ [ "l", "r" ] ]) ];
-const right = at3(at(shelf, $g), $h);
+const right = at3(at(shelf, $k), $l);
 set(right, "R");
-const left = get(at3(at(shelf, $g), $i));
+const left = get(at3(at(shelf, $k), $m));
 console.log(left + get(right));
 //# sourceMappingURL=field-syntax-keys.mjs.map

@@ -70,10 +70,7 @@ function assert(condition, message, caller) {
 function name(self) {
 	let name3 = "";
 	for (const step of self[0]) {
-		if (name3 !== "") {
-			name3 = name3 + ".";
-		}
-		name3 = name3 + step[2];
+		name3 = name3 + spelled(step, name3 === "");
 	}
 	return name3;
 }
@@ -83,8 +80,8 @@ function starts_with(self, prefix) {
 	}
 	let at3 = 0;
 	for (const step of prefix[0]) {
-		const own = __at(self[0], at3, "std/src/key.vl:112:14");
-		if (step[1] !== own[1] || step[0] !== own[0]) {
+		const own = __at(self[0], at3, "std/src/key.vl:141:14");
+		if (step[1] !== own[1] || step[0] !== own[0] || !(same_kind(step[3], own[3]))) {
 			return false;
 		}
 		at3 = at3 + 1;
@@ -104,23 +101,67 @@ function then(self, next) {
 function eq2(self, other) {
 	return eq(__hash(self[0]), __hash(other[0]));
 }
-const $b = [ [ [ [ "struct-keys.vl::Task", 0, "title" ] ] ] ];
+function spelled(step, leads) {
+	const $h = step[3];
+	let $i = null;
+	if ($h[0] === 0) {
+		let $j = null;
+		if (leads) {
+			$j = step[2];
+		} else {
+			$j = "." + step[2];
+		}
+		$i = $j;
+	} else {
+		const position = $h[1];
+		const width = $h[2];
+		let $k = null;
+		if (width > 1) {
+			$k = "::" + step[2] + "." + position;
+		} else {
+			$k = "::" + step[2];
+		}
+		$i = $k;
+	}
+	return $i;
+}
+function same_kind(left, right) {
+	const $l = left;
+	let $m = null;
+	if ($l[0] === 0) {
+		const $n = right;
+		$m = $n[0] === 0;
+	} else {
+		const position = $l[1];
+		const $o = right;
+		let $p = null;
+		if ($o[0] === 1) {
+			const other = $o[1];
+			$p = position === other;
+		} else {
+			$p = false;
+		}
+		$m = $p;
+	}
+	return $m;
+}
+const $b = [ [ [ [ "struct-keys.vl::Task", 0, "title", [ 0 ] ] ] ] ];
 function write(task2, key, value) {
 	__key_put(task2, key, __clone(value));
 }
 function read(task2, key) {
 	return __clone(__key_at(task2, key));
 }
-const $c = [ [ [ [ "struct-keys.vl::Task", 1, "meta" ], [ "struct-keys.vl::Meta", 1, "stars" ] ] ] ];
+const $c = [ [ [ [ "struct-keys.vl::Task", 1, "meta", [ 0 ] ], [ "struct-keys.vl::Meta", 1, "stars", [ 0 ] ] ] ] ];
 function at(task2, key) {
 	return __key_view(task2, key);
 }
-const $e = [ [ [ [ "struct-keys.vl::Task", 1, "meta" ] ] ] ];
+const $e = [ [ [ [ "struct-keys.vl::Task", 1, "meta", [ 0 ] ] ] ] ];
 function at2(task2, key) {
 	return __key_at(task2, key);
 }
-const $f = [ [ [ [ "struct-keys.vl::Task", 1, "meta" ], [ "struct-keys.vl::Meta", 0, "owner" ] ] ] ];
-const $g = [ [ [ [ "struct-keys.vl::Meta", 0, "owner" ] ] ] ];
+const $f = [ [ [ [ "struct-keys.vl::Task", 1, "meta", [ 0 ] ], [ "struct-keys.vl::Meta", 0, "owner", [ 0 ] ] ] ] ];
+const $g = [ [ [ [ "struct-keys.vl::Meta", 0, "owner", [ 0 ] ] ] ] ];
 function then2(self, next) {
 	return [ then(self[0], next[0]) ];
 }
@@ -147,15 +188,15 @@ function get(self, key) {
 	return __nmap_get(self[0], hash(key));
 }
 function unwrap_or(self, fallback) {
-	const $h = self;
-	let $i = null;
-	if ($h[0] === 0) {
-		const x = $h[1];
-		$i = x;
+	const $q = self;
+	let $r = null;
+	if ($q[0] === 0) {
+		const x = $q[1];
+		$r = x;
 	} else {
-		$i = __clone(fallback);
+		$r = __clone(fallback);
 	}
-	return $i;
+	return $r;
 }
 let task = [ "a", [ "ada", 1 ] ];
 task[1][0] = "bob";

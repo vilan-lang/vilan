@@ -1,6 +1,6 @@
 use crate::analyzer::{
     BackingValue, CopyDecision, Expr, ExprIfBranch, ExprPattern, Function, GenericDispatch,
-    Intrinsic, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
+    Intrinsic, KeyLiteralStep, LiftDispatch, Program, RENDER_MEMBER, TransferForm, TryDispatch,
     enum_lowers_to_js_primitive,
 };
 use crate::call_graph::{CallTarget, IndirectReason};
@@ -3153,6 +3153,55 @@ fn helper_source(name: &str) -> &'static str {
              \treturn value[parts[last][1]] = field;\n\
              }"
         }
+        // B711 S3a: a `MaybeKey`'s place — `[container, slot]`, or `null`
+        // where a variant step finds another variant. A part is `[owner,
+        // index, name, kind]`, `kind` `[0]` for a field and `[1, position,
+        // width]` for a variant's payload slot, whose enum array is `[tag,
+        // ..payload]`: the step tests the tag, then descends past it.
+        "__mkey_reach" => {
+            "function __mkey_reach(value, key) {\n\
+             \tconst parts = key[0][0];\n\
+             \tconst last = parts.length - 1;\n\
+             \tfor (let at = 0; ; at++) {\n\
+             \t\tconst part = parts[at];\n\
+             \t\tlet slot = part[1];\n\
+             \t\tif (part[3][0] === 1) {\n\
+             \t\t\tif (value[0] !== slot) return null;\n\
+             \t\t\tslot = 1 + part[3][1];\n\
+             \t\t}\n\
+             \t\tif (at === last) return [ value, slot ];\n\
+             \t\tvalue = value[slot];\n\
+             \t}\n\
+             }"
+        }
+        // `get`: the place copied out as an `Option` (`[0, v]` / `[1]`); an
+        // aggregate is cloned, so the copy shares nothing with the subject.
+        "__mkey_get" => {
+            "function __mkey_get(value, key, copy) {\n\
+             \tconst place = __mkey_reach(value, key);\n\
+             \tif (place === null) return [ 1 ];\n\
+             \tconst field = place[0][place[1]];\n\
+             \treturn [ 0, copy ? __clone(field) : field ];\n\
+             }"
+        }
+        // `view` / `change`: the place lent to `body` — the `(base, key)`
+        // pair at a scalar, the aggregate itself otherwise.
+        "__mkey_lend" => {
+            "function __mkey_lend(value, key, body, scalar) {\n\
+             \tconst place = __mkey_reach(value, key);\n\
+             \tif (place === null) return false;\n\
+             \tbody(scalar ? place : place[0][place[1]]);\n\
+             \treturn true;\n\
+             }"
+        }
+        "__mkey_put" => {
+            "function __mkey_put(value, key, field) {\n\
+             \tconst place = __mkey_reach(value, key);\n\
+             \tif (place === null) return false;\n\
+             \tplace[0][place[1]] = field;\n\
+             \treturn true;\n\
+             }"
+        }
         // B711 S2b: a `[field_syntax]` door's key, resolved once at the
         // door's entry: its field's position for a one-step key, `-1` for a
         // path; the two `_at` forms take that step and walk only a path.
@@ -3977,7 +4026,7 @@ struct Transformer<'src> {
     /// B711: the hoisted constant for each distinct key literal, by its steps —
     /// `Task.meta.owner` allocates nothing where it is written, however often
     /// that runs.
-    key_literals: HashMap<Vec<(Id, usize)>, String>,
+    key_literals: HashMap<Vec<KeyLiteralStep>, String>,
     // Per-type `__drop` helpers (destruction.md §7), keyed by `type_key`. `None`
     // records a type whose destruction is a complete no-op (no `Drop` impl, no
     // resource members) so callers skip it; `Some(name)` is the emitted helper.
@@ -7588,7 +7637,7 @@ impl<'src> Transformer<'src> {
     /// so `[[[[owner, index, name], ..]]]` — hoisted to one module constant per
     /// distinct literal and named where it is written. A key's parts are std's
     /// internal fields and nothing writes them, so the one value is shared.
-    fn emit_key_literal(&mut self, steps: &[(Id, usize)]) -> String {
+    fn emit_key_literal(&mut self, steps: &[KeyLiteralStep]) -> String {
         if let Some(name) = self.key_literals.get(steps) {
             let name = name.clone();
             self.record_hit(|recorder| recorder.key_literals.get(&name).copied());
@@ -7600,19 +7649,45 @@ impl<'src> Transformer<'src> {
             recorder.key_literals.insert(name.clone(), id);
         });
         let frame = self.record_enter();
+        let number = |value: usize| js::Node::Number(value.to_string(), None);
         let parts = steps
             .iter()
-            .map(|(owner, index)| {
-                let field_name = self
-                    .program
-                    .structs
-                    .get(owner)
-                    .and_then(|struct_| struct_.fields.get(*index))
-                    .map_or("", |field| field.name);
+            .map(|step| {
+                // `KeyStep { owner, index, name, kind }`, `kind` std's
+                // `StepKind`: `[0]` a field, `[1, position, width]` a
+                // variant's payload slot (S3a).
+                let (index, step_name, kind) = match *step {
+                    KeyLiteralStep::Field(owner, index) => (
+                        index,
+                        self.program
+                            .structs
+                            .get(&owner)
+                            .and_then(|struct_| struct_.fields.get(index))
+                            .map_or("", |field| field.name),
+                        vec![number(0)],
+                    ),
+                    KeyLiteralStep::Variant(owner, variant, slot) => {
+                        let declared = self
+                            .program
+                            .enums
+                            .get(&owner)
+                            .and_then(|enum_| enum_.variants.get(variant));
+                        (
+                            variant,
+                            declared.map_or("", |declared| declared.name),
+                            vec![
+                                number(1),
+                                number(slot),
+                                number(declared.map_or(1, |declared| declared.data_type_ids.len())),
+                            ],
+                        )
+                    }
+                };
                 js::Node::Array(vec![
-                    js::Node::String(Cow::Owned(self.program.key_step_owner(*owner))),
-                    js::Node::Number(index.to_string(), None),
-                    js::Node::String(Cow::Owned(field_name.to_string())),
+                    js::Node::String(Cow::Owned(self.program.key_step_owner(step.owner()))),
+                    number(index),
+                    js::Node::String(Cow::Owned(step_name.to_string())),
+                    js::Node::Array(kind),
                 ])
             })
             .collect();
@@ -7628,6 +7703,66 @@ impl<'src> Transformer<'src> {
         name
     }
 
+    /// B711 S3a: `k.get(&s)`, `k.view(&s, body)`, `k.change(&mut s, body)`,
+    /// `k.put(&mut s, v)` — `args` the key, the subject and the third
+    /// argument. The walk tests each variant step's tag before it descends
+    /// (`__mkey_reach`); whether the place is a SCALAR (lent as its
+    /// `(base, key)` pair) or an aggregate (lent as itself, and cloned by
+    /// `get`) is the field type's at this instance.
+    fn emit_maybe_key_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        args: Vec<js::Node<'src>>,
+        call_expr_id: Option<Id>,
+    ) -> js::Node<'src> {
+        let scalar = call_expr_id.is_some_and(|id| self.maybe_key_place_is_scalar(id));
+        let mut args = args.into_iter();
+        let key = args.next().unwrap_or(js::Node::Void);
+        let subject = args.next().unwrap_or(js::Node::Void);
+        let third = args.next().unwrap_or(js::Node::Void);
+        self.used_helpers.insert("__mkey_reach");
+        let flag = |on: bool| js::Node::Number(if on { "1" } else { "0" }.to_string(), None);
+        let (helper, arguments) = match intrinsic {
+            Intrinsic::MaybeKeyGet => {
+                if !scalar {
+                    self.used_helpers.insert("__clone");
+                }
+                ("__mkey_get", vec![subject, key, flag(!scalar)])
+            }
+            Intrinsic::MaybeKeyPut => ("__mkey_put", vec![subject, key, third]),
+            _ => ("__mkey_lend", vec![subject, key, third, flag(scalar)]),
+        };
+        self.used_helpers.insert(helper);
+        js::Node::Call(Box::new(js::Node::Local(helper.to_string())), arguments)
+    }
+
+    /// B711 S3a: whether the place a `MaybeKey` call's receiver reaches is a
+    /// scalar view pointee at this instance — the `F` of its `MaybeKey<S, F>`.
+    fn maybe_key_place_is_scalar(&self, call_expr_id: Id) -> bool {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return false;
+        };
+        let Some(receiver_type_id) = self
+            .program
+            .function_calls
+            .get(call_id)
+            .and_then(|function_call| function_call.argument_ids.first())
+            .and_then(|receiver_id| self.expr_type_id(*receiver_id))
+        else {
+            return false;
+        };
+        let Some(Type::Struct(_, arguments)) = self
+            .program
+            .type_id_to_type_map
+            .get(&self.resolve_type_id(receiver_type_id))
+        else {
+            return false;
+        };
+        arguments
+            .get(1)
+            .is_some_and(|field| self.resolves_to_scalar_view_pointee(*field))
+    }
+
     /// B711: the field positions of a key subscript's index when it is written
     /// as a key LITERAL (`s[Task.meta.owner]`): the place is then a plain field
     /// chain, emitted as `s.x` would be. `None` for a key held in a value.
@@ -7638,7 +7773,10 @@ impl<'src> Transformer<'src> {
             current = *inner;
         }
         match self.program.entity_map.get(&current) {
-            Some(Expr::Key(steps)) => Some(steps.iter().map(|(_, index)| *index).collect()),
+            Some(Expr::Key(steps)) => steps
+                .iter()
+                .map(|step| step.field().map(|(_, index)| index))
+                .collect(),
             _ => None,
         }
     }
@@ -12615,6 +12753,19 @@ impl<'src> Transformer<'src> {
                 let transform = args.next().unwrap_or(js::Node::Void);
                 self.emit_tuple_map(receiver, transform, call_expr_id)
             }
+            // B711 S3a: `MaybeKey`'s continuations, over the run-time walk.
+            Intrinsic::MaybeKeyGet
+            | Intrinsic::MaybeKeyView
+            | Intrinsic::MaybeKeyChange
+            | Intrinsic::MaybeKeyPut => {
+                self.emit_maybe_key_intrinsic(intrinsic, args.collect(), call_expr_id)
+            }
+            Intrinsic::OptionSomeKey => match self.program.option_enum_id {
+                Some(option) => {
+                    js::Node::Local(self.emit_key_literal(&[KeyLiteralStep::Variant(option, 0, 0)]))
+                }
+                None => js::Node::Void,
+            },
             // B711 S1c: a key's position, `[at]`'s one slot.
             Intrinsic::TupleKeyIndex => js::Node::PropertyIndex(
                 Box::new(args.next().unwrap_or(js::Node::Void)),

@@ -128,20 +128,21 @@ impl<S: 'static, F: 'static> PartialEq for KeyAccess<S, F> {
     }
 }
 
-/// `first` then `next`, erasing the middle type.
-struct Then<S: 'static, M: 'static, F: 'static> {
-    first: KeyAccess<S, M>,
-    next: KeyAccess<M, F>,
+/// `first` then `next`, erasing the middle type: two [`KeyAccess`]es, or two
+/// [`MaybeAccess`]es.
+struct Then<First, Next> {
+    first: First,
+    next: Next,
 }
 
 /// A composition going away is a RELEASE, counted for the leak gate.
-impl<S: 'static, M: 'static, F: 'static> Drop for Then<S, M, F> {
+impl<First, Next> Drop for Then<First, Next> {
     fn drop(&mut self) {
         COMPOSITIONS_RELEASED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-impl<S: 'static, M: 'static, F: 'static> Reach<S, F> for Then<S, M, F> {
+impl<S: 'static, M: 'static, F: 'static> Reach<S, F> for Then<KeyAccess<S, M>, KeyAccess<M, F>> {
     fn reach<'a>(&self, subject: &'a S) -> &'a F {
         self.next.reach(self.first.reach(subject))
     }
@@ -165,6 +166,161 @@ pub fn key_mut<'a, S: 'static, F: 'static>(
     subject: &'a mut S,
 ) -> &'a mut F {
     access.reach_mut(subject)
+}
+
+/// A `MaybeKey<S, F>`'s ACCESS natively (B711 S3a, R11): a key whose place
+/// may not be there, so each projection answers `Option`.
+///
+/// - [`MaybeAccess::Total`]: a total key's access, held as a `MaybeKey` (a
+///   total literal where a `MaybeKey` is expected, `k.maybe()`): it always
+///   answers `Some`.
+/// - [`MaybeAccess::Field`]: a literal's (`Doc.shape::Rect.0`): two
+///   non-capturing functions the emitter writes at the literal, each a field
+///   chain with a `match` at every variant step.
+/// - [`MaybeAccess::Composed`]: a composition's (`then`, `some()`): one `Rc`
+///   holding both halves.
+pub enum MaybeAccess<S: 'static, F: 'static> {
+    /// A total key's access.
+    Total(KeyAccess<S, F>),
+    /// A literal's: `|s| match &s.shape { Shape::Rect(x, ..) => Some(x), _ => None }`
+    /// and its `&mut` twin.
+    Field(fn(&S) -> Option<&F>, fn(&mut S) -> Option<&mut F>),
+    /// A composition's: the halves behind one shared allocation.
+    Composed(Rc<dyn Probe<S, F>>),
+}
+
+/// A projection from `S` to an `F` that may be missing, both ways.
+pub trait Probe<S, F> {
+    /// The place, read, when it is there.
+    fn probe<'a>(&self, subject: &'a S) -> Option<&'a F>;
+    /// The place, written, when it is there.
+    fn probe_mut<'a>(&self, subject: &'a mut S) -> Option<&'a mut F>;
+}
+
+impl<S: 'static, F: 'static> MaybeAccess<S, F> {
+    /// A literal's access, from its two projections.
+    pub fn field(read: fn(&S) -> Option<&F>, write: fn(&mut S) -> Option<&mut F>) -> Self {
+        MaybeAccess::Field(read, write)
+    }
+
+    /// A total key's access, held as a `MaybeKey`'s.
+    pub fn total(access: &KeyAccess<S, F>) -> Self {
+        MaybeAccess::Total(access.clone())
+    }
+
+    /// This access followed by `next`'s. Two total halves stay total (one
+    /// composed [`KeyAccess`]).
+    pub fn then<G: 'static>(&self, next: &MaybeAccess<F, G>) -> MaybeAccess<S, G> {
+        if let (MaybeAccess::Total(first), MaybeAccess::Total(second)) = (self, next) {
+            return MaybeAccess::Total(first.then(second));
+        }
+        COMPOSITIONS_MINTED.fetch_add(1, Ordering::Relaxed);
+        MaybeAccess::Composed(Rc::new(Then {
+            first: self.clone(),
+            next: next.clone(),
+        }))
+    }
+}
+
+impl<S: 'static, F: 'static> Probe<S, F> for MaybeAccess<S, F> {
+    fn probe<'a>(&self, subject: &'a S) -> Option<&'a F> {
+        match self {
+            MaybeAccess::Total(access) => Some(access.reach(subject)),
+            MaybeAccess::Field(read, _) => read(subject),
+            MaybeAccess::Composed(composed) => composed.probe(subject),
+        }
+    }
+
+    fn probe_mut<'a>(&self, subject: &'a mut S) -> Option<&'a mut F> {
+        match self {
+            MaybeAccess::Total(access) => Some(access.reach_mut(subject)),
+            MaybeAccess::Field(_, write) => write(subject),
+            MaybeAccess::Composed(composed) => composed.probe_mut(subject),
+        }
+    }
+}
+
+impl<S: 'static, F: 'static> Clone for MaybeAccess<S, F> {
+    fn clone(&self) -> Self {
+        match self {
+            MaybeAccess::Total(access) => MaybeAccess::Total(access.clone()),
+            MaybeAccess::Field(read, write) => MaybeAccess::Field(*read, *write),
+            MaybeAccess::Composed(composed) => MaybeAccess::Composed(Rc::clone(composed)),
+        }
+    }
+}
+
+/// As [`KeyAccess`]'s: the identity is the path beside it.
+impl<S: 'static, F: 'static> PartialEq for MaybeAccess<S, F> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<S: 'static, M: 'static, F: 'static> Probe<S, F>
+    for Then<MaybeAccess<S, M>, MaybeAccess<M, F>>
+{
+    fn probe<'a>(&self, subject: &'a S) -> Option<&'a F> {
+        self.next.probe(self.first.probe(subject)?)
+    }
+
+    fn probe_mut<'a>(&self, subject: &'a mut S) -> Option<&'a mut F> {
+        self.next.probe_mut(self.first.probe_mut(subject)?)
+    }
+}
+
+/// `k.get(&s)`: the place copied out, or `None`.
+pub fn maybe_get<S: 'static, F: Clone + 'static>(
+    access: &MaybeAccess<S, F>,
+    subject: &S,
+) -> Option<F> {
+    access.probe(subject).cloned()
+}
+
+/// `k.view(&s, body)`: the place lent to `body` when it is there.
+pub fn maybe_view<S: 'static, F: 'static>(
+    access: &MaybeAccess<S, F>,
+    subject: &S,
+    body: &dyn Fn(&F),
+) -> bool {
+    match access.probe(subject) {
+        Some(place) => {
+            body(place);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `k.change(&mut s, body)`: the place lent for writing when it is there.
+pub fn maybe_change<S: 'static, F: 'static>(
+    access: &MaybeAccess<S, F>,
+    subject: &mut S,
+    body: &dyn Fn(&mut F),
+) -> bool {
+    match access.probe_mut(subject) {
+        Some(place) => {
+            body(place);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `k.put(&mut s, value)`: the place written when it is there; a missing
+/// place stays missing (and `value` is dropped).
+pub fn maybe_put<S: 'static, F: 'static>(
+    access: &MaybeAccess<S, F>,
+    subject: &mut S,
+    value: F,
+) -> bool {
+    match access.probe_mut(subject) {
+        Some(place) => {
+            *place = value;
+            true
+        }
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +375,69 @@ mod tests {
         drop(copy);
         assert_eq!(Rc::strong_count(shared), 1);
         assert_eq!(subject.title, "a");
+    }
+
+    enum Shape {
+        Circle(f64),
+        Rect(f64, f64),
+    }
+
+    struct Doc {
+        title: Option<String>,
+        shape: Shape,
+    }
+
+    #[test]
+    fn keys_a_partial_access_reaches_its_place_only_when_it_is_there() {
+        let width = MaybeAccess::<Doc, f64>::field(
+            |s| match &s.shape {
+                Shape::Rect(x, ..) => Some(x),
+                _ => None,
+            },
+            |s| match &mut s.shape {
+                Shape::Rect(x, ..) => Some(x),
+                _ => None,
+            },
+        );
+        let mut doc = Doc {
+            title: None,
+            shape: Shape::Rect(1.0, 2.0),
+        };
+        assert!(maybe_put(&width, &mut doc, 5.0));
+        assert_eq!(maybe_get(&width, &doc), Some(5.0));
+        let Shape::Rect(_, height) = doc.shape else {
+            panic!("a put writes the place in place");
+        };
+        assert_eq!(height, 2.0, "and only the slot the key names");
+        doc.shape = Shape::Circle(3.0);
+        assert!(!maybe_change(&width, &mut doc, &|x| *x += 1.0));
+        assert_eq!(maybe_get(&width, &doc), None);
+        let Shape::Circle(radius) = doc.shape else {
+            panic!("a miss leaves the place alone");
+        };
+        assert_eq!(radius, 3.0);
+    }
+
+    #[test]
+    fn keys_a_composition_of_total_halves_stays_total_and_partial_halves_probe() {
+        let title = KeyAccess::<Doc, Option<String>>::field(|s| &s.title, |s| &mut s.title);
+        let some = MaybeAccess::<Option<String>, String>::field(|o| o.as_ref(), |o| o.as_mut());
+        let total = MaybeAccess::total(&title);
+        let composed = total.then(&some);
+        let mut doc = Doc {
+            title: Some("a".to_string()),
+            shape: Shape::Circle(1.0),
+        };
+        assert!(maybe_change(&composed, &mut doc, &|t| t.push('!')));
+        assert_eq!(maybe_get(&composed, &doc).as_deref(), Some("a!"));
+        doc.title = None;
+        assert!(!maybe_view(&composed, &doc, &|_| panic!(
+            "no place to lend"
+        )));
+        let both_total = total.then(&MaybeAccess::total(&KeyAccess::<
+            Option<String>,
+            Option<String>,
+        >::field(|o| o, |o| o)));
+        assert!(matches!(both_total, MaybeAccess::Total(_)));
     }
 }
