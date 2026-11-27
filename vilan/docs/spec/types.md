@@ -1862,6 +1862,40 @@ mutable subject; `&s[k]` and `&mut s[k]` are views of the field, and a
 borrows s { s[k] }`). A key cannot miss, so `s[k]` never fails at run time. A
 key over another struct than the subject's is refused.
 
+**Field syntax on a handle** (B711 S2a, the paper's R6). A method marked
+`[field_syntax]` is a handle's door: on a receiver whose type has one, a
+member that is not a member of the receiver and names a field of the struct
+`T` its key parameter is over reads as the method's call with that field's
+key literal — `user.address.city` is `user.at(User.address).at(Address.city)`
+— checked, typed and emitted as that call, so a chain follows from each
+call's result type.
+
+- **Resolution order.** A member access resolves to the receiver's own field
+  first; then to std's store projection (A149 S4, on `Store`/`StoreSome`,
+  std::store); then to the `[field_syntax]` reading. A member that names one
+  of the receiver's METHODS (its own, a trait's, a blanket impl's) does not
+  read through: it is refused as a method named without parentheses, and the
+  refusal names the written call that reaches the field
+  (`h.at(Request.get)`).
+- **`T`.** `T` is the key's root at the receiver's arguments: an impl's type
+  parameter bound by the receiver, or a struct the parameter names. A
+  generic `T` takes the receiver's arguments, and the key literal takes its
+  arguments from the parameter (R8). Where `T` is a type parameter at the
+  receiver, an enum, a tuple or a host type, nothing reads through.
+- **The field.** A field reachable by field syntax is exactly a field `T.name`
+  reaches as a key literal; anything else (std's `[internal]` field, a field
+  of a resource or of an `external` struct) is refused at the member with the
+  key literal's own reason.
+- **A value.** The read is the call's result, never a place: an assignment to
+  it is refused.
+- **The declaration.** `fun m<U>(self, key: Key<T, U>): R` with `self` or
+  `&self`, exactly one further parameter, a plain value (no `lazy`, `own`,
+  `mut`, view or spread) of type `Key<T, U>`, `U` the method's only type
+  parameter and `T` a struct or a type parameter of the impl. It labels a
+  bodied method of an inherent `impl` on a struct; on a trait's method or a
+  trait impl's, a free function, an `external fun` or another item it is
+  refused by name, as is a second `[field_syntax]` method on one struct.
+
 **Identity.** Two keys are equal when their PATHS are, however each was
 written: `Task.meta.owner == Task.meta.then(Meta.owner)`. A step is the field
 of one struct DECLARATION: same-named structs in two files, two inline
@@ -1889,8 +1923,8 @@ backends a subscript through a key LITERAL is the plain field access. The
 native backend refuses one shape by name: a call handed two loans into one
 value where one goes through a key held in a value (`both(&mut s[j], &mut
 s[k])`), because Rust cannot see two run-time places apart. A key into a place
-that may be missing (`MaybeKey`), field syntax on a handle and keys parsed
-from run-time data are later stages.*
+that may be missing (`MaybeKey`) and keys parsed from run-time data are later
+stages.*
 
 *`Debug`: `Key`, `KeyPath`, `KeyStep` and `TupleKey` implement it, so
 `[derive(Debug)]` takes a struct holding one. A key debugs as it is written,

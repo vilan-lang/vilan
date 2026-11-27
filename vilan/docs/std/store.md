@@ -105,7 +105,9 @@ projection is renamed (`[reactive(name = "..")]`, below) is read by the
 projection's name, as a call; a type that does not derive `Storable` has no
 projections, so its store reads no fields this way. The handle's own fields
 are std's `[internal]` machinery and are not members outside std, so a field
-of `T` named `path` or `root` reads `T`'s field.
+of `T` named `path` or `root` reads `T`'s field. A library handle opens the
+same door with one `[field_syntax]` method taking a key (std::key §"Field
+syntax on a handle"); the store's own rule is unchanged by it.
 
 A handle is data: copying it allocates nothing, a projection allocates one step
 of its path, and it has no owner. It is a `Source<T>`, so every pipe, effect
