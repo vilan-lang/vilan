@@ -378,6 +378,59 @@ fn a149_s4_a_field_named_like_a_handle_internal_types_as_the_projection() {
     );
 }
 
+// --- B711 S2a: field syntax through a `[field_syntax]` method ---------------
+
+const KEYED_PRELUDE: &str = "import std::shared::Shared;\n\nstruct Address {\n\tcity: str,\n}\n\nstruct Profile {\n\tname: str,\n\taddress: Address,\n\tget: str,\n}\n\nstruct Optic<S, T> {\n\tstate: Shared<S>,\n\tkey: Key<S, T>,\n}\n\nimpl Optic<type S, type T> {\n\tfun get(self): T {\n\t\tself.state.read()[self.key]\n\t}\n\n\t[field_syntax]\n\tfun at<U>(self, key: Key<T, U>): Optic<S, U> {\n\t\tOptic { state = self.state, key = self.key.then(key) }\n\t}\n}\n\n";
+
+#[test]
+fn b711_s2a_a_field_syntax_receiver_offers_its_keys_fields_with_the_reads_type() {
+    // After `user.` on an `Optic<Profile, Profile>`: `Profile`'s fields, as
+    // fields, each with the read's result type, after the handle's own
+    // members. `get` is the handle's method and shadows the field `get`, which
+    // is offered once, as the method.
+    let source = format!(
+        "{KEYED_PRELUDE}fun main() {{\n\tlet state = Shared::new(Profile {{ name = \"a\", address = Address {{ city = \"c\" }}, get = \"g\" }});\n\tlet user = Optic {{ state, key = Profile.address }};\n\tlet _x = user.¦\n}}\n"
+    );
+    let (_, items) = completions(&source);
+    let city = items
+        .iter()
+        .position(|item| item.label == "city")
+        .unwrap_or_else(|| panic!("`city` offered: {:?}", labels(&items)));
+    assert_eq!(items[city].kind, CompletionKind::Field);
+    assert_eq!(items[city].detail.as_deref(), Some("Optic<Profile, str>"));
+    let at = items
+        .iter()
+        .position(|item| item.label == "at")
+        .expect("the handle's method");
+    assert!(
+        at < city,
+        "the handle's members first: {:?}",
+        labels(&items)
+    );
+    let gets: Vec<CompletionKind> = items
+        .iter()
+        .filter(|item| item.label == "get")
+        .map(|item| item.kind)
+        .collect();
+    assert_eq!(gets, vec![CompletionKind::Method], "{:?}", labels(&items));
+}
+
+#[test]
+fn b711_s2a_a_receiver_without_the_attribute_offers_no_keyed_fields() {
+    // The same handle with the attribute removed: `at` is an ordinary method,
+    // and nothing of `Address` is offered.
+    let source = format!(
+        "{}fun main() {{\n\tlet state = Shared::new(Profile {{ name = \"a\", address = Address {{ city = \"c\" }}, get = \"g\" }});\n\tlet user = Optic {{ state, key = Profile.address }};\n\tlet _x = user.¦\n}}\n",
+        KEYED_PRELUDE.replace("\t[field_syntax]\n", "")
+    );
+    let (_, items) = completions(&source);
+    assert!(
+        !items.iter().any(|item| item.label == "city"),
+        "{:?}",
+        labels(&items)
+    );
+}
+
 // --- E274: a generic receiver is offered the impls at ITS arguments -------
 
 #[test]

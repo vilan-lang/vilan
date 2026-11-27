@@ -6641,6 +6641,10 @@ impl<'src> Printer<'src> {
             self.out.push_str("[element]");
             self.end_attribute_line();
         }
+        if func.field_syntax {
+            self.out.push_str("[field_syntax]");
+            self.end_attribute_line();
+        }
         if func.is_async {
             self.out.push_str("async ");
         }
@@ -17974,6 +17978,16 @@ mod typed_element_head_layout {
         assert_construct(
             "[deprecated(\"x\")] [element] fun row(): i32 { 1 }\n",
             "[deprecated(\"x\")]\n[element]\nfun row(): i32 {\n\t1\n}\n",
+        );
+    }
+
+    /// B711 S2a: `[field_syntax]` is a method's class attribute, printed on a
+    /// line of its own after the checks band, as `[element]` is.
+    #[test]
+    fn the_field_syntax_attribute_prints_on_its_own_line_in_the_class_band() {
+        assert_construct(
+            "struct H {}\nimpl H {\n\t[field_syntax] [must_use] fun at<U>(self, key: Key<H, U>): i32 { 1 }\n}\n",
+            "struct H {}\nimpl H {\n\t[must_use]\n\t[field_syntax]\n\tfun at<U>(self, key: Key<H, U>): i32 {\n\t\t1\n\t}\n}\n",
         );
     }
 }

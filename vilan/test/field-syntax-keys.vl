@@ -1,0 +1,96 @@
+// B711 S2a: field syntax on a handle (proposal/struct-keys.md §3.5, R6). On a
+// receiver whose type has a `[field_syntax]` method taking a `Key<T, _>`, a
+// member that is no member of the receiver and names a field of `T` is the
+// call `receiver.at(T.name)`. The emission pins that the read is exactly that
+// call: a hoisted key literal handed to the method, nothing else.
+import std::io::assert;
+import std::shared::Shared;
+
+struct Address {
+	city: str,
+	zip: i32,
+}
+
+struct User {
+	name: str,
+	address: Address,
+	get: str,
+}
+
+struct Pair<T> {
+	left: T,
+	right: T,
+}
+
+struct Shelf {
+	pair: Pair<str>,
+}
+
+/// A read/write cursor at one place inside a shared root; `at` composes the
+/// key it holds with the next one.
+struct Cursor<S, T> {
+	root: Shared<S>,
+	key: Key<S, T>,
+}
+
+impl Cursor<type S, type T> {
+	fun get(self): T {
+		self.root.read()[self.key]
+	}
+
+	fun set(self, value: T) {
+		self.root.write()[self.key] = value;
+	}
+
+	[field_syntax]
+	fun at<U>(self, key: Key<T, U>): Cursor<S, U> {
+		Cursor { root = self.root, key = self.key.then(key) }
+	}
+}
+
+/// The root handle: S1 has no identity key (`Key<S, S>`), so the root is a
+/// type of its own whose `at` starts a cursor.
+struct Root<S> {
+	state: Shared<S>,
+}
+
+impl Root<type S> {
+	[field_syntax]
+	fun at<U>(self, key: Key<S, U>): Cursor<S, U> {
+		Cursor { root = self.state, key }
+	}
+}
+
+fun city_of(user: &Root<User>): str {
+	user.address.city.get()
+}
+
+fun main() {
+	let user = Root {
+		state = Shared::new(User {
+			name = "ada",
+			address = Address { city = "london", zip = 1 },
+			get = "verb",
+		}),
+	};
+	// One step, and a chain through each read's result.
+	print(user.name.get());
+	let city = user.address.city;
+	city.set("paris");
+	print(user.address.city.get());
+	print(city_of(&user));
+	let zip = user.address.zip;
+	zip.set(zip.get() + 41);
+	print(user.state.read().address.zip);
+	// The cursor's own `get` shadows the field `get`; the written call reaches it.
+	print(user.at(User.get).get());
+	// Two spellings of one place are one key.
+	assert(user.address.city.key == user.at(User.address).at(Address.city).key, "one key");
+	print(user.address.city.key.name());
+	// A generic struct at concrete arguments.
+	let shelf = Root { state = Shared::new(Shelf { pair = Pair { left = "l", right = "r" } }) };
+	let right: Cursor<Shelf, str> = shelf.pair.right;
+	right.set("R");
+	let left: str = shelf.pair.left.get();
+	print(left + right.get());
+}

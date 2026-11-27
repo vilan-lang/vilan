@@ -155,6 +155,12 @@ pub struct Func<'src> {
     // web `view("row")` chain. The parser holds it to a free, bodied function
     // with no parameters.
     pub element: bool,
+    // Declared `[field_syntax]` (B711 S2a, `proposal/struct-keys.md` §3.5,
+    // R6): on a receiver whose type has this method, a member that is no
+    // member of the receiver and names a field of the struct `T` the method's
+    // `Key<T, _>` parameter is over reads as the call `receiver.method(T.name)`.
+    // The parser holds it to a method; the analyzer checks the signature.
+    pub field_syntax: bool,
     pub generic_parameters: Option<GenericParameters<'src>>,
     pub parameters: Spanned<Vec<Parameter<'src>>>,
     pub return_type: Option<Box<Spanned<Node<'src>>>>,

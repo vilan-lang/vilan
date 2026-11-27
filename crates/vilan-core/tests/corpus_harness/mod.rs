@@ -109,6 +109,7 @@ macro_rules! corpus_manifest {
             f64_print_boundary => "f64-print-boundary.vl",
             f64_print_negative_zero => "f64-print-negative-zero.vl",
             field_assignment => "field-assignment.vl",
+            field_syntax_keys => "field-syntax-keys.vl",
             file => "file.vl",
             fixed_arrays => "fixed-arrays.vl",
             for_in => "for-in.vl",

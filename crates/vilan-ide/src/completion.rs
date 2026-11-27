@@ -2455,11 +2455,50 @@ impl<'a, 'src> Analysis<'a, 'src> {
     /// and the field spelling is the one a reader writes. The answer is
     /// `vilan_core::field_syntax`'s, the analyzer's own reader, so the list
     /// cannot offer a field the analysis would refuse.
-    fn push_field_syntax(&self, receiver: TypeId, items: &mut Vec<Completion>) {
+    ///
+    /// B711 S2a: on a receiver whose type has a `[field_syntax]` method, the
+    /// fields of the struct its key is over, AFTER the receiver's own members
+    /// and never in place of one (a member of the receiver shadows the field,
+    /// as the analysis reads it). Each carries the read's RESULT type, the
+    /// method's return at that field (`Optic<Profile, str>`), and the field's
+    /// own `///`. A field a key literal cannot name here (std's `[internal]`
+    /// one) is not offered.
+    fn push_field_syntax(&self, receiver_type_id: TypeId, items: &mut Vec<Completion>) {
         let program = self.program;
-        let Some(receiver) = program.type_id_to_type_map.get(&receiver) else {
+        let Some(receiver) = program.type_id_to_type_map.get(&receiver_type_id) else {
             return;
         };
+        let keyed = program.field_syntax().keyed_fields(receiver);
+        for (name, keyed) in keyed {
+            if items.iter().any(|item| item.label == name) {
+                continue;
+            }
+            let Some(field) = program
+                .structs
+                .get(&keyed.subject)
+                .and_then(|structure| structure.fields.get(keyed.field))
+            else {
+                continue;
+            };
+            let source = program.source_of(keyed.subject);
+            if vilan_core::labels::internal_field_out_of_reach(
+                field.internal,
+                source,
+                Some(self.focus),
+                &program.std_sources,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            let mut completion = Completion::bare(name.to_string(), CompletionKind::Field);
+            completion.detail = program.keyed_result_label(receiver_type_id, keyed);
+            completion.documentation = source.and_then(|source| {
+                self.doc_first_paragraph_at(source, field.name_span.into_range().start)
+            });
+            completion.internal = field.internal.map(str::to_string);
+            items.push(completion);
+        }
         for (name, projection) in program.field_syntax().projected_fields(receiver) {
             items.retain(|item| !(item.label == name && item.kind == CompletionKind::Method));
             let mut completion = Completion::bare(name.to_string(), CompletionKind::Field);
@@ -2469,6 +2508,17 @@ impl<'a, 'src> Analysis<'a, 'src> {
             }
             items.push(completion);
         }
+    }
+
+    /// B711 S2a: whether `name` is a member (a method, inherited or blanket)
+    /// of a receiver of type `receiver` — what shadows a keyed field-syntax
+    /// read, as the analysis decides it. The editor's member table answers.
+    fn receiver_has_member(&self, nominal: Id, receiver: TypeId, name: &str) -> bool {
+        let mut members = self.nominal_member_completions(nominal, Some(receiver));
+        self.push_blanket_methods(receiver, &mut members);
+        members
+            .iter()
+            .any(|member| member.label == name && member.kind == CompletionKind::Method)
     }
 
     /// The receiver's resolved type — its live-token walk (E131) first, then
@@ -2949,13 +2999,20 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     .map(|field| field.type_id);
                 field.or_else(|| {
                     let receiver_type = program.type_id_to_type_map.get(&receiver)?;
-                    let vilan_core::field_syntax::Reading::Projection(member) =
-                        program.field_syntax().read(receiver_type, name)
-                    else {
-                        return None;
-                    };
-                    self.receiver_grounded_result_type_id(member, receiver)
-                        .or_else(|| self.declared_result_type_id(member))
+                    match program.field_syntax().read(receiver_type, name) {
+                        vilan_core::field_syntax::Reading::Projection(member) => self
+                            .receiver_grounded_result_type_id(member, receiver)
+                            .or_else(|| self.declared_result_type_id(member)),
+                        // B711 S2a: a keyed read is the method's result at
+                        // the field — unless a member of the receiver shadows
+                        // it, which the analysis reads instead (and refuses).
+                        vilan_core::field_syntax::Reading::Keyed(keyed)
+                            if !self.receiver_has_member(nominal, receiver, name) =>
+                        {
+                            program.keyed_result_type_id(receiver, keyed)
+                        }
+                        _ => None,
+                    }
                 })
             }
             // `a::B` names a namespace, not a value.

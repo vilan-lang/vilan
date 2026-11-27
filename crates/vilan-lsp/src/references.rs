@@ -576,6 +576,8 @@ impl ReferenceIndex {
         }
 
         // --- Uses, from the entity table ----------------------------------
+        let minted_keys: std::collections::HashSet<Id> =
+            program.field_syntax_keyed.values().copied().collect();
         for (use_id, expr) in &program.entity_map {
             match expr {
                 // An enum variant's DECLARATION is an entity; its `span_map`
@@ -651,6 +653,12 @@ impl ReferenceIndex {
                 // a field's references list its keys, and a rename rewrites
                 // them.
                 Expr::Key(steps) => {
+                    // B711 S2a: the literal a keyed field-syntax read minted
+                    // as its argument was never written; the read's member
+                    // is the reference (the `Call` arm below).
+                    if minted_keys.contains(use_id) {
+                        continue;
+                    }
                     let Some(&(struct_id, index)) = steps.last() else {
                         continue;
                     };
@@ -675,6 +683,26 @@ impl ReferenceIndex {
                     let Some(member_span) = program.member_name_spans.get(use_id) else {
                         continue;
                     };
+                    // B711 S2a: a field-syntax read (`user.name` through a
+                    // `[field_syntax]` method, `app.user` through a store
+                    // projection) is a reference to the FIELD it names, so a
+                    // field's references list it and a rename rewrites it.
+                    if let Some(&(struct_id, index)) = program.field_syntax_fields.get(use_id) {
+                        let definition = Definition::Field(struct_id, index);
+                        if let Some(name) = name_of(program, definition) {
+                            push(
+                                &mut rows,
+                                &mut dropped,
+                                source_of.of(*use_id),
+                                Some(*member_span),
+                                name,
+                                Anchor::Exact,
+                                definition,
+                                false,
+                            );
+                        }
+                        continue;
+                    }
                     let Some(call) = program.function_calls.get(call_id) else {
                         continue;
                     };

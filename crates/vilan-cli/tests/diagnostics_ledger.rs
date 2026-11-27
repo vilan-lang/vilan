@@ -398,7 +398,7 @@ const ROWS_WITHOUT_A_KEY: &[(&str, &str)] = &[
 /// `&'static str` rather than a literal (the lexer's rule constants come through
 /// one of them), which is why the enumeration in check (3) cannot reach the row
 /// and why it is keyless in the first place.
-const RULE_STATEMENT_SITES: usize = 72;
+const RULE_STATEMENT_SITES: usize = 76;
 
 /// The one literal run of the resource-derive refusal that is neither a slot
 /// nor assembled: what its ledger row is keyed on, and what
@@ -434,6 +434,26 @@ const RESOURCE_DERIVE_REFUSAL_FRAGMENT: &str =
 /// unmistakable is the bar, and a tail edit that leaves the head standing
 /// still lands on a row that names the constant.
 const CURATED_RULE_STATEMENTS: &[(&str, &str, &str)] = &[
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "FIELD_SYNTAX_ON_A_FREE_FUNCTION",
+        "`[field_syntax]` marks the method a handle's field syntax calls (`handle.name` is `handle.at(T.name)`): it may label only a method in an `impl`, and a free function",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "FIELD_SYNTAX_ON_AN_EXTERNAL",
+        "`[field_syntax]` marks the method a handle's field syntax calls: it may label only a method with a body",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "FIELD_SYNTAX_WITH_ELEMENT",
+        "`[field_syntax]` labels a method and `[element]` a free function",
+    ),
+    (
+        "crates/vilan-core/src/parsing.rs",
+        "FIELD_SYNTAX_NOT_ON_A_FUNCTION",
+        "`[field_syntax]` marks the method a handle's field syntax calls (`handle.name` is `handle.at(T.name)`): it may label only a method in an `impl`",
+    ),
     (
         "crates/vilan-core/src/parsing.rs",
         "ELEMENT_ON_A_METHOD",

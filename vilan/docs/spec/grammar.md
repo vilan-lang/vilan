@@ -87,7 +87,8 @@ export      = { lead-attribute }   (* the item's own prefix, in THE order below 
 lead-attribute = deprecated-label | internal-label | hint-label | platform-attr
                | resource-attr | extern-attr | "[" "must_use" "]"
                | "[" "track_caller" "]" | "[" "rpc" "]"
-               | "[" "trait_only" "]" | "[" "element" "]" | derive-attr | service-attr
+               | "[" "trait_only" "]" | "[" "element" "]" | "[" "field_syntax" "]"
+               | derive-attr | service-attr
                | client-service-attr | macro-attr ;
 ```
 
@@ -128,8 +129,8 @@ each on its own line:
 4. the checks — `[must_use]`, then `[track_caller]`, then `[rpc]`, then
    `[trait_only]`;
 5. the fence — `[platform(..)]`;
-6. the class — `[resource]` on a type, `[element]` on a function (no
-   declaration takes both).
+6. the class — `[resource]` on a type, `[element]` on a free function,
+   `[field_syntax]` on a method (no declaration takes two).
 
 So `[derive(Wire)]` ⏎ `export struct Handle { … }`, `[platform("browser")]`
 ⏎ `export impl …`, `[deprecated("use g")]` ⏎ `[must_use]` ⏎ `export async
@@ -224,6 +225,7 @@ function = [ "[" "deprecated" "(" STRING ")" "]" ]
            [ "[" "rpc" "]" ] [ "[" "trait_only" "]" ]
            [ "[" "platform" "(" STRING { "," STRING } [ "," ] ")" "]" ]
            [ "[" "element" "]" ]             (* a free, bodied, parameterless fun: §3.6's typed element *)
+           [ "[" "field_syntax" "]" ]        (* a bodied method of an inherent impl: types.md §5.13's handle door *)
            [ "async" ] [ "external" ]
            "fun" MEMBER [ generic-params ]   (* IDENT unless an impl/trait member *)
            "(" [ parameter { "," parameter } [ "," ] ] ")"
