@@ -37,11 +37,10 @@ export struct KeyPath {
 
 /// One step of a path: a field of a struct, by its declaring struct and its
 /// position, or a variant's payload slot, by its declaring enum, the variant's
-/// position and the slot's. Two paths agree at a step when both name the same
-/// field (or slot) of the same declaration — `Left.x` and `Right.x` are
-/// different steps even when both are each struct's first field, and
-/// `Pair<i32>.left` and `Pair<str>.left` are the same step (the field of one
-/// declaration).
+/// position and the slot's. Two paths agree at a step when both name the same field
+/// (or slot) of the same declaration — `Left.x` and `Right.x` are different steps
+/// even when both are each struct's first field, and `Pair<i32>.left` and
+/// `Pair<str>.left` are the same step (the field of one declaration).
 export struct KeyStep {
 	[internal("the declaring struct or enum, by its file and name; read it through `owner()`")] owner: str,
 	[internal("the field's or the variant's position; read it through `index()`")] index: usize,
@@ -49,16 +48,16 @@ export struct KeyStep {
 	[internal("whether the step is a field or a variant's payload slot; read it through `position()`")] kind: StepKind,
 }
 
-/// What a step reaches. The variant ORDER is the compiler's: a key literal
-/// writes it as `[0]` for a field and `[1, position, width]` for a variant's
-/// payload slot on JS, and the run-time walk reads it there. Room is left for a
-/// list position and a map entry (S3b), which will carry their value's `Hash`.
+/// What a step reaches. The variant ORDER is the compiler's: a key literal writes
+/// it as `[0]` for a field and `[1, position, width]` for a variant's payload slot
+/// on JS, and the run-time walk reads it there. Room is left for a list position
+/// and a map entry (S3b), which will carry their value's `Hash`.
 enum StepKind {
 	/// A struct's field: always there.
 	Field,
-	/// A variant's payload slot: the slot's position and the payload's width
-	/// (the width only decides how `name()` spells the step). There only when
-	/// the enum holds that variant.
+	/// A variant's payload slot: the slot's position and the payload's width (the
+	/// width only decides how `name()` spells the step). There only when the enum
+	/// holds that variant.
 	Variant(usize, usize),
 }
 
@@ -92,9 +91,9 @@ export impl Key<type S, type F> {
 		Key { erased = self.erased.then(next.erased) }
 	}
 
-	/// This key as a `MaybeKey`: the same path, whose place is always there, so
-	/// its `get` is always `Some`. (A key LITERAL needs no call where a
-	/// `MaybeKey` is expected: it takes the expected type.)
+	/// This key as a `MaybeKey`: the same path, whose place is always there, so its
+	/// `get` is always `Some`. (A key LITERAL needs no call where a `MaybeKey` is
+	/// expected: it takes the expected type.)
 	fun maybe(self): MaybeKey<S, F> {
 		MaybeKey { erased = self.erased }
 	}
@@ -184,16 +183,16 @@ export impl KeyStep {
 		self.index
 	}
 
-	/// The struct that declares the field (or the enum that declares the
-	/// variant), for display: its file, the items it sits inside and its name
-	/// (`src/model.vl::Task`, `src/app.vl::render::Row`). Not a storage format —
-	/// it moves with the file; stored data uses `name()`.
+	/// The struct that declares the field (or the enum that declares the variant),
+	/// for display: its file, the items it sits inside and its name
+	/// (`src/model.vl::Task`, `src/app.vl::render::Row`). Not a storage format — it
+	/// moves with the file; stored data uses `name()`.
 	fun owner(self): str {
 		self.owner
 	}
 
-	/// The payload slot a variant step reaches, counting from 0; `None` for a
-	/// field step.
+	/// The payload slot a variant step reaches, counting from 0; `None` for a field
+	/// step.
 	fun position(self): Option<usize> {
 		match self.kind {
 			StepKind::Field => None,
@@ -201,8 +200,8 @@ export impl KeyStep {
 		}
 	}
 
-	/// Whether the place this step reaches may be missing at run time: a
-	/// variant step's, when the enum holds another variant.
+	/// Whether the place this step reaches may be missing at run time: a variant
+	/// step's, when the enum holds another variant.
 	fun may_miss(self): bool {
 		self.kind is StepKind::Variant(_, _)
 	}
@@ -256,18 +255,22 @@ fun owner_name(step: KeyStep): str {
 	segments[segments.len() - 1].split("#")[0]
 }
 
-/// One step as a key literal spells it: `.name` for a field (no dot when it
-/// `leads` the name), `::Variant` for a variant step, then `.position` when its
-/// payload has more than one slot.
+/// One step as a key literal spells it: `.name` for a field (no dot when it `leads`
+/// the name), `::Variant` for a variant step, then `.position` when its payload has
+/// more than one slot.
 fun spelled(step: KeyStep, leads: bool): str {
 	if step.kind is StepKind::Variant(let position, let width) {
 		ret if width > 1 { i"::{step.name}.{position}" } else { "::" + step.name };
 	}
-	if leads { step.name } else { "." + step.name }
+	if leads {
+		step.name
+	} else {
+		"." + step.name
+	}
 }
 
-/// A step's payload slot plus one, 0 for a field step: two steps of one
-/// declaration and position reach the same place exactly when these agree.
+/// A step's payload slot plus one, 0 for a field step: two steps of one declaration
+/// and position reach the same place exactly when these agree.
 fun slot_of(step: KeyStep): usize {
 	if step.kind is StepKind::Variant(let position, _) {
 		ret position + 1;
@@ -283,8 +286,8 @@ fun slot_of(step: KeyStep): usize {
 ///
 /// Written `S.x::Some`, `S.shape::Rect.0` (a payload of several slots is reached
 /// one slot at a time), or composed (`then`, `some()`); there is no other
-/// constructor. A `MaybeKey` has no `s[k]`: its place is reached by
-/// continuation, which answers whether it was there.
+/// constructor. A `MaybeKey` has no `s[k]`: its place is reached by continuation,
+/// which answers whether it was there.
 export struct MaybeKey<S, F> {
 	[internal("a key's erased path; read it through `path()`")] erased: KeyPath,
 }
@@ -300,8 +303,8 @@ export impl MaybeKey<type S, type F> {
 		self.erased.name()
 	}
 
-	/// Whether `prefix`'s path is the start of this one (a key starts with
-	/// itself). A total key's literal is a `MaybeKey` here too.
+	/// Whether `prefix`'s path is the start of this one (a key starts with itself).
+	/// A total key's literal is a `MaybeKey` here too.
 	fun starts_with<G>(self, prefix: MaybeKey<S, G>): bool {
 		self.erased.starts_with(prefix.erased)
 	}
@@ -319,13 +322,13 @@ export impl MaybeKey<type S, type F> {
 	/// Lends the place to `body` when it is there; answers whether it was.
 	external fun view(self, subject: &S, body: |&F| void): bool;
 
-	/// Lends the place for writing to `body` when it is there; answers whether
-	/// it was. Nothing is created: a missing place stays missing.
+	/// Lends the place for writing to `body` when it is there; answers whether it
+	/// was. Nothing is created: a missing place stays missing.
 	external fun change(self, subject: &mut S, body: |&mut F| void): bool;
 
-	/// Writes `value` to the place when it is there (`change` with an
-	/// assignment); answers whether it was. It never creates a missing place:
-	/// `Doc.title::Some` puts into a title that is `Some`, and leaves `None`.
+	/// Writes `value` to the place when it is there (`change` with an assignment);
+	/// answers whether it was. It never creates a missing place: `Doc.title::Some`
+	/// puts into a title that is `Some`, and leaves `None`.
 	external fun put(self, subject: &mut S, value: F): bool;
 }
 
@@ -345,8 +348,8 @@ export impl MaybeKey<type S, Option<type T>> {
 }
 
 /// The one step `::Some` from an `Option<T>` to its payload — an intrinsic, a key
-/// rooted at the option itself, which no literal writes (a key literal is rooted
-/// at a struct).
+/// rooted at the option itself, which no literal writes (a key literal is rooted at
+/// a struct).
 external fun option_some<T>(): MaybeKey<Option<T>, T>;
 
 /// Two keys are equal when their paths are, however each was written.

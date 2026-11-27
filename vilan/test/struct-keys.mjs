@@ -80,7 +80,7 @@ function starts_with(self, prefix) {
 	}
 	let at3 = 0;
 	for (const step of prefix[0]) {
-		const own = __at(self[0], at3, "std/src/key.vl:141:14");
+		const own = __at(self[0], at3, "std/src/key.vl:140:14");
 		if (step[1] !== own[1] || step[0] !== own[0] || slot_of(step) !== slot_of(own)) {
 			return false;
 		}

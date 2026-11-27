@@ -178,7 +178,7 @@ function starts_with(self, prefix) {
 	}
 	let at = 0;
 	for (const step of prefix[0]) {
-		const own = __at(self[0], at, "std/src/key.vl:141:14");
+		const own = __at(self[0], at, "std/src/key.vl:140:14");
 		if (step[1] !== own[1] || step[0] !== own[0] || slot_of(step) !== slot_of(own)) {
 			return false;
 		}
@@ -203,7 +203,7 @@ function written(path) {
 	if (path[0].length === 0) {
 		return "";
 	}
-	let out = owner_name(__at(path[0], 0, "std/src/key.vl:245:23"));
+	let out = owner_name(__at(path[0], 0, "std/src/key.vl:244:23"));
 	for (const step of path[0]) {
 		out = out + spelled(step, false);
 	}
@@ -211,7 +211,7 @@ function written(path) {
 }
 function owner_name(step) {
 	const segments = step[0].split("::");
-	return __at(__at(segments, segments.length - 1, "std/src/key.vl:256:2").split("#"), 0, "std/src/key.vl:256:2");
+	return __at(__at(segments, segments.length - 1, "std/src/key.vl:255:2").split("#"), 0, "std/src/key.vl:255:2");
 }
 function spelled(step, leads) {
 	const $z = step[3];
