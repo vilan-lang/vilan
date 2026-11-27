@@ -83833,7 +83833,9 @@ const STD_KEY_NAMES: [&str; 3] = ["Key", "KeyPath", "KeyStep"];
 ///    subject is a bare name or a path. Only the analyzer knows the subject is
 ///    a struct, so the seed over-approximates with the spelling: a subject
 ///    whose name does not begin with a lowercase ASCII letter (`Task`, `Self`,
-///    `_t`). That is never a miss for a struct named the usual way, and it is
+///    `_t`), and a half-typed one (`Task.`, the member still missing) whose
+///    completion offers the fields as keys. That is never a miss for a struct
+///    named the usual way, and it is
 ///    rare otherwise — a field read off an upper-case constant (`LIMITS.max`)
 ///    is the one ordinary false positive. A struct named in LOWER case
 ///    (`struct point { .. }`) roots a literal this test cannot see, so its
@@ -83912,8 +83914,10 @@ fn seeds_std_key(node: &Node) -> StdKeySeed {
             names(name_bit(name.0))
         }
         Node::MemberAccessor(subject, member) => {
+            // An `Error` member is the editor's half-typed `Task.`, whose
+            // completion offers the fields as keys (`Key<Task, str>`).
             let (member, _) = crate::node::unmark_head_link(member);
-            yes(matches!(member.0, Node::Accessor(_))
+            yes(matches!(member.0, Node::Accessor(_) | Node::Error)
                 && matches!(
                     &subject.0,
                     Node::Accessor(name) | Node::StaticAccessor(_, name, None)

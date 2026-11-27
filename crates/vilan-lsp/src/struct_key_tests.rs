@@ -498,3 +498,21 @@ fn m211_completion_offers_key_before_any_use() {
         assert_eq!(bound.detail, key.detail);
     });
 }
+
+/// M211: in a file with no key yet, `Task.` half-typed still loads
+/// `std::key`, so its completion offers the fields as keys.
+#[test]
+fn m211_a_half_typed_key_literal_completes_as_keys_in_a_keyless_file() {
+    on_big_stack(|| {
+        let text = KEYLESS.replace("\tprint(t.title);\n", "\tlet k = Task.;\n");
+        let document = analyzed(&text);
+        assert!(loads_key(&document));
+        let at = text.find("Task.;").expect("the typed key") + "Task.".len();
+        let title = document
+            .completion(at)
+            .into_iter()
+            .find(|candidate| candidate.label == "title")
+            .expect("the field");
+        assert_eq!(title.detail.as_deref(), Some("Key<Task, str>"));
+    });
+}
