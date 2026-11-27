@@ -1,0 +1,34 @@
+// M211: `std::key` loads on demand. This program never writes `Key`: its keys
+// are literals (a path among them), a lower-case struct roots one, and a field
+// read off an upper-case module binding is the seed's false positive. Both
+// backends must build it with the module the seed loaded, and answer alike.
+struct Meta {
+	owner: str,
+}
+
+struct Task {
+	title: str,
+	meta: Meta,
+}
+
+struct point {
+	x: i32,
+}
+
+struct Limits {
+	max: i32,
+}
+
+let LIMITS: Limits = Limits { max = 9 };
+
+fun main() {
+	mut t = Task { title = "a", meta = Meta { owner = "b" } };
+	let title = Task.title;
+	t[Task.meta.owner] = "c";
+	print(t[title]);
+	print(t.meta.owner);
+	print(title.path() == Task.title.path());
+	let p = point { x = 3 };
+	print(p[point.x]);
+	print(LIMITS.max);
+}

@@ -389,3 +389,130 @@ fn keys_a_tuple_keys_members_complete() {
         assert!(labels.contains(&"index".to_string()), "{labels:?}");
     });
 }
+
+// --- M211: `std::key` loads on demand ----------------------------------------
+
+/// A file with a struct and no key.
+const KEYLESS: &str = "struct Task {\n\ttitle: str,\n}\n\n\
+     fun main() {\n\tlet t = Task { title = \"a\" };\n\tprint(t.title);\n}\n";
+
+/// Whether the document's analysis loaded `std::key`.
+fn loads_key(document: &Document) -> bool {
+    document
+        .program
+        .as_ref()
+        .is_some_and(|program| program.key_struct_id.is_some())
+}
+
+/// M211: an open file with no key loads no `std::key`; the keystroke that
+/// writes the first key literal brings it in with nothing stale left behind,
+/// and the one that takes the literal out again lands on the keyless world
+/// (the module is dropped, not kept) — clean at every step.
+#[test]
+fn m211_the_first_key_literal_loads_std_key_and_removing_it_unloads_it() {
+    on_big_stack(|| {
+        let mut document = analyzed(KEYLESS);
+        assert!(document.diagnostics.is_empty(), "{:?}", messages(&document));
+        assert!(!loads_key(&document));
+        let at = KEYLESS.find("t.title)").expect("the read");
+        let keyed = edited(&mut document, at + 1, at + 1, "[Task.title]");
+        let keyed = {
+            let mut keyed = keyed;
+            let read = keyed.text.find("[Task.title].title").expect("the edit");
+            edited(
+                &mut keyed,
+                read + "[Task.title]".len(),
+                read + "[Task.title].title".len(),
+                "",
+            )
+        };
+        assert!(
+            keyed.text.contains("print(t[Task.title]);"),
+            "{}",
+            keyed.text
+        );
+        assert!(keyed.diagnostics.is_empty(), "{:?}", messages(&keyed));
+        assert!(loads_key(&keyed));
+        let mut keyed = keyed;
+        let read = keyed.text.find("[Task.title]").expect("the key");
+        let back = edited(&mut keyed, read, read + "[Task.title]".len(), ".title");
+        assert_eq!(back.text, KEYLESS);
+        assert!(back.diagnostics.is_empty(), "{:?}", messages(&back));
+        assert!(!loads_key(&back));
+    });
+}
+
+/// M211: the first `Key` written in a signature, then a `[field_syntax]`
+/// method, each brings the module in, clean.
+#[test]
+fn m211_the_first_key_in_a_signature_or_a_field_syntax_method_loads_std_key() {
+    on_big_stack(|| {
+        let mut document = analyzed(KEYLESS);
+        assert!(!loads_key(&document));
+        let at = KEYLESS.find("fun main()").expect("main");
+        let signature = "fun read(t: Task, k: Key<Task, str>): str {\n\tt[k]\n}\n\n";
+        let signed = edited(&mut document, at, at, signature);
+        assert!(signed.diagnostics.is_empty(), "{:?}", messages(&signed));
+        assert!(loads_key(&signed));
+        let mut document = analyzed(KEYLESS);
+        let door = "struct Box {\n\ttask: Task,\n}\n\nimpl Box {\n\t[field_syntax]\n\t\
+                    fun at<U>(self, key: Key<Task, U>): U {\n\t\tself.task[key]\n\t}\n}\n\n";
+        let doored = edited(&mut document, at, at, door);
+        assert!(doored.diagnostics.is_empty(), "{:?}", messages(&doored));
+        assert!(loads_key(&doored));
+    });
+}
+
+/// M211: completion offers the ambient `Key` in a file that has not used it
+/// — its module not loaded — exactly as it does once the module is.
+#[test]
+fn m211_completion_offers_key_before_any_use() {
+    on_big_stack(|| {
+        let text = KEYLESS.replace("\tprint(t.title);\n", "\tlet k: Ke\n");
+        let document = analyzed(&text);
+        assert!(!loads_key(&document));
+        let at = text.find("let k: Ke").expect("the typed name") + "let k: Ke".len();
+        let offered = document.completion(at);
+        let key = offered
+            .iter()
+            .find(|candidate| candidate.label == "Key")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{:?}",
+                    offered
+                        .iter()
+                        .map(|candidate| &candidate.label)
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(key.kind, vilan_ide::CompletionKind::Struct);
+        let keyed = analyzed(&SOURCE.replace("\tprint(t[k]);\n", "\tlet j: Ke\n"));
+        assert!(loads_key(&keyed));
+        let at = keyed.text.find("let j: Ke").expect("the typed name") + "let j: Ke".len();
+        let bound = keyed
+            .completion(at)
+            .into_iter()
+            .find(|candidate| candidate.label == "Key")
+            .expect("the bound `Key`");
+        assert_eq!(bound.kind, key.kind);
+        assert_eq!(bound.detail, key.detail);
+    });
+}
+
+/// M211: in a file with no key yet, `Task.` half-typed still loads
+/// `std::key`, so its completion offers the fields as keys.
+#[test]
+fn m211_a_half_typed_key_literal_completes_as_keys_in_a_keyless_file() {
+    on_big_stack(|| {
+        let text = KEYLESS.replace("\tprint(t.title);\n", "\tlet k = Task.;\n");
+        let document = analyzed(&text);
+        assert!(loads_key(&document));
+        let at = text.find("Task.;").expect("the typed key") + "Task.".len();
+        let title = document
+            .completion(at)
+            .into_iter()
+            .find(|candidate| candidate.label == "title")
+            .expect("the field");
+        assert_eq!(title.detail.as_deref(), Some("Key<Task, str>"));
+    });
+}

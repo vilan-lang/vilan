@@ -3722,6 +3722,16 @@ impl<'a, 'src> Analysis<'a, 'src> {
             }
             scope_id = scope.parent_id;
         }
+        // M211: an ambient name whose module this program never needed
+        // (`Key`, before the file writes a key) is bound nowhere, yet it is in
+        // scope as far as the author can tell: writing it loads the module.
+        // Offered as the bound name is — a struct candidate with no detail,
+        // which is what a struct's `entity_completion` renders.
+        for name in &program.prelude_deferred_names {
+            if seen.insert(*name) {
+                items.push(Completion::bare(name.to_string(), CompletionKind::Struct));
+            }
+        }
         // The offered keywords are exactly the lexer's, drawn from the one
         // documented table [`KEYWORD_DOCS`] (kept in lockstep with the lexer by
         // [`keyword_lexeme`]) — no separate hand-list to drift (WO-3).

@@ -10405,3 +10405,438 @@ fn keys_a_module_qualified_root_is_a_key() {
     );
     assert_eq!(stdout, "x\nmodel.vl::Task\nfalse\n");
 }
+
+// --- M211: `std::key` loads on demand -----------------------------------------
+//
+// `Key` is ambient (the base and web preludes publish it), but its module loads
+// only for a program some file of which may need it: one that writes `Key`,
+// `KeyPath` or `KeyStep`, a field read off a name that is not lower-case (a key
+// literal `Task.title`), a lower-case struct or alias that could root one, or a
+// `[field_syntax]` method — in the entry, a package module, a dependency, or
+// what a macro generated. `Program::key_struct_id` says whether it loaded.
+
+/// What one M211 analysis answers: whether `std::key` loaded, the
+/// diagnostics, and the program's stdout when it was clean and `run` asked.
+struct KeyLoad {
+    loaded: bool,
+    errors: Vec<String>,
+    stdout: Option<String>,
+}
+
+/// Lays `files` out as the entry package (with `main.vl` its entry) beside
+/// `deps`, analyzes under `prelude` on `platform`, and answers [`KeyLoad`].
+fn key_load(
+    prelude: PreludeSpec,
+    files: &[(&str, &str)],
+    deps: &[Dep],
+    platform: Platform,
+    run: bool,
+) -> KeyLoad {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let root = scratch::root().join(format!("vilan_m211_{}_{unique}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let app_dir = root.join("app");
+    for (relative, contents) in files {
+        let path = app_dir.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+    let mut packages = Vec::new();
+    let mut entry_dependencies = Vec::new();
+    for (index, dep) in deps.iter().enumerate() {
+        let dep_root = root.join(dep.import_name);
+        for (relative, contents) in dep.files {
+            let path = dep_root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+        }
+        packages.push(PackageSpec {
+            base_root: dep_root,
+            layers: Vec::new(),
+            dependencies: Vec::new(),
+            surface: true,
+            member: false,
+            prelude: Default::default(),
+        });
+        entry_dependencies.push((dep.import_name.to_string(), index));
+    }
+    let workspace = Workspace {
+        packages,
+        entry_dependencies,
+        entry_prelude: prelude,
+        ..Workspace::default()
+    };
+    let entry_path = app_dir.join("main.vl");
+    let source = std::fs::read_to_string(&entry_path).unwrap();
+    let leaked: &'static str = Box::leak(source.into_boxed_str());
+    let (program, errors) = analyze_source(
+        leaked,
+        &std_spec(),
+        &app_dir,
+        &entry_path,
+        Some(platform),
+        &workspace,
+    );
+    let errors: Vec<String> = errors.into_iter().map(|error| error.msg).collect();
+    let loaded = program
+        .as_ref()
+        .is_some_and(|program| program.key_struct_id.is_some());
+    let stdout = match (run, program) {
+        (true, Some(program)) if errors.is_empty() => Some(run_node(
+            &vilan_core::transform(&program, &vilan_core::BuildOptions::default())
+                .expect("the program emits"),
+        )),
+        _ => None,
+    };
+    let _ = std::fs::remove_dir_all(&root);
+    KeyLoad {
+        loaded,
+        errors,
+        stdout,
+    }
+}
+
+/// [`key_load`] for a single-file program under the base prelude, run.
+fn key_load_entry(entry: &str) -> KeyLoad {
+    key_load(
+        base_prelude(),
+        &[("main.vl", entry)],
+        &[],
+        Platform::default(),
+        true,
+    )
+}
+
+/// Asserts the analysis was clean and loaded `std::key`, and answers stdout.
+fn assert_loads_key(load: KeyLoad) -> String {
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(load.loaded, "`std::key` should have loaded");
+    load.stdout.unwrap_or_default()
+}
+
+const M211_TASK: &str =
+    "struct Meta {\n\towner: str,\n}\n\nstruct Task {\n\ttitle: str,\n\tmeta: Meta,\n}\n";
+
+#[test]
+fn m211_a_program_with_no_key_does_not_load_std_key() {
+    let load = key_load_entry(&format!(
+        "{M211_TASK}\nfun main() {{\n\tlet t = Task {{ title = \"a\", meta = Meta {{ owner = \"b\" }} }};\n\
+         \tlet owner = t.meta.owner;\n\tprint(t.title + owner);\n}}\n"
+    ));
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded, "a program with no key loaded `std::key`");
+    assert_eq!(load.stdout.as_deref(), Some("ab\n"));
+}
+
+/// A key literal is a key with no `Key` written anywhere.
+#[test]
+fn m211_a_key_literal_alone_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(&format!(
+        "{M211_TASK}\nfun main() {{\n\tlet t = Task {{ title = \"a\", meta = Meta {{ owner = \"b\" }} }};\n\
+         \tlet k = Task.title;\n\tprint(t[k]);\n}}\n"
+    )));
+    assert_eq!(stdout, "a\n");
+}
+
+#[test]
+fn m211_a_path_key_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(&format!(
+        "{M211_TASK}\nfun main() {{\n\tmut t = Task {{ title = \"a\", meta = Meta {{ owner = \"b\" }} }};\n\
+         \tt[Task.meta.owner] = \"c\";\n\tprint(t.meta.owner);\n}}\n"
+    )));
+    assert_eq!(stdout, "c\n");
+}
+
+/// `Key` written only in a signature, the function never called.
+#[test]
+fn m211_key_only_in_a_signature_loads_std_key() {
+    assert_loads_key(key_load_entry(&format!(
+        "{M211_TASK}\nfun read(t: Task, k: Key<Task, str>): str {{\n\tt[k]\n}}\n\nfun main() {{\n\tprint(\"x\");\n}}\n"
+    )));
+}
+
+/// `KeyPath` written without its import is the same miss it always was — with
+/// the module loaded, so the steer to its import names it.
+#[test]
+fn m211_key_path_written_without_its_import_loads_std_key() {
+    let load = key_load_entry("fun f(path: KeyPath) {}\n\nfun main() {}\n");
+    assert!(load.loaded);
+    assert!(!load.errors.is_empty());
+}
+
+/// `s[k]` in a file that writes no key at all: the key arrives as a parameter,
+/// and the module that made it seeds the load.
+#[test]
+fn m211_a_subscript_through_a_received_key_loads_std_key() {
+    let stdout = assert_loads_key(key_load(
+        base_prelude(),
+        &[
+            (
+                "main.vl",
+                "import pkg::model::{ Task, title_key };\n\
+                 fun read(t: Task): str {\n\tlet k = title_key();\n\tt[k]\n}\n\
+                 fun main() {\n\tprint(read(Task { title = \"t\" }));\n}\n",
+            ),
+            (
+                "model.vl",
+                "export struct Task {\n\ttitle: str,\n}\n\
+                 export fun title_key(): Key<Task, str> {\n\tTask.title\n}\n",
+            ),
+        ],
+        &[],
+        Platform::default(),
+        true,
+    ));
+    assert_eq!(stdout, "t\n");
+}
+
+/// A `[field_syntax]` method in one module; the reads through it in a file
+/// that writes no key.
+#[test]
+fn m211_a_field_syntax_method_loads_std_key() {
+    let stdout = assert_loads_key(key_load(
+        base_prelude(),
+        &[
+            (
+                "main.vl",
+                "import pkg::handle::{ Box, User };\n\
+                 fun main() {\n\tlet b = Box { user = User { name = \"n\" } };\n\tprint(b.name);\n}\n",
+            ),
+            (
+                "handle.vl",
+                "export struct User {\n\tname: str,\n}\n\
+                 export struct Box {\n\tuser: User,\n}\n\
+                 export impl Box {\n\t[field_syntax]\n\tfun at<U>(self, key: Key<User, U>): U {\n\t\tself.user[key]\n\t}\n}\n",
+            ),
+        ],
+        &[],
+        Platform::default(),
+        true,
+    ));
+    assert_eq!(stdout, "n\n");
+}
+
+/// A key written only inside a dependency's module, and only in a
+/// dependency's `lib.vl` surface.
+#[test]
+fn m211_a_key_only_inside_a_dependency_loads_std_key() {
+    let module = Dep {
+        import_name: "common",
+        files: &[
+            ("lib.vl", "export import pkg::model::{ Task, title_of };\n"),
+            (
+                "model.vl",
+                "export struct Task {\n\ttitle: str,\n}\n\
+                 export fun title_of(t: Task): str {\n\tt[Task.title]\n}\n",
+            ),
+        ],
+    };
+    let entry = "import common::{ Task, title_of };\n\
+                 fun main() {\n\tprint(title_of(Task { title = \"d\" }));\n}\n";
+    let stdout = assert_loads_key(key_load(
+        base_prelude(),
+        &[("main.vl", entry)],
+        &[module],
+        Platform::default(),
+        true,
+    ));
+    assert_eq!(stdout, "d\n");
+    let surface = Dep {
+        import_name: "common",
+        files: &[(
+            "lib.vl",
+            "export struct Task {\n\ttitle: str,\n}\n\
+             export fun title_of(t: Task): str {\n\tt[Task.title]\n}\n",
+        )],
+    };
+    let stdout = assert_loads_key(key_load(
+        base_prelude(),
+        &[("main.vl", entry)],
+        &[surface],
+        Platform::default(),
+        true,
+    ));
+    assert_eq!(stdout, "d\n");
+}
+
+/// A macro that writes `Seed.unused` into its output: the defining file and
+/// the annotated one write no key (the literal is inside a string), the
+/// generated code does.
+const M211_KEY_MACRO: &str = concat!(
+    "macro fun keyed(item: Item): Source {\n",
+    "    import macro_std::source;\n",
+    "    import macro_std::meta::{ Item, Source };\n",
+    "\n",
+    "    source(\"fun read_unused(s: Seed): i32 {\\ns[Seed.unused]\\n}\\n\")\n",
+    "}\n",
+);
+
+#[test]
+fn m211_a_key_only_in_macro_output_loads_std_key() {
+    let entry = format!(
+        "{M211_KEY_MACRO}\n[keyed]\nstruct Seed {{\n    unused: i32,\n}}\n\n\
+         fun main() {{\n    print(read_unused(Seed {{ unused = 7 }}));\n}}\n"
+    );
+    assert_eq!(assert_loads_key(key_load_entry(&entry)), "7\n");
+    // The same expansion in an imported module.
+    let module =
+        format!("export *;\n\n{M211_KEY_MACRO}\n[keyed]\nstruct Seed {{\n    unused: i32,\n}}\n");
+    let stdout = assert_loads_key(key_load(
+        base_prelude(),
+        &[
+            (
+                "main.vl",
+                "import pkg::seeds::{ Seed, read_unused };\n\
+                 fun main() {\n    print(read_unused(Seed { unused = 8 }));\n}\n",
+            ),
+            ("seeds.vl", &module),
+        ],
+        &[],
+        Platform::default(),
+        true,
+    ));
+    assert_eq!(stdout, "8\n");
+}
+
+/// A struct named in lower case roots a key literal the spelling test cannot
+/// see, so its declaration seeds the module; so does a lower-case alias of an
+/// upper-case name.
+#[test]
+fn m211_a_lower_case_root_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(
+        "struct point {\n\tx: i32,\n}\n\nfun main() {\n\tlet p = point { x = 3 };\n\tprint(p[point.x]);\n}\n",
+    ));
+    assert_eq!(stdout, "3\n");
+    let stdout = assert_loads_key(key_load(
+        base_prelude(),
+        &[
+            (
+                "main.vl",
+                "import pkg::model::Task as task;\n\
+                 fun main() {\n\tlet t = task { title = \"l\" };\n\tprint(t[task.title]);\n}\n",
+            ),
+            ("model.vl", "export struct Task {\n\ttitle: str,\n}\n"),
+        ],
+        &[],
+        Platform::default(),
+        true,
+    ));
+    assert_eq!(stdout, "l\n");
+}
+
+/// The seed's false positives: a field read off an upper-case module binding
+/// loads the module and changes nothing else.
+#[test]
+fn m211_an_upper_case_value_s_field_read_loads_std_key_and_means_what_it_did() {
+    let stdout = assert_loads_key(key_load_entry(
+        "struct Limits {\n\tmax: i32,\n}\n\nlet LIMITS: Limits = Limits { max = 9 };\n\n\
+         fun main() {\n\tprint(LIMITS.max);\n}\n",
+    ));
+    assert_eq!(stdout, "9\n");
+}
+
+/// A key literal on an external type is refused with the same words whether
+/// `std::key` loaded or not — here it does not (`i32` is lower-case and
+/// bodyless, so nothing seeds it).
+#[test]
+fn m211_a_key_refusal_needs_no_std_key() {
+    let load = key_load_entry("fun main() {\n\tlet a = i32.max;\n}\n");
+    assert!(!load.loaded);
+    assert_eq!(
+        load.errors,
+        vec![
+            "a key reaches only struct fields: `i32` is an external type, which has no fields a \
+             key can name"
+                .to_string()
+        ]
+    );
+}
+
+/// An explicit import of the module loads it, and the ambient `Key` binds.
+#[test]
+fn m211_an_explicit_import_loads_std_key_and_key_stays_ambient() {
+    assert_loads_key(key_load_entry(
+        "import std::key::KeyPath;\n\nfun f(path: KeyPath) {}\n\nfun main() {}\n",
+    ));
+}
+
+/// A package prelude that globs std's: `Key` stays ambient through it when a
+/// key is written, and nothing is missing from it when none is.
+#[test]
+fn m211_a_package_prelude_globbing_std_s_keeps_key_ambient() {
+    let prelude = PreludeSpec::Module("pkg::prelude".to_string());
+    let prelude_file = ("prelude.vl", "export import std::prelude::*;\n");
+    let load = key_load(
+        prelude.clone(),
+        &[
+            (
+                "main.vl",
+                "struct Task {\n\ttitle: str,\n}\n\nfun f(k: Key<Task, str>) {}\n\nfun main() {\n\tprint(\"k\");\n}\n",
+            ),
+            prelude_file,
+        ],
+        &[],
+        Platform::default(),
+        true,
+    );
+    assert_eq!(assert_loads_key(load), "k\n");
+    let load = key_load(
+        prelude,
+        &[
+            ("main.vl", "fun main() {\n\tprint(\"n\");\n}\n"),
+            prelude_file,
+        ],
+        &[],
+        Platform::default(),
+        true,
+    );
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded);
+    assert_eq!(load.stdout.as_deref(), Some("n\n"));
+}
+
+/// A file that declares or imports its own `Key` means its own by every bare
+/// `Key` it writes (a declaration beats the prelude), so it seeds nothing —
+/// `std::process`'s terminal `enum Key` among them; a path ending in `Key`
+/// (`Step::Key`) is a member of what it reached. An inline `mod` that does
+/// not declare one is asked afresh, and its bare `Key` is the ambient one.
+#[test]
+fn m211_a_file_s_own_key_does_not_load_std_key() {
+    let own = "enum Key {\n\tUp,\n\tDown,\n}\n\nenum Step {\n\tKey(i32),\n\tDone,\n}\n\n\
+               fun name(key: Key): str {\n\tmatch key {\n\t\tKey::Up => \"up\",\n\t\tKey::Down => \"down\",\n\t}\n}\n\n\
+               fun main() {\n\tlet step = Step::Key(1);\n\tlet n = match step {\n\t\tStep::Key(let k) => k,\n\t\tStep::Done => 0,\n\t};\n\
+               \tprint(name(Key::Up));\n\tprint(n);\n}\n";
+    let load = key_load_entry(own);
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded, "a file's own `Key` loaded `std::key`");
+    assert_eq!(load.stdout.as_deref(), Some("up\n1\n"));
+    let terminal = key_load_entry(
+        "import std::process::Key;\n\nfun f(key: Key): bool {\n\tkey == Key::Up\n}\n\nfun main() {\n\tprint(f(Key::Up));\n}\n",
+    );
+    assert!(terminal.errors.is_empty(), "{:#?}", terminal.errors);
+    assert!(!terminal.loaded, "`std::process::Key` loaded `std::key`");
+    let nested = key_load_entry(
+        "enum Key {\n\tUp,\n}\n\nmod inner {\n\tstruct Task {\n\t\ttitle: str,\n\t}\n\n\
+         \texport fun read(t: Task, k: Key<Task, str>): str {\n\t\tt[k]\n\t}\n}\n\nfun main() {\n\tprint(\"m\");\n}\n",
+    );
+    assert!(
+        nested.loaded,
+        "an inline module's ambient `Key` must load `std::key`"
+    );
+}
+
+/// A tuple key is std::tuple's, not std::key's: a program that indexes a
+/// tuple through its keys loads no `std::key`, and the subscript still waits
+/// for its index to be typed (the struct-key arm's deferral used to do that
+/// for it, with the module always loaded).
+#[test]
+fn m211_tuple_keys_need_no_std_key() {
+    let load = key_load_entry(
+        "import std::tuple::Tuple;\n\nfun main() {\n\tmut t = (1, \"a\");\n\tlet (a, b) = t.keys();\n\
+         \tt[a] = 5;\n\tprint(t[a]);\n\tprint(t[b]);\n}\n",
+    );
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded, "a tuple key loaded `std::key`");
+    assert_eq!(load.stdout.as_deref(), Some("5\na\n"));
+}

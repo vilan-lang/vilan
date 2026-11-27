@@ -5505,6 +5505,14 @@ pub struct Analyzer<'src> {
     prelude_seeds: Vec<(Id, String, SourceId)>,
     /// What the ENTRY file's prelude bound, for `Program::prelude_bindings`.
     prelude_entry_bindings: Vec<Id>,
+    /// M211: the ambient names a prelude publishes whose on-demand module this
+    /// program did not load (`Key`, when nothing needs `std::key`), by the
+    /// prelude's scope — dropped from `prelude_exports` when its re-export is
+    /// deferred, so a glob of the prelude is ready without them.
+    prelude_deferred: HashMap<Id, Vec<&'src str>>,
+    /// M211: the deferred names of the ENTRY file's prelude, for
+    /// `Program::prelude_deferred_names` (completion offers them).
+    prelude_entry_deferred: Vec<&'src str>,
     /// The scope the entry file resolves in, so `seed_preludes` knows which of
     /// its seeds is the one Organize Imports acts on.
     prelude_entry_scope: Option<Id>,
@@ -8549,6 +8557,8 @@ impl<'src> Analyzer<'src> {
             prelude_exports: HashMap::default(),
             prelude_seeds: Vec::new(),
             prelude_entry_bindings: Vec::new(),
+            prelude_deferred: HashMap::default(),
+            prelude_entry_deferred: Vec::new(),
             prelude_entry_scope: None,
             modules: IndexMap::default(),
             parameters: IndexMap::default(),
@@ -55842,7 +55852,55 @@ impl<'src> Analyzer<'src> {
             // the editor is acting on — so record only that seed.
             if self.prelude_entry_scope == Some(scope_id) {
                 self.prelude_entry_bindings.extend(entry_bindings);
+                if let Some(deferred) = self.prelude_deferred.get(&prelude_scope_id) {
+                    self.prelude_entry_deferred.extend(deferred.iter().copied());
+                }
             }
+        }
+    }
+
+    /// M211: whether this import is a std file's `pkg::key::Key` while
+    /// `std::key` is not loaded — which is only ever a prelude's on-demand
+    /// re-export, since every other import of it loads the module (the loader
+    /// drops only the re-export's request, [`drop_on_demand_reexports`]). It
+    /// resolves to nothing, in silence: the program names no `Key`, so the
+    /// ambient name it would publish has nothing to answer.
+    fn is_deferred_on_demand_import(
+        &self,
+        path: &[(&'src str, Span)],
+        name: &str,
+        source_id: SourceId,
+    ) -> bool {
+        // The leaf first: it rejects almost every import in one comparison.
+        if name != STD_KEY_AMBIENT {
+            return false;
+        }
+        let [("pkg", _), (STD_KEY_MODULE, _)] = path else {
+            return false;
+        };
+        if !self.std_sources.contains(&source_id) {
+            return false;
+        }
+        let Some(namespace_id) = self.resolve_import_root("pkg", source_id) else {
+            return false;
+        };
+        let Some(module) = self.modules.get(&namespace_id) else {
+            return false;
+        };
+        self.scopes
+            .get(&module.body.1)
+            .is_some_and(|scope| !scope.name_to_id_map.contains_key(STD_KEY_MODULE))
+    }
+
+    /// M211: records `name` as a deferred ambient name of the prelude scope
+    /// `scope_id` and takes it out of the names the scope publishes.
+    fn defer_on_demand_name(&mut self, scope_id: Id, name: &'src str) {
+        if let Some(published) = self.prelude_exports.get_mut(&scope_id) {
+            published.retain(|published| *published != name);
+        }
+        let deferred = self.prelude_deferred.entry(scope_id).or_default();
+        if !deferred.contains(&name) {
+            deferred.push(name);
         }
     }
 
@@ -55996,6 +56054,10 @@ impl<'src> Analyzer<'src> {
     ) -> bool {
         if name == crate::node::GLOB_IMPORT_LEAF {
             return self.resolve_glob_reexport(path, scope_id, span, report, source_id);
+        }
+        if alias.is_none() && self.is_deferred_on_demand_import(path, name, source_id) {
+            self.defer_on_demand_name(scope_id, name);
+            return true;
         }
         // The segments to walk, each with its source span. A `self` leaf re-binds
         // the namespace it sits in (e.g. `Option::{ self }` binds `Option`);
@@ -70596,7 +70658,10 @@ impl<'src> Analyzer<'src> {
         subject_id: Id,
         member_name: &'src str,
     ) -> Option<Resolution> {
-        let key_struct_id = self.key_struct_id?;
+        // M211: the refusals below need nothing from `std::key`, so they are
+        // said whether it loaded or not — `i32.max` is refused with the same
+        // words in a program the module is never seeded for. Only a key that
+        // IS built needs `Key`; see the end.
         let (root, mut steps) = match self.expr_id_to_expr_map.get(&subject_id) {
             Some(Expr::Local(target)) if self.key_root_uses.contains(&subject_id) => {
                 match self.expr_id_to_expr_map.get(target) {
@@ -70640,6 +70705,18 @@ impl<'src> Analyzer<'src> {
                 Err(msg) => return refuse(self, msg),
             };
         steps.push((owner, field_index));
+        // M211: a key literal stands here, so the loader's seed
+        // (`seeds_std_key`) must have loaded `std::key`. A miss is a defect in
+        // the seed, said as one rather than compiled as a member access.
+        let Some(key_struct_id) = self.key_struct_id else {
+            return refuse(
+                self,
+                format!(
+                    "internal error: `{path_so_far}.{member_name}` is a key literal, and \
+                     `std::key` was not loaded for it (M211: the loader's key seed missed it)"
+                ),
+            );
+        };
         let root_is_generic = self
             .structs
             .get(&root)
@@ -70883,7 +70960,20 @@ impl<'src> Analyzer<'src> {
         index_id: Id,
         subject_type: &Type,
     ) -> Option<Resolution> {
-        let key_struct_id = self.key_struct_id?;
+        // M211: with no `std::key` loaded the index is no struct key, but this
+        // is still the subscript's last word before the refusal, and the
+        // refusal must wait for an index not yet typed — a tuple key
+        // (`resolve_tuple_key_subscript`, which answers only a typed one)
+        // among them. The struct-key arm below defers on the same two shapes.
+        let Some(key_struct_id) = self.key_struct_id else {
+            return match self.infer_type(index_id, &Type::Unknown, &HashMap::default()) {
+                Type::Unresolved => Some(Resolution::Deferred),
+                Type::Unknown if self.is_unknown_closure_parameter(index_id) => {
+                    Some(Resolution::Deferred)
+                }
+                _ => None,
+            };
+        };
         let subject_type_id = subject_type.clone().get_type_id(self);
         let hole = Type::Unknown.get_type_id(self);
         let expected = Type::Struct(key_struct_id, vec![subject_type_id, hole]);
@@ -80399,6 +80489,11 @@ pub struct Program<'src> {
     // what the file means. Matching on the DEFINITION and not just the name is
     // what keeps `import my_lib::print;` alive beside an ambient `std::io::print`.
     pub prelude_bindings: Vec<Id>,
+    /// M211: the ambient names the entry's prelude publishes that this program
+    /// did not load, because nothing in it needs their module (`Key`, with no
+    /// key anywhere). Completion offers them beside the bound ones: writing
+    /// one loads its module, and the name then resolves as it always has.
+    pub prelude_deferred_names: Vec<&'src str>,
     // A human-readable type label for every typed expression (e.g. `struct
     // Point`, `type i32`, `enum Option<i32>`), pre-rendered during analysis for
     // language-server hover. Keyed by expr id; `expr_id_to_type_id_map` wins
@@ -83483,7 +83578,20 @@ fn resolve_module_file_with(
 /// for the overwhelming majority of files, which pay one `for_each_child` walk
 /// that stops at the first miss.
 fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
-    fn walk(node: &Spanned<Node>, found: &mut Vec<String>) {
+    collect_std_item_modules_seeding(nodes, true)
+}
+
+/// [`collect_std_item_modules`], with M211's `std::key` seed asked for only
+/// when `want_key`: the drain passes `false` once `std::key` is already
+/// loading, where the answer could add nothing and its test is the one this
+/// walk pays at every node.
+fn collect_std_item_modules_seeding(nodes: &NodeList, want_key: bool) -> Vec<&'static str> {
+    fn walk<'a, 'src>(
+        node: &'a Spanned<Node<'src>>,
+        found: &mut Vec<String>,
+        want_key: &mut bool,
+        scope: &StdKeyScope<'a, 'src>,
+    ) {
         match &node.0 {
             Node::StdItem(module, _) => {
                 if !found.iter().any(|seen| seen == module) {
@@ -83506,15 +83614,398 @@ fn collect_std_item_modules(nodes: &NodeList) -> Vec<&'static str> {
             Node::Async(_) if !found.iter().any(|seen| seen == "task") => {
                 found.push("task".to_string());
             }
+            // M211: the syntax that may need `std::key` ([`seeds_std_key`]),
+            // asked until the first yes.
+            other if *want_key && scope.admits(seeds_std_key(other)) => {
+                found.push(STD_KEY_MODULE.to_string());
+                *want_key = false;
+            }
             _ => {}
         }
-        node.0.for_each_child(&mut |child| walk(child, found));
+        match &node.0 {
+            Node::Module(_, body) if *want_key => {
+                let inner = StdKeyScope::new(&body.0, None);
+                node.0
+                    .for_each_child(&mut |child| walk(child, found, want_key, &inner));
+            }
+            _ => node
+                .0
+                .for_each_child(&mut |child| walk(child, found, want_key, scope)),
+        }
     }
     let mut found = Vec::new();
+    let mut want_key = want_key;
+    let scope = StdKeyScope::new(nodes, None);
     for node in nodes {
-        walk(node, &mut found);
+        walk(node, &mut found, &mut want_key, &scope);
     }
     found.into_iter().map(interned_display_name).collect()
+}
+
+/// M211: `std::key`, the home of `Key<S, F>` — ambient, and loaded ON DEMAND.
+///
+/// The base and web preludes publish `Key` (`export import pkg::key::Key;`),
+/// but a prelude's re-export of it does not load the module
+/// ([`is_on_demand_reexport`]): the module's impls and functions cost every
+/// program about 5.8 M instructions of `vilan check` (+2.3 % on a tiny one),
+/// and only a program with keys uses them. It loads when some file of the
+/// program — the entry, a package module, a dependency's module or surface,
+/// or code a macro or derive generated — writes syntax that may need it
+/// ([`seeds_std_key`]), or when anything imports it by path. A std module is
+/// not asked: std writes its need as an import (the store does), and
+/// `std_modules_import_the_key_they_seed` holds every std file to that. When it is loaded the preludes bind `Key` exactly as before;
+/// when it is not, nothing in the program can tell `Key` apart from absent,
+/// since nothing names it and no key value can exist.
+const STD_KEY_MODULE: &str = "key";
+
+/// M211: `std::key` when `nodes` seed it ([`seeds_std_key`]), for the files
+/// the loader does not run [`collect_std_item_modules`] over: code a macro or
+/// derive GENERATED (read at each place the loader asks what an expansion
+/// demands — the drain's epilogue and its first-round premint, the entry's
+/// expansion over a stored world, a hot set's) and a dependency's `lib.vl` surface (the drain's and the dependency
+/// tier's, which must agree).
+///
+/// `host` is the file generated code lands in: a derive on `std::process`'s
+/// own `enum Key` writes `Key` meaning that enum, since generated items
+/// resolve in the annotated file's module scope ([`StdKeyScope::shadow`]). A
+/// file the loader reads whole passes `None`.
+fn std_key_seed<'src>(
+    nodes: &NodeList<'src>,
+    host: Option<&NodeList<'src>>,
+) -> Option<&'static str> {
+    fn any_seeds<'a, 'src>(node: &'a Spanned<Node<'src>>, scope: &StdKeyScope<'a, 'src>) -> bool {
+        if scope.admits(seeds_std_key(&node.0)) {
+            return true;
+        }
+        let mut found = false;
+        match &node.0 {
+            Node::Module(_, body) => {
+                let inner = StdKeyScope::new(&body.0, None);
+                node.0
+                    .for_each_child(&mut |child| found = found || any_seeds(child, &inner));
+            }
+            _ => node
+                .0
+                .for_each_child(&mut |child| found = found || any_seeds(child, scope)),
+        }
+        found
+    }
+    let scope = StdKeyScope::new(nodes, host.map(Vec::as_slice));
+    nodes
+        .iter()
+        .any(|node| any_seeds(node, &scope))
+        .then_some(STD_KEY_MODULE)
+}
+
+/// M211: the body a seed walk is in, for the one question a bare `Key`
+/// raises — whether the body binds the name itself — answered on first need,
+/// since almost no body writes one.
+struct StdKeyScope<'a, 'src> {
+    body: &'a [Spanned<Node<'src>>],
+    /// The file generated code lands in ([`std_key_seed`]), whose names it
+    /// may take as its own.
+    host: Option<&'a [Spanned<Node<'src>>]>,
+    shadow: std::cell::Cell<Option<StdKeyShadow>>,
+}
+
+impl<'a, 'src> StdKeyScope<'a, 'src> {
+    fn new(body: &'a [Spanned<Node<'src>>], host: Option<&'a [Spanned<Node<'src>>]>) -> Self {
+        StdKeyScope {
+            body,
+            host,
+            shadow: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Whether `seed` stands in this body.
+    fn admits(&self, seed: StdKeySeed) -> bool {
+        match seed {
+            StdKeySeed::No => false,
+            StdKeySeed::Yes => true,
+            StdKeySeed::Names(names) => names & !self.shadow() != 0,
+        }
+    }
+
+    /// The names the body binds itself; for generated code, also the ones
+    /// its host binds in its top level AND every inline `mod` (B201 may place
+    /// generated items into one, where only that body's names are in scope).
+    fn shadow(&self) -> StdKeyShadow {
+        if let Some(shadow) = self.shadow.get() {
+            return shadow;
+        }
+        fn host_bodies(nodes: &[Spanned<Node>], shadow: &mut StdKeyShadow) {
+            *shadow &= std_key_names_shadowed(nodes);
+            for node in nodes {
+                let mut item = &node.0;
+                while let Node::Export(_, inner, _) = item {
+                    item = &inner.0;
+                }
+                if let Node::Module(_, body) = item {
+                    host_bodies(&body.0, shadow);
+                }
+            }
+        }
+        let mut shadow = std_key_names_shadowed(self.body);
+        if let Some(host) = self.host {
+            let mut hosted = StdKeyShadow::MAX;
+            host_bodies(host, &mut hosted);
+            shadow |= hosted;
+        }
+        self.shadow.set(Some(shadow));
+        shadow
+    }
+}
+
+/// M211: the ambient name the preludes publish from `std::key`.
+const STD_KEY_AMBIENT: &str = "Key";
+
+/// M211: the request a std prelude's `export import pkg::key::Key;` makes, as
+/// [`collect_module_paths`] spells it (the module path joined with the leaf).
+const STD_KEY_REEXPORT_REQUEST: &str = "key::Key";
+
+/// M211: whether `node` is `export import pkg::key::Key;` — the one re-export
+/// that publishes an on-demand module's name WITHOUT loading the module. The
+/// base and web preludes write it, and keep `Key` listed beside every other
+/// ambient name, so the prelude file still answers what is in scope; the
+/// laziness is the loader's ([`drop_on_demand_reexports`]) and the resolver's
+/// (`Analyzer::is_deferred_on_demand_import`), not the file's.
+fn is_on_demand_reexport(node: &Node) -> bool {
+    use crate::node::{ImportBranch, ImportTail};
+    let Node::Export(None, inner, _) = node else {
+        return false;
+    };
+    let Node::Import(ImportBranch::Path("pkg", _, ImportTail::Continue(module)), _) = &inner.0
+    else {
+        return false;
+    };
+    let ImportBranch::Path(STD_KEY_MODULE, _, ImportTail::Continue(leaf)) = module.as_ref() else {
+        return false;
+    };
+    matches!(
+        leaf.as_ref(),
+        ImportBranch::Path(STD_KEY_AMBIENT, _, ImportTail::Leaf)
+    )
+}
+
+/// M211: takes the requests a std module's on-demand re-exports made out of
+/// `requests` (its [`collect_module_paths`] under `pkg`) — one per re-export,
+/// so a module that also imports `pkg::key::Key` plainly still loads it. Read
+/// by the drain and by the std import index, which must agree (the std
+/// prefix's closure is the index's).
+fn drop_on_demand_reexports(nodes: &NodeList, requests: &mut Vec<(&str, Span)>) {
+    for _ in nodes.iter().filter(|node| is_on_demand_reexport(&node.0)) {
+        if let Some(index) = requests
+            .iter()
+            .position(|(request, _)| *request == STD_KEY_REEXPORT_REQUEST)
+        {
+            requests.remove(index);
+        }
+    }
+}
+
+/// M211: the names `std::key` publishes. Writing any of them, anywhere, loads
+/// the module — so `Key` resolves as the ambient name, and `KeyPath` written
+/// without its import is the same miss (with the same import steer) it was.
+const STD_KEY_NAMES: [&str; 3] = ["Key", "KeyPath", "KeyStep"];
+
+/// M211: whether this ONE node (its children are the caller's walk) is syntax
+/// that may need `std::key`. Decided syntactically, before any name resolves,
+/// so the loader can seed the module the way it seeds `std::web::style` for a
+/// `css` block — and therefore so every world key, the std prefix's closure
+/// and the hot-set requests, which all read [`collect_std_item_modules`], see
+/// the same answer. Loading on first need during analysis was the other
+/// choice; the analysis runs over a world already loaded (and often cached
+/// whole), so a module arriving mid-walk would mint after the entry's ids and
+/// change what the stored world is a function of.
+///
+/// A key value has three origins, and each is caught where it is written:
+///
+/// 1. A NAME: `Key`, `KeyPath` or `KeyStep` written BARE — as a type, a value,
+///    a struct literal's head or a one-segment pattern: a signature
+///    `k: Key<Task, str>`, a `[field_syntax]` method's parameter, `KeyPath` in
+///    a field. Not in a body that declares or imports that name itself
+///    (`shadowed`, [`std_key_names_shadowed`]), where the bare name is the
+///    body's own and beats the prelude; not as a path's last segment
+///    (`Decoded::Key`), which names a member of what the path reached. An
+///    `import` is not looked at either: an import of `std::key` by path loads
+///    the module anyway, and a prelude's re-export must not.
+/// 2. A KEY LITERAL `Task.title` / `model::Task.title`: a field read whose
+///    subject is a bare name or a path. Only the analyzer knows the subject is
+///    a struct, so the seed over-approximates with the spelling: a subject
+///    whose name does not begin with a lowercase ASCII letter (`Task`, `Self`,
+///    `_t`), and a half-typed one (`Task.`, the member still missing) whose
+///    completion offers the fields as keys. That is never a miss for a struct
+///    named the usual way, and it is
+///    rare otherwise — a field read off an upper-case constant (`LIMITS.max`)
+///    is the one ordinary false positive. A struct named in LOWER case
+///    (`struct point { .. }`) roots a literal this test cannot see, so its
+///    DECLARATION seeds the module instead (when it has fields; a bodyless
+///    `external struct i32;` has none for a key to name), and so does an
+///    import that binds a lower-case alias to a name that is not lower-case
+///    (`import model::Task as task;`), the one other way a lower-case name
+///    can come to stand for a struct. Vilan has no type aliases.
+/// 3. A `[field_syntax]` method, whose reads (`app.user`) become key literals
+///    in files that write no key at all; its declaration seeds the module
+///    (its `Key<T, U>` parameter would too, by rule 1).
+///
+/// Every other key value is computed from one of these, so a program none of
+/// whose files seeds the module holds no key. If the analysis ever builds a
+/// key literal with the module absent anyway, it says so as an internal error
+/// (`resolve_key_step`) rather than compiling a different program.
+fn seeds_std_key(node: &Node) -> StdKeySeed {
+    fn name_bit(name: &str) -> StdKeyShadow {
+        STD_KEY_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+            .map_or(0, |index| 1 << index)
+    }
+    fn lower_case_led(name: &str) -> bool {
+        name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+    }
+    fn pattern_names(pattern: &crate::node::Pattern) -> StdKeyShadow {
+        use crate::node::Pattern;
+        match pattern {
+            // Only a BARE path can mean the ambient name; `Decoded::Key` is a
+            // variant of `Decoded`.
+            Pattern::Variant(path, payload) => {
+                let own = match path.as_slice() {
+                    [only] => name_bit(only),
+                    _ => 0,
+                };
+                own | payload
+                    .iter()
+                    .flatten()
+                    .fold(0, |names, (sub, _)| names | pattern_names(sub))
+            }
+            Pattern::Tuple(elements) | Pattern::Array(elements) => elements
+                .iter()
+                .fold(0, |names, (sub, _)| names | pattern_names(sub)),
+            Pattern::Labelled(_, inner) => pattern_names(&inner.0),
+            Pattern::Wildcard | Pattern::Binding(..) | Pattern::Literal(_) => 0,
+        }
+    }
+    fn binds_lower_case_alias(branch: &crate::node::ImportBranch) -> bool {
+        use crate::node::{ImportBranch, ImportTail};
+        match branch {
+            ImportBranch::Path(name, _, ImportTail::Alias(alias, _)) => {
+                lower_case_led(alias) && !lower_case_led(name)
+            }
+            ImportBranch::Path(_, _, ImportTail::Continue(child)) => binds_lower_case_alias(child),
+            ImportBranch::Path(_, _, ImportTail::Leaf) | ImportBranch::Selector(_) => false,
+            ImportBranch::Reach(_, inner) => binds_lower_case_alias(inner),
+            ImportBranch::Set(branches) => branches.iter().any(binds_lower_case_alias),
+        }
+    }
+    let yes = |seeds: bool| match seeds {
+        true => StdKeySeed::Yes,
+        false => StdKeySeed::No,
+    };
+    let names = |names: StdKeyShadow| match names {
+        0 => StdKeySeed::No,
+        names => StdKeySeed::Names(names),
+    };
+    match node {
+        // A bare name only: a path's last segment (`Decoded::Key`,
+        // `model::Key`) names a member of what the path reached, and the one
+        // path that reaches std's `Key` goes through an import of the module,
+        // which loads it.
+        Node::Accessor(name) | Node::AccessorWithGenerics(name, _) => names(name_bit(name)),
+        Node::StructInitializer(namespace, name, ..) if namespace.is_empty() => {
+            names(name_bit(name.0))
+        }
+        Node::MemberAccessor(subject, member) => {
+            // An `Error` member is the editor's half-typed `Task.`, whose
+            // completion offers the fields as keys (`Key<Task, str>`).
+            let (member, _) = crate::node::unmark_head_link(member);
+            yes(matches!(member.0, Node::Accessor(_) | Node::Error)
+                && matches!(
+                    &subject.0,
+                    Node::Accessor(name) | Node::StaticAccessor(_, name, None)
+                        if !lower_case_led(name)
+                ))
+        }
+        Node::Struct(name, _, external, _, fields, _) => {
+            yes(lower_case_led(name.0) && !*external && fields.is_some())
+        }
+        Node::Func(function) => yes(function.field_syntax),
+        Node::Import(branch, ..) | Node::Use(branch) => yes(binds_lower_case_alias(branch)),
+        Node::Is(_, pattern) => names(pattern_names(&pattern.0)),
+        Node::Match(_, legs) => names(legs.0.iter().fold(0, |found, (patterns, ..)| {
+            patterns
+                .iter()
+                .fold(found, |found, (pattern, _)| found | pattern_names(pattern))
+        })),
+        _ => StdKeySeed::No,
+    }
+}
+
+/// M211: what one node says about `std::key` ([`seeds_std_key`]).
+#[derive(Clone, Copy)]
+enum StdKeySeed {
+    No,
+    /// It may need the module, wherever it stands.
+    Yes,
+    /// It writes these of [`STD_KEY_NAMES`] bare (one bit each, by index):
+    /// it needs the module unless its body binds every one itself.
+    Names(StdKeyShadow),
+}
+
+/// M211: which of [`STD_KEY_NAMES`] a module body binds ITSELF — one bit per
+/// name, by its index there. A declaration or an import of the name beats the
+/// prelude (`names.md` §4.4), so a bare `Key` in that body is the body's own
+/// (`std::process`'s `enum Key`, a terminal's key) and needs no `std::key`.
+/// An inline `mod` is a body of its own and is asked afresh; anything the
+/// test cannot see — a glob import, a macro's declaration — leaves the name
+/// unshadowed, which only ever loads the module where it was not needed.
+type StdKeyShadow = u8;
+
+fn std_key_names_shadowed(body: &[Spanned<Node>]) -> StdKeyShadow {
+    fn bind(name: &str, shadow: &mut StdKeyShadow) {
+        if let Some(index) = STD_KEY_NAMES
+            .iter()
+            .position(|candidate| *candidate == name)
+        {
+            *shadow |= 1 << index;
+        }
+    }
+    fn item(node: &Node, shadow: &mut StdKeyShadow) {
+        match node {
+            Node::Export(_, inner, _)
+            | Node::Derive(_, inner)
+            | Node::MacroAttribute(.., inner)
+            | Node::Service(_, inner) => item(&inner.0, shadow),
+            Node::Struct(name, ..) | Node::Enum(name, ..) | Node::Trait(name, ..) => {
+                bind(name.0, shadow)
+            }
+            Node::Let(name, ..) => bind(name.0, shadow),
+            Node::Func(function) => bind(function.name.0, shadow),
+            Node::Import(branch, ..) | Node::Use(branch) => bound(branch, shadow),
+            _ => {}
+        }
+    }
+    // The names an import binds — each leaf, or its alias — walked without
+    // flattening (this runs only where a body writes a bare `Key`, but a
+    // body's imports are many).
+    fn bound(branch: &crate::node::ImportBranch, shadow: &mut StdKeyShadow) {
+        use crate::node::{ImportBranch, ImportTail};
+        match branch {
+            ImportBranch::Path(name, _, ImportTail::Leaf) => bind(name, shadow),
+            ImportBranch::Path(_, _, ImportTail::Alias(alias, _)) => bind(alias, shadow),
+            ImportBranch::Path(_, _, ImportTail::Continue(child)) => bound(child, shadow),
+            ImportBranch::Reach(_, inner) => bound(inner, shadow),
+            ImportBranch::Set(branches) => {
+                for child in branches {
+                    bound(child, shadow);
+                }
+            }
+            ImportBranch::Selector(_) => {}
+        }
+    }
+    let mut shadow = 0;
+    for node in body {
+        item(&node.0, &mut shadow);
+    }
+    shadow
 }
 
 /// The std modules a `[service]` item seeds: `std::rpc`, which hosts the
@@ -87840,7 +88331,15 @@ fn expand_entry_over_world<'src>(
     }
     for generated in &output.items {
         let list = generated.nodes;
-        for (module, _) in collect_module_refs(list, "std") {
+        for module in collect_module_refs(list, "std")
+            .into_iter()
+            .map(|(module, _)| module)
+            .chain(
+                (!world.module_scopes.contains_key(STD_KEY_MODULE))
+                    .then(|| std_key_seed(list, Some(&nodes.0)))
+                    .flatten(),
+            )
+        {
             if !world.module_scopes.contains_key(module) {
                 return true;
             }
@@ -88210,7 +88709,15 @@ fn load_hot_modules<'src>(
                 }
                 return Err(HotLoadRefusal::Refused("generated-new-module"));
             }
-            for (module, _) in collect_module_paths(generated.nodes, "std") {
+            for module in collect_module_paths(generated.nodes, "std")
+                .into_iter()
+                .map(|(module, _)| module)
+                .chain(
+                    (!world.module_scopes.contains_key(STD_KEY_MODULE))
+                        .then(|| std_key_seed(generated.nodes, Some(&ast.0)))
+                        .flatten(),
+                )
+            {
                 let resolved = deepest_module_or_namespace(&std_roots, module)
                     .unwrap_or_else(|| module.to_string());
                 if !world.module_scopes.contains_key(resolved.as_str()) {
@@ -88893,7 +89400,13 @@ fn std_import_index(std: &PackageSpec, platform: Platform) -> std::sync::Arc<Std
     files.dedup_by(|a, b| a.0 == b.0);
     let tree_hash = {
         use std::fmt::Write as _;
-        let mut rendered = String::new();
+        // The analyzer's BUILD rides in the hash: what a file's requests ARE
+        // is this compiler's reading of it (M211 changed it twice: a prelude's
+        // `export import pkg::key::Key;` is no request, and the key seed is
+        // one), and an index another build wrote for the same tree must not
+        // be served — the prefix file's key carries the build for the same
+        // reason.
+        let mut rendered = format!("{}\0", crate::BUILD_ID);
         for (name, path) in &files {
             let hash = crate::util::read_source(path)
                 .map(|text| crate::content_hash(&text))
@@ -88930,7 +89443,10 @@ fn std_import_index(std: &PackageSpec, platform: Platform) -> std::sync::Arc<Std
                 let Some(loaded) = load_package_module(path) else {
                     continue;
                 };
-                let mut requests: Vec<String> = collect_module_paths(&loaded.ast.0, "pkg")
+                let mut siblings = collect_module_paths(&loaded.ast.0, "pkg");
+                // M211: as the drain reads a std module's requests.
+                drop_on_demand_reexports(&loaded.ast.0, &mut siblings);
+                let mut requests: Vec<String> = siblings
                     .into_iter()
                     .map(|(module, _)| module.to_string())
                     .chain(
@@ -88939,7 +89455,9 @@ fn std_import_index(std: &PackageSpec, platform: Platform) -> std::sync::Arc<Std
                             .map(|seed| seed.to_string()),
                     )
                     .chain(
-                        collect_std_item_modules(&loaded.ast.0)
+                        // M211: without the key seed, as the drain reads a std
+                        // module.
+                        collect_std_item_modules_seeding(&loaded.ast.0, false)
                             .into_iter()
                             .map(str::to_string),
                     )
@@ -89125,6 +89643,7 @@ fn premint_expansion<'src>(
     std: &PackageSpec,
     workspace: &Workspace,
     site_counter: u32,
+    want_key: bool,
 ) -> Premint<'src> {
     let mut diagnostics: Vec<(SourceId, Vec<Error>)> = Vec::new();
     let mut registry = crate::macros::MacroRegistry::default();
@@ -89187,6 +89706,12 @@ fn premint_expansion<'src>(
                     .into_iter()
                     .map(|(module, _)| (Origin::Std, module)),
             );
+            // M211: a derive's or macro's output may write a key (asked only
+            // while `std::key` is not already loading).
+            if want_key {
+                requests
+                    .extend(std_key_seed(list, Some(file.ast)).map(|module| (Origin::Std, module)));
+            }
             requests.extend(
                 collect_module_paths(list, "pkg")
                     .into_iter()
@@ -89858,7 +90383,10 @@ fn dependency_tier(
                 .into_iter()
                 .map(|(module, _)| interned_display_name(module.to_string())),
         );
-        if !surface {
+        if surface {
+            // M211: as the drain seeds a surface's key.
+            std_requests.extend(std_key_seed(ast, None));
+        } else {
             std_requests.extend(collect_std_item_modules(ast));
         }
         std_requests.extend(service_seeds(ast).iter().copied());
@@ -91336,6 +91864,8 @@ fn analyze_inner<'src>(
                     .into_iter()
                     .map(|(module, _)| (Origin::Std, module)),
             );
+            // M211: a surface's bodies may write a key.
+            to_load.extend(std_key_seed(&lib_ast.0, None).map(|module| (Origin::Std, module)));
             // A `[service]` in the dependency's surface needs the std `service`
             // macro (hosted in `std::rpc`) loaded BEFORE the expansion epilogue
             // builds the once-only macro registry. The entry scan and the load
@@ -91641,11 +92171,14 @@ fn analyze_inner<'src>(
                     // dependency. (Std modules reference each other via `pkg::` only, so
                     // collecting their `std::` imports would be a no-op — skip it to keep the
                     // std load byte-for-byte unchanged.)
-                    to_load.extend(
-                        collect_module_paths(&ast.0, "pkg")
-                            .into_iter()
-                            .map(|(sibling, _)| (origin, sibling)),
-                    );
+                    // M211: a std prelude's re-export of an on-demand module is
+                    // not a request for it — unless the file is open as the
+                    // entry, where the editor resolves what it shows.
+                    let mut siblings = collect_module_paths(&ast.0, "pkg");
+                    if origin == Origin::Std && !is_entry_file {
+                        drop_on_demand_reexports(&ast.0, &mut siblings);
+                    }
+                    to_load.extend(siblings.into_iter().map(|(sibling, _)| (origin, sibling)));
                     // A `[service]` item means the std `service` macro (hosted in
                     // `std::rpc`, too heavy to always-load) must be in the prelude.
                     for seed in service_seeds(&ast.0) {
@@ -91653,8 +92186,14 @@ fn analyze_inner<'src>(
                     }
                     // B270, the entry's twin: a loaded module's own `css` blocks and
                     // elements seed their std modules, whatever package it belongs to.
+                    // M211's key seed is not asked of a std module (std writes its
+                    // dependency on `std::key` as an import — `std_modules_import_
+                    // the_key_they_seed` holds every file to it), nor once the module
+                    // is loading.
+                    let want_key = !(origin == Origin::Std && !compiling_std)
+                        && !loaded_keys.contains(&(Origin::Std, STD_KEY_MODULE));
                     to_load.extend(
-                        collect_std_item_modules(&ast.0)
+                        collect_std_item_modules_seeding(&ast.0, want_key)
                             .into_iter()
                             .map(|module| (Origin::Std, module)),
                     );
@@ -91804,8 +92343,14 @@ fn analyze_inner<'src>(
                         .iter()
                         .filter(|file| !expanded_sources.contains(&file.source)),
                 );
-                let computed =
-                    premint_expansion(&register, &expand, std, workspace, macro_site_counter);
+                let computed = premint_expansion(
+                    &register,
+                    &expand,
+                    std,
+                    workspace,
+                    macro_site_counter,
+                    !loaded_keys.contains(&(Origin::Std, STD_KEY_MODULE)),
+                );
                 to_load.extend(computed.requests.iter().copied());
                 premint = Some(computed);
                 if to_load.is_empty() {
@@ -92302,30 +92847,38 @@ fn analyze_inner<'src>(
             // (H2 block-scoped imports let a macro emit code carrying its own
             // dependencies). Runs even with an empty registry: an unknown
             // `[attribute]` must error, not silently skip.
-            let seed_generated_refs =
-                |generated: &[crate::macros::GeneratedItems],
-                 origin: Origin,
-                 to_load: &mut Vec<(Origin, &str)>| {
-                    for list in generated.iter().map(|items| items.nodes) {
+            let seed_generated_refs = |generated: &[crate::macros::GeneratedItems],
+                                       origin: Origin,
+                                       to_load: &mut Vec<(Origin, &str)>,
+                                       want_key: bool,
+                                       host: &NodeList| {
+                for list in generated.iter().map(|items| items.nodes) {
+                    to_load.extend(
+                        collect_module_paths(list, "std")
+                            .into_iter()
+                            .map(|(module, _)| (Origin::Std, module)),
+                    );
+                    // M211: a derive's or macro's output may write a key
+                    // (asked only while `std::key` is not already loading).
+                    if want_key {
                         to_load.extend(
-                            collect_module_paths(list, "std")
-                                .into_iter()
-                                .map(|(module, _)| (Origin::Std, module)),
+                            std_key_seed(list, Some(host)).map(|module| (Origin::Std, module)),
                         );
-                        to_load.extend(
-                            collect_module_paths(list, "pkg")
-                                .into_iter()
-                                .map(|(module, _)| (origin, module)),
-                        );
-                        for (dep_name, index) in &workspace.entry_dependencies {
-                            to_load.extend(
-                                collect_module_paths(list, dep_name)
-                                    .into_iter()
-                                    .map(|(module, _)| (Origin::Dep(*index), module)),
-                            );
-                        }
                     }
-                };
+                    to_load.extend(
+                        collect_module_paths(list, "pkg")
+                            .into_iter()
+                            .map(|(module, _)| (origin, module)),
+                    );
+                    for (dep_name, index) in &workspace.entry_dependencies {
+                        to_load.extend(
+                            collect_module_paths(list, dep_name)
+                                .into_iter()
+                                .map(|(module, _)| (Origin::Dep(*index), module)),
+                        );
+                    }
+                }
+            };
             let file_package = |origin: &Origin| match origin {
                 Origin::Std => crate::macros::FilePackage::Std,
                 Origin::Pkg => crate::macros::FilePackage::Entry,
@@ -92361,7 +92914,8 @@ fn analyze_inner<'src>(
                         analyzer.diagnostics.push(error);
                         analyzer.attribute_new_diagnostics(before, defining_source);
                     }
-                    seed_generated_refs(&output.items, origin, to_load);
+                    let want_key = !loaded_keys.contains(&(Origin::Std, STD_KEY_MODULE));
+                    seed_generated_refs(&output.items, origin, to_load, want_key, ast);
                     generated_by_source
                         .entry(source)
                         .or_default()
@@ -96074,6 +96628,7 @@ fn analyze_over_world<'src>(
         module_children_scopes: std::mem::take(&mut analyzer.module_children_scopes),
         generated_expansion_scopes: std::mem::take(&mut analyzer.generated_expansion_scopes),
         prelude_bindings: analyzer.prelude_entry_bindings.clone(),
+        prelude_deferred_names: analyzer.prelude_entry_deferred.clone(),
         expr_types,
         hint_labels,
         stage_hints,
@@ -98184,6 +98739,56 @@ pub fn check_unlowered_externals(program: &mut Program) {
                 msg,
             },
             source,
+        );
+    }
+}
+
+#[cfg(test)]
+mod std_key_seed_tests {
+    //! M211: the loader does not ask a std module for the `std::key` seed —
+    //! the drain and the std import index both skip it — so every std file
+    //! whose syntax would seed the module must import it by path instead (or
+    //! be `std::key` itself). This holds every file of every std layer to it.
+
+    use super::*;
+
+    #[test]
+    fn std_modules_import_the_key_they_seed() {
+        let std_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../vilan/std");
+        let spec = crate::manifest::resolve_std(&std_dir);
+        let roots: Vec<&Path> = std::iter::once(spec.base_root.as_path())
+            .chain(spec.layers.iter().map(|layer| layer.root.as_path()))
+            .collect();
+        let mut checked = 0;
+        let mut offenders = Vec::new();
+        for root in &roots {
+            for (_, path) in modules_under_root(root, &roots) {
+                let Some(loaded) = load_package_module(&path) else {
+                    continue;
+                };
+                checked += 1;
+                if path == std_module_path(&spec.base_root, "key.vl")
+                    || !collect_std_item_modules(&loaded.ast.0).contains(&STD_KEY_MODULE)
+                {
+                    continue;
+                }
+                let imports_key =
+                    collect_module_paths(&loaded.ast.0, "pkg")
+                        .iter()
+                        .any(|(request, _)| {
+                            *request == STD_KEY_MODULE
+                                || request.starts_with(&format!("{STD_KEY_MODULE}::"))
+                        });
+                if !imports_key {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(checked > 50, "only {checked} std files were found");
+        assert!(
+            offenders.is_empty(),
+            "these std files write syntax that needs `std::key` without importing it \
+             (add `import pkg::key::Key;` or whatever they use): {offenders:#?}"
         );
     }
 }

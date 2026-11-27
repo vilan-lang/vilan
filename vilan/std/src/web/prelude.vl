@@ -11,7 +11,9 @@
 export import pkg::io::print;
 export import pkg::iterator::Iterator;
 // `Key` (B711): the type of a struct key (`Task.title`), restated from the base
-// prelude, which the language produces where nothing imported it.
+// prelude, which the language produces where nothing imported it. Like the base
+// prelude's, this re-export does not load `std::key`; a program that may need it
+// does (M211, `prelude.vl`).
 export import pkg::key::Key;
 export import pkg::option::Option::{ self, None, Some };
 export import pkg::result::Result::{ self, Err, Ok };

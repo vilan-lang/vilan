@@ -19648,6 +19648,22 @@ fn field_syntax_builds_the_same_on_both_backends() {
     }
 }
 
+/// M211: a program whose keys are literals only — `Key` never written, a
+/// lower-case struct rooting one, an upper-case binding's field read — builds
+/// and answers the same on both backends with `std::key` loaded on demand.
+#[test]
+fn keys_loaded_on_demand_build_the_same_on_both_backends() {
+    let staged = stage();
+    let probe = "native_probe_key_on_demand.vl";
+    std::fs::write(staged.join(probe), include_str!("native/key_on_demand.vl"))
+        .expect("write the probe program");
+    assert_eq!(
+        compare(&staged, probe),
+        Verdict::Identical,
+        "{probe}: keys loaded on demand must build and answer the same on both backends"
+    );
+}
+
 /// B711 S1c: a call handed two loans into one tuple, one `&mut` and one
 /// through a tuple key (always held in a value), is refused by name natively,
 /// as the struct-key form is: the position is chosen at run time.
