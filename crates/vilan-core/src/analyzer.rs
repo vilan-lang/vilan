@@ -50720,6 +50720,16 @@ impl<'src> Analyzer<'src> {
         substitution_context: &SubstitutionContext,
         exprs_seen: &mut HashSet<Id>,
     ) -> Type {
+        // B711 S3a: a TOTAL key literal lands as a `MaybeKey` where one is
+        // expected — a literal takes the expected kind, as an unsuffixed
+        // number takes the expected width — and its record says so from
+        // then on.
+        if let Type::Struct(wanted, _) = constraint
+            && self.maybe_key_struct_id == Some(*wanted)
+            && let Some(adapted) = self.adapt_total_key_literal(expr_id, constraint)
+        {
+            return adapted;
+        }
         if let Some(type_id) = self.expr_id_to_type_id_map.get(&expr_id) {
             return type_id.get_type(self);
         }
@@ -70848,8 +70858,51 @@ impl<'src> Analyzer<'src> {
                 ),
             );
         }
+        // A non-generic root's literal has its type now — a `MaybeKey` when a
+        // step may miss, else a `Key` that a `MaybeKey` position adapts where
+        // it lands (`infer_type_path`); a generic root's is the
+        // expectation's (R8).
+        let root_is_generic = steps.first().is_some_and(|step| {
+            self.structs
+                .get(&step.owner())
+                .is_some_and(|struct_| !struct_.generic_parameter_constraint_ids.is_empty())
+        });
+        let typed = (!root_is_generic)
+            .then(|| self.key_literal_type(&steps, &Type::Unknown, &HashMap::default()));
         self.expr_id_to_expr_map.insert(id, Expr::Key(steps));
+        if let Some(key_type) = typed.filter(|key_type| !matches!(key_type, Type::Unresolved)) {
+            let key_type = key_type.get_type_id(self);
+            self.expr_id_to_type_id_map.insert(id, key_type);
+            self.resolved_types.insert(id, key_type);
+        }
         Resolution::Resolved
+    }
+
+    /// B711 S3a: a total key LITERAL whose record is a `Key<S, F>`, landing
+    /// where `constraint` (a `MaybeKey`) is expected: re-recorded as the
+    /// `MaybeKey<S, F>` of the same path. `None` for anything else.
+    fn adapt_total_key_literal(&mut self, expr_id: Id, constraint: &Type) -> Option<Type> {
+        let Some(Expr::Key(steps)) = self.expr_id_to_expr_map.get(&expr_id) else {
+            return None;
+        };
+        if key_steps_are_partial(steps) {
+            return None;
+        }
+        let recorded = self.expr_id_to_type_id_map.get(&expr_id)?.get_type(self);
+        let Type::Struct(kind, arguments) = recorded else {
+            return None;
+        };
+        if Some(kind) != self.key_struct_id {
+            return None;
+        }
+        let Type::Struct(maybe_key, _) = constraint else {
+            return None;
+        };
+        let adapted = Type::Struct(*maybe_key, arguments);
+        let adapted_id = adapted.clone().get_type_id(self);
+        self.expr_id_to_type_id_map.insert(expr_id, adapted_id);
+        self.resolved_types.insert(expr_id, adapted_id);
+        Some(adapted)
     }
 
     /// B711: a key path as a literal spells it, root first: `Task.meta`,

@@ -10840,3 +10840,81 @@ fn m211_tuple_keys_need_no_std_key() {
     assert!(!load.loaded, "a tuple key loaded `std::key`");
     assert_eq!(load.stdout.as_deref(), Some("5\na\n"));
 }
+
+// --- B711 S3a: `MaybeKey` and variant steps seed `std::key` ---------------------
+
+const M211_DOC: &str = "struct User {\n\tname: str,\n}\n\nstruct Doc {\n\ttitle: Option<str>,\n\towner: Option<User>,\n}\n";
+
+/// A variant step is a key literal: it loads the module with no `Key` or
+/// `MaybeKey` written anywhere.
+#[test]
+fn m211_a_variant_step_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(&format!(
+        "{M211_DOC}\nfun main() {{\n\tlet d = Doc {{ title = Some(\"a\"), owner = None }};\n\
+         \tprint(Doc.title::Some.get(&d));\n}}\n"
+    )));
+    assert_eq!(stdout, "Some(\"a\")\n");
+}
+
+/// A field step past a variant step, and a variant step inside a closure and
+/// an interpolation.
+#[test]
+fn m211_a_path_past_a_variant_step_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(&format!(
+        "{M211_DOC}\nfun main() {{\n\tmut d = Doc {{ title = None, owner = Some(User {{ name = \"n\" }}) }};\n\
+         \tlet put = || Doc.owner::Some.name.put(&mut d, \"m\");\n\tprint(put());\n\
+         \tprint(i\"{{Doc.owner::Some.name.name()}}\");\n}}\n"
+    )));
+    assert_eq!(stdout, "true\nowner::Some.name\n");
+}
+
+/// `MaybeKey` written only in a signature, the function never called.
+#[test]
+fn m211_maybe_key_only_in_a_signature_loads_std_key() {
+    assert_loads_key(key_load_entry(&format!(
+        "{M211_DOC}\nfun read(d: Doc, k: MaybeKey<Doc, str>): Option<str> {{\n\tk.get(&d)\n}}\n\n\
+         fun main() {{\n\tprint(\"x\");\n}}\n"
+    )));
+}
+
+/// A struct named in lower case roots a variant step too: its declaration
+/// seeds the module.
+#[test]
+fn m211_a_lower_case_root_s_variant_step_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(
+        "struct doc {\n\ttitle: Option<str>,\n}\n\nfun main() {\n\tlet d = doc { title = Some(\"t\") };\n\
+         \tprint(doc.title::Some.get(&d));\n}\n",
+    ));
+    assert_eq!(stdout, "Some(\"t\")\n");
+}
+
+/// A variant step on a VALUE seeds the module (the spelling cannot tell) and
+/// is refused as no key, with the same words.
+#[test]
+fn m211_a_variant_step_on_a_value_is_refused_with_the_module_loaded() {
+    let load = key_load_entry(&format!(
+        "{M211_DOC}\nfun main() {{\n\tlet d = Doc {{ title = None, owner = None }};\n\tlet k = d.title::Some;\n}}\n"
+    ));
+    assert!(load.loaded);
+    assert_eq!(
+        load.errors,
+        vec![
+            "a variant step (`::Some`) stands only in a key literal's path, rooted at a struct \
+             type (`Doc.title::Some`), and `d.title` is a value: to test a value's variant write \
+             `d.title is Some(..)` or `match`"
+                .to_string()
+        ]
+    );
+}
+
+/// A file's own `MaybeKey` is its own (a declaration beats the prelude) and
+/// loads nothing; the prelude's re-export of `MaybeKey` loads nothing either.
+#[test]
+fn m211_a_file_s_own_maybe_key_does_not_load_std_key() {
+    let load = key_load_entry(
+        "struct MaybeKey {\n\tn: i32,\n}\n\nfun main() {\n\tlet k = MaybeKey { n = 2 };\n\tprint(k.n);\n}\n",
+    );
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded, "a file's own `MaybeKey` loaded `std::key`");
+    assert_eq!(load.stdout.as_deref(), Some("2\n"));
+}

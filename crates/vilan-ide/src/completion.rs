@@ -2529,6 +2529,11 @@ impl<'a, 'src> Analysis<'a, 'src> {
         // position: the enum and variant it named.
         let mut pending: Option<(Id, usize)> = None;
         let mut partial = false;
+        // The reached declaration's parameters and the arguments it is at, so
+        // a generic field or payload (`Option<User>`'s `T`) reads as its
+        // argument.
+        let mut generics: Vec<TypeId> = Vec::new();
+        let mut arguments: Vec<TypeId> = Vec::new();
         for step in &written {
             let type_id = match (step, &reached, pending.take()) {
                 (Written::Position(position), _, Some((enum_id, variant))) => program
@@ -2570,6 +2575,14 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 }
                 _ => None,
             };
+            let type_id = type_id.map(|type_id| match program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Generic(constraint)) => generics
+                    .iter()
+                    .position(|parameter| parameter == constraint || *parameter == type_id)
+                    .and_then(|at| arguments.get(at).copied())
+                    .unwrap_or(type_id),
+                _ => type_id,
+            });
             // Not a step the checker accepts: nothing to continue.
             let Some(type_id) = type_id else {
                 return Some(KeyChain {
@@ -2579,13 +2592,29 @@ impl<'a, 'src> Analysis<'a, 'src> {
                     steps: written.len(),
                 });
             };
-            reached = match program.type_id_to_type_map.get(&type_id) {
-                Some(Type::Struct(next, _)) => match step_struct(*next) {
-                    Some(struct_id) => KeyReached::Struct(struct_id),
-                    None => KeyReached::Leaf,
+            (reached, generics, arguments) = match program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Struct(next, next_arguments)) => match step_struct(*next) {
+                    Some(struct_id) => (
+                        KeyReached::Struct(struct_id),
+                        program
+                            .structs
+                            .get(&struct_id)
+                            .map(|structure| structure.generic_parameter_constraint_ids.clone())
+                            .unwrap_or_default(),
+                        next_arguments.clone(),
+                    ),
+                    None => (KeyReached::Leaf, Vec::new(), Vec::new()),
                 },
-                Some(Type::Enum(next, _)) => KeyReached::Enum(*next),
-                _ => KeyReached::Leaf,
+                Some(Type::Enum(next, next_arguments)) => (
+                    KeyReached::Enum(*next),
+                    program
+                        .enums
+                        .get(next)
+                        .map(|enumeration| enumeration.generic_parameter_constraint_ids.clone())
+                        .unwrap_or_default(),
+                    next_arguments.clone(),
+                ),
+                _ => (KeyReached::Leaf, Vec::new(), Vec::new()),
             };
         }
         Some(KeyChain {
