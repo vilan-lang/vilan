@@ -4027,6 +4027,9 @@ struct Transformer<'src> {
     /// `Task.meta.owner` allocates nothing where it is written, however often
     /// that runs.
     key_literals: HashMap<Vec<KeyLiteralStep>, String>,
+    /// B711 S3a: one accessor function per partial key literal and the
+    /// continuation it serves ([`Transformer::emit_maybe_key_accessor`]).
+    maybe_key_accessors: HashMap<(Vec<KeyLiteralStep>, MaybeKeyAccess), String>,
     // Per-type `__drop` helpers (destruction.md §7), keyed by `type_key`. `None`
     // records a type whose destruction is a complete no-op (no `Drop` impl, no
     // resource members) so callers skip it; `Some(name)` is the emitted helper.
@@ -4315,6 +4318,19 @@ fn collect_bound_names_in_order(scope: &JsScope, into: &mut Vec<String>) {
     }
 }
 
+/// B711 S3a: what a `MaybeKey` literal's accessor function does at its
+/// place, once the walk found it there.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum MaybeKeyAccess {
+    /// `get`: the place as `Some`, cloned when it is an aggregate.
+    Get { copy: bool },
+    /// `view` / `change`: the place lent to the body, as its `(base, key)`
+    /// pair when it is a scalar.
+    Lend { scalar: bool },
+    /// `put`: the place written.
+    Put,
+}
+
 /// What one emission contributed DIRECTLY, recorded the first — and, in the
 /// shared world, only — time it is lowered (`const-eval.md` §10.6).
 ///
@@ -4597,6 +4613,7 @@ impl<'src> Transformer<'src> {
             default_instances: HashMap::default(),
             vtables: HashMap::default(),
             key_literals: HashMap::default(),
+            maybe_key_accessors: HashMap::default(),
             vtables_by_slots: HashMap::default(),
             drop_helpers: HashMap::default(),
             shared_bodies: HashMap::default(),
@@ -7720,6 +7737,17 @@ impl<'src> Transformer<'src> {
         let key = args.next().unwrap_or(js::Node::Void);
         let subject = args.next().unwrap_or(js::Node::Void);
         let third = args.next().unwrap_or(js::Node::Void);
+        // A key LITERAL is walked by a function of its own, the code a
+        // hand-written `match` would be: no step is read at run time.
+        if let Some(steps) = call_expr_id.and_then(|id| self.maybe_key_literal_receiver(id)) {
+            let (access, arguments) = match intrinsic {
+                Intrinsic::MaybeKeyGet => (MaybeKeyAccess::Get { copy: !scalar }, vec![subject]),
+                Intrinsic::MaybeKeyPut => (MaybeKeyAccess::Put, vec![subject, third]),
+                _ => (MaybeKeyAccess::Lend { scalar }, vec![subject, third]),
+            };
+            let name = self.emit_maybe_key_accessor(&steps, access);
+            return js::Node::Call(Box::new(js::Node::Local(name)), arguments);
+        }
         self.used_helpers.insert("__mkey_reach");
         let flag = |on: bool| js::Node::Number(if on { "1" } else { "0" }.to_string(), None);
         let (helper, arguments) = match intrinsic {
@@ -7734,6 +7762,157 @@ impl<'src> Transformer<'src> {
         };
         self.used_helpers.insert(helper);
         js::Node::Call(Box::new(js::Node::Local(helper.to_string())), arguments)
+    }
+
+    /// B711 S3a: the steps of a `MaybeKey` call's receiver when it is written
+    /// as a key LITERAL (`Doc.title::Some.get(&d)`); `None` for a key held in
+    /// a value.
+    fn maybe_key_literal_receiver(&self, call_expr_id: Id) -> Option<Vec<KeyLiteralStep>> {
+        let Some(Expr::Call(call_id)) = self.program.entity_map.get(&call_expr_id) else {
+            return None;
+        };
+        let receiver = *self
+            .program
+            .function_calls
+            .get(call_id)?
+            .argument_ids
+            .first()?;
+        self.key_literal_steps(receiver)
+            .filter(|steps| crate::analyzer::key_steps_are_partial(steps))
+    }
+
+    /// B711: a key subscript's or call's key when it is written as a key
+    /// LITERAL (an ascription is transparent), and not one a `const` folded.
+    fn key_literal_steps(&self, index_id: Id) -> Option<Vec<KeyLiteralStep>> {
+        let mut current = index_id;
+        while let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&current) {
+            current = *inner;
+        }
+        match self.program.entity_map.get(&current) {
+            Some(Expr::Key(steps)) => Some(steps.clone()),
+            _ => None,
+        }
+    }
+
+    /// B711 S3a: the accessor function of a partial key LITERAL for one
+    /// continuation — one per distinct literal and access, emitted once and
+    /// named where it is called. Its body is the walk the literal spells, as
+    /// a hand-written `match` would be: each field step an index, each
+    /// variant step a test of the enum's tag (`[tag, ..payload]`) and a
+    /// return of the miss, then the place's access.
+    fn emit_maybe_key_accessor(
+        &mut self,
+        steps: &[KeyLiteralStep],
+        access: MaybeKeyAccess,
+    ) -> String {
+        let memo = (steps.to_vec(), access);
+        if let Some(name) = self.maybe_key_accessors.get(&memo) {
+            let name = name.clone();
+            self.record_hit(|recorder| recorder.key_literals.get(&name).copied());
+            return name;
+        }
+        let name = self.ng.next_name();
+        self.maybe_key_accessors.insert(memo, name.clone());
+        let emission = self.record_keyed(|recorder, id| {
+            recorder.key_literals.insert(name.clone(), id);
+        });
+        let frame = self.record_enter();
+        let local = |name: &str| js::Node::Local(name.to_string());
+        let number = |value: usize| js::Node::Number(value.to_string(), None);
+        let miss = match access {
+            MaybeKeyAccess::Get { .. } => js::Node::Array(vec![number(1)]),
+            _ => js::Node::Bool(false),
+        };
+        let mut body = Vec::new();
+        let mut current = local("value");
+        let mut place = (local("value"), 0);
+        for (at, step) in steps.iter().enumerate() {
+            let slot = match *step {
+                KeyLiteralStep::Field(_, index) => index,
+                KeyLiteralStep::Variant(_, tag, position) => {
+                    let tested = format!("v{at}");
+                    body.push(js::Node::ConstVariable(js::Variable {
+                        name: tested.clone(),
+                        value: Box::new(current),
+                    }));
+                    body.push(js::Node::If(js::IfBranch::If(
+                        Box::new(js::Node::Binary(
+                            BinaryOp::NotEq,
+                            Box::new(js::Node::PropertyIndex(
+                                Box::new(local(&tested)),
+                                Box::new(number(0)),
+                            )),
+                            Box::new(number(tag)),
+                        )),
+                        vec![js::Node::Return(Box::new(miss.clone()))],
+                        None,
+                    )));
+                    current = local(&tested);
+                    1 + position
+                }
+            };
+            if at + 1 == steps.len() {
+                place = (current.clone(), slot);
+            } else {
+                current = js::Node::PropertyIndex(Box::new(current), Box::new(number(slot)));
+            }
+        }
+        let (holder, slot) = place;
+        let field = js::Node::PropertyIndex(Box::new(holder.clone()), Box::new(number(slot)));
+        let (parameters, tail) = match access {
+            MaybeKeyAccess::Get { copy } => {
+                let value = if copy {
+                    self.used_helpers.insert("__clone");
+                    js::Node::Call(Box::new(local("__clone")), vec![field])
+                } else {
+                    field
+                };
+                (
+                    vec!["value"],
+                    vec![js::Node::Return(Box::new(js::Node::Array(vec![
+                        number(0),
+                        value,
+                    ])))],
+                )
+            }
+            MaybeKeyAccess::Lend { scalar } => {
+                let lent = if scalar {
+                    js::Node::Array(vec![holder, number(slot)])
+                } else {
+                    field
+                };
+                (
+                    vec!["value", "body"],
+                    vec![
+                        js::Node::Call(Box::new(local("body")), vec![lent]),
+                        js::Node::Return(Box::new(js::Node::Bool(true))),
+                    ],
+                )
+            }
+            MaybeKeyAccess::Put => (
+                vec!["value", "field"],
+                vec![
+                    js::Node::Assignment(Box::new(field), Box::new(local("field"))),
+                    js::Node::Return(Box::new(js::Node::Bool(true))),
+                ],
+            ),
+        };
+        body.extend(tail);
+        self.monomorphized.push(js::Node::Function(js::Function {
+            name: name.clone(),
+            parameters: parameters
+                .into_iter()
+                .map(|parameter| js::Parameter {
+                    name: parameter.to_string(),
+                })
+                .collect(),
+            body,
+            is_async: false,
+            origin: None,
+        }));
+        self.record_leave(frame, emission);
+        self.record_landed(emission);
+        name
     }
 
     /// B711 S3a: whether the place a `MaybeKey` call's receiver reaches is a
@@ -7767,18 +7946,10 @@ impl<'src> Transformer<'src> {
     /// as a key LITERAL (`s[Task.meta.owner]`): the place is then a plain field
     /// chain, emitted as `s.x` would be. `None` for a key held in a value.
     fn key_literal_positions(&self, index_id: Id) -> Option<Vec<usize>> {
-        let mut current = index_id;
-        // An ascription is transparent (`s[Pair.left as Key<..>]`).
-        while let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&current) {
-            current = *inner;
-        }
-        match self.program.entity_map.get(&current) {
-            Some(Expr::Key(steps)) => steps
-                .iter()
-                .map(|step| step.field().map(|(_, index)| index))
-                .collect(),
-            _ => None,
-        }
+        self.key_literal_steps(index_id)?
+            .iter()
+            .map(|step| step.field().map(|(_, index)| index))
+            .collect()
     }
 
     /// B711 S1c: where a `TupleKey` subscript's element sits in its subject's

@@ -530,11 +530,17 @@ fn maybe_keys_a_path_after_a_call_still_fails_to_parse() {
 // --- emission -----------------------------------------------------------------
 
 /// A partial literal is one hoisted constant whose variant step carries its
-/// kind (`[1, position, width]`); a total literal's steps carry `[0]`.
+/// kind (`[1, position, width]`); a total literal's steps carry `[0]`. A
+/// continuation through a LITERAL calls one accessor function per literal
+/// and access — the walk the literal spells, a tag test per variant step,
+/// as a hand-written `match` is — and through a key HELD in a value it walks
+/// the key's steps (`__mkey_get`).
 #[test]
-fn maybe_keys_a_literal_is_one_constant_with_its_step_kinds() {
+fn maybe_keys_a_literal_is_one_constant_and_one_accessor_per_access() {
     let js = compile(&format!(
-        "{MAYBE_PRELUDE}\nfun main() {{ let d = doc(); print(Doc.shape::Rect.1.get(&d)); print(Doc.shape::Rect.1.get(&d)); }}"
+        "{MAYBE_PRELUDE}\nfun held(k: MaybeKey<Doc, f64>, d: Doc): Option<f64> {{ k.get(&d) }}\n\
+         fun main() {{ let d = doc(); print(Doc.shape::Rect.1.get(&d)); print(Doc.shape::Rect.1.get(&d)); \
+         print(held(Doc.shape::Rect.1, d)); }}"
     ))
     .expect("compiles");
     assert_eq!(
@@ -546,7 +552,19 @@ fn maybe_keys_a_literal_is_one_constant_with_its_step_kinds() {
         js.contains("\"shape\", [ 0 ] ]"),
         "a field step's kind is `[0]`:\n{js}"
     );
-    assert!(js.contains("__mkey_get("), "a get walks the key:\n{js}");
+    assert_eq!(
+        js.matches("if (v1[0] !== 1) {").count(),
+        1,
+        "one accessor for the literal's `get`, testing `Rect`'s tag:\n{js}"
+    );
+    assert!(
+        js.contains("return [ 0, v1[2] ];"),
+        "the slot after the tag:\n{js}"
+    );
+    assert!(
+        js.contains("__mkey_get("),
+        "a held key walks its steps:\n{js}"
+    );
 }
 
 /// The compiler builds `std::key`'s values itself (both emitters and the

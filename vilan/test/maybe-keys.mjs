@@ -132,12 +132,6 @@ function __mkey_lend(value, key, body, scalar) {
 	body(scalar ? place : place[0][place[1]]);
 	return true;
 }
-function __mkey_put(value, key, field) {
-	const place = __mkey_reach(value, key);
-	if (place === null) return false;
-	place[0][place[1]] = field;
-	return true;
-}
 function __mkey_reach(value, key) {
 	const parts = key[0][0];
 	const last = parts.length - 1;
@@ -163,13 +157,13 @@ function eq(self, b) {
 	return self === b;
 }
 function assert(condition, message, caller) {
-	let $g = null;
+	let $h = null;
 	if (!(condition)) {
-		$g = (() => {
+		$h = (() => {
 			throw __panic(message, caller);
 		})();
 	}
-	return $g;
+	return $h;
 }
 function name(self) {
 	let name3 = "";
@@ -220,66 +214,66 @@ function owner_name(step) {
 	return __at(__at(segments, segments.length - 1, "std/src/key.vl:256:2").split("#"), 0, "std/src/key.vl:256:2");
 }
 function spelled(step, leads) {
-	const $x = step[3];
-	let $y = null;
-	if ($x[0] === 0) {
-		let $z = null;
+	const $D = step[3];
+	let $E = null;
+	if ($D[0] === 0) {
+		let $F = null;
 		if (leads) {
-			$z = step[2];
+			$F = step[2];
 		} else {
-			$z = "." + step[2];
+			$F = "." + step[2];
 		}
-		$y = $z;
+		$E = $F;
 	} else {
-		const position = $x[1];
-		const width = $x[2];
-		let $A = null;
+		const position = $D[1];
+		const width = $D[2];
+		let $G = null;
 		if (width > 1) {
-			$A = "::" + step[2] + "." + position;
+			$G = "::" + step[2] + "." + position;
 		} else {
-			$A = "::" + step[2];
+			$G = "::" + step[2];
 		}
-		$y = $A;
+		$E = $G;
 	}
-	return $y;
+	return $E;
 }
 function same_kind(left, right) {
-	const $s = left;
-	let $t = null;
-	if ($s[0] === 0) {
-		const $u = right;
-		$t = $u[0] === 0;
+	const $y = left;
+	let $z = null;
+	if ($y[0] === 0) {
+		const $A = right;
+		$z = $A[0] === 0;
 	} else {
-		const position = $s[1];
-		const $v = right;
-		let $w = null;
-		if ($v[0] === 1) {
-			const other = $v[1];
-			$w = position === other;
+		const position = $y[1];
+		const $B = right;
+		let $C = null;
+		if ($B[0] === 1) {
+			const other = $B[1];
+			$C = position === other;
 		} else {
-			$w = false;
+			$C = false;
 		}
-		$t = $w;
+		$z = $C;
 	}
-	return $t;
+	return $z;
 }
 function eq3(self, b) {
-	const $b = self;
-	let $e = null;
-	if ($b[0] === 0) {
-		const $c = b;
-		let $d = null;
-		if ($c[0] === 0) {
-			$d = $b[1] === $c[1];
+	const $c = self;
+	let $f = null;
+	if ($c[0] === 0) {
+		const $d = b;
+		let $e = null;
+		if ($d[0] === 0) {
+			$e = $c[1] === $d[1];
 		} else {
-			$d = false;
+			$e = false;
 		}
-		$e = $d;
+		$f = $e;
 	} else {
-		const $f = b;
-		$e = $f[0] === 1;
+		const $g = b;
+		$f = $g[0] === 1;
 	}
-	return $e;
+	return $f;
 }
 function grow(d2, key) {
 	return __mkey_lend(d2, key, (x) => {
@@ -288,24 +282,69 @@ function grow(d2, key) {
 	}, 1);
 }
 const $a = [ [ [ [ "maybe-keys.vl::Doc", 0, "title", [ 0 ] ], [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ] ] ] ];
-const $h = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ], [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ], [ "maybe-keys.vl::User", 0, "name", [ 0 ] ] ] ] ];
-const $i = [ [ [ [ "maybe-keys.vl::Doc", 2, "shape", [ 0 ] ], [ "maybe-keys.vl::Shape", 0, "Circle", [ 1, 0, 1 ] ] ] ] ];
-const $j = [ [ [ [ "maybe-keys.vl::Doc", 2, "shape", [ 0 ] ], [ "maybe-keys.vl::Shape", 1, "Rect", [ 1, 1, 2 ] ] ] ] ];
-const $k = [ [ [ [ "maybe-keys.vl::Doc", 2, "shape", [ 0 ] ], [ "maybe-keys.vl::Shape", 1, "Rect", [ 1, 0, 2 ] ] ] ] ];
-const $l = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ], [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ] ] ] ];
-const $m = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ], [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ], [ "maybe-keys.vl::User", 1, "age", [ 0 ] ] ] ] ];
-const $p = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ] ] ] ];
+function $b(value) {
+	const v1 = value[0];
+	if (v1[0] !== 0) {
+		return [ 1 ];
+	}
+	return [ 0, v1[1] ];
+}
+const $i = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ], [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ], [ "maybe-keys.vl::User", 0, "name", [ 0 ] ] ] ] ];
+function $j(value) {
+	const v1 = value[1];
+	if (v1[0] !== 0) {
+		return [ 1 ];
+	}
+	return [ 0, v1[1][0] ];
+}
+const $k = [ [ [ [ "maybe-keys.vl::Doc", 2, "shape", [ 0 ] ], [ "maybe-keys.vl::Shape", 0, "Circle", [ 1, 0, 1 ] ] ] ] ];
+function $l(value) {
+	const v1 = value[2];
+	if (v1[0] !== 0) {
+		return [ 1 ];
+	}
+	return [ 0, v1[1] ];
+}
+const $m = [ [ [ [ "maybe-keys.vl::Doc", 2, "shape", [ 0 ] ], [ "maybe-keys.vl::Shape", 1, "Rect", [ 1, 1, 2 ] ] ] ] ];
+function $n(value, field) {
+	const v1 = value[2];
+	if (v1[0] !== 1) {
+		return false;
+	}
+	v1[2] = field;
+	return true;
+}
+const $o = [ [ [ [ "maybe-keys.vl::Doc", 2, "shape", [ 0 ] ], [ "maybe-keys.vl::Shape", 1, "Rect", [ 1, 0, 2 ] ] ] ] ];
+const $p = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ], [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ] ] ] ];
+function $q(value, body) {
+	const v1 = value[1];
+	if (v1[0] !== 0) {
+		return false;
+	}
+	body(v1[1]);
+	return true;
+}
+const $r = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ], [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ], [ "maybe-keys.vl::User", 1, "age", [ 0 ] ] ] ] ];
+function $s(value, body) {
+	const v1 = value[1];
+	if (v1[0] !== 0) {
+		return false;
+	}
+	body([ v1[1], 1 ]);
+	return true;
+}
+const $v = [ [ [ [ "maybe-keys.vl::Doc", 1, "owner", [ 0 ] ] ] ] ];
 function maybe(self) {
 	return [ __clone(self[0]) ];
 }
-const $q = [ [ [ [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ] ] ] ];
+const $w = [ [ [ [ "std/src/option.vl::Option", 0, "Some", [ 1, 0, 1 ] ] ] ] ];
 function then2(self, next) {
 	return [ then(self[0], next[0]) ];
 }
 function some(self) {
-	return then2(maybe(self), $q);
+	return then2(maybe(self), $w);
 }
-const $r = [ [ [ [ "maybe-keys.vl::User", 1, "age", [ 0 ] ] ] ] ];
+const $x = [ [ [ [ "maybe-keys.vl::User", 1, "age", [ 0 ] ] ] ] ];
 function eq4(self, other) {
 	return eq2(self[0], other[0]);
 }
@@ -317,6 +356,14 @@ function name2(self) {
 }
 function debug(self) {
 	return written(self[0]);
+}
+function $H(value, field) {
+	const v1 = value[0];
+	if (v1[0] !== 0) {
+		return false;
+	}
+	v1[1] = field;
+	return true;
 }
 function __show_i32(value) {
 	return "" + value;
@@ -337,38 +384,38 @@ function __show_Option_str(value) {
 	return "None";
 }
 let d = [ [ 0, "a" ], [ 0, [ "ada", 3 ] ], [ 1, 1.0, 2.0 ] ];
-assert(eq3(__mkey_get(d, $a, 0), [ 0, "a" ]), "an option\'s payload", "maybe-keys.vl:39:2");
-assert(eq3(__mkey_get(d, $h, 0), [ 0, "ada" ]), "a field past a variant step", "maybe-keys.vl:40:2");
-assert(eq3(__mkey_get(d, $i, 0), [ 1 ]), "another variant misses", "maybe-keys.vl:41:2");
-assert(__mkey_put(d, $j, 5.0), "a put where the place is", "maybe-keys.vl:42:2");
-assert(grow(d, $k), "a held key lends its place", "maybe-keys.vl:43:2");
-assert(__mkey_lend(d, $l, (u) => {
+assert(eq3($b(d), [ 0, "a" ]), "an option\'s payload", "maybe-keys.vl:39:2");
+assert(eq3($j(d), [ 0, "ada" ]), "a field past a variant step", "maybe-keys.vl:40:2");
+assert(eq3($l(d), [ 1 ]), "another variant misses", "maybe-keys.vl:41:2");
+assert($n(d, 5.0), "a put where the place is", "maybe-keys.vl:42:2");
+assert(grow(d, $o), "a held key lends its place", "maybe-keys.vl:43:2");
+assert($q(d, (u) => {
 	return console.log(String(u[1]));
-}, 0), "a view lends a struct", "maybe-keys.vl:44:2");
-assert(__mkey_lend(d, $m, (a) => {
+}), "a view lends a struct", "maybe-keys.vl:44:2");
+assert($s(d, (a) => {
 	a[0][a[1]] = a[0][a[1]] + 1;
 	return;
-}, 1), "a change writes in place", "maybe-keys.vl:45:2");
-const $n = d[2];
-let $o = null;
-if ($n[0] === 1) {
-	const w = $n[1];
-	const h = $n[2];
-	$o = console.log("" + w + " " + h);
+}), "a change writes in place", "maybe-keys.vl:45:2");
+const $t = d[2];
+let $u = null;
+if ($t[0] === 1) {
+	const w = $t[1];
+	const h = $t[2];
+	$u = console.log("" + w + " " + h);
 } else {
-	$o = console.log("moved");
+	$u = console.log("moved");
 }
-$o;
-const age = then2(some($p), $r);
-assert(eq4(age, $m), "equal paths, however written", "maybe-keys.vl:54:2");
-assert(starts_with2(age, $p), "a variant step starts with its field", "maybe-keys.vl:55:2");
-assert(!(starts_with2($k, $j)), "two slots are disjoint", "maybe-keys.vl:56:2");
+$u;
+const age = then2(some($v), $x);
+assert(eq4(age, $r), "equal paths, however written", "maybe-keys.vl:54:2");
+assert(starts_with2(age, $v), "a variant step starts with its field", "maybe-keys.vl:55:2");
+assert(!(starts_with2($o, $m)), "two slots are disjoint", "maybe-keys.vl:56:2");
 console.log(__dbg_flat(__show_Option_i32(__mkey_get(d, age, 0))));
-console.log(name2($k));
+console.log(name2($o));
 console.log(debug(age));
 d[0] = [ 1 ];
 d[2] = [ 2 ];
-assert(!(__mkey_put(d, $a, "b")), "a put never creates a place", "maybe-keys.vl:63:2");
-assert(!(grow(d, $k)), "a miss lends nothing", "maybe-keys.vl:64:2");
+assert(!($H(d, "b")), "a put never creates a place", "maybe-keys.vl:63:2");
+assert(!(grow(d, $o)), "a miss lends nothing", "maybe-keys.vl:64:2");
 console.log(__dbg_flat(__show_Option_str(d[0])));
 //# sourceMappingURL=maybe-keys.mjs.map
