@@ -311,11 +311,16 @@ is written as the literal writes it: `"shape::Rect.0"`, `"title::Some"`,
 slot). Its `KeyStep` names the variant, `index()` is the variant's position
 in its enum, `position()` the payload slot, and `may_miss()` is true.
 
-**Cost.** A literal is one constant, as a `Key`'s is. On the JS backend each
-continuation walks the key's steps, testing a variant's tag before it
-descends. Natively a `MaybeKey` carries two projections answering `Option`;
-a literal's are plain functions, one `match` per variant step, and `then`
-shares one allocation as `Key`'s does.
+**Cost.** A literal is one constant, as a `Key`'s is. On the JS backend a
+continuation through a key LITERAL is a call of one function per literal and
+continuation, whose body is the `match` the literal spells (a tag test per
+variant step), so `get` and `put` through a literal cost what the
+hand-written `match` does; a key held in a value walks its steps at run
+time. Natively a `MaybeKey` carries two projections answering `Option`; a
+literal's are plain functions, one `match` per variant step, and `then`
+shares one allocation as `Key`'s does. `view` and `change` take a closure,
+which costs what a closure costs. The continuations keep nothing they are
+handed, so the closure may capture a view.
 
 A `[field_syntax]` door takes a `Key`, not a `MaybeKey`: a variant step
 written through one (`handle.title::Some`) is a step on the read's VALUE, and

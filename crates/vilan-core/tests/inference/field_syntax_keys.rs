@@ -509,4 +509,10 @@ fn field_syntax_a_variant_step_through_a_door_is_refused() {
         ),
         "but got MaybeKey<Profile, str> instead: this key's path has a step that may find nothing",
     );
+    // And a door declared over a `MaybeKey` is refused by the shape check
+    // (the door for partial keys is S3c's).
+    declaration_refused(
+        "[field_syntax]\n\tfun at<U>(self, key: MaybeKey<A, U>): Option<U> { None }",
+        "this one's parameter is no `Key<T, U>`",
+    );
 }

@@ -1991,7 +1991,9 @@ backends a subscript through a key LITERAL is the plain field access. The
 native backend refuses one shape by name: a call handed two loans into one
 value where one goes through a key held in a value (`both(&mut s[j], &mut
 s[k])`), because Rust cannot see two run-time places apart. A variant step on
-JS tests the enum's tag before it descends into the payload; natively a
+JS tests the enum's tag before it descends into the payload (a continuation
+through a literal calls one emitted accessor per literal and continuation;
+through a held key it walks the steps); natively a
 `MaybeKey` carries projections answering `Option`, a literal's two plain
 functions with one `match` per variant step. List and map steps and keys
 parsed from run-time data are later stages.*
