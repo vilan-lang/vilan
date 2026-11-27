@@ -71120,24 +71120,53 @@ impl<'src> Analyzer<'src> {
             {
                 (*owner, arguments.clone())
             }
-            Type::Enum(enum_id, _) => {
+            Type::Enum(enum_id, arguments) => {
                 // S3a: an enum is stepped into through one of its variants.
-                let variant = self
-                    .enums
-                    .get(enum_id)
-                    .and_then(|enum_| {
-                        enum_
-                            .variants
+                let variant = self.enums.get(enum_id).and_then(|enum_| {
+                    let variant = enum_
+                        .variants
+                        .iter()
+                        .find(|variant| !variant.data_type_ids.is_empty())?;
+                    Some((
+                        variant.name,
+                        variant.data_type_ids.clone(),
+                        enum_.generic_parameter_constraint_ids.clone(),
+                    ))
+                });
+                // The member continues the steer only where the payload is a
+                // struct it could be a field of (`Doc.owner::Some.name`).
+                let payload_is_a_struct =
+                    |this: &mut Self, slots: &[TypeId], generics: &[TypeId]| {
+                        let [only] = slots else {
+                            return false;
+                        };
+                        let declared = only.get_type(this);
+                        let substitution: SubstitutionContext = generics
                             .iter()
-                            .find(|variant| !variant.data_type_ids.is_empty())
-                    })
-                    .map(|variant| (variant.name, variant.data_type_ids.len()));
+                            .copied()
+                            .zip(arguments.iter().copied())
+                            .collect();
+                        matches!(
+                            this.substitute_type(&declared, &substitution),
+                            Type::Struct(owner, _)
+                                if this.structs.get(&owner).is_some_and(|struct_| !struct_.external)
+                        )
+                    };
                 let steer = match variant {
-                    Some((name, 1)) => format!(
-                        ": a key reaches a variant's payload with a variant step, \
-                         `{path_so_far}::{name}.{member_name}`"
-                    ),
-                    Some((name, _)) => format!(
+                    Some((name, slots, generics)) if slots.len() == 1 => {
+                        if payload_is_a_struct(self, &slots, &generics) {
+                            format!(
+                                ": a key reaches a variant's payload with a variant step, \
+                                 `{path_so_far}::{name}.{member_name}`"
+                            )
+                        } else {
+                            format!(
+                                ": a key reaches a variant's payload with a variant step, \
+                                 `{path_so_far}::{name}`"
+                            )
+                        }
+                    }
+                    Some((name, ..)) => format!(
                         ": a key reaches a variant's payload with a variant step and its \
                          position, `{path_so_far}::{name}.0`"
                     ),

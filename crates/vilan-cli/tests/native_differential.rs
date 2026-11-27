@@ -19837,6 +19837,81 @@ fn keys_two_live_views_through_two_held_keys_build() {
     );
 }
 
+/// B711 S3a (R11): `MaybeKey` natively — a key's access answers `Option`,
+/// a literal's projections are plain functions with a `match` per variant
+/// step. `maybe_keys_places.vl` reaches places by continuation over every
+/// subject the backend lowers its own way (a binding, a view parameter, a
+/// generic subject, a key the subject holds, a captured `mut` binding, a
+/// `Shared` cell, a module binding), misses included; `maybe_keys_values.vl`
+/// composes and compares keys (`then` across total and partial, `maybe()`,
+/// `some()`, a map key, `starts_with`, names, `Debug`, steps' kinds, keys in
+/// a list and a struct, a generic root and enum, nested variant steps); and
+/// the corpus program `maybe-keys.vl`.
+#[test]
+fn maybe_keys_build_the_same_on_both_backends() {
+    let staged = stage();
+    let mut programs = Vec::new();
+    for (name, program) in [
+        (
+            "native_probe_maybe_keys_places.vl",
+            include_str!("native/maybe_keys_places.vl"),
+        ),
+        (
+            "native_probe_maybe_keys_values.vl",
+            include_str!("native/maybe_keys_values.vl"),
+        ),
+    ] {
+        std::fs::write(staged.join(name), program).expect("write the probe program");
+        programs.push(name);
+    }
+    programs.push("maybe-keys.vl");
+    let verdicts = legs_in_parallel("maybe-keys", programs.clone(), |program, target| {
+        compare_in(&staged, program, target)
+    });
+    for (program, verdict) in programs.iter().zip(verdicts) {
+        assert_eq!(
+            verdict,
+            Verdict::Identical,
+            "{program}: partial keys must build and answer the same on both backends"
+        );
+    }
+}
+
+/// B711 S3a: partial keys leave nothing live natively. `maybe_keys_leak.vl`
+/// composes a hundred partial keys in a loop (`some()`, then a field past
+/// it) and stores them in a list and a map; at exit none is live.
+#[test]
+fn maybe_keys_composed_partial_keys_leave_nothing_live_natively() {
+    let staged = stage();
+    std::fs::write(
+        staged.join("native_probe_maybe_keys_leak.vl"),
+        include_str!("native/maybe_keys_leak.vl"),
+    )
+    .expect("write the keyed probe");
+    assert_eq!(
+        compare(&staged, "native_probe_maybe_keys_leak.vl"),
+        Verdict::Identical,
+        "the partial-key probe must answer the same on both backends"
+    );
+    let output = vilan(&staged)
+        .env("VILAN_NATIVE_LEAK_CENSUS", "1")
+        .args([
+            "run",
+            "--backend",
+            "rust",
+            "native_probe_maybe_keys_leak.vl",
+        ])
+        .output()
+        .expect("run the program natively");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "vilan-native: key compositions minted=100 live=0"),
+        "a hundred compositions, none live at exit:\n{stderr}"
+    );
+}
+
 /// B711 S1b: keys leave nothing live natively. `keys_leak.vl` composes keys
 /// with `then` in a loop and stores them in a list, a struct, a map and a
 /// closure's capture; at exit no composition is live, and its counted cells

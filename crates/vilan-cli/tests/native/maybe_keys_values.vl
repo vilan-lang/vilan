@@ -1,0 +1,111 @@
+// B711 S3a: `MaybeKey` values natively, against the JS backend: composition
+// (`then` across total and partial, `maybe()`, `some()` total and partial),
+// identity (`==`, a `HashMap` key, `starts_with`, `path`, `name`), `Debug`,
+// keys held in a list and a struct, generic code over keys, a generic root
+// and a generic enum, nested variant steps.
+import std::hash_map::HashMap;
+import std::key::KeyStep;
+
+struct Inner {
+	v: Option<i32>,
+	w: i32,
+	label: Option<str>,
+}
+
+struct Mid {
+	inner: Option<Inner>,
+	plain: Inner,
+	deep: Option<Option<i32>>,
+}
+
+struct Top {
+	mid: Mid,
+}
+
+struct Pair<T> {
+	left: Option<T>,
+	right: Result<T, str>,
+}
+
+struct Holder {
+	pair: Pair<i32>,
+	keys: List<MaybeKey<Top, i32>>,
+}
+
+fun top(): Top {
+	Top {
+		mid = Mid {
+			inner = Some(Inner { v = Some(1), w = 2, label = Some("x") }),
+			plain = Inner { v = None, w = 3, label = None },
+			deep = Some(Some(4)),
+		},
+	}
+}
+
+fun payload<S, T>(key: Key<S, Option<T>>, subject: &S): Option<T> {
+	key.some().get(subject)
+}
+
+fun describe(step: KeyStep): str {
+	i"{step.name()}:{step.index()}:{step.position().unwrap_or(9)}:{step.may_miss()}"
+}
+
+fun main() {
+	mut t = top();
+	let a: MaybeKey<Top, Inner> = Top.mid.maybe().then(Mid.inner::Some);
+	let b: MaybeKey<Top, i32> = a.then(Inner.w);
+	let c: MaybeKey<Top, i32> = a.then(Inner.v::Some);
+	let total: Key<Top, i32> = Top.mid.then(Mid.plain).then(Inner.w);
+	print(b.get(&t));
+	print(c.get(&t));
+	print(b == Top.mid.inner::Some.w);
+	print(c == Top.mid.inner::Some.v::Some);
+	print(Top.mid.inner.some() == Top.mid.inner::Some);
+	print(a.then(Inner.v).some().get(&t));
+	print(total.maybe().get(&t));
+	print(total.maybe().path() == total.path());
+	print(Top.mid.deep::Some::Some.get(&t));
+	print(Top.mid.deep.some().some().put(&mut t, 8));
+	print(t.mid.deep);
+	print(payload(Top.mid.deep, &t));
+	print(payload(Mid.inner, &t.mid).map(|inner| inner.w));
+	// identity
+	mut names: HashMap<MaybeKey<Top, i32>, str> = HashMap::new();
+	names.insert(b, "w");
+	names.insert(c, "v");
+	print(names.get(Top.mid.inner::Some.w).unwrap_or("none"));
+	print(names.get(Top.mid.inner.some().then(Inner.v::Some)).unwrap_or("none"));
+	print(c.starts_with(a));
+	print(a.starts_with(c));
+	print(c.starts_with(Top.mid));
+	print(c.name());
+	print(c.path().name());
+	print(c.debug());
+	print(c.path().debug());
+	for step in c.path().steps() {
+		print(describe(step));
+	}
+	// held in a list and a struct
+	let holder = Holder {
+		pair = Pair { left = Some(5), right = Err("no") },
+		keys = [b, c, total.maybe()],
+	};
+	for key in holder.keys {
+		print(key.change(&mut t, |x| {
+			x += 100;
+		}));
+	}
+	print(b.get(&t));
+	print(c.get(&t));
+	print(t[total]);
+	// generic root and generic enum
+	print(Holder.pair.left::Some.get(&holder));
+	print(Holder.pair.right::Ok.get(&holder));
+	print(Holder.pair.right::Err.get(&holder));
+	let direct: MaybeKey<Pair<i32>, i32> = Pair.left::Some;
+	print(direct.get(&holder.pair));
+	// a miss through a composed key
+	t.mid.inner = None;
+	print(c.put(&mut t, 1));
+	print(b.get(&t));
+}

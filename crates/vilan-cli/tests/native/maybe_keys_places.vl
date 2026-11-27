@@ -1,0 +1,114 @@
+// B711 S3a: `MaybeKey`'s continuations natively, against the JS backend: get,
+// view, change and put through a literal and a held key, over a binding, a
+// view parameter, a generic subject, a captured `mut` binding, a `Shared`
+// cell and a module binding; a key the subject holds; a miss leaving the
+// place alone.
+import std::shared::Shared;
+
+enum Shape {
+	Circle(f64),
+	Rect(f64, f64),
+	Dot,
+}
+
+struct User {
+	name: str,
+	age: i32,
+}
+
+struct Doc {
+	title: Option<str>,
+	owner: Option<User>,
+	shape: Shape,
+	pick: MaybeKey<Doc, f64>,
+}
+
+mut module_doc = Doc {
+	title = None,
+	owner = None,
+	shape = Shape::Circle(2.0),
+	pick = Doc.shape::Circle,
+};
+
+fun doc(): Doc {
+	Doc {
+		title = Some("a"),
+		owner = Some(User { name = "ada", age = 3 }),
+		shape = Shape::Rect(1.0, 2.0),
+		pick = Doc.shape::Rect.1,
+	}
+}
+
+fun rename(d: &mut Doc, to: str): bool {
+	Doc.owner::Some.name.put(d, to)
+}
+
+fun grow<S>(subject: &mut S, key: MaybeKey<S, f64>): bool {
+	key.change(subject, |x| {
+		x = *x * 2.0;
+	})
+}
+
+fun peek<S, F>(subject: &S, key: MaybeKey<S, F>): Option<F> {
+	key.get(subject)
+}
+
+fun shape_of(d: Doc): str {
+	match d.shape {
+		Shape::Circle(let r) => i"circle {r}",
+		Shape::Rect(let w, let h) => i"rect {w} {h}",
+		Shape::Dot => "dot",
+	}
+}
+
+fun main() {
+	mut d = doc();
+	print(Doc.title::Some.get(&d));
+	print(Doc.owner::Some.name.get(&d));
+	print(Doc.shape::Rect.0.get(&d));
+	print(Doc.shape::Circle.get(&d));
+	print(Doc.title::Some.view(&d, |t| print(*t)));
+	print(Doc.owner::Some.view(&d, |u| print(u.age)));
+	print(Doc.shape::Rect.1.change(&mut d, |h| {
+		h = *h + 10.0;
+	}));
+	print(Doc.owner::Some.change(&mut d, |u| {
+		u.age += 1;
+		u.name = u.name + "!";
+	}));
+	print(Doc.title::Some.put(&mut d, "b"));
+	print(rename(&mut d, "cy"));
+	print(shape_of(d));
+	print(d.title);
+	print(Doc.owner::Some.age.get(&d));
+	// a held key, and a key the subject holds
+	let held = Doc.shape::Rect.0;
+	print(grow(&mut d, held));
+	print(peek(&d, d.pick));
+	print(d.pick.put(&mut d, 7.0));
+	print(shape_of(d));
+	// misses
+	d.shape = Shape::Dot;
+	d.title = None;
+	print(held.put(&mut d, 1.0));
+	print(Doc.title::Some.put(&mut d, "c"));
+	print(Doc.title::Some.change(&mut d, |t| {
+		t = "never";
+	}));
+	print(d.title);
+	print(shape_of(d));
+	// a captured `mut` binding
+	mut captured = doc();
+	let bump = || Doc.shape::Rect.0.put(&mut captured, 9.0);
+	print(bump());
+	print(shape_of(captured));
+	// a `Shared` cell
+	let cell = Shared::new(doc());
+	print(Doc.owner::Some.age.put(&mut cell.write(), 50));
+	print(Doc.owner::Some.age.get(&cell.read()));
+	// a module binding
+	print(module_doc.pick.change(&mut module_doc, |r| {
+		r = *r * 3.0;
+	}));
+	print(shape_of(module_doc));
+}
