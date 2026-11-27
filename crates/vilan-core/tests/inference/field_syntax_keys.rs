@@ -491,3 +491,22 @@ fn field_syntax_an_impl_not_on_a_struct_is_refused() {
         "`[field_syntax]` labels a method of a struct's inherent `impl`",
     );
 }
+
+/// B711 S3a: the door takes a `Key`, never a `MaybeKey` (S3c's), so a variant
+/// step written through it (`r.name::Some`) is a variant step on a VALUE —
+/// the read's result — and refused as one; a `MaybeKey` passed to the door
+/// is refused as the `Key` it is not.
+#[test]
+fn field_syntax_a_variant_step_through_a_door_is_refused() {
+    handles_refused(
+        "fun main() { let r = user(); let k = r.address::Some; }",
+        "a variant step (`::Some`) stands only in a key literal's path, rooted at a struct type (`Doc.title::Some`), and `r.address` is a value",
+    );
+    assert_fails_with(
+        &format!(
+            "{HANDLES}\nstruct Profile {{ nick: Option<str> }}\n\
+             fun main() {{ let r = Root {{ state = Shared::new(Profile {{ nick = None }}) }}; let c = r.at(Profile.nick::Some); }}"
+        ),
+        "but got MaybeKey<Profile, str> instead: this key's path has a step that may find nothing",
+    );
+}

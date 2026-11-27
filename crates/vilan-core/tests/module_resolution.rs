@@ -10421,6 +10421,8 @@ struct KeyLoad {
     loaded: bool,
     errors: Vec<String>,
     stdout: Option<String>,
+    /// The program's interface fingerprints by item (B711 S3a).
+    interface: std::collections::BTreeMap<String, u64>,
 }
 
 /// Lays `files` out as the entry package (with `main.vl` its entry) beside
@@ -10482,6 +10484,10 @@ fn key_load(
     let loaded = program
         .as_ref()
         .is_some_and(|program| program.key_struct_id.is_some());
+    let interface = program
+        .as_ref()
+        .map(|program| vilan_core::incremental::fingerprints(program).items)
+        .unwrap_or_default();
     let stdout = match (run, program) {
         (true, Some(program)) if errors.is_empty() => Some(run_node(
             &vilan_core::transform(&program, &vilan_core::BuildOptions::default())
@@ -10494,6 +10500,7 @@ fn key_load(
         loaded,
         errors,
         stdout,
+        interface,
     }
 }
 
@@ -10917,4 +10924,49 @@ fn m211_a_file_s_own_maybe_key_does_not_load_std_key() {
     assert!(load.errors.is_empty(), "{:#?}", load.errors);
     assert!(!load.loaded, "a file's own `MaybeKey` loaded `std::key`");
     assert_eq!(load.stdout.as_deref(), Some("2\n"));
+}
+
+/// What a variant step means — the variant's position, its payload's width
+/// and slot types — is the enum's declaration, and that is part of the
+/// enum's interface fingerprint: reordering the variants or reshaping a
+/// payload moves it (an importer's key literal is re-analyzed), a body edit
+/// elsewhere does not.
+#[test]
+fn b711_a_variant_step_s_meaning_is_in_the_enum_s_interface_fingerprint() {
+    let interface = |model: &str| {
+        let load = key_load(
+            base_prelude(),
+            &[
+                (
+                    "main.vl",
+                    "import pkg::model::{ Doc, Shape };\n\
+                     fun main() {\n\tlet d = Doc { shape = Shape::Circle(1.0) };\n\
+                     \tprint(Doc.shape::Rect.1.get(&d));\n}\n",
+                ),
+                ("model.vl", model),
+            ],
+            &[],
+            Platform::default(),
+            false,
+        );
+        assert!(load.errors.is_empty(), "{:#?}", load.errors);
+        load.interface
+            .into_iter()
+            .find(|(item, _)| item.starts_with("enum ") && item.ends_with("::Shape"))
+            .map(|(_, hash)| hash)
+            .expect("the enum's interface item")
+    };
+    let base = "export enum Shape {\n\tCircle(f64),\n\tRect(f64, f64),\n}\n\n\
+                export struct Doc {\n\tshape: Shape,\n}\n\n\
+                fun helper(): i32 {\n\t1\n}\n";
+    let reordered = base.replace(
+        "\tCircle(f64),\n\tRect(f64, f64),",
+        "\tRect(f64, f64),\n\tCircle(f64),",
+    );
+    // The payload's slot TYPE moves it too (the entry's literal still checks).
+    let reshaped = base.replace("Rect(f64, f64)", "Rect(f64, i32)");
+    let body = base.replace("\t1\n", "\t2\n");
+    assert_ne!(interface(base), interface(&reordered), "variant order");
+    assert_ne!(interface(base), interface(&reshaped), "payload shape");
+    assert_eq!(interface(base), interface(&body), "a body edit");
 }

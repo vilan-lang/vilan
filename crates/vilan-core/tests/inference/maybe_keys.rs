@@ -548,3 +548,43 @@ fn maybe_keys_a_literal_is_one_constant_with_its_step_kinds() {
     );
     assert!(js.contains("__mkey_get("), "a get walks the key:\n{js}");
 }
+
+/// The compiler builds `std::key`'s values itself (both emitters and the
+/// const evaluator write the layout and walk it by position), so the field
+/// ORDER of `Key`, `MaybeKey`, `KeyPath` and `KeyStep`, and the variant order
+/// of `StepKind`, is the representation: this pins it against the source.
+#[test]
+fn keys_std_layout() {
+    let source = include_str!("../../../../vilan/std/src/key.vl");
+    let declared = |head: &str| -> Vec<String> {
+        let start = source
+            .find(head)
+            .unwrap_or_else(|| panic!("`{head}` in std::key"));
+        let body = &source[start + head.len()..];
+        let body = &body[..body.find("\n}").expect("the declaration closes")];
+        body.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("///"))
+            .map(|line| {
+                // `[internal("..")] name: T,` or `Variant(..),`
+                let line = match line.rfind(")] ") {
+                    Some(at) if line.starts_with('[') => &line[at + 3..],
+                    _ => line,
+                };
+                line.split([':', '(', ','])
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    };
+    assert_eq!(declared("export struct Key<S, F> {"), ["erased"]);
+    assert_eq!(declared("export struct MaybeKey<S, F> {"), ["erased"]);
+    assert_eq!(declared("export struct KeyPath {"), ["parts"]);
+    assert_eq!(
+        declared("export struct KeyStep {"),
+        ["owner", "index", "name", "kind"]
+    );
+    assert_eq!(declared("enum StepKind {"), ["Field", "Variant"]);
+}

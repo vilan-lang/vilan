@@ -12703,6 +12703,86 @@ mod tests {
         }
     }
 
+    /// B711 S3a: a key's variant step is the MEMBER of its access —
+    /// `Doc.title::Some` is `MemberAccessor(Doc.title, KeyVariant(Some))` —
+    /// its payload position folds into the step, and steps continue past it.
+    #[test]
+    fn a_key_variant_step_is_a_member_with_its_position_folded_in() {
+        let variant = |node: &Spanned<Node<'_>>| match &node.0 {
+            Node::MemberAccessor(subject, member) => match &member.0 {
+                Node::KeyVariant((name, _), position) => Some((
+                    matches!(subject.0, Node::MemberAccessor(..)),
+                    name.to_string(),
+                    position.map(|(digits, _)| digits.to_string()),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        let title = expr("Doc.title::Some");
+        let (subject, name, position) = variant(&title).expect("a variant step");
+        assert!(subject, "the step's subject is the field access");
+        assert_eq!((name.as_str(), position), ("Some", None));
+        let width = expr("Doc.shape::Rect.0");
+        let (_, name, position) = variant(&width).expect("a variant step");
+        assert_eq!((name.as_str(), position.as_deref()), ("Rect", Some("0")));
+        // Steps continue: a field, and another variant step.
+        let name = expr("Doc.owner::Some.name");
+        let Node::MemberAccessor(inner, member) = &name.0 else {
+            panic!("a member after the step: {name:?}");
+        };
+        assert!(matches!(member.0, Node::Accessor("name")));
+        assert!(variant(inner).is_some(), "{inner:?}");
+        let twice = expr("Doc.depth::Some::Some");
+        let Node::MemberAccessor(inner, _) = &twice.0 else {
+            panic!("{twice:?}");
+        };
+        assert!(variant(inner).is_some() && variant(&twice).is_some());
+        let after_position = expr("Doc.shape::Rect.1::Some");
+        assert!(variant(&after_position).is_some());
+    }
+
+    /// A `::` path is the BASE's, before any postfix, and stays a path; `::`
+    /// after a postfix that is no member is no step; a half-typed step keeps
+    /// an empty name, and a name on the next line is not taken.
+    #[test]
+    fn a_key_variant_step_follows_only_a_member() {
+        assert!(matches!(expr("a::b::C").0, Node::StaticAccessor(..)));
+        assert!(matches!(
+            expr("Shape::Rect.0").0,
+            Node::MemberAccessor(ref subject, ref member)
+                if matches!(subject.0, Node::StaticAccessor(..)) && matches!(member.0, Node::Number(..))
+        ));
+        let source = "f()::Some";
+        let (mut tokens, _) = lexing::tokenize(source);
+        let count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let parsed = parser.parse_expression();
+        assert!(
+            parsed.is_none() || parser.position < count,
+            "`::` after a call is no step: {parsed:?}"
+        );
+        let half = expr("Doc.title::");
+        let Node::MemberAccessor(_, member) = &half.0 else {
+            panic!("{half:?}");
+        };
+        assert!(
+            matches!(member.0, Node::KeyVariant(("", _), None)),
+            "{member:?}"
+        );
+        let source = "Doc.title::\nSome";
+        let (mut tokens, _) = lexing::tokenize(source);
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let parsed = parser.parse_expression().expect("the half-typed step");
+        let Node::MemberAccessor(_, member) = &parsed.0 else {
+            panic!("{parsed:?}");
+        };
+        assert!(
+            matches!(member.0, Node::KeyVariant(("", _), None)),
+            "the next line's name is not taken: {member:?}"
+        );
+    }
+
     /// Parse `source` as a bare expression, asserting a clean full-consumption
     /// parse. Spans are at their natural source offsets (no wrapper).
     fn expr(source: &str) -> Spanned<Node<'_>> {

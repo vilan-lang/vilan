@@ -10299,6 +10299,19 @@ mod reformats {
         assert_eq!(format(expected), expected, "output is not idempotent");
     }
 
+    /// B711 S3a: a key's variant step prints as written — `::` against its
+    /// field, the position against its variant — and spacing around the `::`
+    /// is normalized.
+    #[test]
+    fn a_key_variant_step_prints_against_its_field() {
+        let source = "fun main() {\n\tlet k = Doc.shape::Rect.0;\n\tlet n = Doc.owner::Some.name;\n\tprint(Doc.depth::Some::Some.get(&d));\n}\n";
+        assert_formats(source, source);
+        assert_formats(
+            "fun main() {\n\tlet k = Doc.shape :: Rect.0;\n}\n",
+            "fun main() {\n\tlet k = Doc.shape::Rect.0;\n}\n",
+        );
+    }
+
     /// N141: an identity expectation over a source the formatter DECLINES is
     /// a failure, not a pass — `format` hands the declined source back
     /// unchanged, which is exactly what an identity pin expects.
