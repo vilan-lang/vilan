@@ -2539,6 +2539,56 @@ impl<'a> Interpreter<'a> {
                 }
                 Ok(field)
             }
+            // B711 S3a: a `MaybeKey`'s place, matching the emitted helpers:
+            // each part is `[owner, index, name, kind]`, `kind` `[0]` for a
+            // field and `[1, position, width]` for a variant's payload slot,
+            // whose enum array is `[tag, ..payload]`.
+            "__mkey_get" | "__mkey_lend" | "__mkey_put" => {
+                let place = maybe_key_place(&take(0), &take(1))?;
+                let Some((holder, slot)) = place else {
+                    return Ok(match name {
+                        "__mkey_get" => {
+                            Value::Array(Rc::new(RefCell::new(vec![Value::Number(1.0)])))
+                        }
+                        _ => Value::Bool(false),
+                    });
+                };
+                match name {
+                    "__mkey_get" => {
+                        let field = array_slot(&Value::Array(holder), slot)?;
+                        let copy = expect_number(&take(2))? != 0.0;
+                        let field = if copy { deep_clone(&field) } else { field };
+                        Ok(Value::Array(Rc::new(RefCell::new(vec![
+                            Value::Number(0.0),
+                            field,
+                        ]))))
+                    }
+                    "__mkey_put" => {
+                        let field = take(2);
+                        match holder.borrow_mut().get_mut(slot) {
+                            Some(place) => *place = field,
+                            None => {
+                                return Err(Failure::internal("a key past its value".to_string()));
+                            }
+                        }
+                        Ok(Value::Bool(true))
+                    }
+                    _ => {
+                        let body = take(2);
+                        let scalar = expect_number(&take(3))? != 0.0;
+                        let lent = if scalar {
+                            Value::Array(Rc::new(RefCell::new(vec![
+                                Value::Array(holder),
+                                Value::Number(slot as f64),
+                            ])))
+                        } else {
+                            array_slot(&Value::Array(holder), slot)?
+                        };
+                        self.call_value(&body, vec![lent])?;
+                        Ok(Value::Bool(true))
+                    }
+                }
+            }
             "__at_view" => {
                 let list = expect_array(&take(0))?;
                 let index = expect_number(&take(1))?;
@@ -3809,6 +3859,38 @@ fn key_positions(key: &Value) -> Result<Vec<usize>, Failure> {
         .iter()
         .map(|part| expect_number(&array_slot(part, 1)?).map(|index| index as usize))
         .collect()
+}
+
+/// B711 S3a: where a `MaybeKey` reaches in `value` — the array holding the
+/// place and the place's slot — or `None` where a variant step finds another
+/// variant (the walk `__mkey_reach` emits).
+#[allow(
+    clippy::type_complexity,
+    reason = "the holder and its slot, as the helper answers"
+)]
+fn maybe_key_place<'a>(
+    value: &Value<'a>,
+    key: &Value<'a>,
+) -> Result<Option<(Rc<RefCell<Vec<Value<'a>>>>, usize)>, Failure> {
+    let parts = array_slot(&array_slot(key, 0)?, 0)?;
+    let parts = expect_array(&parts)?.borrow().clone();
+    let mut value = value.clone();
+    for (at, part) in parts.iter().enumerate() {
+        let mut slot = expect_number(&array_slot(part, 1)?)? as usize;
+        let kind = array_slot(part, 3)?;
+        if expect_number(&array_slot(&kind, 0)?)? == 1.0 {
+            let tag = expect_number(&array_slot(&value, 0)?)? as usize;
+            if tag != slot {
+                return Ok(None);
+            }
+            slot = 1 + expect_number(&array_slot(&kind, 1)?)? as usize;
+        }
+        if at + 1 == parts.len() {
+            return Ok(Some((expect_array(&value)?, slot)));
+        }
+        value = array_slot(&value, slot)?;
+    }
+    Err(Failure::internal("a key with no steps".to_string()))
 }
 
 /// Slot `index` of an array value (B711's key walk).

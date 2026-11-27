@@ -46,6 +46,15 @@ fun payload<S, T>(key: Key<S, Option<T>>, subject: &S): Option<T> {
 	key.some().get(subject)
 }
 
+fun grown(): Top {
+	mut t = top();
+	Top.mid.inner::Some.w.change(&mut t, |w| {
+		w += 40;
+	});
+	Top.mid.deep::Some::Some.put(&mut t, 7);
+	t
+}
+
 fun describe(step: KeyStep): str {
 	i"{step.name()}:{step.index()}:{step.position().unwrap_or(9)}:{step.may_miss()}"
 }
@@ -104,6 +113,13 @@ fun main() {
 	print(Holder.pair.right::Err.get(&holder));
 	let direct: MaybeKey<Pair<i32>, i32> = Pair.left::Some;
 	print(direct.get(&holder.pair));
+	// `const`: a partial key folded, and a function using its continuations
+	let folded = const Top.mid.inner::Some.v::Some;
+	print(folded.get(&top()));
+	print(folded == c);
+	let made = const grown();
+	print(made.mid.inner.map(|inner| inner.w));
+	print(made.mid.deep);
 	// a miss through a composed key
 	t.mid.inner = None;
 	print(c.put(&mut t, 1));

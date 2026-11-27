@@ -612,3 +612,32 @@ fn maybe_keys_a_continuation_takes_a_closure_capturing_a_view() {
         "true\n13\n",
     );
 }
+
+/// A partial key folds in a `const` expression, and so does a function that
+/// reaches places through one (the const evaluator walks the key as the
+/// emitted helpers do).
+#[test]
+fn maybe_keys_fold_in_a_const_expression() {
+    maybe_runs(
+        r#"
+        fun grown(): Doc {
+            mut d = doc();
+            Doc.owner::Some.age.change(&mut d, |a| { a += 4; });
+            Doc.shape::Rect.1.put(&mut d, 9.0);
+            Doc.shape::Circle.put(&mut d, 1.0);
+            d
+        }
+
+        fun main() {
+            let key = const Doc.owner::Some.name;
+            print(key.get(&doc()));
+            print(const Doc.shape::Rect.0.name());
+            let d = const grown();
+            print(d.owner.map(|u| u.age));
+            match d.shape { Shape::Rect(let w, let h) => print(i"{w} {h}"), _ => {} }
+            print(const Doc.title::Some.get(&empty()));
+        }
+        "#,
+        "Some(\"ada\")\nshape::Rect.0\nSome(7)\n1 9\nNone\n",
+    );
+}

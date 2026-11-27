@@ -432,7 +432,9 @@ const KEY_ACCESS: &str = "__access";
 
 /// The positions of a `const` key's path, out of `std::key`'s layout (`[[parts]]`,
 /// each part `[owner, index, name]`).
-fn const_key_positions(items: &[vilan_core::interpreter::ConstValue]) -> Option<Vec<usize>> {
+fn const_key_steps(
+    items: &[vilan_core::interpreter::ConstValue],
+) -> Option<Vec<(usize, Option<usize>)>> {
     use vilan_core::interpreter::ConstValue;
     let [ConstValue::Array(path)] = items else {
         return None;
@@ -442,12 +444,28 @@ fn const_key_positions(items: &[vilan_core::interpreter::ConstValue]) -> Option<
     };
     parts
         .iter()
-        .map(|part| match part {
-            ConstValue::Array(step) => match step.get(1) {
-                Some(ConstValue::Number(index)) if *index >= 0.0 => Some(*index as usize),
+        .map(|part| {
+            let ConstValue::Array(step) = part else {
+                return None;
+            };
+            let index = match step.get(1) {
+                Some(ConstValue::Number(index)) if *index >= 0.0 => *index as usize,
+                _ => return None,
+            };
+            // `StepKind`: `[0]` a field, `[1, position, width]` a variant's
+            // payload slot (B711 S3a).
+            let slot = match step.get(3) {
+                Some(ConstValue::Array(kind)) => match kind.as_slice() {
+                    [ConstValue::Number(tag), ConstValue::Number(position), ..]
+                        if *tag == 1.0 && *position >= 0.0 =>
+                    {
+                        Some(*position as usize)
+                    }
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            };
+            Some((index, slot))
         })
         .collect()
 }
@@ -9703,17 +9721,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         // B711 S1b: a `const` key (`const Task.meta.owner`) is its path; its
         // access is rebuilt from the path's positions over its root type.
-        if self.program.maybe_key_struct_id == Some(struct_id) {
-            return Err(unsupported(
-                "a `const` `MaybeKey` (write the key literal where it is used)",
-                span,
-            ));
-        }
-        if self.program.key_struct_id == Some(struct_id) {
-            let positions = const_key_positions(items).ok_or_else(|| {
+        if self.program.key_struct_id == Some(struct_id)
+            || self.program.maybe_key_struct_id == Some(struct_id)
+        {
+            let positions = const_key_steps(items).ok_or_else(|| {
                 unsupported("a `const` key whose path this backend cannot read", span)
             })?;
-            let access = self.key_access_from_positions(arguments, &positions, span)?;
+            let access = self.key_access_from_positions(struct_id, arguments, &positions, span)?;
             fields.push(format!("{KEY_ACCESS}: {access}"));
         }
         Ok(format!("{name} {{ {} }}", fields.join(", ")))
@@ -11728,37 +11742,68 @@ impl<'a, 'src> Emitter<'a, 'src> {
         resolved
     }
 
-    /// A key's access from its path's POSITIONS alone (a `const` key), walking
-    /// the declared field types down from the root struct.
+    /// A key's access from its path's POSITIONS alone (a `const` key) — each
+    /// step's index, and a variant step's payload slot — walking the declared
+    /// field and payload types down from the root, for the key struct `kind`
+    /// (`Key` or `MaybeKey`).
     fn key_access_from_positions(
         &mut self,
+        kind: Id,
         arguments: &[TypeId],
-        positions: &[usize],
+        positions: &[(usize, Option<usize>)],
         span: Span,
     ) -> Result<String, Error> {
         let root = arguments
             .first()
             .copied()
             .ok_or_else(|| unsupported("a `Key` with no root type", span))?;
-        let root = self.deeply_resolved(root);
-        let mut owner = match self.resolve(root) {
-            Some(Type::Struct(struct_id, _)) => Some(*struct_id),
-            _ => None,
-        };
+        let mut reached = self.deeply_resolved(root);
         let mut steps = Vec::new();
-        for position in positions {
-            let struct_id =
-                owner.ok_or_else(|| unsupported("a `const` key through a non-struct", span))?;
-            steps.push(KeyLiteralStep::Field(struct_id, *position));
-            owner = self
-                .program
-                .structs
-                .get(&struct_id)
-                .and_then(|declaration| declaration.fields.get(*position))
-                .and_then(|field| match self.resolve(field.type_id) {
-                    Some(Type::Struct(next, _)) => Some(*next),
-                    _ => None,
-                });
+        for (index, slot) in positions {
+            let (step, generics, arguments, declared) =
+                match (self.resolve(reached).cloned(), slot) {
+                    (Some(Type::Struct(struct_id, arguments)), None) => {
+                        let declaration =
+                            self.program.structs.get(&struct_id).ok_or_else(|| {
+                                unsupported("a `const` key through a non-struct", span)
+                            })?;
+                        let field = declaration.fields.get(*index).ok_or_else(|| {
+                            unsupported("a `const` key step past its struct's fields", span)
+                        })?;
+                        (
+                            KeyLiteralStep::Field(struct_id, *index),
+                            declaration.generic_parameter_constraint_ids.clone(),
+                            arguments,
+                            field.type_id,
+                        )
+                    }
+                    (Some(Type::Enum(enum_id, arguments)), Some(slot)) => {
+                        let declaration =
+                            self.program.enums.get(&enum_id).ok_or_else(|| {
+                                unsupported("a `const` key through a non-enum", span)
+                            })?;
+                        let payload = declaration
+                            .variants
+                            .get(*index)
+                            .and_then(|variant| variant.data_type_ids.get(*slot))
+                            .copied()
+                            .ok_or_else(|| {
+                                unsupported("a `const` key step past its variant's payload", span)
+                            })?;
+                        (
+                            KeyLiteralStep::Variant(enum_id, *index, *slot),
+                            declaration.generic_parameter_constraint_ids.clone(),
+                            arguments,
+                            payload,
+                        )
+                    }
+                    _ => return Err(unsupported("a `const` key this backend cannot walk", span)),
+                };
+            steps.push(step);
+            reached = self.declared_under(&generics, &arguments, declared);
+        }
+        if self.program.maybe_key_struct_id == Some(kind) {
+            return self.maybe_key_literal_access(arguments, &steps, span);
         }
         let chain = self.key_field_chain(&steps, span)?;
         self.key_field_access(arguments, &chain, span)
