@@ -516,3 +516,183 @@ fn m211_a_half_typed_key_literal_completes_as_keys_in_a_keyless_file() {
         assert_eq!(title.detail.as_deref(), Some("Key<Task, str>"));
     });
 }
+
+// --- B711 S3a: `MaybeKey` and variant steps in the editor ------------------------
+
+const MAYBE_SOURCE: &str = "enum Shape {\n\t/// A round one.\n\tCircle(f64),\n\tRect(f64, f64),\n\tDot,\n}\n\n\
+     struct User {\n\tname: str,\n\tage: i32,\n}\n\n\
+     struct Doc {\n\ttitle: Option<str>,\n\towner: Option<User>,\n\tshape: Shape,\n}\n\n\
+     fun main() {\n\tmut d = Doc { title = None, owner = None, shape = Shape::Dot };\n\
+     \tlet k = Doc.owner::Some.name;\n\tlet w = Doc.shape::Rect.0;\n\tlet r = Doc.shape::Circle;\n\
+     \tprint(k.get(&d));\n\tprint(w.put(&mut d, 1.0));\n\tprint(r.name());\n}\n";
+
+/// `MAYBE_SOURCE` with `let k = ...;` replaced by `let k = <typed>;`, and the
+/// offset of the end of `<typed>`.
+fn typing_maybe(typed: &str) -> (Document, usize) {
+    let text = MAYBE_SOURCE.replace(
+        "let k = Doc.owner::Some.name;",
+        &format!("let k = {typed};"),
+    );
+    let at = text.find(&format!("{typed};")).expect("the typed key") + typed.len();
+    (analyzed(&text), at)
+}
+
+#[test]
+fn maybe_keys_a_file_using_partial_keys_analyzes_clean() {
+    on_big_stack(|| {
+        let document = analyzed(MAYBE_SOURCE);
+        assert!(document.diagnostics.is_empty(), "{:?}", messages(&document));
+    });
+}
+
+/// After `Doc.shape::` — the payload variants (not the unit `Dot`); after
+/// `Doc.title::` — `Some`.
+#[test]
+fn maybe_keys_completion_after_a_variant_separator_offers_the_payload_variants() {
+    on_big_stack(|| {
+        let (document, at) = typing_maybe("Doc.shape::");
+        assert_eq!(labels(&document, at), vec!["Circle", "Rect"]);
+        let (document, at) = typing_maybe("Doc.title::");
+        assert_eq!(labels(&document, at), vec!["Some"]);
+        // Past a variant step, another variant step: `Option<Option<..>>`
+        // is not here, so the payload `str` has none.
+        let (document, at) = typing_maybe("Doc.title::Some::");
+        assert!(labels(&document, at).is_empty());
+    });
+}
+
+/// After a variant whose payload has several slots, its positions; after a
+/// one-slot payload struct, its fields (as `MaybeKey`s) then the key's
+/// methods.
+#[test]
+fn maybe_keys_completion_after_a_variant_offers_positions_or_the_payload_fields() {
+    on_big_stack(|| {
+        let (document, at) = typing_maybe("Doc.shape::Rect.");
+        assert_eq!(labels(&document, at), vec!["0", "1"]);
+        let (document, at) = typing_maybe("Doc.owner::Some.");
+        let completed = document.completion(at);
+        assert_eq!(completed[0].label, "name");
+        assert_eq!(completed[0].detail.as_deref(), Some("MaybeKey<Doc, str>"));
+        let labels: Vec<&str> = completed
+            .iter()
+            .map(|candidate| candidate.label.as_str())
+            .collect();
+        for method in ["get", "view", "change", "put", "then", "name"] {
+            assert!(labels.contains(&method), "{method} in {labels:?}");
+        }
+    });
+}
+
+/// A variant step hovers as the key it spells, with its type, then the
+/// variant's `///`.
+#[test]
+fn maybe_keys_hover_on_a_variant_step_shows_the_key() {
+    on_big_stack(|| {
+        let document = analyzed(MAYBE_SOURCE);
+        let step =
+            MAYBE_SOURCE.find("Doc.shape::Circle").expect("the literal") + "Doc.shape::".len() + 1;
+        let hover = document.hover(step).expect("a hover on the step");
+        assert!(
+            hover.contains("Doc.shape::Circle: MaybeKey<Doc, f64>"),
+            "{hover}"
+        );
+        assert!(hover.contains("A round one."), "{hover}");
+        let past = MAYBE_SOURCE
+            .find("Doc.owner::Some.name")
+            .expect("the literal")
+            + "Doc.owner::Some.".len()
+            + 1;
+        let hover = document.hover(past).expect("a hover on the field past it");
+        assert!(
+            hover.contains("Doc.owner::Some.name: MaybeKey<Doc, str>"),
+            "{hover}"
+        );
+    });
+}
+
+/// Go to definition on a variant step lands on the variant.
+#[test]
+fn maybe_keys_definition_of_a_variant_step_is_its_variant() {
+    on_big_stack(|| {
+        let document = analyzed(MAYBE_SOURCE);
+        let step =
+            MAYBE_SOURCE.find("Doc.shape::Rect").expect("the literal") + "Doc.shape::".len() + 1;
+        let (_, variant) = document.definition(step).expect("the variant");
+        assert_eq!(
+            variant.start,
+            MAYBE_SOURCE
+                .find("Rect(f64, f64)")
+                .expect("the declaration")
+        );
+    });
+}
+
+/// A variant's references list its key literals, and a rename rewrites them;
+/// a field's rename reaches a field step past a variant step.
+#[test]
+fn maybe_keys_renaming_a_variant_or_a_field_rewrites_its_key_literals() {
+    on_big_stack(|| {
+        let document = analyzed(MAYBE_SOURCE);
+        let apply = |at: usize, to: &str| {
+            let edits = document
+                .rename_edits(at, to)
+                .unwrap_or_else(|refusal| panic!("{}", refusal.message()));
+            let mut spans: Vec<(usize, usize)> = edits
+                .iter()
+                .map(|(_, span, _)| (span.start, span.end))
+                .collect();
+            spans.sort_unstable();
+            let mut renamed = MAYBE_SOURCE.to_string();
+            for (start, end) in spans.into_iter().rev() {
+                renamed.replace_range(start..end, to);
+            }
+            renamed
+        };
+        let declaration = MAYBE_SOURCE.find("Rect(f64, f64)").expect("the variant");
+        let literal =
+            MAYBE_SOURCE.find("Doc.shape::Rect").expect("the literal") + "Doc.shape::".len();
+        let starts: Vec<usize> = document
+            .references(declaration)
+            .into_iter()
+            .map(|(_, span)| span.start)
+            .collect();
+        assert!(starts.contains(&literal), "{starts:?}");
+        let renamed = apply(declaration, "Box");
+        assert!(renamed.contains("Doc.shape::Box.0"), "{renamed}");
+        let after = analyzed(&renamed);
+        assert!(after.diagnostics.is_empty(), "{:?}", messages(&after));
+        let renamed = apply(MAYBE_SOURCE.find("name: str").expect("the field"), "label");
+        assert!(renamed.contains("Doc.owner::Some.label"), "{renamed}");
+        let after = analyzed(&renamed);
+        assert!(after.diagnostics.is_empty(), "{:?}", messages(&after));
+    });
+}
+
+/// Mid-edit: a variant step typed wrong is refused, then cleared when it is
+/// fixed; a half-typed `Doc.shape::` is refused and cleared too.
+#[test]
+fn maybe_keys_editing_a_variant_step_is_diagnosed_then_cleared() {
+    on_big_stack(|| {
+        let mut document = analyzed(MAYBE_SOURCE);
+        let at = MAYBE_SOURCE.find("Doc.shape::Rect").expect("the literal") + "Doc.shape::".len();
+        let broken = edited(&mut document, at, at + "Rect".len(), "Rec");
+        assert_eq!(
+            messages(&broken),
+            vec!["enum 'Shape' has no variant 'Rec'; did you mean `Rect`?".to_string()],
+        );
+        let mut broken = broken;
+        let fixed = edited(&mut broken, at, at + "Rec".len(), "Rect");
+        assert!(fixed.diagnostics.is_empty(), "{:?}", messages(&fixed));
+        let mut fixed = fixed;
+        let half = edited(&mut fixed, at, at + "Rect.0".len(), "");
+        assert_eq!(messages(&half).len(), 1, "{:?}", messages(&half));
+        assert!(
+            messages(&half)[0].starts_with("expected a variant name after `::`"),
+            "{:?}",
+            messages(&half)
+        );
+        let mut half = half;
+        let restored = edited(&mut half, at, at, "Rect.0");
+        assert!(restored.diagnostics.is_empty(), "{:?}", messages(&restored));
+    });
+}

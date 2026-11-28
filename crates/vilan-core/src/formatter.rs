@@ -8593,7 +8593,9 @@ impl<'src> Printer<'src> {
     fn print_postfix_suffix(&mut self, step: &Spanned<Node<'src>>) {
         match &step.0 {
             Node::MemberAccessor(_, member) => {
-                self.out.push('.');
+                if !matches!(member.0, Node::KeyVariant(..)) {
+                    self.out.push('.');
+                }
                 self.print_expr(member);
             }
             Node::Index(_, index) => {
@@ -9167,6 +9169,16 @@ impl<'src> Printer<'src> {
             return;
         }
         match &expr.0 {
+            // B711 S3a: a key's variant step, the member of its access —
+            // `::Rect.0` (the access prints no dot before it).
+            Node::KeyVariant((name, _), position) => {
+                self.out.push_str("::");
+                self.out.push_str(name);
+                if let Some((digits, _)) = position {
+                    self.out.push('.');
+                    self.out.push_str(digits);
+                }
+            }
             Node::Number(whole, fraction, suffix) => {
                 self.out.push_str(whole);
                 if let Some(fraction) = fraction {
@@ -9231,7 +9243,9 @@ impl<'src> Printer<'src> {
                 };
                 self.print_postfix_subject(subject);
                 self.leave_postfix_subject(entered);
-                self.out.push('.');
+                if !matches!(member.0, Node::KeyVariant(..)) {
+                    self.out.push('.');
+                }
                 // The callee of `list.push(…)` IS the member, so a permission
                 // dropped here never reaches the call's arguments — which made
                 // a method call's tail unreachable from statement level however
@@ -10283,6 +10297,19 @@ mod reformats {
         assert_eq!(format(source), expected);
         // The output must be a fixed point — formatting it again is a no-op.
         assert_eq!(format(expected), expected, "output is not idempotent");
+    }
+
+    /// B711 S3a: a key's variant step prints as written — `::` against its
+    /// field, the position against its variant — and spacing around the `::`
+    /// is normalized.
+    #[test]
+    fn a_key_variant_step_prints_against_its_field() {
+        let source = "fun main() {\n\tlet k = Doc.shape::Rect.0;\n\tlet n = Doc.owner::Some.name;\n\tprint(Doc.depth::Some::Some.get(&d));\n}\n";
+        assert_formats(source, source);
+        assert_formats(
+            "fun main() {\n\tlet k = Doc.shape :: Rect.0;\n}\n",
+            "fun main() {\n\tlet k = Doc.shape::Rect.0;\n}\n",
+        );
     }
 
     /// N141: an identity expectation over a source the formatter DECLINES is

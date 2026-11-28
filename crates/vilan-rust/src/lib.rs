@@ -66,7 +66,8 @@ use std::fmt::Write as _;
 
 use vilan_core::analyzer::{
     AdaptedInstance, Backing, BackingValue, ContinuationPath, CopyDecision, Expr, ExprIfBranch,
-    ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, Program, RENDER_MEMBER, TryDispatch,
+    ExprMatchLeg, ExprPattern, GenericDispatch, Intrinsic, KeyLiteralStep, Program, RENDER_MEMBER,
+    TryDispatch,
 };
 use vilan_core::captures::{mutates_its_receiver, reads_its_receiver_in_place};
 use vilan_core::error::Error;
@@ -431,7 +432,9 @@ const KEY_ACCESS: &str = "__access";
 
 /// The positions of a `const` key's path, out of `std::key`'s layout (`[[parts]]`,
 /// each part `[owner, index, name]`).
-fn const_key_positions(items: &[vilan_core::interpreter::ConstValue]) -> Option<Vec<usize>> {
+fn const_key_steps(
+    items: &[vilan_core::interpreter::ConstValue],
+) -> Option<Vec<(usize, Option<usize>)>> {
     use vilan_core::interpreter::ConstValue;
     let [ConstValue::Array(path)] = items else {
         return None;
@@ -441,12 +444,28 @@ fn const_key_positions(items: &[vilan_core::interpreter::ConstValue]) -> Option<
     };
     parts
         .iter()
-        .map(|part| match part {
-            ConstValue::Array(step) => match step.get(1) {
-                Some(ConstValue::Number(index)) if *index >= 0.0 => Some(*index as usize),
+        .map(|part| {
+            let ConstValue::Array(step) = part else {
+                return None;
+            };
+            let index = match step.get(1) {
+                Some(ConstValue::Number(index)) if *index >= 0.0 => *index as usize,
+                _ => return None,
+            };
+            // `StepKind`: `[0]` a field, `[1, position, width]` a variant's
+            // payload slot (B711 S3a).
+            let slot = match step.get(3) {
+                Some(ConstValue::Array(kind)) => match kind.as_slice() {
+                    [ConstValue::Number(tag), ConstValue::Number(position), ..]
+                        if *tag == 1.0 && *position >= 0.0 =>
+                    {
+                        Some(*position as usize)
+                    }
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            };
+            Some((index, slot))
         })
         .collect()
 }
@@ -3979,7 +3998,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
         // below (`Js`, `Json`) and every field walk leave it out, and its
         // `PartialEq` answers `true`, so the derived one compares the paths.
         let key_access = if self.program.key_struct_id == Some(id) {
-            Some(self.key_access_type(&entries, span))
+            Some(self.key_access_type(&entries, false, span))
+        } else if self.program.maybe_key_struct_id == Some(id) {
+            // S3a: a `MaybeKey`'s access answers `Option`.
+            Some(self.key_access_type(&entries, true, span))
         } else {
             None
         };
@@ -9699,11 +9721,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         }
         // B711 S1b: a `const` key (`const Task.meta.owner`) is its path; its
         // access is rebuilt from the path's positions over its root type.
-        if self.program.key_struct_id == Some(struct_id) {
-            let positions = const_key_positions(items).ok_or_else(|| {
+        if self.program.key_struct_id == Some(struct_id)
+            || self.program.maybe_key_struct_id == Some(struct_id)
+        {
+            let positions = const_key_steps(items).ok_or_else(|| {
                 unsupported("a `const` key whose path this backend cannot read", span)
             })?;
-            let access = self.key_access_from_positions(arguments, &positions, span)?;
+            let access = self.key_access_from_positions(struct_id, arguments, &positions, span)?;
             fields.push(format!("{KEY_ACCESS}: {access}"));
         }
         Ok(format!("{name} {{ {} }}", fields.join(", ")))
@@ -11482,8 +11506,10 @@ impl<'a, 'src> Emitter<'a, 'src> {
             self.current_substitution = saved;
             parts.push(format!("{name}: {}", rendered?));
         }
-        if self.program.key_struct_id == Some(struct_id) {
-            let access = self.composed_key_access(fields, depth, span)?;
+        if self.program.key_struct_id == Some(struct_id)
+            || self.program.maybe_key_struct_id == Some(struct_id)
+        {
+            let access = self.composed_key_access(struct_id, fields, depth, span)?;
             parts.push(format!("{KEY_ACCESS}: {access}"));
         }
         Ok(format!("{} {{ {} }}", instance.name, parts.join(", ")))
@@ -11492,10 +11518,11 @@ impl<'a, 'src> Emitter<'a, 'src> {
     // --- B711 S1b: struct keys natively (R11) ----------------------------------
 
     /// The Rust type of a `Key<S, F>` instance's access, `entries` its two
-    /// bindings.
+    /// bindings — a `MaybeKey`'s when `partial` (S3a).
     fn key_access_type(
         &mut self,
         entries: &[(TypeId, TypeId)],
+        partial: bool,
         span: Span,
     ) -> Result<String, Error> {
         let [(_, root), (_, field)] = entries else {
@@ -11506,11 +11533,13 @@ impl<'a, 'src> Emitter<'a, 'src> {
         };
         let root = self.rust_type(*root, span)?;
         let field = self.rust_type(*field, span)?;
-        Ok(format!("vilan_rt::KeyAccess<{root}, {field}>"))
+        let access = if partial { "MaybeAccess" } else { "KeyAccess" };
+        Ok(format!("vilan_rt::{access}<{root}, {field}>"))
     }
 
-    /// The `S` and `F` of a key-typed expression, as Rust types.
-    fn key_type_arguments(&mut self, key: Id, span: Span) -> Result<Vec<TypeId>, Error> {
+    /// The key struct (`Key` or `MaybeKey`) and the `S` and `F` of a
+    /// key-typed expression, as Rust types.
+    fn key_type_arguments(&mut self, key: Id, span: Span) -> Result<(Id, Vec<TypeId>), Error> {
         // A generic struct's literal (`Pair.left`) takes its arguments from
         // where it lands (R8), so its own record may be open where the
         // position's is not.
@@ -11527,24 +11556,29 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .ok_or_else(|| unsupported("a struct key of an unresolved type", span))?;
         match self.resolve(type_id) {
             Some(Type::Struct(struct_id, arguments))
-                if self.program.key_struct_id == Some(*struct_id) && arguments.len() == 2 =>
+                if (self.program.key_struct_id == Some(*struct_id)
+                    || self.program.maybe_key_struct_id == Some(*struct_id))
+                    && arguments.len() == 2 =>
             {
-                Ok(arguments.clone())
+                Ok((*struct_id, arguments.clone()))
             }
             _ => Err(unsupported("a struct key of an unresolved type", span)),
         }
     }
 
-    /// `.a.b` — the Rust field chain of a key's steps, each step the struct
-    /// that declares the field and the field's position.
-    fn key_field_chain(&self, steps: &[(Id, usize)], span: Span) -> Result<String, Error> {
+    /// `.a.b` — the Rust field chain of a TOTAL key's steps, each step the
+    /// struct that declares the field and the field's position.
+    fn key_field_chain(&self, steps: &[KeyLiteralStep], span: Span) -> Result<String, Error> {
         let mut chain = String::new();
-        for (owner, index) in steps {
-            let field = self
-                .program
-                .structs
-                .get(owner)
-                .and_then(|declaration| declaration.fields.get(*index))
+        for step in steps {
+            let field = step
+                .field()
+                .and_then(|(owner, index)| {
+                    self.program
+                        .structs
+                        .get(&owner)
+                        .and_then(|declaration| declaration.fields.get(index))
+                })
                 .ok_or_else(|| unsupported("a struct key step past its struct's fields", span))?;
             let _ = write!(chain, ".{}", sanitize(field.name));
         }
@@ -11574,56 +11608,235 @@ impl<'a, 'src> Emitter<'a, 'src> {
         ))
     }
 
-    /// A key's access from its path's POSITIONS alone (a `const` key), walking
-    /// the declared field types down from the root struct.
-    fn key_access_from_positions(
+    /// B711 S3a: the access of a `MaybeKey` literal over `S` (`arguments` =
+    /// `[S, F]`): two non-capturing functions, each the field chain with a
+    /// `match` at every variant step — `|subject| match &subject.shape {
+    /// Shape::Rect(__slot0, ..) => Some(&(*__slot0)), _ => None }` — so a
+    /// literal allocates nothing for it. A TOTAL literal held as a `MaybeKey`
+    /// is its plain access, wrapped.
+    fn maybe_key_literal_access(
         &mut self,
         arguments: &[TypeId],
-        positions: &[usize],
+        steps: &[KeyLiteralStep],
+        span: Span,
+    ) -> Result<String, Error> {
+        let [root, field] = arguments else {
+            return Err(unsupported(
+                "a `MaybeKey` whose type arguments are not two",
+                span,
+            ));
+        };
+        if !vilan_core::analyzer::key_steps_are_partial(steps) {
+            let chain = self.key_field_chain(steps, span)?;
+            let total = self.key_field_access(arguments, &chain, span)?;
+            return Ok(format!("vilan_rt::MaybeAccess::Total({total})"));
+        }
+        let (root, field) = (*root, *field);
+        let read = self.maybe_key_probe(root, steps, false, span)?;
+        let write = self.maybe_key_probe(root, steps, true, span)?;
+        let root = self.rust_type(root, span)?;
+        let field = self.rust_type(field, span)?;
+        Ok(format!(
+            "vilan_rt::MaybeAccess::<{root}, {field}>::field(|subject| {read}, |subject| {write})"
+        ))
+    }
+
+    /// The body of one `MaybeKey` projection over `subject` (of type `root`):
+    /// an `Option<&F>` (`Option<&mut F>` when `mutable`).
+    fn maybe_key_probe(
+        &mut self,
+        root: TypeId,
+        steps: &[KeyLiteralStep],
+        mutable: bool,
+        span: Span,
+    ) -> Result<String, Error> {
+        let borrow = if mutable { "&mut " } else { "&" };
+        // Each `match` opens around what follows it; the closers are written
+        // at the end, innermost first.
+        let mut out = String::new();
+        let mut closers: Vec<&str> = Vec::new();
+        let mut place = "(*subject)".to_string();
+        let mut reached = self.deeply_resolved(root);
+        for (depth, step) in steps.iter().enumerate() {
+            match *step {
+                KeyLiteralStep::Field(owner, index) => {
+                    let (name, declared, generics) = self
+                        .program
+                        .structs
+                        .get(&owner)
+                        .and_then(|declaration| {
+                            let field = declaration.fields.get(index)?;
+                            Some((
+                                field.name,
+                                field.type_id,
+                                declaration.generic_parameter_constraint_ids.clone(),
+                            ))
+                        })
+                        .ok_or_else(|| {
+                            unsupported("a struct key step past its struct's fields", span)
+                        })?;
+                    let arguments = match self.resolve(reached) {
+                        Some(Type::Struct(_, arguments)) => arguments.clone(),
+                        _ => Vec::new(),
+                    };
+                    reached = self.declared_under(&generics, &arguments, declared);
+                    let _ = write!(place, ".{}", sanitize(name));
+                }
+                KeyLiteralStep::Variant(owner, variant, slot) => {
+                    let (generics, declared, width) = self
+                        .program
+                        .enums
+                        .get(&owner)
+                        .and_then(|declaration| {
+                            let payload = &declaration.variants.get(variant)?.data_type_ids;
+                            Some((
+                                declaration.generic_parameter_constraint_ids.clone(),
+                                *payload.get(slot)?,
+                                payload.len(),
+                            ))
+                        })
+                        .ok_or_else(|| {
+                            unsupported("a variant key step past its variant's payload", span)
+                        })?;
+                    let arguments = match self.resolve(reached) {
+                        Some(Type::Enum(_, arguments)) => arguments.clone(),
+                        _ => Vec::new(),
+                    };
+                    let path = self.variant_path(owner, variant, &arguments, span)?;
+                    let binding = format!("__slot{depth}");
+                    let mut slots: Vec<String> = (0..slot).map(|_| "_".to_string()).collect();
+                    slots.push(binding.clone());
+                    if slot + 1 < width {
+                        slots.push("..".to_string());
+                    }
+                    let _ = write!(
+                        out,
+                        "match {borrow}{place} {{ {path}({}) => ",
+                        slots.join(", ")
+                    );
+                    closers.push(", _ => None }");
+                    reached = self.declared_under(&generics, &arguments, declared);
+                    place = format!("(*{binding})");
+                }
+            }
+        }
+        let _ = write!(out, "Some({borrow}{place})");
+        for closer in closers.iter().rev() {
+            out.push_str(closer);
+        }
+        Ok(out)
+    }
+
+    /// A field's or payload slot's declared type, under its declaration's
+    /// `generics` bound to `arguments`, resolved.
+    fn declared_under(
+        &mut self,
+        generics: &[TypeId],
+        arguments: &[TypeId],
+        declared: TypeId,
+    ) -> TypeId {
+        let entries = self.nominal_entries(generics, arguments);
+        let saved = self.enter_substitution(entries);
+        let resolved = self.deeply_resolved(declared);
+        self.current_substitution = saved;
+        resolved
+    }
+
+    /// A key's access from its path's POSITIONS alone (a `const` key) — each
+    /// step's index, and a variant step's payload slot — walking the declared
+    /// field and payload types down from the root, for the key struct `kind`
+    /// (`Key` or `MaybeKey`).
+    fn key_access_from_positions(
+        &mut self,
+        kind: Id,
+        arguments: &[TypeId],
+        positions: &[(usize, Option<usize>)],
         span: Span,
     ) -> Result<String, Error> {
         let root = arguments
             .first()
             .copied()
             .ok_or_else(|| unsupported("a `Key` with no root type", span))?;
-        let root = self.deeply_resolved(root);
-        let mut owner = match self.resolve(root) {
-            Some(Type::Struct(struct_id, _)) => Some(*struct_id),
-            _ => None,
-        };
+        let mut reached = self.deeply_resolved(root);
         let mut steps = Vec::new();
-        for position in positions {
-            let struct_id =
-                owner.ok_or_else(|| unsupported("a `const` key through a non-struct", span))?;
-            steps.push((struct_id, *position));
-            owner = self
-                .program
-                .structs
-                .get(&struct_id)
-                .and_then(|declaration| declaration.fields.get(*position))
-                .and_then(|field| match self.resolve(field.type_id) {
-                    Some(Type::Struct(next, _)) => Some(*next),
-                    _ => None,
-                });
+        for (index, slot) in positions {
+            let (step, generics, arguments, declared) =
+                match (self.resolve(reached).cloned(), slot) {
+                    (Some(Type::Struct(struct_id, arguments)), None) => {
+                        let declaration =
+                            self.program.structs.get(&struct_id).ok_or_else(|| {
+                                unsupported("a `const` key through a non-struct", span)
+                            })?;
+                        let field = declaration.fields.get(*index).ok_or_else(|| {
+                            unsupported("a `const` key step past its struct's fields", span)
+                        })?;
+                        (
+                            KeyLiteralStep::Field(struct_id, *index),
+                            declaration.generic_parameter_constraint_ids.clone(),
+                            arguments,
+                            field.type_id,
+                        )
+                    }
+                    (Some(Type::Enum(enum_id, arguments)), Some(slot)) => {
+                        let declaration =
+                            self.program.enums.get(&enum_id).ok_or_else(|| {
+                                unsupported("a `const` key through a non-enum", span)
+                            })?;
+                        let payload = declaration
+                            .variants
+                            .get(*index)
+                            .and_then(|variant| variant.data_type_ids.get(*slot))
+                            .copied()
+                            .ok_or_else(|| {
+                                unsupported("a `const` key step past its variant's payload", span)
+                            })?;
+                        (
+                            KeyLiteralStep::Variant(enum_id, *index, *slot),
+                            declaration.generic_parameter_constraint_ids.clone(),
+                            arguments,
+                            payload,
+                        )
+                    }
+                    _ => return Err(unsupported("a `const` key this backend cannot walk", span)),
+                };
+            steps.push(step);
+            reached = self.declared_under(&generics, &arguments, declared);
+        }
+        if self.program.maybe_key_struct_id == Some(kind) {
+            return self.maybe_key_literal_access(arguments, &steps, span);
         }
         let chain = self.key_field_chain(&steps, span)?;
         self.key_field_access(arguments, &chain, span)
     }
 
-    /// A key LITERAL (`Task.meta.owner`) as a value: `std::key`'s layout —
-    /// the path that is its identity — and its access, two non-capturing
-    /// functions over the field chain.
-    fn key_literal(&mut self, id: Id, steps: &[(Id, usize)], span: Span) -> Result<String, Error> {
-        let arguments = self.key_type_arguments(id, span)?;
-        let key_id = self
-            .program
-            .key_struct_id
-            .ok_or_else(|| unsupported("a struct key without `std::key`", span))?;
-        let key = self.ensure_struct(key_id, &arguments, span)?.name;
+    /// A key LITERAL (`Task.meta.owner`, `Doc.shape::Rect.0`) as a value:
+    /// `std::key`'s layout — the path that is its identity — and its access,
+    /// two non-capturing functions over the field chain (with a `match` at
+    /// each variant step for a `MaybeKey`).
+    fn key_literal(
+        &mut self,
+        id: Id,
+        steps: &[KeyLiteralStep],
+        span: Span,
+    ) -> Result<String, Error> {
+        let (kind, arguments) = self.key_type_arguments(id, span)?;
+        self.key_literal_of(kind, &arguments, steps, span)
+    }
+
+    /// [`Self::key_literal`] at a known key struct (`Key` or `MaybeKey`) and
+    /// its `[S, F]`.
+    fn key_literal_of(
+        &mut self,
+        kind: Id,
+        arguments: &[TypeId],
+        steps: &[KeyLiteralStep],
+        span: Span,
+    ) -> Result<String, Error> {
+        let key = self.ensure_struct(kind, arguments, span)?.name;
         let path_id = self
             .program
             .structs
-            .get(&key_id)
+            .get(&kind)
             .and_then(|declaration| declaration.fields.first())
             .and_then(|field| match self.resolve(field.type_id) {
                 Some(Type::Struct(path_id, _)) => Some(*path_id),
@@ -11644,24 +11857,58 @@ impl<'a, 'src> Emitter<'a, 'src> {
                 _ => None,
             })
             .ok_or_else(|| unsupported("a `KeyPath` whose steps are no list of structs", span))?;
+        // `KeyStep`'s fourth field, std's `StepKind`.
+        let step_kind_id = self
+            .program
+            .structs
+            .get(&step_id)
+            .and_then(|declaration| declaration.fields.get(3))
+            .and_then(|field| match self.resolve(field.type_id) {
+                Some(Type::Enum(kind_id, _)) => Some(*kind_id),
+                _ => None,
+            })
+            .ok_or_else(|| unsupported("a `KeyStep` with no step kind", span))?;
         let path = self.ensure_struct(path_id, &[], span)?.name;
         let step = self.ensure_struct(step_id, &[], span)?.name;
         let mut parts = Vec::new();
-        for (owner, index) in steps {
-            let name = self
-                .program
-                .structs
-                .get(owner)
-                .and_then(|declaration| declaration.fields.get(*index))
-                .map_or("", |field| field.name);
+        for literal_step in steps {
+            let (index, name, kind) = match *literal_step {
+                KeyLiteralStep::Field(owner, index) => (
+                    index,
+                    self.program
+                        .structs
+                        .get(&owner)
+                        .and_then(|declaration| declaration.fields.get(index))
+                        .map_or("", |field| field.name),
+                    self.variant_path(step_kind_id, 0, &[], span)?,
+                ),
+                KeyLiteralStep::Variant(owner, variant, slot) => {
+                    let declared = self
+                        .program
+                        .enums
+                        .get(&owner)
+                        .and_then(|declaration| declaration.variants.get(variant));
+                    let width = declared.map_or(1, |declared| declared.data_type_ids.len());
+                    let kind_path = self.variant_path(step_kind_id, 1, &[], span)?;
+                    (
+                        variant,
+                        declared.map_or("", |declared| declared.name),
+                        format!("{kind_path}({slot}usize, {width}usize)"),
+                    )
+                }
+            };
             parts.push(format!(
-                "{step} {{ owner: vilan_rt::str_new({}), index: {index}usize, name: vilan_rt::str_new({}) }}",
-                rust_literal(&self.program.key_step_owner(*owner)),
+                "{step} {{ owner: vilan_rt::str_new({}), index: {index}usize, name: vilan_rt::str_new({}), kind: {kind} }}",
+                rust_literal(&self.program.key_step_owner(literal_step.owner())),
                 rust_literal(name),
             ));
         }
-        let chain = self.key_field_chain(steps, span)?;
-        let access = self.key_field_access(&arguments, &chain, span)?;
+        let access = if self.program.maybe_key_struct_id == Some(kind) {
+            self.maybe_key_literal_access(arguments, steps, span)?
+        } else {
+            let chain = self.key_field_chain(steps, span)?;
+            self.key_field_access(arguments, &chain, span)?
+        };
         let value = format!(
             "{key} {{ erased: {path} {{ parts: vec![{}] }}, {KEY_ACCESS}: {access} }}",
             parts.join(", ")
@@ -11705,13 +11952,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
             .then(|| format!("{name}_lent()"))
     }
 
-    /// The access of the one `Key` literal std writes: `then`'s `Key { erased
-    /// = self.erased.then(next.erased) }`. The path is composed by std's code,
-    /// and the access composes the same two keys' accesses, in the same
-    /// order, so the two cannot disagree (K5). A `Key` built any other way has
-    /// no access to give it, and is refused by name.
+    /// The access of the key literals std writes, `kind` the struct built
+    /// (`Key` or `MaybeKey`): `then`'s `Key { erased =
+    /// self.erased.then(next.erased) }` (and `MaybeKey`'s twin), whose access
+    /// composes the same two keys' accesses in the same order, so path and
+    /// access cannot disagree (K5); and `maybe()`'s `MaybeKey { erased =
+    /// self.erased }`, a total key's access wrapped. A key built any other way
+    /// has no access to give it, and is refused by name.
     fn composed_key_access(
         &mut self,
+        kind: Id,
         fields: &[(usize, Id)],
         depth: usize,
         span: Span,
@@ -11720,6 +11970,21 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let Some(&(_, erased)) = fields.iter().find(|(index, _)| *index == 0) else {
             return Err(refused());
         };
+        let is_key = |struct_id: Id| {
+            self.program.key_struct_id == Some(struct_id)
+                || self.program.maybe_key_struct_id == Some(struct_id)
+        };
+        let partial = self.program.maybe_key_struct_id == Some(kind);
+        // `maybe()`: the erased path of a total key, read as is.
+        if partial
+            && let Some(&Expr::Field(key, struct_id, 0)) = self.program.entity_map.get(&erased)
+            && self.program.key_struct_id == Some(struct_id)
+        {
+            let key = self.expecting_nothing(|emitter| emitter.expression(key, depth))?;
+            return Ok(format!(
+                "vilan_rt::MaybeAccess::total(&({key}).{KEY_ACCESS})"
+            ));
+        }
         let Some(&Expr::Call(call_id)) = self.program.entity_map.get(&erased) else {
             return Err(refused());
         };
@@ -11734,7 +11999,7 @@ impl<'a, 'src> Emitter<'a, 'src> {
             else {
                 return Err(refused());
             };
-            if self.program.key_struct_id != Some(struct_id) {
+            if !is_key(struct_id) {
                 return Err(refused());
             }
             halves.push(self.expecting_nothing(|emitter| emitter.expression(key, depth))?);
@@ -11742,15 +12007,16 @@ impl<'a, 'src> Emitter<'a, 'src> {
         let [first, next] = halves.as_slice() else {
             return Err(refused());
         };
+        let access = if partial { "MaybeAccess" } else { "KeyAccess" };
         Ok(format!(
-            "vilan_rt::KeyAccess::then(&({first}).{KEY_ACCESS}, &({next}).{KEY_ACCESS})"
+            "vilan_rt::{access}::then(&({first}).{KEY_ACCESS}, &({next}).{KEY_ACCESS})"
         ))
     }
 
     /// The field positions of a key subscript's index when it is written as a
     /// key LITERAL (`s[Task.meta.owner]`) — the place is then the plain field
     /// chain, as on JS. `None` for a key held in a value.
-    fn key_literal_steps(&self, index: Id) -> Option<Vec<(Id, usize)>> {
+    fn key_literal_steps(&self, index: Id) -> Option<Vec<KeyLiteralStep>> {
         let mut current = index;
         while let Some(Expr::Ascribe(inner)) = self.program.entity_map.get(&current) {
             current = *inner;
@@ -17304,7 +17570,12 @@ impl<'a, 'src> Emitter<'a, 'src> {
             &Expr::Index(subject, index) if self.program.key_subscripts.contains(&id) => {
                 let steps = self.key_literal_steps(index)?;
                 let (binding, mut path) = self.place_spine(subject)?;
-                path.extend(steps.iter().map(|(_, position)| *position));
+                path.extend(
+                    steps
+                        .iter()
+                        .filter_map(|step| step.field())
+                        .map(|(_, position)| position),
+                );
                 Some((binding, path))
             }
             _ => None,
@@ -19030,6 +19301,17 @@ impl<'a, 'src> Emitter<'a, 'src> {
         if matches!(intrinsic, Intrinsic::ListToArray) {
             return self.list_to_array(argument_ids, call, depth, span);
         }
+        // B711 S3a: a `MaybeKey`'s continuations and `option_some`'s key.
+        if matches!(
+            intrinsic,
+            Intrinsic::MaybeKeyGet
+                | Intrinsic::MaybeKeyView
+                | Intrinsic::MaybeKeyChange
+                | Intrinsic::MaybeKeyPut
+                | Intrinsic::OptionSomeKey
+        ) {
+            return self.maybe_key_intrinsic(intrinsic, argument_ids, call, depth, span);
+        }
         // B711 S1c: a tuple key's position.
         if matches!(intrinsic, Intrinsic::TupleKeyIndex) {
             let Some(&key) = argument_ids.first() else {
@@ -19225,6 +19507,81 @@ impl<'a, 'src> Emitter<'a, 'src> {
             });
         }
         self.intrinsic(intrinsic, arguments, span)
+    }
+
+    /// B711 S3a: `k.get(&s)`, `k.view(&s, body)`, `k.change(&mut s, body)`,
+    /// `k.put(&mut s, v)` over the key's [`vilan_rt::MaybeAccess`], and
+    /// `option_some<T>()`'s key literal. The key's access and the third
+    /// argument are settled BEFORE the subject is borrowed — a closure that
+    /// reads the subject copies it where it is made, and a key the subject
+    /// holds is read before the subject is lent — so the call borrows only
+    /// the subject. A literal key lends its per-thread value, copying nothing.
+    fn maybe_key_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        argument_ids: &[Id],
+        call: Option<Id>,
+        depth: usize,
+        span: Span,
+    ) -> Result<String, Error> {
+        if matches!(intrinsic, Intrinsic::OptionSomeKey) {
+            let call = call.ok_or_else(|| unsupported("`option_some` outside a call", span))?;
+            let option = self
+                .program
+                .option_enum_id
+                .ok_or_else(|| unsupported("`option_some` without `std::option`", span))?;
+            let (kind, arguments) = self.key_type_arguments(call, span)?;
+            return self.key_literal_of(
+                kind,
+                &arguments,
+                &[KeyLiteralStep::Variant(option, 0, 0)],
+                span,
+            );
+        }
+        let [key, subject, rest @ ..] = argument_ids else {
+            return Err(unsupported("a `MaybeKey` call without its subject", span));
+        };
+        let mut prelude = String::new();
+        let key_text = self.expecting_nothing(|emitter| emitter.expression(*key, depth))?;
+        let access = match self.lent_key_literal(&key_text) {
+            Some(lent) => format!("&{lent}.{KEY_ACCESS}"),
+            None => {
+                let _ = write!(
+                    prelude,
+                    "let __access = ({key_text}).{KEY_ACCESS}.clone(); "
+                );
+                "&__access".to_string()
+            }
+        };
+        let third = match (intrinsic, rest.first()) {
+            (Intrinsic::MaybeKeyGet, _) => None,
+            (Intrinsic::MaybeKeyPut, Some(value)) => {
+                let value = self.consumed_value_of_expecting(*value, None, depth)?;
+                let _ = write!(prelude, "let __value = {value}; ");
+                Some("__value".to_string())
+            }
+            (_, Some(body)) => {
+                let body = self.expecting_nothing(|emitter| emitter.value_of(*body, depth))?;
+                let _ = write!(prelude, "let __body = {body}; ");
+                Some("&*__body".to_string())
+            }
+            _ => return Err(unsupported("a `MaybeKey` call without its argument", span)),
+        };
+        let subject_text = self.expecting_nothing(|emitter| emitter.expression(*subject, depth))?;
+        let function = match intrinsic {
+            Intrinsic::MaybeKeyGet => "maybe_get",
+            Intrinsic::MaybeKeyView => "maybe_view",
+            Intrinsic::MaybeKeyChange => "maybe_change",
+            _ => "maybe_put",
+        };
+        let call_text = match third {
+            Some(third) => format!("vilan_rt::{function}({access}, {subject_text}, {third})"),
+            None => format!("vilan_rt::{function}({access}, {subject_text})"),
+        };
+        if prelude.is_empty() {
+            return Ok(call_text);
+        }
+        Ok(format!("{{ {prelude}{call_text} }}"))
     }
 
     /// The type an intrinsic's argument at `index` is expected to have, read

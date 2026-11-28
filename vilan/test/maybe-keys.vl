@@ -1,0 +1,66 @@
+// B711 S3a — keys to a place that may not be there (proposal/struct-keys.md
+// §3.4): `Doc.title::Some` and `Doc.shape::Rect.0` as `MaybeKey<Doc, F>`
+// values, reached by continuation (`get`, `view`, `change`, `put`), composed
+// and compared. The corpus gate compares emitted bytes, so what this pins is
+// the emission: a literal is one hoisted constant whose variant step carries
+// its kind (`[1, position, width]`), and each continuation walks the key
+// through `__mkey_reach`, which tests the variant's tag before it descends.
+import std::io::assert;
+
+enum Shape {
+	Circle(f64),
+	Rect(f64, f64),
+	Dot,
+}
+
+struct User {
+	name: str,
+	age: i32,
+}
+
+struct Doc {
+	title: Option<str>,
+	owner: Option<User>,
+	shape: Shape,
+}
+
+fun grow(d: &mut Doc, key: MaybeKey<Doc, f64>): bool {
+	key.change(d, |x| {
+		x = *x * 2.0;
+	})
+}
+
+fun main() {
+	mut d = Doc {
+		title = Some("a"),
+		owner = Some(User { name = "ada", age = 3 }),
+		shape = Shape::Rect(1.0, 2.0),
+	};
+	assert(Doc.title::Some.get(&d) == Some("a"), "an option's payload");
+	assert(Doc.owner::Some.name.get(&d) == Some("ada"), "a field past a variant step");
+	assert(Doc.shape::Circle.get(&d) == None, "another variant misses");
+	assert(Doc.shape::Rect.1.put(&mut d, 5.0), "a put where the place is");
+	assert(grow(&mut d, Doc.shape::Rect.0), "a held key lends its place");
+	assert(Doc.owner::Some.view(&d, |u| print(u.age)), "a view lends a struct");
+	assert(Doc.owner::Some.age.change(&mut d, |a| {
+		a += 1;
+	}), "a change writes in place");
+	match d.shape {
+		Shape::Rect(let w, let h) => print(i"{w} {h}"),
+		_ => print("moved"),
+	}
+	// composition and identity
+	let age: MaybeKey<Doc, i32> = Doc.owner.some().then(User.age);
+	assert(age == Doc.owner::Some.age, "equal paths, however written");
+	assert(age.starts_with(Doc.owner), "a variant step starts with its field");
+	assert(!Doc.shape::Rect.0.starts_with(Doc.shape::Rect.1), "two slots are disjoint");
+	print(age.get(&d));
+	print(Doc.shape::Rect.0.name());
+	print(age.debug());
+	// misses change nothing
+	d.title = None;
+	d.shape = Shape::Dot;
+	assert(!Doc.title::Some.put(&mut d, "b"), "a put never creates a place");
+	assert(!grow(&mut d, Doc.shape::Rect.0), "a miss lends nothing");
+	print(d.title);
+}

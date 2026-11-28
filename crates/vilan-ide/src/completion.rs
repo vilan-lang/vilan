@@ -28,6 +28,30 @@ use crate::analysis::{
 };
 
 /// N115: the engine's own pins, driven without a protocol layer.
+/// B711 S3a: where a key literal's steps arrive, for its completions.
+#[derive(Clone, Copy)]
+enum KeyReached {
+    /// A struct whose fields are its next steps.
+    Struct(Id),
+    /// An enum whose payload variants are its next (variant) steps.
+    Enum(Id),
+    /// A variant step's payload of this many slots, awaiting its position.
+    Positions(usize),
+    /// A type no step goes into.
+    Leaf,
+}
+
+/// B711: a key literal read off the live tokens ([`Analysis::key_chain`]).
+struct KeyChain {
+    /// The struct it is rooted at.
+    root: Id,
+    reached: KeyReached,
+    /// Whether a step may miss (a variant step): a `MaybeKey`.
+    partial: bool,
+    /// How many steps follow the root.
+    steps: usize,
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1765,7 +1789,9 @@ impl<'a, 'src> Analysis<'a, 'src> {
                 receiver_end,
                 lifted: false,
             } => self.member_completions(&tokens, receiver_end),
-            CursorContext::Path { path_start } => self.code_path_completions(text, path_start),
+            CursorContext::Path { path_start } => self
+                .key_variant_completions(&tokens, path_start)
+                .unwrap_or_else(|| self.code_path_completions(text, path_start)),
             _ => {
                 // An ordinary expression position: the cursor's own scope,
                 // resolved in ANALYZED space (E52) — `path_completions` needs
@@ -2310,97 +2336,49 @@ impl<'a, 'src> Analysis<'a, 'src> {
         receiver_end: usize,
     ) -> Option<Vec<Completion>> {
         let program = self.program;
-        let key_struct = program.key_struct_id?;
         let last = self.live_receiver_index(tokens, receiver_end)?;
-        // `Ident (. Ident)*`, the root first.
-        let mut names = Vec::new();
-        let mut root = last;
-        loop {
-            let Token::Ident(name) = tokens[root].0 else {
-                return None;
-            };
-            names.push(name);
-            if root >= 2
-                && matches!(tokens[root - 1].0, Token::Ctrl('.'))
-                && matches!(tokens[root - 2].0, Token::Ident(_))
-            {
-                root -= 2;
-                continue;
-            }
-            break;
-        }
-        names.reverse();
-        let declared = |binding: Id| match program.entity_map.get(&binding) {
-            Some(Expr::Struct(id)) => Some(*id),
-            _ if program.structs.contains_key(&binding) => Some(binding),
-            _ => None,
+        let chain = self.key_chain(tokens, last)?;
+        let key_struct = match chain.partial {
+            true => program.maybe_key_struct_id?,
+            false => program.key_struct_id?,
         };
-        let root_struct = match root.checked_sub(1).map(|before| &tokens[before].0) {
-            // A member of something else (`f().Task.`), never a root.
-            Some(Token::Ctrl('.')) => return None,
-            Some(Token::Op("::")) => {
-                let namespace = self.live_namespace_id(tokens, root.checked_sub(2)?, 0)?;
-                declared(self.namespace_entry_id(namespace, names[0])?)?
-            }
-            _ => {
-                let offset = self.to_analyzed_offset(tokens[root].1.into_range().end);
-                let binding = self.binding_in_scope(names[0], offset)?;
-                // R9: a value of the name is the value.
-                if self.same_file_variable(names[0], offset).is_some() {
-                    return None;
-                }
-                declared(binding)?
-            }
-        };
-        let key_step_struct = |struct_id: Id| {
-            program
-                .structs
-                .get(&struct_id)
-                .filter(|structure| !structure.external && !structure.resource)
-                .map(|_| struct_id)
-        };
-        let mut current = key_step_struct(root_struct);
-        for step in &names[1..] {
-            let field = current.and_then(|struct_id| {
-                program
-                    .structs
-                    .get(&struct_id)?
-                    .fields
-                    .iter()
-                    .find(|field| field.name == *step && self.field_is_a_member(struct_id, field))
-            });
-            let Some(field) = field else {
-                // Not a step the checker accepts: nothing to continue.
-                return Some(Vec::new());
-            };
-            current = match program.type_id_to_type_map.get(&field.type_id) {
-                Some(Type::Struct(next, _)) => key_step_struct(*next),
-                _ => None,
-            };
-        }
-        let root_label = self.struct_head_label(root_struct);
+        let root_label = self.struct_head_label(chain.root);
+        let key_name = if chain.partial { "MaybeKey" } else { "Key" };
         let mut items = Vec::new();
-        if let Some(struct_id) = current
-            && let Some(structure) = program.structs.get(&struct_id)
-        {
-            let source = program.source_of(struct_id);
-            for (index, field) in structure.fields.iter().enumerate() {
-                if !self.field_is_a_member(struct_id, field) {
-                    continue;
+        match chain.reached {
+            KeyReached::Struct(struct_id) => {
+                if let Some(structure) = program.structs.get(&struct_id) {
+                    let source = program.source_of(struct_id);
+                    for (index, field) in structure.fields.iter().enumerate() {
+                        if !self.field_is_a_member(struct_id, field) {
+                            continue;
+                        }
+                        let mut completion =
+                            Completion::bare(field.name.to_string(), CompletionKind::Field);
+                        completion.detail = self
+                            .field_type_label(struct_id, index, field.name)
+                            .map(|field_type| format!("{key_name}<{root_label}, {field_type}>"));
+                        completion.documentation = source.and_then(|source| {
+                            self.doc_first_paragraph_at(source, field.name_span.into_range().start)
+                        });
+                        completion.internal = field.internal.map(str::to_string);
+                        items.push(completion);
+                    }
                 }
-                let mut completion =
-                    Completion::bare(field.name.to_string(), CompletionKind::Field);
-                completion.detail = self
-                    .field_type_label(struct_id, index, field.name)
-                    .map(|field_type| format!("Key<{root_label}, {field_type}>"));
-                completion.documentation = source.and_then(|source| {
-                    self.doc_first_paragraph_at(source, field.name_span.into_range().start)
-                });
-                completion.internal = field.internal.map(str::to_string);
-                items.push(completion);
             }
+            // S3a: `Doc.shape::Rect.` — the payload's positions, one slot at
+            // a time.
+            KeyReached::Positions(width) => {
+                for position in 0..width {
+                    let mut completion =
+                        Completion::bare(position.to_string(), CompletionKind::Field);
+                    completion.detail = Some(format!("payload position {position}"));
+                    items.push(completion);
+                }
+            }
+            KeyReached::Enum(_) | KeyReached::Leaf => {}
         }
-        if names.len() > 1 {
+        if chain.steps > 0 && !matches!(chain.reached, KeyReached::Positions(_)) {
             let offered: HashSet<String> = items.iter().map(|item| item.label.clone()).collect();
             items.extend(
                 self.nominal_member_completions(key_struct, None)
@@ -2409,6 +2387,258 @@ impl<'a, 'src> Analysis<'a, 'src> {
             );
         }
         Some(items)
+    }
+
+    /// B711 S3a: the candidates after a key literal's `::` — `Doc.title::`,
+    /// `Doc.shape::` — the reached enum's variants that hold a value, each a
+    /// variant step (`MaybeKey`). `None` where the `::` ends no key chain,
+    /// which is then the ordinary path position.
+    fn key_variant_completions(
+        &self,
+        tokens: &[(Token<'_>, Span)],
+        path_start: usize,
+    ) -> Option<Vec<Completion>> {
+        let program = self.program;
+        let separator = tokens.iter().rposition(|(token, span)| {
+            matches!(token, Token::Op("::")) && span.into_range().start == path_start
+        })?;
+        let last = separator.checked_sub(1)?;
+        // A variant step follows a member or another variant step: a chain
+        // of at least one step.
+        let chain = self.key_chain(tokens, last)?;
+        if chain.steps == 0 {
+            return None;
+        }
+        let KeyReached::Enum(enum_id) = chain.reached else {
+            return Some(Vec::new());
+        };
+        let enumeration = program.enums.get(&enum_id)?;
+        let label = program.declaration_labels.get(&enum_id);
+        let mut items = Vec::new();
+        for (index, variant) in enumeration.variants.iter().enumerate() {
+            if variant.data_type_ids.is_empty() || !self.variant_is_a_member(enum_id, variant) {
+                continue;
+            }
+            let mut completion =
+                Completion::bare(variant.name.to_string(), CompletionKind::EnumVariant);
+            completion.detail = label
+                .and_then(|label| label.lines().nth(index + 1))
+                .map(|line| format!("variant step: {}", line.trim().trim_end_matches(',')));
+            items.push(completion);
+        }
+        Some(items)
+    }
+
+    /// Whether `variant` of `enum_id` is a member here: std's `[internal]`
+    /// variants are none outside std.
+    fn variant_is_a_member(
+        &self,
+        enum_id: Id,
+        variant: &vilan_core::analyzer::EnumVariantDeclaration<'_>,
+    ) -> bool {
+        vilan_core::labels::internal_field_out_of_reach(
+            variant.internal,
+            self.program.source_of(enum_id),
+            Some(self.focus),
+            &self.program.std_sources,
+        )
+        .is_none()
+    }
+
+    /// B711: the key literal whose LAST token is `tokens[last]`, read off the
+    /// live tokens — `Ident ( . Ident | . Number | :: Ident )*` whose root
+    /// names a struct TYPE (not a value in scope, R9; `model::Task` too) —
+    /// and where its steps arrive, under the checker's rules for a step
+    /// (`resolve_key_step`, `resolve_key_variant_step`). `None` for any other
+    /// receiver.
+    fn key_chain(&self, tokens: &[(Token<'_>, Span)], last: usize) -> Option<KeyChain> {
+        let program = self.program;
+        // The steps, last first; the root is the first identifier not led by
+        // a `.` or a step's `::`.
+        enum Written<'t> {
+            Field(&'t str),
+            Position(usize),
+            Variant(&'t str),
+        }
+        let mut written = Vec::new();
+        let mut at = last;
+        let root = loop {
+            match &tokens[at].0 {
+                Token::Ident(name) => {
+                    let joined_by_dot = at >= 2 && matches!(tokens[at - 1].0, Token::Ctrl('.'));
+                    // `x.a::V`: a `::` after a step's member is a variant
+                    // step; after a bare root it is a path (`model::Task`).
+                    let joined_by_path = at >= 2
+                        && matches!(tokens[at - 1].0, Token::Op("::"))
+                        && self.key_step_before_path(tokens, at - 1);
+                    if joined_by_dot {
+                        written.push(Written::Field(name));
+                        at -= 2;
+                    } else if joined_by_path {
+                        written.push(Written::Variant(name));
+                        at -= 2;
+                    } else {
+                        break (at, *name);
+                    }
+                }
+                Token::Number(whole, None, None)
+                    if at >= 2 && matches!(tokens[at - 1].0, Token::Ctrl('.')) =>
+                {
+                    written.push(Written::Position(whole.parse().ok()?));
+                    at -= 2;
+                }
+                _ => return None,
+            }
+        };
+        let (root_index, root_name) = root;
+        written.reverse();
+        let declared = |binding: Id| match program.entity_map.get(&binding) {
+            Some(Expr::Struct(id)) => Some(*id),
+            _ if program.structs.contains_key(&binding) => Some(binding),
+            _ => None,
+        };
+        let root_struct = match root_index.checked_sub(1).map(|before| &tokens[before].0) {
+            // A member of something else (`f().Task.`), never a root.
+            Some(Token::Ctrl('.')) => return None,
+            Some(Token::Op("::")) => {
+                let namespace = self.live_namespace_id(tokens, root_index.checked_sub(2)?, 0)?;
+                declared(self.namespace_entry_id(namespace, root_name)?)?
+            }
+            _ => {
+                let offset = self.to_analyzed_offset(tokens[root_index].1.into_range().end);
+                let binding = self.binding_in_scope(root_name, offset)?;
+                // R9: a value of the name is the value.
+                if self.same_file_variable(root_name, offset).is_some() {
+                    return None;
+                }
+                declared(binding)?
+            }
+        };
+        let step_struct = |struct_id: Id| {
+            program
+                .structs
+                .get(&struct_id)
+                .filter(|structure| !structure.external && !structure.resource)
+                .map(|_| struct_id)
+        };
+        let mut reached = match step_struct(root_struct) {
+            Some(struct_id) => KeyReached::Struct(struct_id),
+            None => KeyReached::Leaf,
+        };
+        // A variant step whose payload has several slots waits for its
+        // position: the enum and variant it named.
+        let mut pending: Option<(Id, usize)> = None;
+        let mut partial = false;
+        // The reached declaration's parameters and the arguments it is at, so
+        // a generic field or payload (`Option<User>`'s `T`) reads as its
+        // argument.
+        let mut generics: Vec<TypeId> = Vec::new();
+        let mut arguments: Vec<TypeId> = Vec::new();
+        for step in &written {
+            let type_id = match (step, &reached, pending.take()) {
+                (Written::Position(position), _, Some((enum_id, variant))) => program
+                    .enums
+                    .get(&enum_id)?
+                    .variants
+                    .get(variant)?
+                    .data_type_ids
+                    .get(*position)
+                    .copied(),
+                (Written::Field(name), KeyReached::Struct(struct_id), None) => program
+                    .structs
+                    .get(struct_id)?
+                    .fields
+                    .iter()
+                    .find(|field| field.name == *name && self.field_is_a_member(*struct_id, field))
+                    .map(|field| field.type_id),
+                (Written::Variant(name), KeyReached::Enum(enum_id), None) => {
+                    let enum_id = *enum_id;
+                    let (index, variant) = program
+                        .enums
+                        .get(&enum_id)?
+                        .variants
+                        .iter()
+                        .enumerate()
+                        .find(|(_, variant)| {
+                            variant.name == *name && self.variant_is_a_member(enum_id, variant)
+                        })?;
+                    partial = true;
+                    match variant.data_type_ids.as_slice() {
+                        [] => None,
+                        [only] => Some(*only),
+                        many => {
+                            pending = Some((enum_id, index));
+                            reached = KeyReached::Positions(many.len());
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let type_id = type_id.map(|type_id| match program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Generic(constraint)) => generics
+                    .iter()
+                    .position(|parameter| parameter == constraint || *parameter == type_id)
+                    .and_then(|at| arguments.get(at).copied())
+                    .unwrap_or(type_id),
+                _ => type_id,
+            });
+            // Not a step the checker accepts: nothing to continue.
+            let Some(type_id) = type_id else {
+                return Some(KeyChain {
+                    root: root_struct,
+                    reached: KeyReached::Leaf,
+                    partial,
+                    steps: written.len(),
+                });
+            };
+            (reached, generics, arguments) = match program.type_id_to_type_map.get(&type_id) {
+                Some(Type::Struct(next, next_arguments)) => match step_struct(*next) {
+                    Some(struct_id) => (
+                        KeyReached::Struct(struct_id),
+                        program
+                            .structs
+                            .get(&struct_id)
+                            .map(|structure| structure.generic_parameter_constraint_ids.clone())
+                            .unwrap_or_default(),
+                        next_arguments.clone(),
+                    ),
+                    None => (KeyReached::Leaf, Vec::new(), Vec::new()),
+                },
+                Some(Type::Enum(next, next_arguments)) => (
+                    KeyReached::Enum(*next),
+                    program
+                        .enums
+                        .get(next)
+                        .map(|enumeration| enumeration.generic_parameter_constraint_ids.clone())
+                        .unwrap_or_default(),
+                    next_arguments.clone(),
+                ),
+                _ => (KeyReached::Leaf, Vec::new(), Vec::new()),
+            };
+        }
+        Some(KeyChain {
+            root: root_struct,
+            reached,
+            partial,
+            steps: written.len(),
+        })
+    }
+
+    /// Whether the `::` at `tokens[separator]` follows a key step's member
+    /// (`.title::`, `.0::`, `::Some::`) rather than a path's segment.
+    fn key_step_before_path(&self, tokens: &[(Token<'_>, Span)], separator: usize) -> bool {
+        let Some(before) = separator.checked_sub(1) else {
+            return false;
+        };
+        let led = |index: usize, token: &Token<'_>| {
+            index >= 1
+                && matches!(token, Token::Ident(_) | Token::Number(_, None, None))
+                && matches!(tokens[index - 1].0, Token::Ctrl('.') | Token::Op("::"))
+        };
+        led(before, &tokens[before].0)
+            && (matches!(tokens[before - 1].0, Token::Ctrl('.'))
+                || self.key_step_before_path(tokens, before - 1))
     }
 
     /// Whether `field` of `struct_id` is a member here: std's `[internal]`

@@ -699,7 +699,8 @@ postfix = "." member                     (* span-adjacent: `.` then the member *
                                           (* direct call on the chain result *)
         | "?." member                    (* lift link, §5.10 *)
         | "?"                            (* expression lift, §5.10 *)
-        | "as" ascribed-type ;           (* ascription, §5.8 *)
+        | "as" ascribed-type             (* ascription, §5.8 *)
+        | variant-step ;                 (* a key's variant step, §3.6 below *)
 ascribed-type = type ;   (* every generic list in it span-adjacent, below *)
 
 atom    = literal | IDENT | IDENT generic-args | struct-init
@@ -771,6 +772,24 @@ names a field of the field type, never a member of `Key` (`Task.title.name()`
 is a method call on the key; `Task.title.erased` is a step into `str`, and
 refused). The generic arguments of a key's root are not written —
 `Pair<i32>.left` reads `<` as a comparison — they come from the expected type.
+
+A **variant step** (B711 S3a) continues a key's path into an `Option` or an
+enum's payload: `::` and a variant's name, then optionally its payload
+position, `Doc.title::Some`, `Doc.shape::Rect.0`:
+
+```text
+variant-step = "::" MEMBER [ "." NUMBER ] ;   (* only after a member or a variant step *)
+```
+
+It is admitted only directly after a member (`.name`, `.0`) or another
+variant step, so a `::` path stays the base's (`a::b::C`, written before any
+postfix) and `::` after any other postfix (`f()::x`) is still the parse
+error it was; no program changes meaning. The name must start on the `::`'s
+line (E142's rule). The position is an integer literal against its dot, with
+no fraction and no suffix, folded into the step. Name resolution decides the
+rest: on a key literal's path the step is a key step (types §5.13); on a
+value it is refused. A half-typed `Doc.title::` parses with an empty name, so
+the subject still analyzes and completion offers the variants.
 
 `Name<Args>` is read as a generic path head only when `::` immediately
 follows (`List<str>::new()`); otherwise `<` is a comparison. A fixed-array

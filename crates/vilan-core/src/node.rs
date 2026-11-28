@@ -1041,6 +1041,12 @@ pub enum Node<'src> {
     // A match expression: subject and legs of `patterns (if guard)? => body`.
     Match(Box<Spanned<Self>>, Spanned<Vec<MatchLeg<'src>>>),
     MemberAccessor(Box<Spanned<Self>>, Box<Spanned<Self>>),
+    // B711 S3a: the MEMBER of a `MemberAccessor` written `::Variant` (and its
+    // optional payload position, `.0`) — a variant step of a key literal,
+    // `Doc.title::Some`, `Doc.shape::Rect.0`. The name and its span (empty for
+    // the half-typed `Doc.title::`), then the position's digits and span.
+    // Only a key's path admits it; name resolution refuses it anywhere else.
+    KeyVariant(Spanned<&'src str>, Option<Spanned<&'src str>>),
     // `subject[index]` — a subscript into a `List` (element access / assignment,
     // and `&mut list[i]` element views). Subject and index expressions.
     Index(Box<Spanned<Self>>, Box<Spanned<Self>>),
@@ -1300,6 +1306,7 @@ impl<'src> Node<'src> {
         match self {
             // Leaves.
             Node::Accessor(_)
+            | Node::KeyVariant(..)
             | Node::StdItem(..)
             | Node::Bool(_)
             | Node::Error

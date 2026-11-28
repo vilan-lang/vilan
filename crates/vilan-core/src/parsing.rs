@@ -3786,7 +3786,7 @@ impl<'a, 'src> Parser<'a, 'src> {
             // Every link of the chain. Each consumes at least its own leading
             // token, so the loop strictly advances; a following operator is then
             // taken by the arm above, under the refusal already pushed.
-            while matches!(self.parse_one_postfix(), Some(Some(_))) {}
+            while matches!(self.parse_one_postfix(&[]), Some(Some(_))) {}
         }
     }
 
@@ -6060,7 +6060,7 @@ impl<'a, 'src> Parser<'a, 'src> {
         let mut postfixes: Vec<(Postfix<'src>, Span)> = Vec::new();
         loop {
             let start = self.position;
-            match self.parse_one_postfix()? {
+            match self.parse_one_postfix(&postfixes)? {
                 Some(postfix) => postfixes.push((postfix, self.span_from(start))),
                 None => break,
             }
@@ -6068,10 +6068,50 @@ impl<'a, 'src> Parser<'a, 'src> {
         Some(group_postfixes(base, postfixes))
     }
 
+    /// B711 S3a: `::Variant` and its optional payload position (`.0`) after a
+    /// member — the cursor on the `::`. The name must start on the `::`'s
+    /// line (E142's rule); a missing one is the half-typed `Doc.title::`, kept
+    /// as an empty name so the subject still analyzes (completion offers the
+    /// variants there) and the analysis says what is missing.
+    fn parse_key_variant_step(&mut self) -> Spanned<Node<'src>> {
+        let start = self.position;
+        self.bump(); // `::`
+        let name_start = self.position;
+        let name = if self.separator_crosses_a_line() {
+            None
+        } else {
+            self.eat_member_name()
+        };
+        let Some(name) = name else {
+            let at = self.span_from(start);
+            let end = Span::from(at.end..at.end);
+            return (Node::KeyVariant(("", end), None), at);
+        };
+        let name = (name, self.span_from(name_start));
+        // `.0` straight after the variant is its payload position, folded into
+        // the step: one number, against its dot, no fraction and no suffix.
+        let mut position = None;
+        if self.peek_is_ctrl('.')
+            && let Some((Token::Number(whole, None, None), number_span)) =
+                self.tokens.get(self.position + 1)
+            && self.tokens[self.position].1.end == number_span.start
+        {
+            let whole = *whole;
+            let number_span = *number_span;
+            self.bump();
+            self.bump();
+            position = Some((whole, number_span));
+        }
+        (Node::KeyVariant(name, position), self.span_from(start))
+    }
+
     /// One postfix suffix, or `Some(None)` when none starts here (stop the loop).
     /// The outer `Option` is the clean-or-decline signal (a required inner element
     /// failed); the inner `Option` distinguishes "no postfix here".
-    fn parse_one_postfix(&mut self) -> Option<Option<Postfix<'src>>> {
+    fn parse_one_postfix(
+        &mut self,
+        before: &[(Postfix<'src>, Span)],
+    ) -> Option<Option<Postfix<'src>>> {
         // `.member` — with the mid-edit recovery to an `Error` member (silent at
         // parse; the receiver still analyzes, for LSP completion).
         if self.peek_is_ctrl('.') {
@@ -6130,6 +6170,25 @@ impl<'a, 'src> Parser<'a, 'src> {
         // with a name `as` is still reported as the missing `;`.
         if self.peek_is_word("as") && self.type_can_start_at(1) {
             return Some(self.attempt(Self::parse_ascription).map(Postfix::Ascribe));
+        }
+        // B711 S3a: `Doc.title::Some`, `Doc.shape::Rect.0` — a variant step
+        // of a key literal. `::` after a postfix is no form anything else
+        // reads (a `::` path is the BASE's, before any postfix), so the step
+        // is admitted only after a member (`.name`, `.0`) or another variant
+        // step, and name resolution decides whether the chain is a key. Asked
+        // last, so a chain that ends anywhere else pays nothing for it.
+        if matches!(
+            before.last(),
+            Some((
+                Postfix::Member((
+                    Node::Accessor(_) | Node::Number(_, None, None) | Node::KeyVariant(..),
+                    _
+                )),
+                _
+            ))
+        ) && self.peek_is_op("::")
+        {
+            return Some(Some(Postfix::Member(self.parse_key_variant_step())));
         }
         Some(None)
     }
@@ -12642,6 +12701,86 @@ mod tests {
                 "the refusal must say who refused, got: {refusal}"
             );
         }
+    }
+
+    /// B711 S3a: a key's variant step is the MEMBER of its access —
+    /// `Doc.title::Some` is `MemberAccessor(Doc.title, KeyVariant(Some))` —
+    /// its payload position folds into the step, and steps continue past it.
+    #[test]
+    fn a_key_variant_step_is_a_member_with_its_position_folded_in() {
+        let variant = |node: &Spanned<Node<'_>>| match &node.0 {
+            Node::MemberAccessor(subject, member) => match &member.0 {
+                Node::KeyVariant((name, _), position) => Some((
+                    matches!(subject.0, Node::MemberAccessor(..)),
+                    name.to_string(),
+                    position.map(|(digits, _)| digits.to_string()),
+                )),
+                _ => None,
+            },
+            _ => None,
+        };
+        let title = expr("Doc.title::Some");
+        let (subject, name, position) = variant(&title).expect("a variant step");
+        assert!(subject, "the step's subject is the field access");
+        assert_eq!((name.as_str(), position), ("Some", None));
+        let width = expr("Doc.shape::Rect.0");
+        let (_, name, position) = variant(&width).expect("a variant step");
+        assert_eq!((name.as_str(), position.as_deref()), ("Rect", Some("0")));
+        // Steps continue: a field, and another variant step.
+        let name = expr("Doc.owner::Some.name");
+        let Node::MemberAccessor(inner, member) = &name.0 else {
+            panic!("a member after the step: {name:?}");
+        };
+        assert!(matches!(member.0, Node::Accessor("name")));
+        assert!(variant(inner).is_some(), "{inner:?}");
+        let twice = expr("Doc.depth::Some::Some");
+        let Node::MemberAccessor(inner, _) = &twice.0 else {
+            panic!("{twice:?}");
+        };
+        assert!(variant(inner).is_some() && variant(&twice).is_some());
+        let after_position = expr("Doc.shape::Rect.1::Some");
+        assert!(variant(&after_position).is_some());
+    }
+
+    /// A `::` path is the BASE's, before any postfix, and stays a path; `::`
+    /// after a postfix that is no member is no step; a half-typed step keeps
+    /// an empty name, and a name on the next line is not taken.
+    #[test]
+    fn a_key_variant_step_follows_only_a_member() {
+        assert!(matches!(expr("a::b::C").0, Node::StaticAccessor(..)));
+        assert!(matches!(
+            expr("Shape::Rect.0").0,
+            Node::MemberAccessor(ref subject, ref member)
+                if matches!(subject.0, Node::StaticAccessor(..)) && matches!(member.0, Node::Number(..))
+        ));
+        let source = "f()::Some";
+        let (mut tokens, _) = lexing::tokenize(source);
+        let count = tokens.len();
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let parsed = parser.parse_expression();
+        assert!(
+            parsed.is_none() || parser.position < count,
+            "`::` after a call is no step: {parsed:?}"
+        );
+        let half = expr("Doc.title::");
+        let Node::MemberAccessor(_, member) = &half.0 else {
+            panic!("{half:?}");
+        };
+        assert!(
+            matches!(member.0, Node::KeyVariant(("", _), None)),
+            "{member:?}"
+        );
+        let source = "Doc.title::\nSome";
+        let (mut tokens, _) = lexing::tokenize(source);
+        let mut parser = Parser::new(&mut tokens, source, false);
+        let parsed = parser.parse_expression().expect("the half-typed step");
+        let Node::MemberAccessor(_, member) = &parsed.0 else {
+            panic!("{parsed:?}");
+        };
+        assert!(
+            matches!(member.0, Node::KeyVariant(("", _), None)),
+            "the next line's name is not taken: {member:?}"
+        );
     }
 
     /// Parse `source` as a bare expression, asserting a clean full-consumption

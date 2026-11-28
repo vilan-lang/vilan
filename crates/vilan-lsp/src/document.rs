@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range};
-use vilan_core::analyzer::{DERIVED_SOURCE, Expr, ExprIfBranch, Parameter, SourceId};
+use vilan_core::analyzer::{
+    DERIVED_SOURCE, Expr, ExprIfBranch, KeyLiteralStep, Parameter, SourceId,
+};
 use vilan_core::cancel::CancelToken;
 use vilan_core::formatter::{ModuleRescue, STYLE_BREAKPOINT_WIDTHS, STYLE_CONDITION_METHODS};
 use vilan_core::fx::{FxHashMap as HashMap, FxHashSet};
@@ -5122,16 +5124,30 @@ impl Document {
         &self,
         program: &Program,
         id: Id,
-        steps: &[(Id, usize)],
+        steps: &[KeyLiteralStep],
         type_label: &str,
     ) -> Option<HoverBlocks> {
-        let &(owner, index) = steps.last()?;
-        let field = program.structs.get(&owner)?.fields.get(index)?;
         let written = program
             .span_map
             .get(&id)
             .and_then(|span| self.analyzed_text().get(span.into_range()))
             .map(|text| text.split_whitespace().collect::<String>())?;
+        let (owner, index) = match *steps.last()? {
+            KeyLiteralStep::Field(owner, index) => (owner, index),
+            // S3a: a variant step hovers as its key, then the variant's `///`.
+            KeyLiteralStep::Variant(enum_id, variant, _) => {
+                let mut out = HoverBlocks::new();
+                out.push_code(Block::Signature, &format!("{written}: {type_label}"));
+                out.push_some(
+                    Block::Doc,
+                    program
+                        .variant_entity(enum_id, variant)
+                        .and_then(|declaration| self.analysis(program).doc_comment_of(declaration)),
+                );
+                return Some(out);
+            }
+        };
+        let field = program.structs.get(&owner)?.fields.get(index)?;
         let field_line = self
             .analysis(program)
             .field_type_label(owner, index, field.name)
@@ -6550,11 +6566,20 @@ impl Document {
                     Some((program.source_of(*struct_id)?, field.name_span))
                 }
                 // B711 S1c: a key literal's step names the field it reaches.
-                Expr::Key(steps) => {
-                    let (struct_id, index) = steps.last()?;
-                    let field = program.structs.get(struct_id)?.fields.get(*index)?;
-                    Some((program.source_of(*struct_id)?, field.name_span))
-                }
+                Expr::Key(steps) => match *steps.last()? {
+                    KeyLiteralStep::Field(struct_id, index) => {
+                        let field = program.structs.get(&struct_id)?.fields.get(index)?;
+                        Some((program.source_of(struct_id)?, field.name_span))
+                    }
+                    // S3a: a variant step names its variant.
+                    KeyLiteralStep::Variant(enum_id, variant, _) => {
+                        let declaration = program.variant_entity(enum_id, variant)?;
+                        Some((
+                            program.source_of(declaration)?,
+                            span_of(program, declaration)?,
+                        ))
+                    }
+                },
                 Expr::EnumVariant(enum_id, _) => {
                     Some((program.source_of(*enum_id)?, span_of(program, *enum_id)?))
                 }

@@ -98,7 +98,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use vilan_core::Span;
-use vilan_core::analyzer::{DERIVED_SOURCE, Expr, Program, SourceId};
+use vilan_core::analyzer::{DERIVED_SOURCE, Expr, KeyLiteralStep, Program, SourceId};
 use vilan_core::id::Id;
 
 /// A definition that identifiers can name.
@@ -659,10 +659,20 @@ impl ReferenceIndex {
                     if minted_keys.contains(use_id) {
                         continue;
                     }
-                    let Some(&(struct_id, index)) = steps.last() else {
-                        continue;
+                    let definition = match steps.last() {
+                        Some(&KeyLiteralStep::Field(struct_id, index)) => {
+                            Definition::Field(struct_id, index)
+                        }
+                        // S3a: a variant step (`Some` in `Doc.title::Some`)
+                        // names its variant, whose member span is the name.
+                        Some(&KeyLiteralStep::Variant(enum_id, variant, _)) => {
+                            match program.variant_entity(enum_id, variant) {
+                                Some(declaration) => Definition::Entity(declaration),
+                                None => continue,
+                            }
+                        }
+                        None => continue,
                     };
-                    let definition = Definition::Field(struct_id, index);
                     let Some(name) = name_of(program, definition) else {
                         continue;
                     };

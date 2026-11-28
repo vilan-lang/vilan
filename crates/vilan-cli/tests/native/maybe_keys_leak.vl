@@ -1,0 +1,31 @@
+// B711 S3a: partial keys leave nothing live natively. A hundred
+// compositions (`some()` and `then` past a partial step) made in a loop,
+// stored in a list and a map and read through; none is live at exit.
+import std::hash_map::HashMap;
+
+struct User {
+	age: i32,
+}
+
+struct Doc {
+	owner: Option<User>,
+}
+
+fun main() {
+	mut d = Doc { owner = Some(User { age = 0 }) };
+	mut held: List<MaybeKey<Doc, i32>> = [];
+	mut named: HashMap<MaybeKey<Doc, i32>, i32> = HashMap::new();
+	mut i = 0;
+	for i < 50 {
+		let age = Doc.owner.some().then(User.age);
+		held.push(age);
+		age.change(&mut d, |a| {
+			a += 1;
+		});
+		named.insert(age, i);
+		i += 1;
+	}
+	print(held.len());
+	print(named.len());
+	print(held[0].get(&d));
+}

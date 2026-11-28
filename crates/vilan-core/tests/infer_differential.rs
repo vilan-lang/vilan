@@ -194,6 +194,7 @@ const FOLDS: &[&str] = &[
     "map.vl",
     "match-ergonomics.vl",
     "math.vl",
+    "maybe-keys.vl",
     "mut-parameters.vl",
     "number-math.vl",
     "numeric-types.vl",

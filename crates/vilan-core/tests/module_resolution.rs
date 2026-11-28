@@ -10421,6 +10421,8 @@ struct KeyLoad {
     loaded: bool,
     errors: Vec<String>,
     stdout: Option<String>,
+    /// The program's interface fingerprints by item (B711 S3a).
+    interface: std::collections::BTreeMap<String, u64>,
 }
 
 /// Lays `files` out as the entry package (with `main.vl` its entry) beside
@@ -10482,6 +10484,10 @@ fn key_load(
     let loaded = program
         .as_ref()
         .is_some_and(|program| program.key_struct_id.is_some());
+    let interface = program
+        .as_ref()
+        .map(|program| vilan_core::incremental::fingerprints(program).items)
+        .unwrap_or_default();
     let stdout = match (run, program) {
         (true, Some(program)) if errors.is_empty() => Some(run_node(
             &vilan_core::transform(&program, &vilan_core::BuildOptions::default())
@@ -10494,6 +10500,7 @@ fn key_load(
         loaded,
         errors,
         stdout,
+        interface,
     }
 }
 
@@ -10839,4 +10846,127 @@ fn m211_tuple_keys_need_no_std_key() {
     assert!(load.errors.is_empty(), "{:#?}", load.errors);
     assert!(!load.loaded, "a tuple key loaded `std::key`");
     assert_eq!(load.stdout.as_deref(), Some("5\na\n"));
+}
+
+// --- B711 S3a: `MaybeKey` and variant steps seed `std::key` ---------------------
+
+const M211_DOC: &str = "struct User {\n\tname: str,\n}\n\nstruct Doc {\n\ttitle: Option<str>,\n\towner: Option<User>,\n}\n";
+
+/// A variant step is a key literal: it loads the module with no `Key` or
+/// `MaybeKey` written anywhere.
+#[test]
+fn m211_a_variant_step_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(&format!(
+        "{M211_DOC}\nfun main() {{\n\tlet d = Doc {{ title = Some(\"a\"), owner = None }};\n\
+         \tprint(Doc.title::Some.get(&d));\n}}\n"
+    )));
+    assert_eq!(stdout, "Some(\"a\")\n");
+}
+
+/// A field step past a variant step, and a variant step inside a closure and
+/// an interpolation.
+#[test]
+fn m211_a_path_past_a_variant_step_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(&format!(
+        "{M211_DOC}\nfun main() {{\n\tmut d = Doc {{ title = None, owner = Some(User {{ name = \"n\" }}) }};\n\
+         \tlet put = || Doc.owner::Some.name.put(&mut d, \"m\");\n\tprint(put());\n\
+         \tprint(i\"{{Doc.owner::Some.name.name()}}\");\n}}\n"
+    )));
+    assert_eq!(stdout, "true\nowner::Some.name\n");
+}
+
+/// `MaybeKey` written only in a signature, the function never called.
+#[test]
+fn m211_maybe_key_only_in_a_signature_loads_std_key() {
+    assert_loads_key(key_load_entry(&format!(
+        "{M211_DOC}\nfun read(d: Doc, k: MaybeKey<Doc, str>): Option<str> {{\n\tk.get(&d)\n}}\n\n\
+         fun main() {{\n\tprint(\"x\");\n}}\n"
+    )));
+}
+
+/// A struct named in lower case roots a variant step too: its declaration
+/// seeds the module.
+#[test]
+fn m211_a_lower_case_root_s_variant_step_loads_std_key() {
+    let stdout = assert_loads_key(key_load_entry(
+        "struct doc {\n\ttitle: Option<str>,\n}\n\nfun main() {\n\tlet d = doc { title = Some(\"t\") };\n\
+         \tprint(doc.title::Some.get(&d));\n}\n",
+    ));
+    assert_eq!(stdout, "Some(\"t\")\n");
+}
+
+/// A variant step on a VALUE seeds the module (the spelling cannot tell) and
+/// is refused as no key, with the same words.
+#[test]
+fn m211_a_variant_step_on_a_value_is_refused_with_the_module_loaded() {
+    let load = key_load_entry(&format!(
+        "{M211_DOC}\nfun main() {{\n\tlet d = Doc {{ title = None, owner = None }};\n\tlet k = d.title::Some;\n}}\n"
+    ));
+    assert!(load.loaded);
+    assert_eq!(
+        load.errors,
+        vec![
+            "a variant step (`::Some`) stands only in a key literal's path, rooted at a struct \
+             type (`Doc.title::Some`), and `d.title` is a value: to test a value's variant write \
+             `d.title is Some(..)` or `match`"
+                .to_string()
+        ]
+    );
+}
+
+/// A file's own `MaybeKey` is its own (a declaration beats the prelude) and
+/// loads nothing; the prelude's re-export of `MaybeKey` loads nothing either.
+#[test]
+fn m211_a_file_s_own_maybe_key_does_not_load_std_key() {
+    let load = key_load_entry(
+        "struct MaybeKey {\n\tn: i32,\n}\n\nfun main() {\n\tlet k = MaybeKey { n = 2 };\n\tprint(k.n);\n}\n",
+    );
+    assert!(load.errors.is_empty(), "{:#?}", load.errors);
+    assert!(!load.loaded, "a file's own `MaybeKey` loaded `std::key`");
+    assert_eq!(load.stdout.as_deref(), Some("2\n"));
+}
+
+/// What a variant step means — the variant's position, its payload's width
+/// and slot types — is the enum's declaration, and that is part of the
+/// enum's interface fingerprint: reordering the variants or reshaping a
+/// payload moves it (an importer's key literal is re-analyzed), a body edit
+/// elsewhere does not.
+#[test]
+fn b711_a_variant_step_s_meaning_is_in_the_enum_s_interface_fingerprint() {
+    let interface = |model: &str| {
+        let load = key_load(
+            base_prelude(),
+            &[
+                (
+                    "main.vl",
+                    "import pkg::model::{ Doc, Shape };\n\
+                     fun main() {\n\tlet d = Doc { shape = Shape::Circle(1.0) };\n\
+                     \tprint(Doc.shape::Rect.1.get(&d));\n}\n",
+                ),
+                ("model.vl", model),
+            ],
+            &[],
+            Platform::default(),
+            false,
+        );
+        assert!(load.errors.is_empty(), "{:#?}", load.errors);
+        load.interface
+            .into_iter()
+            .find(|(item, _)| item.starts_with("enum ") && item.ends_with("::Shape"))
+            .map(|(_, hash)| hash)
+            .expect("the enum's interface item")
+    };
+    let base = "export enum Shape {\n\tCircle(f64),\n\tRect(f64, f64),\n}\n\n\
+                export struct Doc {\n\tshape: Shape,\n}\n\n\
+                fun helper(): i32 {\n\t1\n}\n";
+    let reordered = base.replace(
+        "\tCircle(f64),\n\tRect(f64, f64),",
+        "\tRect(f64, f64),\n\tCircle(f64),",
+    );
+    // The payload's slot TYPE moves it too (the entry's literal still checks).
+    let reshaped = base.replace("Rect(f64, f64)", "Rect(f64, i32)");
+    let body = base.replace("\t1\n", "\t2\n");
+    assert_ne!(interface(base), interface(&reordered), "variant order");
+    assert_ne!(interface(base), interface(&reshaped), "payload shape");
+    assert_eq!(interface(base), interface(&body), "a body edit");
 }

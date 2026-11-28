@@ -805,7 +805,7 @@ NEW	-	`on:` is the web element's event form: on `<{tag}>`, an event is a method 
 NEW	-	a `.method(…)` link is the web element's head form: on `<{tag}>`, every head item is an attribute, a method of what `{tag}()` returns, written without the dot
 NEW	-	{taker}: write `&mut {place}`; a `&` view cannot be written through
 NEW	-	{taker}, and this view is readonly (`&`): pass a writable one, `&mut <place>`
-NEW	-	a key reaches only struct fields: `{path}` has type `{type}`, and a step into an `Option` or an enum's variant may find nothing there
+NEW	-	a field step reaches only struct fields: `{path}` has type `{type}`, an enum{steer}
 NEW	-	a key reaches only struct fields: `{path}` {what}
 NEW	-	`{owner}` is a resource, and a key cannot reach into a resource's fields
 NEW	-	`{field}` is an `[internal]` field of std's `{owner}`, and an internal std field is not a member outside std, so it has no key: {reason}
@@ -818,3 +818,14 @@ NEW	-	this key is a `{key}`, and the subject is a `{subject}`: a tuple key index
 NEW	-	`{member_name}` reads through `[field_syntax]` as {written}, and that key is refused: {reason}
 NEW	-	; `{member_name}` is a field of `{subject}`, {mark}: write `{receiver}.{member_name}` (the call `{receiver}.{method}({subject}.{member_name})`)
 NEW	-	the left side of this assignment is not a place: {read}, {answers} - {how}
+NEW	-	this key is a `MaybeKey`: its place may not be there, so `s[k]` cannot name it; read it with `k.get(&s)` (an `Option`), lend it with `k.view(&s, |place| ..)` or `k.change(&mut s, |place| ..)`, or write it with `k.put(&mut s, value)` (each answers whether it was there)
+NEW	-	a variant step (`::{variant}`) stands only in a key literal's path, rooted at a struct type (`Doc.title::Some`), and {subject} is a value: to test a value's variant write `{subject} is {variant}(..)` or `match`
+NEW	-	a variant step reaches into an `Option` or an enum's payload: `{path}` has type `{type}`, which has no variants
+NEW	-	`{enum}` is a resource, and a key cannot reach into a resource's payload: a resource is moved, never copied, and a key's place reads by copy
+NEW	-	expected a variant name after `::`: `{path}` is a `{type}`, whose payload variants are {variants}
+NEW	-	enum '{enum}' has no variant '{variant}'{suggestion}
+NEW	-	`{enum}::{variant}` is a unit variant: it holds no value, so there is no place for a key to reach; to test for it, read `{path}` and write `is {enum}::{variant}`
+NEW	-	`{enum}::{variant}`'s payload has {positions}: `.{position}` is out of range
+NEW	-	`{enum}::{variant}` holds {slots} values, and a key reaches one slot at a time: name it by its position, `{path}::{variant}.0` to `{path}::{variant}.{last}`
+NEW	-	Expected {expected}, but got {got} instead: this key's path has a step that may find nothing (a variant step), so it is a `MaybeKey`, which reaches its place with `get`, `view`, `change` or `put`; a `Key` names a place that is always there
+NEW	-	Expected {expected}, but got {got} instead: a total key held in a value becomes a `MaybeKey` with `.maybe()` (a key literal needs no call)
